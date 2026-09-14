@@ -1,0 +1,20 @@
+; Engine configuration file.
+; Used by the headless tests in demo/tests/ and by the demo scenes.
+
+config_version=5
+
+[application]
+
+config/name="AVBD Demo"
+run/main_scene="res://scenes/stack.tscn"
+config/features=PackedStringArray("4.4")
+
+[physics]
+
+; Godot's built-in 3D physics is not used: every node graph in this project is
+; plain Node3D driven by AVBD, so the engine's physics server is switched off.
+3d/physics_engine="Dummy"
+
+[rendering]
+
+renderer/rendering_method="mobile"

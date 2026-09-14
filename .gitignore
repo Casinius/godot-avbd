@@ -1,0 +1,13 @@
+# Build state (xmake).
+build/
+.xmake/
+compile_commands.json
+
+# Godot project artifacts of the demo.
+demo/.godot/
+demo/.import/
+*.uid
+
+# GDExtension binaries: produced by `xmake` into demo/bin/, not source.
+demo/bin/
+.cache

@@ -1,0 +1,434 @@
+[gd_scene load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://scenes/demo.gd" id="1"]
+
+[sub_resource type="Environment" id="Environment_1"]
+background_mode = 1
+background_color = Color(0.11, 0.12, 0.15, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.8, 0.82, 0.9, 1)
+ambient_light_energy = 0.4
+
+[node name="Bridge" type="Node3D"]
+script = ExtResource("1")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_1")
+
+[node name="World" type="AVBDWorld3D" parent="."]
+gravity = 9.8
+iterations = 14
+
+[node name="Ground" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.5, 0)
+size = Vector3(60, 1, 60)
+friction = 0.6
+static_body = true
+visualize_shape = true
+shape_color = Color(0.32, 0.34, 0.38, 1)
+
+[node name="Abutment-1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -10, 9.5, 0)
+size = Vector3(1, 1, 6)
+static_body = true
+visualize_shape = true
+shape_color = Color(0.3, 0.33, 0.36, 1)
+
+[node name="Abutment1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 10, 9.5, 0)
+size = Vector3(1, 1, 6)
+static_body = true
+visualize_shape = true
+shape_color = Color(0.3, 0.33, 0.36, 1)
+
+[node name="Plank0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -9.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+static_body = true
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -8.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank2" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -7.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank3" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -6.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank4" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -5.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank5" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank6" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank7" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank8" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank9" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank10" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank11" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank12" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank13" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank14" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank15" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 5.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank16" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 6.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank17" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 7.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank18" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 8.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Plank19" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 9.5, 10, 0)
+size = Vector3(1, 0.5, 4)
+static_body = true
+visualize_shape = true
+shape_color = Color(0.72, 0.55, 0.35, 1)
+
+[node name="Joint0_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank0")
+node_b = NodePath("../Plank1")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint0_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank0")
+node_b = NodePath("../Plank1")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint1_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank1")
+node_b = NodePath("../Plank2")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint1_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank1")
+node_b = NodePath("../Plank2")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint2_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank2")
+node_b = NodePath("../Plank3")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint2_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank2")
+node_b = NodePath("../Plank3")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint3_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank3")
+node_b = NodePath("../Plank4")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint3_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank3")
+node_b = NodePath("../Plank4")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint4_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank4")
+node_b = NodePath("../Plank5")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint4_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank4")
+node_b = NodePath("../Plank5")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint5_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank5")
+node_b = NodePath("../Plank6")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint5_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank5")
+node_b = NodePath("../Plank6")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint6_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank6")
+node_b = NodePath("../Plank7")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint6_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank6")
+node_b = NodePath("../Plank7")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint7_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank7")
+node_b = NodePath("../Plank8")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint7_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank7")
+node_b = NodePath("../Plank8")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint8_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank8")
+node_b = NodePath("../Plank9")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint8_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank8")
+node_b = NodePath("../Plank9")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint9_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank9")
+node_b = NodePath("../Plank10")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint9_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank9")
+node_b = NodePath("../Plank10")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint10_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank10")
+node_b = NodePath("../Plank11")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint10_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank10")
+node_b = NodePath("../Plank11")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint11_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank11")
+node_b = NodePath("../Plank12")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint11_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank11")
+node_b = NodePath("../Plank12")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint12_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank12")
+node_b = NodePath("../Plank13")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint12_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank12")
+node_b = NodePath("../Plank13")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint13_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank13")
+node_b = NodePath("../Plank14")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint13_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank13")
+node_b = NodePath("../Plank14")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint14_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank14")
+node_b = NodePath("../Plank15")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint14_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank14")
+node_b = NodePath("../Plank15")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint15_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank15")
+node_b = NodePath("../Plank16")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint15_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank15")
+node_b = NodePath("../Plank16")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint16_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank16")
+node_b = NodePath("../Plank17")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint16_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank16")
+node_b = NodePath("../Plank17")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint17_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank17")
+node_b = NodePath("../Plank18")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint17_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank17")
+node_b = NodePath("../Plank18")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Joint18_-1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank18")
+node_b = NodePath("../Plank19")
+anchor_a = Vector3(0.5, 0, -2)
+anchor_b = Vector3(-0.5, 0, -2)
+
+[node name="Joint18_1" type="AVBDJoint3D" parent="World"]
+node_a = NodePath("../Plank18")
+node_b = NodePath("../Plank19")
+anchor_a = Vector3(0.5, 0, 2)
+anchor_b = Vector3(-0.5, 0, 2)
+
+[node name="Load0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3, 13, 0.5)
+size = Vector3(1, 1, 1)
+visualize_shape = true
+shape_color = Color(0.45, 0.7, 0.5, 1)
+
+[node name="Load1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.8, 14.5, 0.5)
+size = Vector3(1, 1, 1)
+visualize_shape = true
+shape_color = Color(0.45, 0.7, 0.5, 1)
+
+[node name="Load2" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.6, 16, 0.5)
+size = Vector3(1, 1, 1)
+visualize_shape = true
+shape_color = Color(0.45, 0.7, 0.5, 1)
+
+[node name="Load3" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.6, 17.5, 0.5)
+size = Vector3(1, 1, 1)
+visualize_shape = true
+shape_color = Color(0.45, 0.7, 0.5, 1)
+
+[node name="Load4" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.8, 19, 0.5)
+size = Vector3(1, 1, 1)
+visualize_shape = true
+shape_color = Color(0.45, 0.7, 0.5, 1)
+
+[node name="Load5" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3, 20.5, 0.5)
+size = Vector3(1, 1, 1)
+visualize_shape = true
+shape_color = Color(0.45, 0.7, 0.5, 1)
+
+[node name="Camera3D" type="Camera3D" parent="."]
+transform = Transform3D(0.8742, -0.0926, 0.4767, 0, 0.9816, 0.1907, -0.4856, -0.1667, 0.8581, 10, 14, 18)
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.774, -0.5162, 0.3668, 0, 0.5793, 0.8151, -0.6332, -0.6309, 0.4483, 0.45, 1, 0.55)

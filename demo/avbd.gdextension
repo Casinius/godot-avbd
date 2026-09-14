@@ -1,0 +1,11 @@
+; AVBD physics for Godot 4. Built with xmake from the godotcpp4 package; see ../xmake.lua.
+[configuration]
+
+entry_symbol = "avbd_library_init"
+compatibility_minimum = "4.1"
+reloadable = false
+
+[libraries]
+
+linux.debug.x86_64 = "res://bin/libavbd.linux.x86_64.so"
+linux.release.x86_64 = "res://bin/libavbd.linux.x86_64.so"

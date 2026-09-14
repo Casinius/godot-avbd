@@ -1,0 +1,850 @@
+[gd_scene load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://scenes/demo.gd" id="1"]
+
+[sub_resource type="Environment" id="Environment_1"]
+background_mode = 1
+background_color = Color(0.11, 0.12, 0.15, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.8, 0.82, 0.9, 1)
+ambient_light_energy = 0.4
+
+[node name="Pyramid" type="Node3D"]
+script = ExtResource("1")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_1")
+
+[node name="World" type="AVBDWorld3D" parent="."]
+gravity = 9.8
+iterations = 10
+
+[node name="Ground" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.5, 0)
+size = Vector3(40, 1, 40)
+friction = 0.6
+static_body = true
+visualize_shape = true
+shape_color = Color(0.32, 0.34, 0.38, 1)
+
+[node name="P0_0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -8, 0.5, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.35, 0.45, 0.75, 1)
+
+[node name="P0_1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -6.99, 0.5, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.35, 0.45, 0.75, 1)
+
+[node name="P0_2" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -5.98, 0.5, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.35, 0.45, 0.75, 1)
+
+[node name="P0_3" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4.97, 0.5, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.35, 0.45, 0.75, 1)
+
+[node name="P0_4" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3.96, 0.5, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.35, 0.45, 0.75, 1)
+
+[node name="P0_5" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.95, 0.5, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.35, 0.45, 0.75, 1)
+
+[node name="P0_6" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.94, 0.5, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.35, 0.45, 0.75, 1)
+
+[node name="P0_7" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.93, 0.5, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.35, 0.45, 0.75, 1)
+
+[node name="P0_8" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.08, 0.5, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.35, 0.45, 0.75, 1)
+
+[node name="P0_9" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.09, 0.5, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.35, 0.45, 0.75, 1)
+
+[node name="P0_10" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.1, 0.5, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.35, 0.45, 0.75, 1)
+
+[node name="P0_11" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3.11, 0.5, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.35, 0.45, 0.75, 1)
+
+[node name="P0_12" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.12, 0.5, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.35, 0.45, 0.75, 1)
+
+[node name="P0_13" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 5.13, 0.5, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.35, 0.45, 0.75, 1)
+
+[node name="P0_14" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 6.14, 0.5, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.35, 0.45, 0.75, 1)
+
+[node name="P0_15" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 7.15, 0.5, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.35, 0.45, 0.75, 1)
+
+[node name="P1_0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -7.5, 1.35, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.38, 0.45, 0.75, 1)
+
+[node name="P1_1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -6.49, 1.35, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.38, 0.45, 0.75, 1)
+
+[node name="P1_2" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -5.48, 1.35, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.38, 0.45, 0.75, 1)
+
+[node name="P1_3" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4.47, 1.35, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.38, 0.45, 0.75, 1)
+
+[node name="P1_4" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3.46, 1.35, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.38, 0.45, 0.75, 1)
+
+[node name="P1_5" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.45, 1.35, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.38, 0.45, 0.75, 1)
+
+[node name="P1_6" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.44, 1.35, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.38, 0.45, 0.75, 1)
+
+[node name="P1_7" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.43, 1.35, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.38, 0.45, 0.75, 1)
+
+[node name="P1_8" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.58, 1.35, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.38, 0.45, 0.75, 1)
+
+[node name="P1_9" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.59, 1.35, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.38, 0.45, 0.75, 1)
+
+[node name="P1_10" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.6, 1.35, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.38, 0.45, 0.75, 1)
+
+[node name="P1_11" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3.61, 1.35, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.38, 0.45, 0.75, 1)
+
+[node name="P1_12" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.62, 1.35, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.38, 0.45, 0.75, 1)
+
+[node name="P1_13" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 5.63, 1.35, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.38, 0.45, 0.75, 1)
+
+[node name="P1_14" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 6.64, 1.35, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.38, 0.45, 0.75, 1)
+
+[node name="P2_0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -7, 2.2, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.41, 0.45, 0.75, 1)
+
+[node name="P2_1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -5.99, 2.2, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.41, 0.45, 0.75, 1)
+
+[node name="P2_2" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4.98, 2.2, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.41, 0.45, 0.75, 1)
+
+[node name="P2_3" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3.97, 2.2, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.41, 0.45, 0.75, 1)
+
+[node name="P2_4" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.96, 2.2, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.41, 0.45, 0.75, 1)
+
+[node name="P2_5" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.95, 2.2, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.41, 0.45, 0.75, 1)
+
+[node name="P2_6" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.94, 2.2, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.41, 0.45, 0.75, 1)
+
+[node name="P2_7" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.07, 2.2, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.41, 0.45, 0.75, 1)
+
+[node name="P2_8" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.08, 2.2, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.41, 0.45, 0.75, 1)
+
+[node name="P2_9" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.09, 2.2, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.41, 0.45, 0.75, 1)
+
+[node name="P2_10" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3.1, 2.2, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.41, 0.45, 0.75, 1)
+
+[node name="P2_11" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.11, 2.2, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.41, 0.45, 0.75, 1)
+
+[node name="P2_12" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 5.12, 2.2, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.41, 0.45, 0.75, 1)
+
+[node name="P2_13" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 6.13, 2.2, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.41, 0.45, 0.75, 1)
+
+[node name="P3_0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -6.5, 3.05, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.43999999999999995, 0.45, 0.75, 1)
+
+[node name="P3_1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -5.49, 3.05, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.43999999999999995, 0.45, 0.75, 1)
+
+[node name="P3_2" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4.48, 3.05, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.43999999999999995, 0.45, 0.75, 1)
+
+[node name="P3_3" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3.47, 3.05, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.43999999999999995, 0.45, 0.75, 1)
+
+[node name="P3_4" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.46, 3.05, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.43999999999999995, 0.45, 0.75, 1)
+
+[node name="P3_5" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.45, 3.05, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.43999999999999995, 0.45, 0.75, 1)
+
+[node name="P3_6" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.44, 3.05, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.43999999999999995, 0.45, 0.75, 1)
+
+[node name="P3_7" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.57, 3.05, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.43999999999999995, 0.45, 0.75, 1)
+
+[node name="P3_8" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.58, 3.05, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.43999999999999995, 0.45, 0.75, 1)
+
+[node name="P3_9" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.59, 3.05, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.43999999999999995, 0.45, 0.75, 1)
+
+[node name="P3_10" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3.6, 3.05, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.43999999999999995, 0.45, 0.75, 1)
+
+[node name="P3_11" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.61, 3.05, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.43999999999999995, 0.45, 0.75, 1)
+
+[node name="P3_12" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 5.62, 3.05, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.43999999999999995, 0.45, 0.75, 1)
+
+[node name="P4_0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -6, 3.9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.47, 0.45, 0.75, 1)
+
+[node name="P4_1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4.99, 3.9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.47, 0.45, 0.75, 1)
+
+[node name="P4_2" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3.98, 3.9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.47, 0.45, 0.75, 1)
+
+[node name="P4_3" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.97, 3.9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.47, 0.45, 0.75, 1)
+
+[node name="P4_4" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.96, 3.9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.47, 0.45, 0.75, 1)
+
+[node name="P4_5" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.95, 3.9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.47, 0.45, 0.75, 1)
+
+[node name="P4_6" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.06, 3.9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.47, 0.45, 0.75, 1)
+
+[node name="P4_7" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.07, 3.9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.47, 0.45, 0.75, 1)
+
+[node name="P4_8" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.08, 3.9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.47, 0.45, 0.75, 1)
+
+[node name="P4_9" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3.09, 3.9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.47, 0.45, 0.75, 1)
+
+[node name="P4_10" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.1, 3.9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.47, 0.45, 0.75, 1)
+
+[node name="P4_11" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 5.11, 3.9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.47, 0.45, 0.75, 1)
+
+[node name="P5_0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -5.5, 4.75, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5, 0.45, 0.75, 1)
+
+[node name="P5_1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4.49, 4.75, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5, 0.45, 0.75, 1)
+
+[node name="P5_2" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3.48, 4.75, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5, 0.45, 0.75, 1)
+
+[node name="P5_3" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.47, 4.75, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5, 0.45, 0.75, 1)
+
+[node name="P5_4" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.46, 4.75, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5, 0.45, 0.75, 1)
+
+[node name="P5_5" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.45, 4.75, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5, 0.45, 0.75, 1)
+
+[node name="P5_6" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.56, 4.75, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5, 0.45, 0.75, 1)
+
+[node name="P5_7" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.57, 4.75, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5, 0.45, 0.75, 1)
+
+[node name="P5_8" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.58, 4.75, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5, 0.45, 0.75, 1)
+
+[node name="P5_9" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3.59, 4.75, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5, 0.45, 0.75, 1)
+
+[node name="P5_10" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.6, 4.75, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5, 0.45, 0.75, 1)
+
+[node name="P6_0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -5, 5.6, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.53, 0.45, 0.75, 1)
+
+[node name="P6_1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3.99, 5.6, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.53, 0.45, 0.75, 1)
+
+[node name="P6_2" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.98, 5.6, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.53, 0.45, 0.75, 1)
+
+[node name="P6_3" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.97, 5.6, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.53, 0.45, 0.75, 1)
+
+[node name="P6_4" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.96, 5.6, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.53, 0.45, 0.75, 1)
+
+[node name="P6_5" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.05, 5.6, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.53, 0.45, 0.75, 1)
+
+[node name="P6_6" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.06, 5.6, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.53, 0.45, 0.75, 1)
+
+[node name="P6_7" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.07, 5.6, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.53, 0.45, 0.75, 1)
+
+[node name="P6_8" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3.08, 5.6, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.53, 0.45, 0.75, 1)
+
+[node name="P6_9" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.09, 5.6, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.53, 0.45, 0.75, 1)
+
+[node name="P7_0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4.5, 6.45, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5599999999999999, 0.45, 0.75, 1)
+
+[node name="P7_1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3.49, 6.45, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5599999999999999, 0.45, 0.75, 1)
+
+[node name="P7_2" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.48, 6.45, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5599999999999999, 0.45, 0.75, 1)
+
+[node name="P7_3" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.47, 6.45, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5599999999999999, 0.45, 0.75, 1)
+
+[node name="P7_4" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.46, 6.45, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5599999999999999, 0.45, 0.75, 1)
+
+[node name="P7_5" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.55, 6.45, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5599999999999999, 0.45, 0.75, 1)
+
+[node name="P7_6" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.56, 6.45, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5599999999999999, 0.45, 0.75, 1)
+
+[node name="P7_7" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.57, 6.45, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5599999999999999, 0.45, 0.75, 1)
+
+[node name="P7_8" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3.58, 6.45, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.5599999999999999, 0.45, 0.75, 1)
+
+[node name="P8_0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4, 7.3, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.59, 0.45, 0.75, 1)
+
+[node name="P8_1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.99, 7.3, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.59, 0.45, 0.75, 1)
+
+[node name="P8_2" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.98, 7.3, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.59, 0.45, 0.75, 1)
+
+[node name="P8_3" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.97, 7.3, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.59, 0.45, 0.75, 1)
+
+[node name="P8_4" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.04, 7.3, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.59, 0.45, 0.75, 1)
+
+[node name="P8_5" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.05, 7.3, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.59, 0.45, 0.75, 1)
+
+[node name="P8_6" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.06, 7.3, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.59, 0.45, 0.75, 1)
+
+[node name="P8_7" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3.07, 7.3, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.59, 0.45, 0.75, 1)
+
+[node name="P9_0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3.5, 8.15, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.62, 0.45, 0.75, 1)
+
+[node name="P9_1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.49, 8.15, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.62, 0.45, 0.75, 1)
+
+[node name="P9_2" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.48, 8.15, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.62, 0.45, 0.75, 1)
+
+[node name="P9_3" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.47, 8.15, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.62, 0.45, 0.75, 1)
+
+[node name="P9_4" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.54, 8.15, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.62, 0.45, 0.75, 1)
+
+[node name="P9_5" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.55, 8.15, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.62, 0.45, 0.75, 1)
+
+[node name="P9_6" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.56, 8.15, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.62, 0.45, 0.75, 1)
+
+[node name="P10_0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3, 9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.6499999999999999, 0.45, 0.75, 1)
+
+[node name="P10_1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.99, 9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.6499999999999999, 0.45, 0.75, 1)
+
+[node name="P10_2" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.98, 9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.6499999999999999, 0.45, 0.75, 1)
+
+[node name="P10_3" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.03, 9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.6499999999999999, 0.45, 0.75, 1)
+
+[node name="P10_4" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.04, 9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.6499999999999999, 0.45, 0.75, 1)
+
+[node name="P10_5" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.05, 9, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.6499999999999999, 0.45, 0.75, 1)
+
+[node name="P11_0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.5, 9.85, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.6799999999999999, 0.45, 0.75, 1)
+
+[node name="P11_1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.49, 9.85, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.6799999999999999, 0.45, 0.75, 1)
+
+[node name="P11_2" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.48, 9.85, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.6799999999999999, 0.45, 0.75, 1)
+
+[node name="P11_3" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.53, 9.85, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.6799999999999999, 0.45, 0.75, 1)
+
+[node name="P11_4" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.54, 9.85, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.6799999999999999, 0.45, 0.75, 1)
+
+[node name="P12_0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2, 10.7, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.71, 0.45, 0.75, 1)
+
+[node name="P12_1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.99, 10.7, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.71, 0.45, 0.75, 1)
+
+[node name="P12_2" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.02, 10.7, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.71, 0.45, 0.75, 1)
+
+[node name="P12_3" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.03, 10.7, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.71, 0.45, 0.75, 1)
+
+[node name="P13_0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.5, 11.55, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.74, 0.45, 0.75, 1)
+
+[node name="P13_1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.49, 11.55, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.74, 0.45, 0.75, 1)
+
+[node name="P13_2" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.52, 11.55, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.74, 0.45, 0.75, 1)
+
+[node name="P14_0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1, 12.4, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.77, 0.45, 0.75, 1)
+
+[node name="P14_1" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.01, 12.4, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.77, 0.45, 0.75, 1)
+
+[node name="P15_0" type="AVBDRigidBody3D" parent="World"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.5, 13.25, 0)
+size = Vector3(1, 0.5, 0.5)
+visualize_shape = true
+shape_color = Color(0.7999999999999999, 0.45, 0.75, 1)
+
+[node name="Camera3D" type="Camera3D" parent="."]
+transform = Transform3D(0.7526, -0.1508, 0.641, 0, 0.9734, 0.2289, -0.6585, -0.1723, 0.7326, 14, 10, 16)
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.774, -0.5162, 0.3668, 0, 0.5793, 0.8151, -0.6332, -0.6309, 0.4483, 0.45, 1, 0.55)
