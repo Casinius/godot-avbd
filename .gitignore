@@ -17,3 +17,4 @@ demo/bin/
 *.import_cache
 *.res
 *.scn
+.cache/
