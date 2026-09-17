@@ -10,6 +10,7 @@
 */
 
 #include "avbd/solver.h"
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 
@@ -59,15 +60,15 @@ struct FaceFrame
     float extentV;
 };
 
-inline OBB makeOBB(const Rigid* body)
+inline OBB makeOBB(const Shape& shape)
 {
     OBB box{};
-    box.center = body->positionLin;
-    box.rotation = body->positionAng;
-    box.half = body->size * 0.5f;
-    box.axis[0] = rotate(body->positionAng, float3{ 1.0f, 0.0f, 0.0f });
-    box.axis[1] = rotate(body->positionAng, float3{ 0.0f, 1.0f, 0.0f });
-    box.axis[2] = rotate(body->positionAng, float3{ 0.0f, 0.0f, 1.0f });
+    box.center = shape.center;
+    box.rotation = shape.rotation;
+    box.half = shape.half;
+    box.axis[0] = rotate(shape.rotation, float3{ 1.0f, 0.0f, 0.0f });
+    box.axis[1] = rotate(shape.rotation, float3{ 0.0f, 1.0f, 0.0f });
+    box.axis[2] = rotate(shape.rotation, float3{ 0.0f, 0.0f, 1.0f });
     return box;
 }
 
@@ -196,7 +197,7 @@ inline int clipPolygonAgainstPlane(const float3* inVerts, int inCount, const flo
     return outCount;
 }
 
-inline bool addContact(Rigid* bodyA, Rigid* bodyB, Manifold::Contact* contacts, int& contactCount, float3* contactMidpoints, float3 xA, float3 xB, int featureKey)
+inline bool addContact(const Shape& shapeA, const Shape& shapeB, Manifold::Contact* contacts, int& contactCount, float3* contactMidpoints, float3 xA, float3 xB, int featureKey)
 {
     float3 midpoint = (xA + xB) * 0.5f;
 
@@ -215,8 +216,8 @@ inline bool addContact(Rigid* bodyA, Rigid* bodyB, Manifold::Contact* contacts, 
 
     Manifold::Contact& c = contacts[contactCount];
     c.feature = feature;
-    c.rA = rotate(conjugate(bodyA->positionAng), xA - bodyA->positionLin);
-    c.rB = rotate(conjugate(bodyB->positionAng), xB - bodyB->positionLin);
+    c.rA = rotate(conjugate(shapeA.rotation), xA - shapeA.center);
+    c.rB = rotate(conjugate(shapeB.rotation), xB - shapeB.center);
     contactMidpoints[contactCount] = midpoint;
     ++contactCount;
 
@@ -336,7 +337,7 @@ inline void closestPointsOnSegments(const float3& p0, const float3& p1, const fl
     c1 = q0 + d2 * t;
 }
 
-inline int buildFaceManifold(Rigid* bodyA, Rigid* bodyB, const OBB& boxA, const OBB& boxB, bool referenceIsA, int referenceAxis, const float3& normalAB, Manifold::Contact* contacts)
+inline int buildFaceManifold(const Shape& shapeA, const Shape& shapeB, const OBB& boxA, const OBB& boxB, bool referenceIsA, int referenceAxis, const float3& normalAB, Manifold::Contact* contacts)
 {
     const OBB& referenceBox = referenceIsA ? boxA : boxB;
     const OBB& incidentBox = referenceIsA ? boxB : boxA;
@@ -393,20 +394,20 @@ inline int buildFaceManifold(Rigid* bodyA, Rigid* bodyB, const OBB& boxA, const 
         float3 xA = referenceIsA ? pReference : pIncident;
         float3 xB = referenceIsA ? pIncident : pReference;
 
-        addContact(bodyA, bodyB, contacts, contactCount, contactMidpoints, xA, xB, featurePrefix | (i & 0xFF));
+        addContact(shapeA, shapeB, contacts, contactCount, contactMidpoints, xA, xB, featurePrefix | (i & 0xFF));
     }
 
     if (!contactCount)
     {
         float3 xA = supportPoint(boxA, normalAB);
         float3 xB = supportPoint(boxB, -normalAB);
-        addContact(bodyA, bodyB, contacts, contactCount, contactMidpoints, xA, xB, featurePrefix);
+        addContact(shapeA, shapeB, contacts, contactCount, contactMidpoints, xA, xB, featurePrefix);
     }
 
     return contactCount;
 }
 
-inline int buildEdgeContact(Rigid* bodyA, Rigid* bodyB, const OBB& boxA, const OBB& boxB, int axisA, int axisB, const float3& normalAB, Manifold::Contact* contacts)
+inline int buildEdgeContact(const Shape& shapeA, const Shape& shapeB, const OBB& boxA, const OBB& boxB, int axisA, int axisB, const float3& normalAB, Manifold::Contact* contacts)
 {
     float3 a0;
     float3 a1;
@@ -422,24 +423,463 @@ inline int buildEdgeContact(Rigid* bodyA, Rigid* bodyB, const OBB& boxA, const O
     int contactCount = 0;
     float3 contactMidpoints[MAX_CONTACTS];
     int featureKey = (AXIS_EDGE << 24) | ((axisA & 0xFF) << 8) | (axisB & 0xFF);
-    addContact(bodyA, bodyB, contacts, contactCount, contactMidpoints, xA, xB, featureKey);
+    addContact(shapeA, shapeB, contacts, contactCount, contactMidpoints, xA, xB, featureKey);
 
     if (!contactCount)
     {
         xA = supportPoint(boxA, normalAB);
         xB = supportPoint(boxB, -normalAB);
-        addContact(bodyA, bodyB, contacts, contactCount, contactMidpoints, xA, xB, featureKey);
+        addContact(shapeA, shapeB, contacts, contactCount, contactMidpoints, xA, xB, featureKey);
     }
 
     return contactCount;
 }
 
+
+// -----------------------------------------------------------------------------
+// Shapes
+//
+// Box-box is the reference implementation's SAT + clipping, above. The other pairs are built on
+// closest points, which is exact for a sphere against anything and for the curved side of a
+// cylinder; the flat caps of a cylinder are handled by testing the rim and cap samples against
+// the other shape. Sampling a curved surface is the usual way to get a manifold (rather than a
+// single point) out of it, and the samples are placed deterministically, so contacts are stable
+// from frame to frame and warm-starting works.
+// -----------------------------------------------------------------------------
+
+constexpr int RIM_SAMPLES = 12;
+// Interior rings along a cylinder's side, between the two caps.
+constexpr int AXIAL_SAMPLES = 3;
+// Upper bound on the candidate contacts one shape pair can produce before they are ranked.
+constexpr int MAX_CANDIDATES = 96;
+
+inline Shape makeShape(const Rigid* body)
+{
+    Shape shape;
+    shape.type = body->shape;
+    shape.center = body->positionLin;
+    shape.rotation = body->positionAng;
+    shape.half = body->size * 0.5f;
+    shape.radius = body->size.x;
+    shape.halfHeight = body->size.z * 0.5f;
+    shape.axis = rotate(body->positionAng, float3{0, 0, 1});
+    return shape;
+}
+
+// Whether a point is inside a box, and if so the shortest way out: the axis of least
+// penetration. Returns false when the point is outside.
+inline bool pointInBox(const Shape& box, const float3& p, float3& r_push, float& r_depth)
+{
+    const float3 local = rotate(conjugate(box.rotation), p - box.center);
+
+    float bestDepth = FLT_MAX;
+    int bestAxis = 0;
+    float bestSign = 1.0f;
+    for (int i = 0; i < 3; ++i)
+    {
+        const float depth = box.half[i] - std::fabs(local[i]);
+        if (depth <= 0.0f)
+            return false;
+        if (depth < bestDepth)
+        {
+            bestDepth = depth;
+            bestAxis = i;
+            bestSign = local[i] >= 0.0f ? 1.0f : -1.0f;
+        }
+    }
+
+    float3 localPush{0, 0, 0};
+    localPush[bestAxis] = bestSign;
+    r_push = rotate(box.rotation, localPush);
+    r_depth = bestDepth;
+    return true;
+}
+
+// Closest point on a solid capped cylinder to a point, plus the outward direction from the
+// cylinder's surface to that point and the distance.
+inline float3 closestPointOnCylinder(const Shape& cyl, const float3& p, float3& r_outward, float& r_distance)
+{
+    const float3 local = rotate(conjugate(cyl.rotation), p - cyl.center);
+
+    // Clamp along the axis, then radially.
+    const float t = clamp(local.y, -cyl.halfHeight, cyl.halfHeight);
+    const float2 radial{local.x, local.z};
+    const float lenSq = lengthSq(radial);
+
+    float3 closest{0, t, 0};
+    if (lenSq > cyl.radius * cyl.radius)
+    {
+        const float scale = cyl.radius / std::sqrt(lenSq);
+        closest.x = radial.x * scale;
+        closest.y = radial.y * scale;
+    }
+    else if (lenSq > 1.0e-12f)
+    {
+        closest.x = radial.x;
+        closest.y = radial.y;
+    }
+    else
+    {
+        // On the axis: the nearest surface point is on the radius, pick a fixed direction.
+        closest.x = cyl.radius;
+    }
+
+    const float3 closestLocal = rotate(cyl.rotation, closest) + cyl.center;
+    const float3 d = p - closestLocal;
+    r_distance = length(d);
+    r_outward = r_distance > 1.0e-9f ? d / r_distance : rotate(cyl.rotation, float3{1, 0, 0});
+    return closestLocal;
+}
+
+// The shortest way from a point inside a solid cylinder out to its surface: along the cap, or
+// radially, whichever is closer. Returns false when the point is outside.
+inline bool pointInCylinder(const Shape& cyl, const float3& p, float3& r_push, float& r_surface)
+{
+    const float3 local = rotate(conjugate(cyl.rotation), p - cyl.center);
+    const float radialSq = lengthSq(float2{local.x, local.y});
+    if (radialSq >= cyl.radius * cyl.radius || std::fabs(local.z) >= cyl.halfHeight)
+        return false;
+
+    const float radialDepth = cyl.radius - std::sqrt(radialSq);
+    const float capDepth = cyl.halfHeight - std::fabs(local.z);
+
+    float3 pushLocal{0, 0, 0};
+    if (capDepth < radialDepth)
+    {
+        pushLocal.z = local.z >= 0.0f ? 1.0f : -1.0f;
+        r_surface = capDepth;
+    }
+    else
+    {
+        const float len = std::sqrt(radialSq);
+        if (len > 1.0e-6f)
+        {
+            pushLocal.x = local.x / len;
+            pushLocal.y = local.y / len;
+        }
+        else
+        {
+            pushLocal.x = 1.0f; // on the axis: any radial direction will do
+        }
+        r_surface = radialDepth;
+    }
+
+    r_push = rotate(cyl.rotation, pushLocal);
+    return true;
+}
+
+// A candidate contact before it is handed to the manifold, with the penetration depth that
+// decides whether it is worth keeping.
+struct Candidate
+{
+    float3 xA;
+    float3 xB;
+    float3 normal; // points from the shape the sample belongs to, outwards
+    float depth;
+};
+
+// Emit the deepest MAX_CONTACTS candidates. Ranking by depth rather than taking them in sampling
+// order is what keeps a contact set sensible when there are more samples than the budget: the
+// shallow ones are the ones to drop.
+inline void emitRanked(const Shape& shapeA, const Shape& shapeB, Candidate* candidates, int candidateCount,
+        Manifold::Contact* contacts, int& contactCount)
+{
+    std::stable_sort(candidates, candidates + candidateCount,
+            [](const Candidate& a, const Candidate& b) { return a.depth > b.depth; });
+
+    float3 midpoints[MAX_CONTACTS];
+    contactCount = 0;
+    for (int i = 0; i < candidateCount; ++i)
+    {
+        const Candidate& c = candidates[i];
+        if (!addContact(shapeA, shapeB, contacts, contactCount, midpoints, c.xA, c.xB, i + 1))
+            if (contactCount >= MAX_CONTACTS)
+                break;
+    }
+}
+
+// Samples a cylinder's surface: the two cap centres, the two rim circles, and rings partway
+// along the side (which is what gives a lying cylinder a line of contacts rather than just its
+// two ends).
+//
+// The angles are visited in an interleaved order rather than 0, 1, 2, ... because the contact
+// budget is smaller than the sample count: adding contacts stops at MAX_CONTACTS, and taking the
+// first N of an ordered ring would cover one arc and leave the other side unsupported - which
+// tips the body over. With a stride coprime to the sample count, any prefix is spread around the
+// circle.
+inline void cylinderSamples(const Shape& cyl, float3* out, int& count)
+{
+    count = 0;
+    const float3 x = rotate(cyl.rotation, float3{1, 0, 0});
+    const float3 y = rotate(cyl.rotation, float3{0, 1, 0});
+
+    // Both caps, centres first so a flat contact has a central point.
+    for (int end = -1; end <= 1; end += 2)
+    {
+        const float3 capCentre = cyl.center + cyl.axis * (cyl.halfHeight * (float)end);
+        out[count++] = capCentre;
+        for (int i = 0; i < RIM_SAMPLES; ++i)
+        {
+            const int step = (i * 5) % RIM_SAMPLES;
+            const float a = 6.28318530718f * (float)step / (float)RIM_SAMPLES;
+            out[count++] = capCentre + (x * std::cos(a) + y * std::sin(a)) * cyl.radius;
+        }
+    }
+
+    // Interior rings along the side.
+    for (int ring = 1; ring < AXIAL_SAMPLES; ++ring)
+    {
+        const float t = -cyl.halfHeight + 2.0f * cyl.halfHeight * (float)ring / (float)AXIAL_SAMPLES;
+        const float3 ringCentre = cyl.center + cyl.axis * t;
+        for (int i = 0; i < RIM_SAMPLES; ++i)
+        {
+            const int step = (i * 5) % RIM_SAMPLES;
+            const float a = 6.28318530718f * (float)step / (float)RIM_SAMPLES;
+            out[count++] = ringCentre + (x * std::cos(a) + y * std::sin(a)) * cyl.radius;
+        }
+    }
+}
+
+inline int collideSphereSphere(const Shape& a, const Shape& b,
+        Manifold::Contact* contacts, float3x3& basisOut)
+{
+    const float3 d = b.center - a.center;
+    const float distSq = lengthSq(d);
+    const float sum = a.radius + b.radius;
+    if (distSq >= sum * sum)
+        return 0;
+
+    const float dist = std::sqrt(distSq);
+    const float3 normalAB = dist > 1.0e-6f ? d / dist : float3{0, 0, 1};
+    basisOut = orthonormal(-normalAB);
+
+    int count = 0;
+    float3 midpoints[MAX_CONTACTS];
+    addContact(a, b, contacts, count, midpoints, a.center + normalAB * a.radius,
+            b.center - normalAB * b.radius, 1);
+    return count;
+}
+
+// Sphere against box, in either order. Exact.
+inline int collideSphereBox(const Shape& a, const Shape& b, bool sphereIsA,
+        Manifold::Contact* contacts, float3x3& basisOut)
+{
+    const Shape& sphere = sphereIsA ? a : b;
+    const Shape& box = sphereIsA ? b : a;
+
+    const float3 local = rotate(conjugate(box.rotation), sphere.center - box.center);
+    float3 clamped{clamp(local.x, -box.half.x, box.half.x), clamp(local.y, -box.half.y, box.half.y),
+            clamp(local.z, -box.half.z, box.half.z)};
+    const float3 closestLocal = rotate(box.rotation, clamped) + box.center;
+    const float3 d = sphere.center - closestLocal;
+    const float distSq = lengthSq(d);
+
+    if (distSq >= sphere.radius * sphere.radius)
+        return 0;
+
+    const float dist = std::sqrt(distSq);
+    float3 normalSphereToBox;
+    if (dist > 1.0e-6f)
+    {
+        normalSphereToBox = d / dist; // points from the box surface towards the sphere centre
+    }
+    else
+    {
+        // The centre is inside the box: push out along the axis of least penetration. This is
+        // the case a sphere spawned inside geometry hits, and it needs a defined direction.
+        float3 push;
+        float depth;
+        if (!pointInBox(box, sphere.center, push, depth))
+            return 0;
+        normalSphereToBox = push;
+    }
+
+    // `normalSphereToBox` leaves the box towards the sphere. The contact normal runs from A to
+    // B, so it is the opposite of that when the sphere is A.
+    const float3 normalAB = sphereIsA ? -normalSphereToBox : normalSphereToBox;
+    basisOut = orthonormal(-normalAB);
+
+    // The point of the sphere nearest the box, not the far side: the pair of points then spans
+    // the penetration, which is what the solver's constraint value measures.
+    const float3 onSphere = sphere.center - normalSphereToBox * sphere.radius;
+    const float3 onBox = closestLocal;
+    const float3 xA = sphereIsA ? onSphere : onBox;
+    const float3 xB = sphereIsA ? onBox : onSphere;
+
+    int count = 0;
+    float3 midpoints[MAX_CONTACTS];
+    addContact(a, b, contacts, count, midpoints, xA, xB, 1);
+    return count;
+}
+
+// Sphere against the closest point on a solid cylinder. Exact for the curved side and both caps.
+inline int collideSphereCylinder(const Shape& a, const Shape& b, bool sphereIsA,
+        Manifold::Contact* contacts, float3x3& basisOut)
+{
+    const Shape& sphere = sphereIsA ? a : b;
+    const Shape& cyl = sphereIsA ? b : a;
+
+    float3 outward;
+    float distance;
+    const float3 onCylinder = closestPointOnCylinder(cyl, sphere.center, outward, distance);
+    if (distance >= sphere.radius)
+        return 0;
+
+    // `outward` points from the cylinder surface towards the sphere centre, so it is the A-to-B
+    // normal only when the cylinder is A.
+    const float3 normalAB = sphereIsA ? -outward : outward;
+    basisOut = orthonormal(-normalAB);
+
+    const float3 onSphere = sphere.center - outward * sphere.radius;
+    const float3 xA = sphereIsA ? onSphere : onCylinder;
+    const float3 xB = sphereIsA ? onCylinder : onSphere;
+
+    int count = 0;
+    float3 midpoints[MAX_CONTACTS];
+    addContact(a, b, contacts, count, midpoints, xA, xB, 1);
+    return count;
+}
+
+// Cylinder against box, in either order. Both directions are tested - the cylinder's surface
+// samples against the box, and the box's corners against the cylinder - so neither shape can slip
+// through the other however they are arranged.
+inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
+        Manifold::Contact* contacts, float3x3& basisOut)
+{
+    const Shape& cyl = cylinderIsA ? a : b;
+    const Shape& box = cylinderIsA ? b : a;
+
+    Candidate candidates[MAX_CANDIDATES];
+    int candidateCount = 0;
+    float3 normalAB{0, 0, 0};
+
+    // Cylinder surface points that are inside the box.
+    float3 samples[2 * (RIM_SAMPLES + 1) + RIM_SAMPLES * (AXIAL_SAMPLES - 1)];
+    int sampleCount = 0;
+    cylinderSamples(cyl, samples, sampleCount);
+
+    for (int i = 0; i < sampleCount && candidateCount < MAX_CANDIDATES; ++i)
+    {
+        float3 pushOut;
+        float depth;
+        if (!pointInBox(box, samples[i], pushOut, depth))
+            continue;
+
+        Candidate& c = candidates[candidateCount++];
+        c.xA = cylinderIsA ? samples[i] : samples[i] + pushOut * depth;
+        c.xB = cylinderIsA ? samples[i] + pushOut * depth : samples[i];
+        c.normal = cylinderIsA ? -pushOut : pushOut;
+        c.depth = depth;
+        normalAB += c.normal;
+    }
+
+    // Box corners inside the cylinder.
+    for (int corner = 0; corner < 8 && candidateCount < MAX_CANDIDATES; ++corner)
+    {
+        const float3 cornerLocal{((corner & 1) ? box.half.x : -box.half.x),
+                ((corner & 2) ? box.half.y : -box.half.y), ((corner & 4) ? box.half.z : -box.half.z)};
+        const float3 cornerWorld = rotate(box.rotation, cornerLocal) + box.center;
+
+        float3 pushOut;
+        float surfaceDist;
+        if (!pointInCylinder(cyl, cornerWorld, pushOut, surfaceDist))
+            continue;
+
+        Candidate& c = candidates[candidateCount++];
+        c.xA = cylinderIsA ? cornerWorld + pushOut * surfaceDist : cornerWorld;
+        c.xB = cylinderIsA ? cornerWorld : cornerWorld + pushOut * surfaceDist;
+        c.normal = cylinderIsA ? pushOut : -pushOut;
+        c.depth = surfaceDist;
+        normalAB += c.normal;
+    }
+
+    if (!candidateCount)
+        return 0;
+
+    basisOut = orthonormal(-(lengthSq(normalAB) > 1.0e-12f ? normalize(normalAB) : cyl.axis));
+
+    int count = 0;
+    emitRanked(a, b, candidates, candidateCount, contacts, count);
+    return count;
+}
+
+// Cylinder against cylinder: each one's surface samples tested against the other.
+inline int collideCylinderCylinder(const Shape& a, const Shape& b,
+        Manifold::Contact* contacts, float3x3& basisOut)
+{
+    Candidate candidates[MAX_CANDIDATES];
+    int candidateCount = 0;
+    float3 normalAB{0, 0, 0};
+
+    float3 samples[2 * (RIM_SAMPLES + 1) + RIM_SAMPLES * (AXIAL_SAMPLES - 1)];
+    const Shape* pair[2] = {&a, &b};
+
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        const Shape& from = *pair[pass];
+        const Shape& into = *pair[pass == 0 ? 1 : 0];
+        const bool fromIsA = pass == 0;
+
+        int sampleCount = 0;
+        cylinderSamples(from, samples, sampleCount);
+
+        for (int i = 0; i < sampleCount && candidateCount < MAX_CANDIDATES; ++i)
+        {
+            float3 pushOut;
+            float surfaceDist;
+            if (!pointInCylinder(into, samples[i], pushOut, surfaceDist))
+                continue;
+
+            Candidate& c = candidates[candidateCount++];
+            c.xA = fromIsA ? samples[i] : samples[i] + pushOut * surfaceDist;
+            c.xB = fromIsA ? samples[i] + pushOut * surfaceDist : samples[i];
+            c.normal = fromIsA ? -pushOut : pushOut;
+            c.depth = surfaceDist;
+            normalAB += c.normal;
+        }
+    }
+
+    if (!candidateCount)
+        return 0;
+
+    basisOut = orthonormal(-(lengthSq(normalAB) > 1.0e-12f ? normalize(normalAB) : a.axis));
+
+    int count = 0;
+    emitRanked(a, b, candidates, candidateCount, contacts, count);
+    return count;
+}
 } // namespace
 
-int Manifold::collide(Rigid* bodyA, Rigid* bodyB, Contact* contacts, float3x3& basisOut)
+int collideShapes(const Shape& a, const Shape& b, Manifold::Contact* contacts, float3x3& basisOut)
 {
-    OBB boxA = makeOBB(bodyA);
-    OBB boxB = makeOBB(bodyB);
+    // Shapes other than boxes take their own paths; box-box keeps the SAT implementation below
+    // untouched, so its behaviour is bit-for-bit what it was.
+    if (a.type != ShapeType::Box || b.type != ShapeType::Box)
+    {
+        if (a.type == ShapeType::Sphere && b.type == ShapeType::Sphere)
+            return collideSphereSphere(a, b, contacts, basisOut);
+
+        if (a.type == ShapeType::Sphere || b.type == ShapeType::Sphere)
+        {
+            if (a.type == ShapeType::Cylinder || b.type == ShapeType::Cylinder)
+            {
+                const bool sphereIsA = a.type == ShapeType::Sphere;
+                return collideSphereCylinder(a, b, sphereIsA, contacts, basisOut);
+            }
+            const bool sphereIsA = a.type == ShapeType::Sphere;
+            return collideSphereBox(a, b, sphereIsA, contacts, basisOut);
+        }
+
+        if (a.type == ShapeType::Cylinder && b.type == ShapeType::Cylinder)
+            return collideCylinderCylinder(a, b, contacts, basisOut);
+
+        // One cylinder, one box.
+        const bool cylinderIsA = a.type == ShapeType::Cylinder;
+        return collideCylinderBox(a, b, cylinderIsA, contacts, basisOut);
+    }
+
+    OBB boxA = makeOBB(a);
+    OBB boxB = makeOBB(b);
     float3 delta = boxB.center - boxA.center;
 
     SatAxis bestFace{};
@@ -487,12 +927,18 @@ int Manifold::collide(Rigid* bodyA, Rigid* bodyB, Contact* contacts, float3x3& b
     basisOut = orthonormal(-best.normalAB);
 
     if (best.type == AXIS_EDGE)
-        return buildEdgeContact(bodyA, bodyB, boxA, boxB, best.indexA, best.indexB, best.normalAB, contacts);
+        return buildEdgeContact(a, b, boxA, boxB, best.indexA, best.indexB, best.normalAB, contacts);
 
     if (best.type == AXIS_FACE_A)
-        return buildFaceManifold(bodyA, bodyB, boxA, boxB, true, best.indexA, best.normalAB, contacts);
+        return buildFaceManifold(a, b, boxA, boxB, true, best.indexA, best.normalAB, contacts);
 
-    return buildFaceManifold(bodyA, bodyB, boxA, boxB, false, best.indexB, best.normalAB, contacts);
+    return buildFaceManifold(a, b, boxA, boxB, false, best.indexB, best.normalAB, contacts);
+}
+
+int Manifold::collide(Rigid* bodyA, Rigid* bodyB, Contact* contacts, float3x3& basisOut)
+{
+    // Thin wrapper: flatten both bodies into shape queries and reuse the solver-free path.
+    return collideShapes(makeShape(bodyA), makeShape(bodyB), contacts, basisOut);
 }
 
 } // namespace avbd

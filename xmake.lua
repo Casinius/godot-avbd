@@ -25,6 +25,7 @@ local avbd_core = {
     "src/avbd/rigid.cpp",
     "src/avbd/force.cpp",
     "src/avbd/joint.cpp",
+    "src/avbd/generic_joint.cpp",
     "src/avbd/spring.cpp",
     "src/avbd/manifold.cpp",
     "src/avbd/collide.cpp",
@@ -77,7 +78,7 @@ target("avbd")
     set_kind("shared")
     set_symbols("debug")
     set_strip("none")
-    add_files(table.join(avbd_core, "src/nodes/*.cpp"))
+    add_files(table.join(avbd_core, "src/nodes/*.cpp", "src/server/*.cpp"))
     add_includedirs("src")
     add_packages("godotcpp4", "thread-pool")
     -- Godot loads the library from the project's bin/ directory.
@@ -95,3 +96,43 @@ target("avbd_core_test")
     add_files(table.join(avbd_core, "test/core_test.cpp", "tools/core_scenes.cpp"))
     add_includedirs("src", "tools")
     add_packages("thread-pool")
+
+-- Constraint composition tests (Godot headless, inside the demo project).
+target("avbd_constraint_tests")
+    set_kind("phony")
+    on_run(function (target)
+        import("scripts.run_godot_tests", {rootdir = "xmake"}).main("res://tests/test_constraints.gd")
+    end)
+
+-- Solver behaviour tests (Godot headless, inside the demo project).
+target("avbd_solver_tests")
+    set_kind("phony")
+    on_run(function (target)
+        import("scripts.run_godot_tests", {rootdir = "xmake"}).main("res://tests/test_solver.gd")
+    end)
+
+-- API compliance audit (Godot headless, inside the demo project).
+target("check_api")
+    set_kind("phony")
+    on_run(function (target)
+        import("scripts.run_godot_tests", {rootdir = "xmake"}).main("res://tests/test_server.gd")
+    end)
+
+-- Load-gate smoke test (Godot headless, inside the demo project).
+target("avbd_load_tests")
+    set_kind("phony")
+    on_run(function (target)
+        import("scripts.run_godot_tests", {rootdir = "xmake"}).main("res://tests/test_load.gd")
+    end)
+
+-- Run every tier: C++ solver tests, then all Godot suites.
+target("run_all_tests")
+    set_kind("phony")
+    on_run(function (target)
+        local runner = import("scripts.run_godot_tests", {rootdir = "xmake"})
+        os.exec("xmake run avbd_core_test")
+        runner.main("res://tests/test_solver.gd")
+        runner.main("res://tests/test_constraints.gd")
+        runner.main("res://tests/test_server.gd")
+        runner.main("res://tests/test_load.gd")
+    end)

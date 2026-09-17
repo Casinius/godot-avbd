@@ -10,4 +10,10 @@ demo/.import/
 
 # GDExtension binaries: produced by `xmake` into demo/bin/, not source.
 demo/bin/
-.cache
+
+# Godot editor
+.editorconfig
+*.import
+*.import_cache
+*.res
+*.scn

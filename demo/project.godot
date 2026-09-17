@@ -1,19 +1,32 @@
 ; Engine configuration file.
-; Used by the headless tests in demo/tests/ and by the demo scenes.
+; It's best edited using the editor UI and not directly,
+; since the parameters that go here are not all obvious.
+;
+; Format:
+;   [section] ; section goes between []
+;   param=value ; assign values to parameters
 
 config_version=5
+
+[animation]
+
+compatibility/default_parent_skeleton_in_mesh_instance_3d=true
 
 [application]
 
 config/name="AVBD Demo"
 run/main_scene="res://scenes/stack.tscn"
-config/features=PackedStringArray("4.4")
+config/features=PackedStringArray("4.7")
 
 [physics]
 
-; Godot's built-in 3D physics is not used: every node graph in this project is
-; plain Node3D driven by AVBD, so the engine's physics server is switched off.
-3d/physics_engine="Dummy"
+3d/run_on_separate_thread=true
+3d/physics_engine="AVBD"
+3d/solver/solver_iterations=10
+avbd/threads=0
+avbd/iterations=10
+avbd/beta_linear=1000000.0
+avbd/beta_angular=50000000.0
 
 [rendering]
 

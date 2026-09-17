@@ -31,6 +31,11 @@ Solver::~Solver()
 
 Rigid *Solver::pick(float3 origin, float3 dir, float3 &local)
 {
+    return pick(origin, dir, local, 0xFFFFFFFFu);
+}
+
+Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
+{
     const float epsilon = 1.0e-6f;
     float bestT = INFINITY;
     Rigid *bestBody = 0;
@@ -41,6 +46,8 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local)
     // also tests static bodies, so rays hit the ground and ramps.
     for (Rigid *body = bodies; body != 0; body = body->next)
     {
+        if ((body->collisionLayer & p_mask) == 0)
+            continue;
         quat invRot = conjugate(body->positionAng);
         float3 o = rotate(invRot, origin - body->positionLin);
         float3 d = rotate(invRot, dir);
@@ -138,7 +145,11 @@ void Solver::broadPhase()
         {
             const float3 dp = bodyA->positionLin - bodyB->positionLin;
             const float reach = bodyA->radius + bodyB->radius;
-            if (dot(dp, dp) <= reach * reach && !bodyA->constrainedTo(bodyB))
+            // Godot semantics: the pair collides when either side's layer is in the other's
+            // mask (defaults 1/1 keep every pair, as before these fields existed).
+            const bool layersAllow = ((bodyA->collisionLayer & bodyB->collisionMask) != 0) ||
+                    ((bodyB->collisionLayer & bodyA->collisionMask) != 0);
+            if (dot(dp, dp) <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB))
                 new Manifold(this, bodyA, bodyB);
         }
     }
@@ -181,15 +192,38 @@ void Solver::warmstartBodies()
     pool->forCount(count, [this](int i) {
         Rigid *body = warmstartOrder[i];
 
+        // Axis locks (Godot BodyAxis): a locked axis cannot carry velocity into the step,
+        // and gravity does not act along a locked linear axis. Constraint coupling can
+        // still displace a locked axis within a step; documented approximation.
+        if (body->axisLockLinear)
+        {
+            for (int k = 0; k < 3; ++k)
+            {
+                if (body->axisLockLinear & (1 << k))
+                    body->velocityLin[k] = 0.0f;
+            }
+        }
+        if (body->axisLockAngular)
+        {
+            for (int k = 0; k < 3; ++k)
+            {
+                if (body->axisLockAngular & (1 << k))
+                    body->velocityAng[k] = 0.0f;
+            }
+        }
+
+        // Gravity runs along -Z only, so the lock on bit 2 (z) gates it entirely.
+        const float g = (body->axisLockLinear & 0x4) ? 0.0f : body->gravity;
+
         body->inertialLin = body->positionLin + body->velocityLin * dt;
         if (body->mass > 0)
-            body->inertialLin += float3{0, 0, gravity} * (dt * dt);
+            body->inertialLin += float3{0, 0, g} * (dt * dt);
         body->inertialAng = body->positionAng + body->velocityAng * dt;
 
         // Adaptive warmstart (See original VBD paper)
         const float3 accel = (body->velocityLin - body->prevVelocityLin) / dt;
-        const float accelExt = accel.z * sign(gravity);
-        float accelWeight = clamp(accelExt / abs(gravity), 0.0f, 1.0f);
+        const float accelExt = accel.z * sign(g);
+        float accelWeight = clamp(accelExt / abs(g), 0.0f, 1.0f);
         if (!std::isfinite(accelWeight))
             accelWeight = 0.0f;
 
@@ -199,7 +233,7 @@ void Solver::warmstartBodies()
         body->initialAng = body->positionAng;
         if (body->mass > 0)
         {
-            body->positionLin = body->positionLin + body->velocityLin * dt + float3{0, 0, gravity} * (accelWeight * dt * dt);
+            body->positionLin = body->positionLin + body->velocityLin * dt + float3{0, 0, g} * (accelWeight * dt * dt);
             body->positionAng = body->positionAng + body->velocityAng * dt;
         }
     }, kMinBodiesPerDispatch);
@@ -238,10 +272,29 @@ void Solver::finishVelocities()
     pool->forCount(count, [this](int i) {
         Rigid *body = warmstartOrder[i];
         body->prevVelocityLin = body->velocityLin;
-        if (body->mass > 0)
+        // Don't update velocity if sleeping (Godot 4.7 API)
+        if (body->mass > 0 && !body->sleeping)
         {
             body->velocityLin = (body->positionLin - body->initialLin) / dt;
             body->velocityAng = (body->positionAng - body->initialAng) / dt;
+        }
+        // A locked axis reports no velocity even if constraint coupling nudged it: the
+        // lock's promise is "this axis does not move" to whoever reads state back.
+        if (body->axisLockLinear)
+        {
+            for (int k = 0; k < 3; ++k)
+            {
+                if (body->axisLockLinear & (1 << k))
+                    body->velocityLin[k] = 0.0f;
+            }
+        }
+        if (body->axisLockAngular)
+        {
+            for (int k = 0; k < 3; ++k)
+            {
+                if (body->axisLockAngular & (1 << k))
+                    body->velocityAng[k] = 0.0f;
+            }
         }
     }, kMinBodiesPerDispatch);
 }
@@ -275,9 +328,11 @@ void Solver::updatePrimal(Rigid *body)
 // body it shares a force with, which is precisely the condition for two bodies to be
 // updatable at the same time.
 //
-// Cost: O(sum over bodies of (degree^2)) with a small constant, against per-body work that
-// is orders of magnitude larger, so it is rebuilt every step - which also means it always
-// sees the current contact set instead of a stale one.
+// Incremental: a body in this step's update set keeps its previous colour unless a
+// neighbour now holds it, in which case it re-runs the first-fit search. Contacts move
+// slowly between steps, so the search is rarely paid. Bodies outside the update set
+// (static or sleeping) carry `colour == -1`, keeping the invariant that `colour >= 0`
+// marks exactly the bodies in `updateOrder` - a stale colour is never trusted.
 void Solver::colourGraph()
 {
     warmstartOrder.clear();
@@ -288,17 +343,65 @@ void Solver::colourGraph()
     // and cannot conflict with anything.
     for (Rigid *body = bodies; body != 0; body = body->next)
     {
-        body->colour = -1;
         warmstartOrder.push_back(body);
+        
+        // Sleep mode support (Godot 4.7 API)
+        // SLEEP_MODE_NEVER: always update
+        // SLEEP_MODE_SLEEP: update if velocity is zero and no forces
+        // SLEEP_MODE_START_IN_SLEEP: start in sleep
         if (body->mass > 0)
-            updateOrder.push_back(body);
+        {
+            // Check if body should be updated based on sleep mode
+            bool should_update = true;
+            if (body->sleep_mode == 1) // SLEEP_MODE_SLEEP
+            {
+                // Skip if sleeping and no velocity or forces
+                if (body->sleeping && 
+                    std::sqrt(body->velocityLin.x*body->velocityLin.x + body->velocityLin.y*body->velocityLin.y + body->velocityLin.z*body->velocityLin.z) == 0.0f && 
+                    body->forces == nullptr)
+                {
+                    should_update = false;
+                }
+            }
+            else if (body->sleep_mode == 2) // SLEEP_MODE_START_IN_SLEEP
+            {
+                // Start in sleep, wake up if velocity or forces are present
+                if (!body->sleeping && 
+                    std::sqrt(body->velocityLin.x*body->velocityLin.x + body->velocityLin.y*body->velocityLin.y + body->velocityLin.z*body->velocityLin.z) == 0.0f && 
+                    body->forces == nullptr)
+                {
+                    should_update = false;
+                }
+                else
+                {
+                    body->sleeping = false; // Wake up
+                }
+            }
+            
+            if (should_update)
+            {
+                updateOrder.push_back(body);
+            }
+            else
+            {
+                // Not in this step's update set: drop any stale colour so the invariant
+                // `colour >= 0` <=> "in updateOrder" holds.
+                body->colour = -1;
+            }
+        }
+        else
+        {
+            // Static body: excluded from the update set, so it must not contribute a
+            // stale colour.
+            body->colour = -1;
+        }
     }
 
     std::vector<int> taken;
     int maxColour = -1;
     for (Rigid *body : updateOrder)
     {
-        // Collect the colours of the neighbours already coloured.
+        // Collect the neighbours' current colours.
         taken.clear();
         for (Force *force = body->forces; force != 0; force = (force->bodyA == body) ? force->nextA : force->nextB)
         {
@@ -307,9 +410,18 @@ void Solver::colourGraph()
                 taken.push_back(other->colour);
         }
 
-        int colour = 0;
-        while (std::find(taken.begin(), taken.end(), colour) != taken.end())
-            colour++;
+        // Incremental recolouring: keep the previous colour when no neighbour took it.
+        // A kept colour is conflict-free: neighbours processed earlier in this loop hold
+        // their final colours, and a later neighbour that would collide with a kept colour
+        // sees it in `taken` and refits. Only bodies whose neighbourhood actually changed
+        // pay for the first-fit search.
+        int colour = body->colour;
+        if (colour < 0 || std::find(taken.begin(), taken.end(), colour) != taken.end())
+        {
+            colour = 0;
+            while (std::find(taken.begin(), taken.end(), colour) != taken.end())
+                colour++;
+        }
 
         body->colour = colour;
         if (colour > maxColour)

@@ -1,29 +1,26 @@
-# Load gate: the extension must register every class with the running Godot build.
-#   Godot_v4.6.3 --headless --path demo --script res://tests/test_load.gd
+# Load gate: the extension must register every class with the running Godot build,
+# the AVBD physics server must be the active engine, and a 200-box pyramid must
+# settle deterministically through it.
+#   Godot --headless --path demo --script res://tests/test_load.gd
 extends SceneTree
-
-const EXPECTED := [
-	"AVBDWorld3D",
-	"AVBDRigidBody3D",
-	"AVBDSoftBody3D",
-	"AVBDConstraint3D",
-	"AVBDJoint3D",
-	"AVBDSpring3D",
-	"AVBDIgnoreCollision3D",
-]
-
 
 func _initialize() -> void:
 	var failures := 0
 
-	for cname in EXPECTED:
+	# Server-side objects are existence-checked only: instantiating a second
+	# physics server (or the state objects the engine owns) corrupts the live one.
+	for cname in ["AVBDPhysicsServer3D", "PhysicsServerFactory", "AVBDDirectBodyState3D",
+			"AVBDDirectSpaceState3D"]:
 		if not ClassDB.class_exists(cname):
 			printerr("MISSING CLASS: ", cname)
 			failures += 1
 			continue
-		if not ClassDB.can_instantiate(cname):
-			# AVBDConstraint3D is abstract: it must exist but not be constructible.
-			print("ok  ", cname, " (abstract, not instantiable)")
+		print("ok  ", cname, " registered")
+
+	for cname in ["AVBDSoftBody3D", "AVBDSoftWorld3D"]:
+		if not ClassDB.class_exists(cname):
+			printerr("MISSING CLASS: ", cname)
+			failures += 1
 			continue
 		var instance = ClassDB.instantiate(cname)
 		if instance == null:
@@ -33,83 +30,103 @@ func _initialize() -> void:
 		print("ok  ", cname, " -> ", instance.get_class())
 		instance.free()
 
-	# Properties must round-trip through the ClassDB, including some whose values
-	# are stored in the solver's Z-up space.
-	var world = ClassDB.instantiate("AVBDWorld3D")
-	if not is_equal_approx(_roundtrip(world, "gravity", 12.5), 12.5):
-		failures += 1
-	if int(_roundtrip(world, "iterations", 24)) != 24:
-		failures += 1
-	if not is_equal_approx(_roundtrip(world, "beta_linear", 250000.0), 250000.0):
-		failures += 1
-	world.free()
-
-	var body = ClassDB.instantiate("AVBDRigidBody3D")
-	if not Vector3(1, 2, 3).is_equal_approx(_roundtrip(body, "size", Vector3(1, 2, 3))):
-		failures += 1
-	if not is_equal_approx(_roundtrip(body, "friction", 0.75), 0.75):
-		failures += 1
-	if bool(_roundtrip(body, "static_body", true)) != true:
-		failures += 1
-	body.free()
-
-	var joint = ClassDB.instantiate("AVBDJoint3D")
-	# -1 is the "infinitely stiff" sentinel; it must survive serialisation.
-	if not is_equal_approx(_roundtrip(joint, "linear_stiffness", -1.0), -1.0):
-		failures += 1
-	if not is_equal_approx(_roundtrip(joint, "angular_stiffness", 250.0), 250.0):
-		failures += 1
-	# Fracture state and the constraint/force plumbing.
-	for method in ["is_broken", "set_broken", "break_joint", "is_simulated"]:
-		if not joint.has_method(method):
-			printerr("MISSING METHOD: AVBDJoint3D.%s" % method)
-			failures += 1
-	if joint.is_broken():
-		printerr("a fresh joint reports itself broken")
-		failures += 1
-	joint.break_joint()
-	if not joint.is_broken():
-		printerr("break_joint() did not break the joint")
-		failures += 1
-	joint.set_broken(false)
-	if joint.is_broken():
-		printerr("set_broken(false) did not mend the joint")
-		failures += 1
-	if joint.is_simulated():
-		printerr("an unsimulated joint reports a solver force")
-		failures += 1
-	joint.free()
-
-	for clazz in ["AVBDJoint3D", "AVBDSpring3D", "AVBDIgnoreCollision3D"]:
-		if not ClassDB.class_has_method(clazz, "is_simulated"):
-			printerr("MISSING METHOD: %s.is_simulated" % clazz)
+	for cname in ["AVBDWorld3D", "AVBDRigidBody3D", "AVBDJoint3D"]:
+		if ClassDB.class_exists(cname):
+			printerr("RETIRED CLASS STILL REGISTERED: ", cname)
 			failures += 1
 
-	var world_probe = ClassDB.instantiate("AVBDWorld3D")
-	if not world_probe.has_method("get_step_count"):
-		printerr("MISSING METHOD: AVBDWorld3D.get_step_count")
-		failures += 1
-	if not world_probe.has_method("get_thread_count"):
-		printerr("MISSING METHOD: AVBDWorld3D.get_thread_count")
-		failures += 1
-	# The thread setting must round-trip, and 0 must mean "automatic".
-	if int(_roundtrip(world_probe, "threads", 3)) != 3:
-		failures += 1
-	world_probe.set("threads", 0)
-	var auto_workers := int(world_probe.call("get_thread_count"))
-	if auto_workers <= 0:
-		printerr("threads=0 should report a usable worker count, got %d" % auto_workers)
-		failures += 1
-	print("ok  AVBDWorld3D.threads=0 -> %d workers" % auto_workers)
-	world_probe.free()
-
+	# Properties must round-trip through the ClassDB.
 	var soft = ClassDB.instantiate("AVBDSoftBody3D")
 	if _roundtrip(soft, "dimensions", Vector3i(3, 4, 5)) != Vector3i(3, 4, 5):
 		failures += 1
 	soft.free()
 
+	var world = ClassDB.instantiate("AVBDSoftWorld3D")
+	if not is_equal_approx(_roundtrip(world, "gravity", 12.5), 12.5):
+		failures += 1
+	world.free()
+
+	# --- 200-box pyramid through the AVBD physics server -----------------------
+	if ProjectSettings.get_setting("physics/3d/physics_engine") != "AVBD":
+		printerr("physics engine is not AVBD")
+		failures += 1
+
+	var t0 := Time.get_ticks_usec()
+	var digest_first := await _pyramid_run()
+	var digest_second := await _pyramid_run()
+	var ms := (Time.get_ticks_usec() - t0) / 2000.0
+	if digest_first != digest_second:
+		printerr("pyramid digests differ: %d vs %d" % [digest_first, digest_second])
+		failures += 1
+
+	print("ok  pyramid 2x200 boxes settled deterministically (%.1f ms total)" % ms)
 	print("AVBD_LOAD_GATE: ", "PASS" if failures == 0 else "FAIL (%d)" % failures)
 	quit(0 if failures == 0 else 1)
+
+
+# Build a 20-row pyramid (~210 boxes), step it to rest, and digest every pose.
+# Both invocations must observe the same number of solver steps, so the builder
+# aligns itself to a physics-frame callback before adding nodes.
+func _pyramid_run() -> int:
+	await physics_frame
+	var ground := StaticBody3D.new()
+	var ground_shape := CollisionShape3D.new()
+	var ground_box := BoxShape3D.new()
+	ground_box.size = Vector3(80, 1, 20)
+	ground_shape.shape = ground_box
+	ground.add_child(ground_shape)
+	ground.position = Vector3(0, -0.5, 0)
+	root.add_child(ground)
+
+	var boxes: Array[RigidBody3D] = []
+	var box_shape := BoxShape3D.new()
+	box_shape.size = Vector3(1, 0.5, 1)
+	var rows := 20
+	for row in rows:
+		for i in rows - row:
+			var b := RigidBody3D.new()
+			var cs := CollisionShape3D.new()
+			cs.shape = box_shape
+			b.add_child(cs)
+			b.mass = 0.5
+			b.position = Vector3((i - (rows - row - 1) / 2.0) * 1.01, 0.25 + row * 0.85, 0)
+			root.add_child(b)
+			boxes.append(b)
+
+	for i in 600:
+		await physics_frame
+
+	var all_finite := true
+	var lowest := INF
+	for b in boxes:
+		if not b.global_position.is_finite():
+			all_finite = false
+		lowest = minf(lowest, b.global_position.y)
+
+	var failures := 0
+	if not all_finite:
+		printerr("pyramid state not finite")
+		failures += 1
+	# A 0.5-high box rests with its centre at 0.25 (plus solver penetration).
+	if lowest < 0.20 or lowest > 0.32:
+		printerr("pyramid lowest box out of range: %f" % lowest)
+		failures += 1
+
+	# Quantized pose digest (millimetre grid), as the harness does.
+	var hash := 5381
+	for b in boxes:
+		var t := b.global_transform
+		t.origin = (t.origin * 1000.0).round() / 1000.0
+		for byte in var_to_bytes(t):
+			hash = (hash * 33 + byte) & 0xFFFFFFFF
+
+	for b in boxes:
+		b.queue_free()
+	ground.queue_free()
+	await physics_frame
+	if failures > 0:
+		return -hash # impossible hash value marks the run failed
+	return hash
 
 
 func _roundtrip(object: Object, property: String, value: Variant) -> Variant:

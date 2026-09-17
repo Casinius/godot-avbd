@@ -5,6 +5,12 @@
 #   extends "res://tests/avbd_harness.gd"
 #   func _scenarios() -> Array: return [scenario("name", run_thing)]
 #
+# Every suite drives the engine's physics loop with the AVBD physics server
+# (physics/3d/physics_engine = "AVBD") through standard Godot nodes: each physics
+# frame is exactly one server step at the 60 Hz headless tick, so `steps(n)` waits
+# n physics frames. Nothing here touches an AVBD-specific class except the
+# registration checks, which is the point: this suite pins the standard-node path.
+#
 # Each scenario's callable may `await` and returns its evidence (a Dictionary of the
 # measurements it made, or null). The harness prints the evidence, counts pass/fail,
 # and with `--digest` runs every scenario twice, comparing the evidence text so the
@@ -51,136 +57,75 @@ func check_range(value: float, low: float, high: float, name: String, label := "
 	check(value >= low and value <= high, name, "%s = %.6f (want %g .. %g)" % [label, value, low, high])
 
 
-func check_between(value: float, low: float, high: float, name: String, label := "value") -> void:
-	check_range(value, low, high, name, label)
-
-
-# Structural pre-flight: the world creates one solver force per active constraint, so
-# a mismatch means a constraint was silently skipped (unresolvable NodePath, a body
-# outside the world, ...). The world builds its solver on its first physics tick, so
-# this waits for that tick before counting.
-#
-# Contact manifolds are also solver forces, but their number depends on the scene's
-# geometry at that moment, so they are excluded: this compares declared constraints.
-func check_forces(world: AVBDWorld3D, expected: int, name := "constraint pre-flight") -> void:
-	await steps(world, 1)
-	var constraints := world.get_force_count() - world.get_contact_count()
-	check(constraints == expected, name,
-			"constraint forces = %d, declared = %d (%d contact manifolds ignored)" %
-			[constraints, expected, world.get_contact_count()])
+# The engine must have selected AVBD: every scenario below walks the server path.
+func check_engine() -> void:
+	var engine: String = ProjectSettings.get_setting("physics/3d/physics_engine")
+	check(engine == "AVBD", "physics engine is AVBD", "engine=%s" % engine)
 
 
 # --- simulation helpers -----------------------------------------------------
 
-# Wait for `count` physics ticks.
-func frames(count: int) -> void:
+# Wait for `count` physics ticks; the server steps once per tick (60 Hz headless).
+func steps(count: int) -> void:
 	for i in count:
 		await physics_frame
 
 
-# Step the world for exactly `count` solver steps. Waiting on physics frames alone can
-# give one world a different number of ticks than another, depending on where in the
-# frame it was created, which makes comparisons meaningless.
-func steps(world: AVBDWorld3D, count: int) -> void:
-	var target := world.get_step_count() + count
-	while world.get_step_count() < target:
-		await physics_frame
+func frames(count: int) -> void:
+	await steps(count)
 
 
-func make_world(parent: Node = null) -> AVBDWorld3D:
-	var world := AVBDWorld3D.new()
-	if parent == null:
-		parent = root
-	parent.add_child(world)
-	return world
+# A static ground slab: full extents `half * 2` horizontally, 1 m thick, top face at
+# y = `top`. Built from standard nodes so the server sees what a game would send.
+func add_ground(parent: Node, top := 0.0, friction := 0.5, half := 50.0) -> StaticBody3D:
+	var ground := StaticBody3D.new()
+	ground.name = "Ground"
+	var shape := CollisionShape3D.new()
+	shape.name = "Shape"
+	var box := BoxShape3D.new()
+	box.size = Vector3(half * 2.0, 1.0, half * 2.0)
+	shape.shape = box
+	ground.add_child(shape)
+	# PhysicsMaterial per body (friction pairs through Godot's own node API).
+	var material := PhysicsMaterial.new()
+	material.friction = friction
+	ground.physics_material_override = material
+	ground.position = Vector3(0, top - 0.5, 0)
+	parent.add_child(ground)
+	return ground
 
 
-func add_body(parent: Node, body_name: String, size: Vector3, position: Vector3, density := 1.0,
-		friction := 0.5, is_static := false) -> AVBDRigidBody3D:
-	var body := AVBDRigidBody3D.new()
+# A dynamic box: `size` full extents, `mass` in kg, dropped at `position`.
+func add_body(parent: Node, body_name: String, size: Vector3, position: Vector3, mass := 1.0,
+		friction := 0.5) -> RigidBody3D:
+	var body := RigidBody3D.new()
 	body.name = body_name
-	body.size = size
-	body.density = density
-	body.friction = friction
-	body.static_body = is_static
-	parent.add_child(body)
+	var shape := CollisionShape3D.new()
+	shape.name = "Shape"
+	var box := BoxShape3D.new()
+	box.size = size
+	shape.shape = box
+	body.add_child(shape)
+	var material := PhysicsMaterial.new()
+	material.friction = friction
+	body.physics_material_override = material
+	body.mass = mass
 	body.position = position
+	parent.add_child(body)
 	return body
-
-
-func add_ground(world: AVBDWorld3D, top := 0.0, friction := 0.5, half := 50.0) -> AVBDRigidBody3D:
-	# A 1 m thick slab whose top face sits at y = `top`.
-	return add_body(world, "Ground", Vector3(half * 2.0, 1.0, half * 2.0), Vector3(0, top - 0.5, 0), 0.0, friction, true)
-
-
-func add_joint(world: AVBDWorld3D, joint_name: String, a: Node3D, b: Node3D, anchor_a: Vector3,
-		anchor_b: Vector3, linear_stiffness := -1.0, angular_stiffness := 0.0,
-		fracture_force := -1.0) -> AVBDJoint3D:
-	var joint := AVBDJoint3D.new()
-	joint.name = joint_name
-	joint.anchor_a = anchor_a
-	joint.anchor_b = anchor_b
-	joint.linear_stiffness = linear_stiffness
-	joint.angular_stiffness = angular_stiffness
-	joint.fracture_force = fracture_force
-	world.add_child(joint)
-	if a != null:
-		joint.node_a = joint.get_path_to(a)
-	joint.node_b = joint.get_path_to(b)
-	return joint
-
-
-# Joint to a fixed point in world space: leave the A side empty.
-func add_world_joint(world: AVBDWorld3D, joint_name: String, b: Node3D, world_anchor: Vector3,
-		anchor_b := Vector3.ZERO, linear_stiffness := -1.0, angular_stiffness := 0.0) -> AVBDJoint3D:
-	return add_joint(world, joint_name, null, b, world_anchor, anchor_b, linear_stiffness, angular_stiffness)
-
-
-func add_spring(world: AVBDWorld3D, spring_name: String, a: Node3D, b: Node3D, anchor_a: Vector3,
-		anchor_b: Vector3, stiffness := 1000.0, rest_length := -1.0) -> AVBDSpring3D:
-	var spring := AVBDSpring3D.new()
-	spring.name = spring_name
-	spring.anchor_a = anchor_a
-	spring.anchor_b = anchor_b
-	spring.stiffness = stiffness
-	spring.rest_length = rest_length
-	world.add_child(spring)
-	spring.node_a = spring.get_path_to(a)
-	spring.node_b = spring.get_path_to(b)
-	return spring
-
-
-func add_ignore(world: AVBDWorld3D, ignore_name: String, a: Node3D, b: Node3D) -> AVBDIgnoreCollision3D:
-	var ignore := AVBDIgnoreCollision3D.new()
-	ignore.name = ignore_name
-	world.add_child(ignore)
-	ignore.node_a = ignore.get_path_to(a)
-	ignore.node_b = ignore.get_path_to(b)
-	return ignore
-
-
-func add_soft_body(world: AVBDWorld3D, body_name: String, position: Vector3, dimensions := Vector3i(3, 3, 3),
-		box_size := Vector3(0.25, 0.25, 0.25)) -> AVBDSoftBody3D:
-	var soft := AVBDSoftBody3D.new()
-	soft.name = body_name
-	soft.dimensions = dimensions
-	soft.box_size = box_size
-	world.add_child(soft)
-	soft.position = position
-	return soft
 
 
 # --- measurement helpers ----------------------------------------------------
 
-func is_finite_body(body: AVBDRigidBody3D) -> bool:
+func is_finite_body(body: RigidBody3D) -> bool:
 	var p := body.global_position
 	var v := body.linear_velocity
-	return p.is_finite() and v.is_finite() and body.get_angular_velocity().is_finite()
+	return p.is_finite() and v.is_finite() and body.angular_velocity.is_finite()
 
 
 func all_finite(bodies: Array) -> bool:
 	for body in bodies:
-		if body is AVBDRigidBody3D and not is_finite_body(body):
+		if body is RigidBody3D and not is_finite_body(body):
 			return false
 	return true
 
@@ -188,7 +133,7 @@ func all_finite(bodies: Array) -> bool:
 func max_speed(bodies: Array) -> float:
 	var worst := 0.0
 	for body in bodies:
-		if body is AVBDRigidBody3D:
+		if body is RigidBody3D:
 			worst = maxf(worst, body.linear_velocity.length())
 	return worst
 
@@ -196,33 +141,28 @@ func max_speed(bodies: Array) -> float:
 func ground_clearance(bodies: Array, floor_y: float) -> float:
 	var lowest := INF
 	for body in bodies:
-		if body is AVBDRigidBody3D:
+		if body is RigidBody3D:
 			lowest = minf(lowest, body.global_position.y)
 	return lowest - floor_y
 
 
-# Pose digest of every simulated body, for comparing two runs.
-func digest(world: AVBDWorld3D) -> int:
+# Pose digest of every given body, for comparing two runs. Transforms are quantized to
+# a millimetre so a one-tick measurement offset between two runs does not flip the
+# hash, while real divergence (centimetres) does.
+func digest_of(bodies: Array) -> int:
 	var hash := 5381
-	for child in world.get_children():
-		if child is AVBDRigidBody3D:
-			for byte in var_to_bytes(child.global_transform):
-				hash = (hash * 33 + byte) & 0xFFFFFFFF
-		elif child is AVBDSoftBody3D:
-			for i in child.get_cell_count():
-				for byte in var_to_bytes(child.to_global(child.get_cell_transform(i).origin)):
-					hash = (hash * 33 + byte) & 0xFFFFFFFF
+	for body in bodies:
+		var t: Transform3D = (body as Node3D).global_transform
+		t.origin = (t.origin * 1000.0).round() / 1000.0
+		for byte in var_to_bytes(t):
+			hash = (hash * 33 + byte) & 0xFFFFFFFF
 	return hash
 
 
-# Distance between the two anchors of a joint, in world space.
-func joint_error(joint: AVBDJoint3D, a: Node3D, b: Node3D) -> float:
-	var point_a: Vector3
-	if a == null:
-		point_a = joint.global_transform * joint.anchor_a
-	else:
-		point_a = a.to_global(joint.anchor_a)
-	return point_a.distance_to(b.to_global(joint.anchor_b))
+# Distance between two bodies' closest anchors (world space), for joint assertions:
+# `anchor_a` / `anchor_b` are local offsets on each body.
+func anchor_error(a: Node3D, b: Node3D, anchor_a: Vector3, anchor_b: Vector3) -> float:
+	return a.to_global(anchor_a).distance_to(b.to_global(anchor_b))
 
 
 # --- runner -----------------------------------------------------------------
@@ -238,9 +178,6 @@ var _evidence := {}
 
 
 func _initialize() -> void:
-	if DisplayServer.get_name() == "headless":
-		# Nothing here draws, and the dummy renderer only adds noise.
-		pass
 	for arg in OS.get_cmdline_user_args():
 		if arg == "--list":
 			_list = true

@@ -1,40 +1,47 @@
-# Demo driver for the AVBD scenes: prints solver statistics and lets the mouse
-# shove bodies around.
+# Demo driver for the AVBD scenes.
 #
-#   Godot_v4.6.3 --path demo                                   # windowed
-#   Godot_v4.6.3 --headless --path demo --quit-after 300       # headless, prints stats
+# The scene's physics runs through the AVBD physics server (project setting
+# physics/3d/physics_engine = "AVBD"): the nodes here are Godot's own RigidBody3D /
+# StaticBody3D. The soft-body scene additionally carries an AVBDSoftWorld3D, which
+# steps its own solver for the lattices.
 #
-# Controls: left click punches along the camera ray, Space pauses, R resets every
-# body back to its scene pose.
+#   Godot --path demo                                   # windowed
+#   Godot --headless --path demo --quit-after 300       # headless, prints stats
+#
+# Controls: left click punches along the camera ray, Space pauses (the whole
+# SceneTree - the physics server follows through set_active), R resets every body
+# back to its scene pose.
 extends Node3D
 
 @export var impulse_strength := 12.0
 @export var stats_interval := 1.0
 
-var world: AVBDWorld3D
-var bodies: Array[AVBDRigidBody3D] = []
+var bodies: Array[RigidBody3D] = []
 var initial: Array[Transform3D] = []
+var soft_world: AVBDSoftWorld3D
 var elapsed := 0.0
 var steps := 0
 var quit_after_steps := 0
-var screenshot_path := ""
 
 
 func _ready() -> void:
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--steps="):
 			quit_after_steps = int(arg.split("=")[1])
-		elif arg.begins_with("--screenshot="):
-			screenshot_path = arg.split("=")[1]
-	world = get_node_or_null("World") as AVBDWorld3D
-	if world == null:
-		push_warning("demo.gd: no AVBDWorld3D child named 'World'")
-		return
-	for child in world.get_children():
-		if child is AVBDRigidBody3D:
+	soft_world = get_node_or_null("World") as AVBDSoftWorld3D
+	_collect_bodies(self)
+	print("AVBD demo: engine=%s, %d rigid bodies%s" % [
+			ProjectSettings.get_setting("physics/3d/physics_engine"),
+			bodies.size(),
+			" + soft lattices" if soft_world != null else ""])
+
+
+func _collect_bodies(node: Node) -> void:
+	for child in node.get_children():
+		if child is RigidBody3D:
 			bodies.append(child)
-			initial.append(child.transform)
-	print("AVBD demo: %d rigid bodies + soft bodies under %s" % [bodies.size(), world.name])
+			initial.append(child.global_transform)
+		_collect_bodies(child)
 
 
 func _physics_process(_delta: float) -> void:
@@ -43,36 +50,35 @@ func _physics_process(_delta: float) -> void:
 	steps += 1
 	if steps < quit_after_steps:
 		return
-	print("after %d steps: bodies=%d forces=%d contacts=%d points=%d step=%.3f ms" % [steps,
-			world.get_body_count(), world.get_force_count(), world.get_contact_count(),
-			world.get_contact_point_count(), world.get_step_time_usec() / 1000.0])
-	if not screenshot_path.is_empty():
-		await RenderingServer.frame_post_draw
-		var image := get_viewport().get_texture().get_image()
-		image.save_png(screenshot_path)
-		print("saved ", screenshot_path)
+	var server := PhysicsServer3D.get_process_info(PhysicsServer3D.INFO_ACTIVE_OBJECTS)
+	var contacts := PhysicsServer3D.get_process_info(PhysicsServer3D.INFO_COLLISION_PAIRS)
+	print("after %d steps: active objects=%d collision pairs=%d%s" % [steps, server, contacts,
+			" (soft bodies stepped separately)" if soft_world != null else ""])
 	print("DEMO_STEPS_OK")
 	get_tree().quit(0)
 
 
 func _process(delta: float) -> void:
 	elapsed += delta
-	if world == null or elapsed < stats_interval:
+	if elapsed < stats_interval:
 		return
 	elapsed = 0.0
-	print("bodies=%d forces=%d contacts=%d points=%d step=%.3f ms%s" % [world.get_body_count(),
-			world.get_force_count(), world.get_contact_count(), world.get_contact_point_count(),
-			world.get_step_time_usec() / 1000.0, "  [paused]" if world.paused else ""])
+	print("active=%d pairs=%d%s" % [
+			PhysicsServer3D.get_process_info(PhysicsServer3D.INFO_ACTIVE_OBJECTS),
+			PhysicsServer3D.get_process_info(PhysicsServer3D.INFO_COLLISION_PAIRS),
+			"  [paused]" if get_tree().paused else ""])
 
 
 func _unhandled_input(event: InputEvent) -> void:
-	if world == null or not event.is_pressed():
+	if not event.is_pressed():
 		return
 	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
 		_punch(event.position)
 	elif event is InputEventKey:
 		if event.keycode == KEY_SPACE:
-			world.paused = not world.paused
+			# Pausing the SceneTree is what drives PhysicsServer3D.set_active(false) -
+			# the AVBD server must follow and freeze with the game.
+			get_tree().paused = not get_tree().paused
 		elif event.keycode == KEY_R:
 			_reset()
 
@@ -82,17 +88,26 @@ func _punch(screen_position: Vector2) -> void:
 	if camera == null:
 		return
 	var from := camera.project_ray_origin(screen_position)
-	var direction := camera.project_ray_normal(screen_position)
-	var hit := world.raycast(from, direction, 500.0)
+	var to := from + camera.project_ray_normal(screen_position) * 500.0
+	# Direct space state query - answered by the AVBD server's AVBDDirectSpaceState3D.
+	var query := PhysicsRayQueryParameters3D.create(from, to)
+	var hit := get_viewport().get_world_3d().direct_space_state.intersect_ray(query)
 	if hit.is_empty():
 		return
-	var body := hit.get("body") as AVBDRigidBody3D
-	if body == null:
+	var body: RID = hit.get("rid")
+	if body == RID():
 		return
-	body.apply_impulse(direction * impulse_strength, hit.get("position") - body.global_position)
+	var node: Object = instance_from_id(hit.get("collider_id"))
+	if node is RigidBody3D:
+		node.apply_impulse(camera.project_ray_normal(screen_position) * impulse_strength,
+				hit.get("position") - (node as RigidBody3D).global_position)
 
 
 func _reset() -> void:
+	get_tree().paused = false
 	for i in bodies.size():
-		var pose := initial[i]
-		bodies[i].teleport(pose.origin, pose.basis.get_rotation_quaternion())
+		var body := bodies[i]
+		body.global_transform = initial[i]
+		body.linear_velocity = Vector3.ZERO
+		body.angular_velocity = Vector3.ZERO
+		body.sleeping = false

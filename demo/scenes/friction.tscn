@@ -1,6 +1,6 @@
-[gd_scene load_steps=3 format=3]
+[gd_scene format=3 uid="uid://5lcx67167ppy"]
 
-[ext_resource type="Script" path="res://scenes/demo.gd" id="1"]
+[ext_resource type="Script" uid="uid://dqjm6ud8kqiwg" path="res://scenes/demo.gd" id="1"]
 
 [sub_resource type="Environment" id="Environment_1"]
 background_mode = 1
@@ -9,90 +9,76 @@ ambient_light_source = 2
 ambient_light_color = Color(0.8, 0.82, 0.9, 1)
 ambient_light_energy = 0.4
 
-[node name="Friction" type="Node3D"]
+[sub_resource type="PhysicsMaterial" id="Mat_sticky"]
+friction = 0.5
+
+[sub_resource type="BoxShape3D" id="BoxShape_ground"]
+size = Vector3(60, 1, 40)
+
+[sub_resource type="BoxMesh" id="BoxMesh_ground"]
+size = Vector3(60, 1, 40)
+
+[sub_resource type="BoxShape3D" id="BoxShape_ramp"]
+size = Vector3(40, 1, 24)
+
+[sub_resource type="BoxMesh" id="BoxMesh_ramp"]
+size = Vector3(40, 1, 24)
+
+[sub_resource type="BoxShape3D" id="BoxShape_box"]
+
+[sub_resource type="BoxMesh" id="BoxMesh_box"]
+
+[sub_resource type="PhysicsMaterial" id="Mat_slippery"]
+friction = 0.05
+
+[node name="Friction" type="Node3D" unique_id=1564758352]
 script = ExtResource("1")
 
-[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=445315155]
 environment = SubResource("Environment_1")
 
-[node name="World" type="AVBDWorld3D" parent="."]
-gravity = 9.8
-iterations = 10
-
-[node name="Ground" type="AVBDRigidBody3D" parent="World"]
+[node name="Ground" type="StaticBody3D" parent="." unique_id=853753197]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.5, 0)
-size = Vector3(40, 1, 40)
-friction = 0.5
-static_body = true
-visualize_shape = true
-shape_color = Color(0.32, 0.34, 0.38, 1)
+physics_material_override = SubResource("Mat_sticky")
 
-[node name="Ramp" type="AVBDRigidBody3D" parent="World"]
-transform = Transform3D(0.9397, -0.342, 0, 0.342, 0.9397, 0, 0, 0, 1, 0, 6, 0)
-size = Vector3(40, 1, 24)
-friction = 0.5
-static_body = true
-visualize_shape = true
-shape_color = Color(0.3, 0.35, 0.4, 1)
+[node name="Shape" type="CollisionShape3D" parent="Ground" unique_id=960306228]
+shape = SubResource("BoxShape_ground")
 
-[node name="Box0" type="AVBDRigidBody3D" parent="World"]
-transform = Transform3D(0.9397, -0.342, 0, 0.342, 0.9397, 0, 0, 0, 1, -5.9973, 4.9346, 0)
-size = Vector3(1, 1, 1)
-friction = 0.05
-visualize_shape = true
-shape_color = Color(0.8, 0.35, 0.3, 1)
+[node name="Mesh" type="MeshInstance3D" parent="Ground" unique_id=1761445248]
+mesh = SubResource("BoxMesh_ground")
 
-[node name="Box1" type="AVBDRigidBody3D" parent="World"]
-transform = Transform3D(0.9397, -0.342, 0, 0.342, 0.9397, 0, 0, 0, 1, -4.4938, 5.4818, 0)
-size = Vector3(1, 1, 1)
-friction = 0.11
-visualize_shape = true
-shape_color = Color(0.8, 0.42, 0.3, 1)
+[node name="Ramp" type="StaticBody3D" parent="." unique_id=835871042]
+transform = Transform3D(0.938572, 0.048822798, 0.34161228, -0.04587842, 0.99880743, -0.016698381, -0.34202015, 0, 0.9396926, 0, 6, 0)
+physics_material_override = SubResource("Mat_sticky")
 
-[node name="Box2" type="AVBDRigidBody3D" parent="World"]
-transform = Transform3D(0.9397, -0.342, 0, 0.342, 0.9397, 0, 0, 0, 1, -2.9903, 6.029, 0)
-size = Vector3(1, 1, 1)
-friction = 0.17
-visualize_shape = true
-shape_color = Color(0.8, 0.49, 0.3, 1)
+[node name="Shape" type="CollisionShape3D" parent="Ramp" unique_id=828671661]
+shape = SubResource("BoxShape_ramp")
 
-[node name="Box3" type="AVBDRigidBody3D" parent="World"]
-transform = Transform3D(0.9397, -0.342, 0, 0.342, 0.9397, 0, 0, 0, 1, -1.4868, 6.5763, 0)
-size = Vector3(1, 1, 1)
-friction = 0.23
-visualize_shape = true
-shape_color = Color(0.8, 0.56, 0.3, 1)
+[node name="Mesh" type="MeshInstance3D" parent="Ramp" unique_id=1161954178]
+mesh = SubResource("BoxMesh_ramp")
 
-[node name="Box4" type="AVBDRigidBody3D" parent="World"]
-transform = Transform3D(0.9397, -0.342, 0, 0.342, 0.9397, 0, 0, 0, 1, 0.0168, 7.1235, 0)
-size = Vector3(1, 1, 1)
-friction = 0.29
-visualize_shape = true
-shape_color = Color(0.8, 0.63, 0.3, 1)
+[node name="StickyBox" type="RigidBody3D" parent="." unique_id=1520134813]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4.3393, 7.5668, -2.6968)
+physics_material_override = SubResource("Mat_sticky")
 
-[node name="Box5" type="AVBDRigidBody3D" parent="World"]
-transform = Transform3D(0.9397, -0.342, 0, 0.342, 0.9397, 0, 0, 0, 1, 1.5203, 7.6707, 0)
-size = Vector3(1, 1, 1)
-friction = 0.35
-visualize_shape = true
-shape_color = Color(0.8, 0.7, 0.3, 1)
+[node name="Shape" type="CollisionShape3D" parent="StickyBox" unique_id=1353255849]
+shape = SubResource("BoxShape_box")
 
-[node name="Box6" type="AVBDRigidBody3D" parent="World"]
-transform = Transform3D(0.9397, -0.342, 0, 0.342, 0.9397, 0, 0, 0, 1, 3.0238, 8.2179, 0)
-size = Vector3(1, 1, 1)
-friction = 0.41
-visualize_shape = true
-shape_color = Color(0.8, 0.77, 0.3, 1)
+[node name="Mesh" type="MeshInstance3D" parent="StickyBox" unique_id=1964620373]
+mesh = SubResource("BoxMesh_box")
 
-[node name="Box7" type="AVBDRigidBody3D" parent="World"]
-transform = Transform3D(0.9397, -0.342, 0, 0.342, 0.9397, 0, 0, 0, 1, 4.5273, 8.7652, 0)
-size = Vector3(1, 1, 1)
-friction = 0.47
-visualize_shape = true
-shape_color = Color(0.8, 0.8400000000000001, 0.3, 1)
+[node name="SlipperyBox" type="RigidBody3D" parent="." unique_id=720383964]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4.3393, 7.5668, -2.6968)
+physics_material_override = SubResource("Mat_slippery")
 
-[node name="Camera3D" type="Camera3D" parent="."]
-transform = Transform3D(0.9285, -0.1148, 0.3532, 0, 0.951, 0.3091, -0.3714, -0.287, 0.883, 8, 12, 20)
+[node name="Shape" type="CollisionShape3D" parent="SlipperyBox" unique_id=1518532173]
+shape = SubResource("BoxShape_box")
 
-[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+[node name="Mesh" type="MeshInstance3D" parent="SlipperyBox" unique_id=1968015266]
+mesh = SubResource("BoxMesh_box")
+
+[node name="Camera3D" type="Camera3D" parent="." unique_id=258865613]
+transform = Transform3D(1, 0, 0, 0, 0.9901506, 0.14000714, 0, 0.14000714, -0.9901506, -6.547123, 7.8504353, -13.532867)
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=558455914]
 transform = Transform3D(0.774, -0.5162, 0.3668, 0, 0.5793, 0.8151, -0.6332, -0.6309, 0.4483, 0.45, 1, 0.55)

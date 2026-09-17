@@ -94,7 +94,7 @@ public:
     // x-major, then y, then z (x * ny * nz + y * nz + z).
     Transform3D get_cell_transform(std::size_t p_index) const;
 
-    // --- simulation interface, used by AVBDWorld3D ---------------------------
+    // --- simulation interface, used by AVBDSoftWorld3D ---------------------------
     void _build(avbd::Solver &p_solver, const Transform3D &p_node_in_sim);
     void _store_state();
     void _clear();

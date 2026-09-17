@@ -10,9 +10,9 @@
  *
  * which maps Godot +Y onto sim +Z and Godot +Z onto sim -Y, preserving handedness.
  *
- * "Sim space" below means the coordinate system defined by the AVBDWorld3D node's
- * transform: the world node's local space. Converts through the helper functions
- * here so the mapping lives in exactly one place.
+ * "Sim space" below means the coordinate system defined by the soft-body world node's
+ * transform (AVBDSoftWorld3D's local space), or the server's world for the physics-server
+ * path - the two agree because a server scene has no intermediate world transform.
  */
 
 #ifndef AVBD_GODOT_CONVERT_HPP
@@ -40,7 +40,24 @@ inline godot::Vector3 to_godot(const avbd::float3 &v) {
     return godot::Vector3(v.x, v.z, -v.y);
 }
 
-// Box extents are unsigned: reorder the components without flipping signs.
+// A direction expressed on a Godot axis, in solver space. Anything that names an *axis index*
+// rather than passing a vector - per-axis joint modes, limits and springs - has to go through
+// this, or it will drive the wrong axis: Godot Y is solver Z, and Godot Z is solver -Y.
+inline avbd::float3 axis_to_sim(int p_godot_axis) {
+    return to_sim(p_godot_axis == 0 ? godot::Vector3(1, 0, 0)
+                                    : (p_godot_axis == 1 ? godot::Vector3(0, 1, 0)
+                                                         : godot::Vector3(0, 0, 1)));
+}
+
+// Which solver axis a Godot axis becomes, and whether its positive direction is preserved.
+// Godot X -> solver X (+), Godot Y -> solver Z (+), Godot Z -> solver -Y (-).
+struct AxisMapping {
+    int solver;
+    float sign;
+};
+
+inline constexpr AxisMapping kAxisMapping[3] = {{0, 1.0f}, {2, 1.0f}, {1, -1.0f}};
+
 inline avbd::float3 to_sim_extents(const godot::Vector3 &v) {
     return avbd::float3{std::fabs(v.x), std::fabs(v.z), std::fabs(v.y)};
 }

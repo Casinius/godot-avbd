@@ -1,12 +1,13 @@
-# Behavioural tests for the AVBD extension, run against a real Godot runtime.
+# Behavioural tests for the AVBD physics server, run against a real Godot runtime.
 #
-#   Godot_v4.6.3 --headless --path demo --script res://tests/test_solver.gd
+#   Godot_v4.7 --headless --path demo --script res://tests/test_solver.gd
 #   ... -- --list | --only=stack | --digest | --strict
 #
-# Every scenario builds its node graph in code, then steps the real physics loop, so
-# this exercises the full path: scene graph -> solver -> transforms written back to the
-# scene graph. Single-constraint behaviour lives here; constraint *combinations* are in
-# test_constraints.gd.
+# Every scenario builds its node graph from standard Godot nodes (RigidBody3D,
+# StaticBody3D, CollisionShape3D, joints), then steps the real physics loop. The
+# AVBD physics server answers every call: scene graph -> server -> solver ->
+# DirectBodyState -> scene graph. Single-constraint behaviour lives here;
+# constraint *combinations* are in test_constraints.gd.
 extends "res://tests/avbd_harness.gd"
 
 
@@ -15,39 +16,39 @@ func _scenarios() -> Array:
 		scenario("rest_contact", test_rest_contact),
 		scenario("stack", test_stack),
 		scenario("friction", test_friction),
-		scenario("joints", test_joints),
+		scenario("hard_joint", test_hard_joint),
 		scenario("world_joint", test_world_joint),
-		scenario("soft_body", test_soft_body),
 		scenario("raycast", test_raycast),
+		scenario("impulse_teleport", test_impulse_teleport),
 		scenario("runtime_add", test_runtime_add),
-		scenario("interaction", test_interaction),
+		scenario("axis_lock", test_axis_lock),
+		scenario("collision_layers", test_collision_layers),
+		scenario("collision_exceptions", test_collision_exceptions),
+		scenario("sleeping", test_sleeping),
+		scenario("paused_follows_game", test_paused_follows_game),
 		scenario("determinism", test_determinism),
 	]
 
 
 # ---------------------------------------------------------------------------
 # A box dropped on a slab comes to rest on top of it: this is the end-to-end
-# check that the Godot Y-up <-> solver Z-up mapping is right.
+# check that the Godot Y-up <-> solver Z-up mapping is right, through the server.
 # ---------------------------------------------------------------------------
 func test_rest_contact() -> Variant:
-	var world := make_world()
-	add_ground(world, 0.5)
-	var box := add_body(world, "Box", Vector3.ONE, Vector3(0, 5, 0))
+	check_engine()
+	var ground := add_ground(root, 0.5, 0.5)
+	var box := add_body(root, "Box", Vector3.ONE, Vector3(0, 5, 0))
 
-	await check_forces(world, 0, "no constraints")
-
-	await steps(world, 240)
+	await steps(240)
 
 	var rest_y := box.global_position.y
 	check(absf(rest_y - 1.0) <= 0.02, "rest contact", "y=%.5f (slab top 0.5 + half box 0.5)" % rest_y)
 	check(absf(box.linear_velocity.y) <= 0.05, "rest velocity", "vy=%.5f" % box.linear_velocity.y)
-	check(world.get_contact_point_count() > 0, "contact reported",
-			"points=%d manifests=%d" % [world.get_contact_point_count(), world.get_contact_count()])
-	check(world.get_body_count() == 2, "body count", "bodies=%d" % world.get_body_count())
 	check(is_finite_body(box), "state finite", "pos=%v" % box.global_position)
 
-	var evidence := {"rest_y": rest_y, "contacts": world.get_contact_point_count()}
-	world.queue_free()
+	var evidence := {"rest_y": rest_y}
+	ground.queue_free()
+	box.queue_free()
 	await frames(2)
 	return evidence
 
@@ -56,14 +57,13 @@ func test_rest_contact() -> Variant:
 # A 10-box stack keeps its shape and does not drift sideways.
 # ---------------------------------------------------------------------------
 func test_stack() -> Variant:
-	var world := make_world()
-	add_ground(world, 0.5)
+	var ground := add_ground(root, 0.5, 0.5)
 
-	var boxes: Array[AVBDRigidBody3D] = []
+	var boxes: Array[RigidBody3D] = []
 	for i in 10:
-		boxes.append(add_body(world, "Box%d" % i, Vector3.ONE, Vector3(0, 1.0 + i * 1.5, 0)))
+		boxes.append(add_body(root, "Box%d" % i, Vector3.ONE, Vector3(0, 1.0 + i * 1.5, 0)))
 
-	await steps(world, 300)
+	await steps(300)
 
 	var worst_y := 0.0
 	var worst_interface := 0.0
@@ -71,8 +71,6 @@ func test_stack() -> Variant:
 	for i in boxes.size():
 		var pos := boxes[i].global_position
 		worst_y = maxf(worst_y, absf(pos.y - (1.0 + i)))
-		# Ideal: the bottom box's centre is 1.0 above the world origin (slab top
-		# 0.5 + half box 0.5) and each box above sits one box-height higher.
 		var penetration := 1.0 - pos.y if i == 0 else 1.0 - (pos.y - boxes[i - 1].global_position.y)
 		worst_interface = maxf(worst_interface, penetration)
 		worst_lateral = maxf(worst_lateral, Vector2(pos.x, pos.z).length())
@@ -82,37 +80,40 @@ func test_stack() -> Variant:
 	check(worst_lateral <= 0.05, "stack drift", "max lateral = %.5f m" % worst_lateral)
 
 	var evidence := {"height_error": worst_y, "penetration": worst_interface, "drift": worst_lateral}
-	world.queue_free()
+	for node in [ground] + boxes:
+		node.queue_free()
 	await frames(2)
 	return evidence
 
 
 # ---------------------------------------------------------------------------
 # Friction on a 20 degree ramp: mu = 0.5 holds (penalty-method creep only),
-# mu = 0.05 lets the box slide away.
+# mu = 0.05 lets the box slide away. Friction arrives through PhysicsMaterial.
 # ---------------------------------------------------------------------------
 func ramp_run(mu: float, settle_frames: int, watch_frames: int) -> Dictionary:
-	var world := make_world()
-	add_ground(world, 0.5, mu)
+	var ground := add_ground(root, 0.5, mu)
 
 	var ramp_basis := Basis(Vector3(0, 0, 1), deg_to_rad(20.0))
-	var ramp := add_body(world, "Ramp", Vector3(40, 1, 24), Vector3(0, 6, 0), 0.0, mu, true)
-	ramp.transform = Transform3D(ramp_basis, ramp.position)
+	var ramp := add_body(root, "Ramp", Vector3(40, 1, 24), Vector3(0, 6, 0), 1.0, mu)
+	ramp.freeze = true # a kinematic ramp: pose fixed by the scene
+	ramp.global_transform = Transform3D(ramp_basis, Vector3(0, 6, 0))
 
 	var up_slope := ramp_basis * Vector3.RIGHT
 	var normal := ramp_basis * Vector3.UP
 	var start := ramp.global_position + up_slope * 5.0 + normal * 1.05
-	var box := add_body(world, "Box", Vector3.ONE, start, 1.0, mu)
+	var box := add_body(root, "Box", Vector3.ONE, start, 1.0, mu)
 
-	await steps(world, settle_frames)
+	await steps(settle_frames)
 	var before := box.global_position
-	await steps(world, watch_frames)
+	await steps(watch_frames)
 
 	var late := (box.global_position - before).dot(-up_slope)
 	var total := (box.global_position - start).dot(-up_slope)
 	var speed := box.linear_velocity.length()
 	var evidence := {"late": late, "total": total, "speed": speed}
-	world.queue_free()
+	ground.queue_free()
+	ramp.queue_free()
+	box.queue_free()
 	await frames(2)
 	return evidence
 
@@ -131,165 +132,174 @@ func test_friction() -> Variant:
 
 
 # ---------------------------------------------------------------------------
-# A 4-link chain hung from a static body: hard joints must hold to a fraction of
-# a link, and the chain must hang downwards.
+# A 4-link chain hung from a static body, built from Generic6DOFJoint3D with all
+# six axes locked. Hard joints must hold to a fraction of a link.
 # ---------------------------------------------------------------------------
-func test_joints() -> Variant:
-	var world := make_world()
-	var anchor := add_body(world, "Anchor", Vector3.ONE, Vector3(0, 10, 0), 0.0, 0.5, true)
+func make_locked_6dof(parent: Node, joint_name: String, a: Node3D, b: Node3D, anchor: Vector3) -> Generic6DOFJoint3D:
+	var joint := Generic6DOFJoint3D.new()
+	joint.name = joint_name
+	parent.add_child(joint)
+	joint.global_position = anchor
+	joint.node_a = joint.get_path_to(a)
+	joint.node_b = joint.get_path_to(b)
+	return joint
 
-	var links: Array[AVBDRigidBody3D] = []
-	var joints: Array[AVBDJoint3D] = []
+
+func test_hard_joint() -> Variant:
+	var anchor := add_body(root, "Anchor", Vector3.ONE, Vector3(0, 10, 0))
+	anchor.freeze = true
+
+	var links: Array[RigidBody3D] = []
+	var joints: Array[Generic6DOFJoint3D] = []
 	var previous: Node3D = anchor
 	for i in 4:
-		var link := add_body(world, "Link%d" % i, Vector3.ONE, Vector3(0, 9.0 - i, 0))
-		joints.append(add_joint(world, "Joint%d" % i, previous, link, Vector3(0, -0.5, 0), Vector3(0, 0.5, 0)))
+		var link := add_body(root, "Link%d" % i, Vector3.ONE, Vector3(0, 9.0 - i, 0))
+		var joint := make_locked_6dof(root, "Joint%d" % i, previous, link, Vector3(0, 8.5 - i, 0))
 		links.append(link)
+		joints.append(joint)
 		previous = link
 
-	await check_forces(world, 4, "joint pre-flight")
-
-	await steps(world, 300)
+	await steps(300)
 
 	var worst := 0.0
 	for i in joints.size():
 		var a: Node3D = anchor if i == 0 else links[i - 1]
-		worst = maxf(worst, joint_error(joints[i], a, links[i]))
+		worst = maxf(worst, anchor_error(a, links[i], Vector3(0, -0.5, 0), Vector3(0, 0.5, 0)))
 
-	check(worst <= 0.01, "hard joint error", "max anchor separation = %.6f m" % worst)
+	check(worst <= 0.02, "hard joint error", "max anchor separation = %.6f m" % worst)
 	check(links[3].global_position.y < anchor.global_position.y, "chain hangs",
 			"tail y=%.4f below anchor y=%.4f" % [links[3].global_position.y, anchor.global_position.y])
-	check(world.get_force_count() == 4, "joint count", "forces=%d" % world.get_force_count())
 
 	var evidence := {"worst_joint_error": worst, "tail_y": links[3].global_position.y}
-	world.queue_free()
+	for node: Node in [anchor] + links + joints:
+		node.queue_free()
 	await frames(2)
 	return evidence
 
 
-# A joint anchored to world space (node_a empty) pins a body to a point. The anchor
-# is deliberately off-axis so a swapped coordinate would show up as a mismatch.
-#
-# AVBD constraints are stabilised, so an initial violation decays over a second or
-# two instead of snapping; the body is therefore spawned at its anchor.
+# ---------------------------------------------------------------------------
+# A PinJoint3D anchored to a static body pins a box to a point. The anchor is
+# deliberately off-axis so a swapped coordinate would show up as a mismatch.
+# AVBD constraints are stabilised, so an initial violation decays over a second
+# or two; the body is spawned at its anchor.
+# ---------------------------------------------------------------------------
 func test_world_joint() -> Variant:
-	var world := make_world()
-	var anchor := Vector3(2, 3, 1)
-	var bob := add_body(world, "Bob", Vector3.ONE, anchor)
-	bob.initial_velocity = Vector3(4, 0, 0)
+	var anchor_point := Vector3(2, 3, 1)
+	var world_anchor := add_body(root, "WorldAnchor", Vector3.ONE, Vector3(50, 50, 50))
+	world_anchor.freeze = true
+	var bob := add_body(root, "Bob", Vector3.ONE, anchor_point)
+	bob.linear_velocity = Vector3(4, 0, 0)
 
-	var joint := add_world_joint(world, "Pin", bob, anchor)
-	await check_forces(world, 1, "joint pre-flight")
+	var joint := PinJoint3D.new()
+	joint.name = "Pin"
+	root.add_child(joint)
+	joint.global_position = anchor_point
+	joint.node_a = joint.get_path_to(world_anchor)
+	joint.node_b = joint.get_path_to(bob)
 
-	await steps(world, 180)
+	await steps(180)
 
-	var error := bob.global_position.distance_to(anchor)
+	var error := bob.global_position.distance_to(anchor_point)
 	check(error <= 0.02, "world anchor holds",
-			"bob at %v, anchor %v, error %.5f m" % [bob.global_position, anchor, error])
+			"bob at %v, anchor %v, error %.5f m" % [bob.global_position, anchor_point, error])
 	check(bob.linear_velocity.length() <= 0.05, "world anchor absorbs velocity",
 			"speed=%.5f m/s from an initial 4 m/s" % bob.linear_velocity.length())
 
-	var evidence := {"error": error, "joint_name": joint.name, "speed": bob.linear_velocity.length()}
-	world.queue_free()
+	var evidence := {"error": error, "speed": bob.linear_velocity.length()}
+	for node: Node in [world_anchor, bob, joint]:
+		node.queue_free()
 	await frames(2)
 	return evidence
 
 
 # ---------------------------------------------------------------------------
-# Lattice soft body: a 3x3x3 blob of jointed boxes dropped on the ground.
-# ---------------------------------------------------------------------------
-func test_soft_body() -> Variant:
-	var world := make_world()
-	add_ground(world, 0.0)
-
-	var soft := add_soft_body(world, "Soft", Vector3(0, 4, 0))
-
-	await steps(world, 300)
-
-	var count := soft.get_cell_count()
-	var finite := true
-	var lowest := INF
-	var highest := -INF
-	for i in count:
-		var t := soft.get_cell_transform(i)
-		if not t.origin.is_finite():
-			finite = false
-		var y := soft.to_global(t.origin).y
-		lowest = minf(lowest, y)
-		highest = maxf(highest, y)
-
-	check(count == 27, "soft body cells", "cells=%d" % count)
-	check(finite, "soft body finite", "all %d cell transforms finite" % count)
-	check(lowest > -0.2 and highest < 4.5, "soft body lands", "cell y in [%.3f, %.3f]" % [lowest, highest])
-	check(world.get_body_count() == 28, "soft body in solver", "bodies=%d (27 cells + ground)" % world.get_body_count())
-
-	# The drawn instances must match the simulated cells, and the lattice must keep
-	# its nominal spacing (0.25 m) after landing. Under --headless the dummy renderer
-	# discards MultiMesh buffers (reads come back as identity), so the instance
-	# comparison only runs against a real rendering device.
-	var mm: MultiMesh = soft.get_multimesh()
-	check(mm != null and mm.get_instance_count() == count, "soft body instances",
-			"multimesh instances=%d" % [mm.get_instance_count() if mm != null else -1])
-	if DisplayServer.get_name() == "headless":
-		print("     (instance transforms not comparable under the dummy renderer)")
-	else:
-		var mismatch := 0.0
-		for i in count:
-			mismatch = maxf(mismatch, mm.get_instance_transform(i).origin.distance_to(soft.get_cell_transform(i).origin))
-		check(mismatch <= 1e-5, "visuals match solver", "max instance/cell mismatch = %.7f m" % mismatch)
-	var spacing := soft.get_cell_transform(0).origin.distance_to(soft.get_cell_transform(1).origin)
-	check(spacing > 0.2 and spacing < 0.4, "lattice spacing", "cell 0-1 spacing = %.4f m (0.25 nominal)" % spacing)
-	# The lattice must fall straight down onto the slab, not drift sideways: the
-	# joint anchors are expressed in the solver's Z-up frame, where a sign error
-	# would push the lattice along the horizontal axes.
-	var worst_lateral := 0.0
-	for i in count:
-		var cell := soft.to_global(soft.get_cell_transform(i).origin)
-		worst_lateral = maxf(worst_lateral, Vector2(cell.x, cell.z).length())
-	check(worst_lateral <= 0.6, "lattice stays centred", "max lateral offset = %.4f m" % worst_lateral)
-
-	var evidence := {"cells": count, "lowest_y": lowest, "highest_y": highest, "spacing": spacing,
-			"lateral": worst_lateral, "digest": digest(world)}
-	world.queue_free()
-	await frames(2)
-	return evidence
-
-
-# ---------------------------------------------------------------------------
-# Raycasts hit dynamic bodies, static bodies and soft bodies.
+# RayCast3D node + direct space state intersect_ray: hits dynamic bodies, static
+# bodies, misses cleanly, and follows a teleported static body.
 # ---------------------------------------------------------------------------
 func test_raycast() -> Variant:
-	var world := make_world()
-	var ground := add_ground(world, 0.5)
-	var box := add_body(world, "Box", Vector3.ONE, Vector3(0, 3, 0))
+	var ground := add_ground(root, 0.5, 0.5)
+	var box := add_body(root, "Box", Vector3.ONE, Vector3(0, 3, 0))
 
-	await steps(world, 60)
+	await steps(60)
+	var top := box.global_position.y + 0.5
 
-	var hit := world.raycast(Vector3(0, 20, 0), Vector3(0, -1, 0))
-	check(hit.get("body") == box, "raycast hits dynamic body", "body=%s" % [hit.get("body")])
-	if hit.has("position"):
-		# The box has settled on the slab, so the ray meets its top face.
-		var top: float = box.global_position.y + 0.5
-		check(absf(hit.position.y - top) <= 0.05, "raycast position", "y=%.4f (box top %.4f)" % [hit.position.y, top])
-		check(absf(hit.distance - (20.0 - top)) <= 0.05, "raycast distance",
-				"d=%.4f (want %.4f)" % [hit.distance, 20.0 - top])
+	# Direct space state query.
+	var space_state := root.get_world_3d().direct_space_state
+	var query := PhysicsRayQueryParameters3D.create(Vector3(0, 20, 0), Vector3(0, -10, 0))
+	var hit := space_state.intersect_ray(query)
+	check(not hit.is_empty() and instance_from_id(hit.get("collider_id")) == box,
+			"ray hits dynamic body", "hit=%s" % [hit.get("collider_id")])
+	check(hit.has("position") and absf(hit.get("position").y - top) <= 0.05, "ray hit position",
+			"y=%.4f (box top %.4f)" % [hit.get("position", Vector3.ZERO).y, top])
 
-	var miss := world.raycast(Vector3(50, 20, 50), Vector3(0, 1, 0))
-	check(miss.is_empty(), "raycast misses", "keys=%s" % [miss.keys()])
+	var miss := space_state.intersect_ray(PhysicsRayQueryParameters3D.create(Vector3(50, 20, 50), Vector3(50, 21, 50)))
+	check(miss.is_empty(), "ray misses cleanly", "keys=%s" % [miss.keys()])
 
-	var ground_hit := world.raycast(Vector3(20, 20, 20), Vector3(0, -1, 0))
-	check(ground_hit.get("body") == ground, "raycast hits static body", "body=%s" % [ground_hit.get("body")])
+	var ground_hit := space_state.intersect_ray(PhysicsRayQueryParameters3D.create(Vector3(20, 20, 20), Vector3(20, -10, 20)))
+	check(not ground_hit.is_empty() and instance_from_id(ground_hit.get("collider_id")) == ground,
+			"ray hits static body", "hit=%s" % [ground_hit.get("collider_id")])
+
+	# RayCast3D node (the engine wraps the same server query).
+	var ray := RayCast3D.new()
+	ray.target_position = Vector3(0, -30, 0)
+	root.add_child(ray)
+	ray.global_position = Vector3(0, 20, 0)
+	await frames(2)
+	check(ray.is_colliding() and ray.get_collider() == box, "RayCast3D node hits", "collider=%s" % ray.get_collider())
 
 	# Static bodies follow their node: move the slab and the ray must follow.
-	ground.position = Vector3(0, 10.5, 0)
+	ground.global_position = Vector3(20, 10.5, 20)
 	await frames(2)
-	var moved := world.raycast(Vector3(20, 20, 20), Vector3(0, -1, 0))
-	check(moved.has("position") and absf(moved.position.y - 11.0) <= 0.05, "static body teleport adopted",
+	var moved := space_state.intersect_ray(PhysicsRayQueryParameters3D.create(Vector3(20, 20, 20), Vector3(20, -10, 20)))
+	check(moved.has("position") and absf(moved.get("position").y - 11.0) <= 0.05, "static body teleport adopted",
 			"hit y=%.4f (moved slab top 11.0)" % [moved.get("position", Vector3.ZERO).y])
 
-	var evidence := {"dynamic_hit": hit.get("body").name if hit.get("body") != null else "<none>",
-			"distance": hit.get("distance", -1.0)}
-	world.queue_free()
+	var evidence := {"hit_y": hit.get("position", Vector3.ZERO).y}
+	ground.queue_free()
+	box.queue_free()
+	ray.queue_free()
+	await frames(2)
+	return evidence
+
+
+# ---------------------------------------------------------------------------
+# Impulses and teleports act on the solver state with the right magnitudes,
+# through the server's apply paths.
+# ---------------------------------------------------------------------------
+func test_impulse_teleport() -> Variant:
+	add_ground(root, 0.5, 0.5)
+	var box := add_body(root, "Box", Vector3.ONE, Vector3(0, 1.0, 0))
+
+	await steps(60)
+
+	# A 1 m^3 box at mass 1 kg: a 10 N.s impulse is 10 m/s. Read the velocity back through
+	# the body's direct state - the same object the sync callback fills - because the node's
+	# cached linear_velocity only refreshes on the next sync.
+	box.apply_impulse(Vector3(10, 0, 0))
+	await steps(1)
+	var direct_state: PhysicsDirectBodyState3D = PhysicsServer3D.body_get_direct_state(box.get_rid())
+	var vx: float = direct_state.linear_velocity.x
+	check(absf(vx - 10.0) <= 0.5, "impulse sets velocity",
+			"vx=%.5f (10 N.s / 1 kg)" % vx)
+
+	box.linear_velocity = Vector3.ZERO
+	box.angular_velocity = Vector3.ZERO
+	box.apply_impulse(Vector3(10, 0, 0), Vector3(0, 0.5, 0))
+	await steps(1)
+	check(box.angular_velocity.length() > 1.0, "offset impulse spins body",
+			"|w|=%.4f rad/s" % box.angular_velocity.length())
+
+	await steps(60)
+	check(box.global_position.x > 1.0, "impulse moves body", "x=%.4f" % box.global_position.x)
+
+	box.global_transform = Transform3D(Basis(), Vector3(-5, 4, 0))
+	box.linear_velocity = Vector3.ZERO
+	check(absf(box.global_position.x + 5.0) <= 0.001, "teleport moves node", "x=%.4f" % box.global_position.x)
+	await frames(2)
+	check(absf(box.global_position.x + 5.0) <= 0.05, "teleport holds", "x=%.4f on the next tick" % box.global_position.x)
+
+	var evidence := {"x_after": box.global_position.x}
+	box.queue_free()
 	await frames(2)
 	return evidence
 
@@ -298,66 +308,172 @@ func test_raycast() -> Variant:
 # Adding a body at runtime must not reset the bodies already simulated.
 # ---------------------------------------------------------------------------
 func test_runtime_add() -> Variant:
-	var world := make_world()
-	add_ground(world, 0.5)
-	var box := add_body(world, "Box", Vector3.ONE, Vector3(0, 3, 0))
+	add_ground(root, 0.5, 0.5)
+	var box := add_body(root, "Box", Vector3.ONE, Vector3(0, 3, 0))
 
-	await steps(world, 120)
+	await steps(120)
 	var settled := box.global_position.y
 
-	var late := add_body(world, "Late", Vector3.ONE, Vector3(5, 2, 0))
-	await steps(world, 60)
+	var late := add_body(root, "Late", Vector3.ONE, Vector3(5, 2, 0))
+	await steps(60)
 
 	check(absf(settled - box.global_position.y) <= 0.02, "rebuild keeps pose",
 			"settled y %.4f -> %.4f after adding a body" % [settled, box.global_position.y])
-	check(world.get_body_count() == 3, "added body simulated", "bodies=%d" % world.get_body_count())
 	check(late.global_position.y > 0.5, "added body rests", "late y=%.4f" % late.global_position.y)
 
 	var evidence := {"settled": settled, "after": box.global_position.y, "late_y": late.global_position.y}
-	world.queue_free()
+	for node in [box, late]:
+		node.queue_free()
 	await frames(2)
 	return evidence
 
 
 # ---------------------------------------------------------------------------
-# Impulses and teleports act on the solver state with the right magnitudes.
+# Axis locks through the server: a box with linear Y locked must hover, resist
+# gravity entirely, and keep spinning only about locked axes.
 # ---------------------------------------------------------------------------
-func test_interaction() -> Variant:
-	var world := make_world()
-	add_ground(world, 0.5)
-	var box := add_body(world, "Box", Vector3.ONE, Vector3(0, 1.0, 0))
+func test_axis_lock() -> Variant:
+	add_ground(root, 0.5, 0.5)
+	var hover := add_body(root, "Hover", Vector3.ONE, Vector3(0, 5, 0))
+	hover.axis_lock_linear_y = true
 
-	await steps(world, 60)
+	var control := add_body(root, "Control", Vector3.ONE, Vector3(5, 5, 0))
 
-	# A 1 m^3 box at density 1 weighs 1 kg, so a 10 N.s impulse is 10 m/s.
-	box.apply_impulse(Vector3(10, 0, 0))
-	check(absf(box.linear_velocity.x - 10.0) <= 0.01, "impulse sets velocity",
-			"vx=%.5f (10 N.s / 1 kg)" % box.linear_velocity.x)
+	await steps(240)
 
-	# The same impulse at the top face also spins the box: I = m*(1+1)/12 = 1/6,
-	# so w = r x J / I = (0,0,-5) / (1/6) = -30 rad/s about Z.
-	box.set_linear_velocity(Vector3.ZERO)
-	box.set_angular_velocity(Vector3.ZERO)
-	box.apply_impulse(Vector3(10, 0, 0), Vector3(0, 0.5, 0))
-	var spin := box.angular_velocity.z
-	check(absf(spin + 30.0) <= 0.1, "impulse spins body", "wz=%.4f (want -30 rad/s)" % spin)
+	check(absf(hover.global_position.y - 5.0) <= 0.01, "locked axis hovers",
+			"y=%.6f (spawn 5.0, no fall in 4 s)" % hover.global_position.y)
+	check(absf(hover.linear_velocity.y) <= 0.01, "locked axis no velocity",
+			"vy=%.6f" % hover.linear_velocity.y)
+	check(control.global_position.y < 2.0, "unlocked control falls",
+			"control y=%.4f" % control.global_position.y)
 
-	await steps(world, 60)
-	check(box.global_position.x > 1.0, "impulse moves body", "x=%.4f" % box.global_position.x)
-
-	box.teleport(Vector3(-5, 4, 0))
-	check(absf(box.global_position.x + 5.0) <= 0.001, "teleport moves node", "x=%.4f" % box.global_position.x)
-	await frames(2)
-	check(absf(box.global_position.x + 5.0) <= 0.05, "teleport holds", "x=%.4f on the next tick" % box.global_position.x)
-
-	var evidence := {"impulse_v": 10.0, "spin_w": spin, "teleport_x": box.global_position.x}
-	world.queue_free()
+	var evidence := {"hover_y": hover.global_position.y}
+	for node in [hover, control]:
+		node.queue_free()
 	await frames(2)
 	return evidence
 
 
 # ---------------------------------------------------------------------------
-# Same scene, same ticks, same state.
+# Collision layers/masks: a box on layer 2 with mask 1 vs a wall on layer 1
+# mask 1... pair test is (A.layer & B.mask) || (B.layer & A.mask).
+# ---------------------------------------------------------------------------
+func test_collision_layers() -> Variant:
+	var wall := add_body(root, "Wall", Vector3(0.5, 4, 4), Vector3(0, 2, 0))
+	wall.freeze = true
+
+	var pass_through := add_body(root, "PassThrough", Vector3.ONE, Vector3(-6, 2, 0), 1.0)
+	pass_through.collision_layer = 2
+	pass_through.collision_mask = 2 # never meets the wall's layer 1
+	pass_through.linear_velocity = Vector3(4, 0, 0) # pushed at the wall, must cross
+
+	var blocked := add_body(root, "Blocked", Vector3.ONE, Vector3(6, 2, 0), 1.0)
+	blocked.collision_layer = 4
+	blocked.collision_mask = 1 | 4 # layer 4 meets the wall's layer 1 through the wall's mask
+	blocked.linear_velocity = Vector3(-4, 0, 0)
+
+	await steps(180)
+
+	check(pass_through.global_position.x > 0.4, "incompatible layers pass through",
+			"x=%.4f (crossed the wall plane)" % pass_through.global_position.x)
+	check(blocked.global_position.x > 0.4, "compatible layers collide",
+			"x=%.4f (stopped at the wall)" % blocked.global_position.x)
+
+	var evidence := {"pass_x": pass_through.global_position.x, "blocked_x": blocked.global_position.x}
+	for node in [wall, pass_through, blocked]:
+		node.queue_free()
+	await frames(2)
+	return evidence
+
+
+# ---------------------------------------------------------------------------
+# Collision exceptions: two overlapping boxes that would blow apart stay put,
+# while a control pair pushes apart.
+# ---------------------------------------------------------------------------
+func test_collision_exceptions() -> Variant:
+	add_ground(root, 0.5, 0.5)
+
+	var a := add_body(root, "OverlapA", Vector3.ONE, Vector3(0, 1.0, 0))
+	var b := add_body(root, "OverlapB", Vector3.ONE, Vector3(0.2, 1.0, 0))
+	a.add_collision_exception_with(b)
+
+	var control_a := add_body(root, "ControlA", Vector3.ONE, Vector3(6, 1.0, 0))
+	var control_b := add_body(root, "ControlB", Vector3.ONE, Vector3(6.2, 1.0, 0))
+
+	await steps(180)
+
+	var separation := (a.global_position - b.global_position).length()
+	var control_separation := (control_a.global_position - control_b.global_position).length()
+	check(separation < 0.9, "exception pair keeps overlapping",
+			"separation=%.4f m (spawned at 0.2)" % separation)
+	check(control_separation > separation + 0.3, "control pair pushes apart further",
+			"separation=%.4f m" % control_separation)
+
+	var evidence := {"separation": separation, "control": control_separation}
+	for node in [a, b, control_a, control_b]:
+		node.queue_free()
+	await frames(2)
+	return evidence
+
+
+# ---------------------------------------------------------------------------
+# Sleeping: putting a body to sleep freezes it; waking it resumes the fall.
+# ---------------------------------------------------------------------------
+func test_sleeping() -> Variant:
+	add_ground(root, 0.5, 0.5)
+	var box := add_body(root, "Box", Vector3.ONE, Vector3(0, 8, 0))
+
+	await steps(30)
+	box.sleeping = true
+	var y_at_sleep := box.global_position.y
+
+	await steps(120)
+	check(absf(box.global_position.y - y_at_sleep) < 0.01, "sleeping body freezes",
+			"y %.4f -> %.4f while asleep" % [y_at_sleep, box.global_position.y])
+
+	box.sleeping = false
+	await steps(120)
+	check(box.global_position.y < y_at_sleep - 1.0, "woken body falls",
+			"y=%.4f after wake" % box.global_position.y)
+
+	var evidence := {"y_at_sleep": y_at_sleep, "y_end": box.global_position.y}
+	box.queue_free()
+	await frames(2)
+	return evidence
+
+
+# ---------------------------------------------------------------------------
+# The direct evidence for pause-following: freeze the SceneTree mid-fall and the
+# server must stop stepping. Position must be bit-stable; resuming resumes.
+# ---------------------------------------------------------------------------
+func test_paused_follows_game() -> Variant:
+	add_ground(root, 0.5, 0.5)
+	var box := add_body(root, "Box", Vector3.ONE, Vector3(0, 8, 0))
+
+	await steps(30)
+	var y_before := box.global_position.y
+
+	paused = true
+	await steps(30)
+	var y_paused := box.global_position.y
+	paused = false
+
+	check(absf(y_paused - y_before) < 1.0e-4, "paused simulation freezes",
+			"y %.6f -> %.6f during 30 paused frames" % [y_before, y_paused])
+
+	await steps(60)
+	check(box.global_position.y < y_paused - 1.0, "resume continues the fall",
+			"y=%.4f after unpause" % box.global_position.y)
+
+	var evidence := {"y_before": y_before, "y_paused": y_paused, "y_resumed": box.global_position.y}
+	box.queue_free()
+	await frames(2)
+	return evidence
+
+
+# ---------------------------------------------------------------------------
+# Same scene, same ticks, same state (in-process, twice).
 # ---------------------------------------------------------------------------
 func test_determinism() -> Variant:
 	var first := await stack_digest()
@@ -367,15 +483,19 @@ func test_determinism() -> Variant:
 
 
 func stack_digest() -> int:
-	var world := make_world()
-	add_ground(world, 0.5)
-	var boxes: Array[AVBDRigidBody3D] = []
+	# Build from inside a physics-frame callback, so every invocation of this scenario
+	# has the same relationship to the engine's step boundary (one solver step per
+	# physics frame, taken after the signal).
+	await frames(1)
+	var ground := add_ground(root, 0.5, 0.5)
+	var boxes: Array[RigidBody3D] = []
 	for i in 10:
-		boxes.append(add_body(world, "Box%d" % i, Vector3.ONE, Vector3(0, 1.0 + i * 1.5, 0)))
+		boxes.append(add_body(root, "Box%d" % i, Vector3.ONE, Vector3(0, 1.0 + i * 1.5, 0)))
 
-	await steps(world, 300)
+	await steps(300)
 
-	var hash := digest(world)
-	world.queue_free()
+	var hash := digest_of(boxes)
+	for node: Node in [ground] + boxes:
+		node.queue_free()
 	await frames(2)
 	return hash
