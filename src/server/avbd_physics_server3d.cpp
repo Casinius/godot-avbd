@@ -23,6 +23,8 @@
 #include <godot_cpp/variant/array.hpp>
 
 using namespace godot;
+// Singleton pointer declaration.
+AVBDPhysicsServer3D *AVBDPhysicsServer3D::SpaceData::singleton = nullptr;
 using namespace avbd_godot;
 
 // Godot 4.3 added per-axis springs to the generic 6-DOF joint and grew the server enums; the
@@ -1738,6 +1740,42 @@ double AVBDPhysicsServer3D::body_state_step() const {
         return space.solver.dt;
     }
     return 0.0;
+}
+
+double AVBDPhysicsServer3D::get_solver_broad_phase_time() const {
+    for (const auto &[id, space] : spaces) {
+        (void)id;
+        return space.solver.get_broadPhase_time();
+    }
+    return 0.0;
+}
+
+double AVBDPhysicsServer3D::get_solver_colour_graph_time() const {
+    for (const auto &[id, space] : spaces) {
+        (void)id;
+        return space.solver.get_colourGraph_time();
+    }
+    return 0.0;
+}
+
+double AVBDPhysicsServer3D::get_solver_solve_time() const {
+    for (const auto &[id, space] : spaces) {
+        (void)id;
+        return space.solver.get_solve_time();
+    }
+    return 0.0;
+}
+
+double AVBDPhysicsServer3D::get_solver_finish_time() const {
+    for (const auto &[id, space] : spaces) {
+        (void)id;
+        return space.solver.get_finish_time();
+    }
+    return 0.0;
+}
+
+AVBDPhysicsServer3D *AVBDPhysicsServer3D::get_singleton() {
+    return SpaceData::singleton;
 }
 
 PhysicsDirectSpaceState3D *AVBDPhysicsServer3D::body_state_space_state(const RID &p_body) {

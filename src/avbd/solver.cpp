@@ -17,6 +17,8 @@
 #include <numeric>
 
 #include "avbd/job_pool.hpp"
+#include "avbd/bvh/bvh.hpp"
+#include "avbd/bvh/node_storage.hpp"
 
 namespace avbd {
 

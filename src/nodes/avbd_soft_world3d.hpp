@@ -31,6 +31,7 @@
 #include <godot_cpp/variant/vector3.hpp>
 
 #include "avbd/solver.h"
+#include "avbd/bvh/node_storage.hpp"
 
 namespace godot {
 

@@ -48,6 +48,7 @@
 #include <godot_cpp/variant/variant.hpp>
 
 #include "avbd/solver.h"
+#include "avbd/bvh/node_storage.hpp"
 
 namespace godot {
 
@@ -198,6 +199,9 @@ protected:
         int substeps = 1;
 
         // Debug contacts collected during the last step (world space, Godot frame).
+
+        // Singleton instance pointer for timing access.
+        static AVBDPhysicsServer3D *singleton;
         bool debug_contacts_requested = false;
         int32_t debug_contacts_max = 0;
 
@@ -318,8 +322,23 @@ public:
     double body_state_step() const;
     PhysicsDirectSpaceState3D *body_state_space_state(const RID &p_body);
 
+    // Solver performance timing (ms).
+    double get_solver_broad_phase_time() const;
+    double get_solver_colour_graph_time() const;
+    double get_solver_solve_time() const;
+    double get_solver_finish_time() const;
+    // Get the singleton instance of AVBDPhysicsServer3D.
+    static AVBDPhysicsServer3D *get_singleton();
+
 protected:
-    static void _bind_methods() {}
+    static void _bind_methods() {
+        // Solver performance timing
+        ClassDB::bind_method(D_METHOD("get_solver_broad_phase_time"), &AVBDPhysicsServer3D::get_solver_broad_phase_time);
+        ClassDB::bind_method(D_METHOD("get_solver_colour_graph_time"), &AVBDPhysicsServer3D::get_solver_colour_graph_time);
+        ClassDB::bind_method(D_METHOD("get_solver_solve_time"), &AVBDPhysicsServer3D::get_solver_solve_time);
+        ClassDB::bind_method(D_METHOD("get_solver_finish_time"), &AVBDPhysicsServer3D::get_solver_finish_time);
+        ClassDB::bind_method(D_METHOD("get_singleton"), &AVBDPhysicsServer3D::get_singleton);
+    }
 
 public:
     AVBDPhysicsServer3D() = default;

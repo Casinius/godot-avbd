@@ -23,6 +23,8 @@ add_requires("thread-pool v5.1.0")
 
 local avbd_core = {
     "src/avbd/rigid.cpp",
+    "src/avbd/bvh/node_storage.cpp",
+    "src/avbd/bvh/bvh.cpp",
     "src/avbd/force.cpp",
     "src/avbd/joint.cpp",
     "src/avbd/generic_joint.cpp",

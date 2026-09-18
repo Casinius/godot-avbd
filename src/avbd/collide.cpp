@@ -10,6 +10,7 @@
 */
 
 #include "avbd/solver.h"
+#include "avbd/bvh/node_storage.hpp"
 #include <algorithm>
 #include <cfloat>
 #include <cmath>

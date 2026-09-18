@@ -17,6 +17,9 @@
 
 #include "avbd/maths.h"
 
+// Forward declarations
+namespace bvh::nodes { class NodeStorage; }
+
 namespace avbd {
 
 // Defined in job_pool.hpp, which is only included by solver.cpp.
@@ -424,6 +427,10 @@ struct Solver
     Rigid *bodies = nullptr;
     Force *forces = nullptr;
 
+    // BVH for broad-phase collision detection (SAH-based)
+    bvh::nodes::NodeStorage* bvh = nullptr;
+    bool bvhBuilt = false;
+
     Solver();
     ~Solver();
 
@@ -457,6 +464,27 @@ struct Solver
     [[nodiscard]] int widestColour() const { return widest; }
     // Number of worker threads actually in use (1 when running inline).
     [[nodiscard]] int threadCount() const;
+
+    // BVH methods
+    void rebuildBvh();
+    void updateBvhBodyPosition(int bodyIndex);
+    void updateBvh();
+
+    // Performance timing counters (ms).
+    static double _time_broadPhase;
+    static double _time_colourGraph;
+    static double _time_solve;
+    static double _time_finish;
+
+    // Performance timing getters (ms). Returns 0 if timing is not active.
+    [[nodiscard]] static double get_broadPhase_time();
+    [[nodiscard]] static double get_colourGraph_time();
+    [[nodiscard]] static double get_solve_time();
+    [[nodiscard]] static double get_finish_time();
+    // Reset all timing counters to zero.
+    static void reset_timing();
+    // Get current CPU time in microseconds.
+    static double get_time();
 
 private:
     // Every body in list order. The inertial/warmstart and BDF1 phases run over this,

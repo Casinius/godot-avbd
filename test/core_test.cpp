@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "avbd/solver.h"
+#include "avbd/bvh/node_storage.hpp"
 #include "core_scenes.hpp"
 
 using namespace avbd;
