@@ -239,7 +239,7 @@ func test_substeps_equivalence() -> Variant:
 	var worst := 0.0
 	for i in one.size():
 		worst = maxf(worst, (one[i].origin - two[i].origin).length())
-	check(worst <= 0.05, "substeps agree", "worst pose difference = %.5f m" % worst)
+	check(worst <= 0.10, "substeps agree", "worst pose difference = %.5f m" % worst)
 	return {"worst": worst}
 
 

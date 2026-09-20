@@ -337,7 +337,7 @@ protected:
         ClassDB::bind_method(D_METHOD("get_solver_colour_graph_time"), &AVBDPhysicsServer3D::get_solver_colour_graph_time);
         ClassDB::bind_method(D_METHOD("get_solver_solve_time"), &AVBDPhysicsServer3D::get_solver_solve_time);
         ClassDB::bind_method(D_METHOD("get_solver_finish_time"), &AVBDPhysicsServer3D::get_solver_finish_time);
-        ClassDB::bind_method(D_METHOD("get_singleton"), &AVBDPhysicsServer3D::get_singleton);
+        // ClassDB::bind_method(D_METHOD("get_singleton"), &AVBDPhysicsServer3D::get_singleton); // static method, not bound
     }
 
 public:

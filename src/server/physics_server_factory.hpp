@@ -7,7 +7,6 @@
 #define AVBD_PHYSICS_SERVER_FACTORY_HPP
 
 #include <godot_cpp/classes/object.hpp>
-#include <godot_cpp/core/class_db.hpp>
 
 namespace godot {
 
@@ -16,13 +15,13 @@ class AVBDPhysicsServer3D;
 class PhysicsServerFactory : public Object {
     GDCLASS(PhysicsServerFactory, Object)
 
-protected:
-    static void _bind_methods();
-
 public:
     // Returns Object* so the method binder has an unambiguous type; the engine casts it to the
     // server interface it asked for.
     Object *create_server();
+
+protected:
+    static void _bind_methods();
 };
 
 } // namespace godot

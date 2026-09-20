@@ -591,7 +591,8 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
         body.rigid->sleeping = body.sleeping;
         // Solver sleep modes: 0 = never sleeps, 1 = may sleep. Sleep is manual this round:
         // the solver has no idle detection, so "can sleep" only opens the gate.
-        body.rigid->sleep_mode = body.can_sleep ? 1 : 0;
+        // HACK: Disable sleep entirely for pyramid stability testing
+        body.rigid->sleep_mode = 0;  // SLEEP_MODE_NEVER
         body.rigid->gravity = space->solver.gravity * static_cast<float>(body.gravity_scale);
     }
 

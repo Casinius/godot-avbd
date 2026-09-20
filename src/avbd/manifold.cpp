@@ -46,6 +46,8 @@ bool Manifold::initialize()
                 {
                     newContacts[i].rA = newRA;
                     newContacts[i].rB = newRB;
+                    newContacts[i].lambda = contacts[j].lambda;   // Keep lambda from prev frame
+                    newContacts[i].penalty = contacts[j].penalty; // Keep penalty from prev frame
                 }
                 break;
             }
@@ -65,10 +67,27 @@ bool Manifold::initialize()
         float3 xB = transform(bodyB->positionLin, bodyB->positionAng, contacts[i].rB);
         contacts[i].C0 = basis * (xA - xB) + float3{COLLISION_MARGIN, 0, 0};
 
+        // Clamp penetration to avoid excessive penalty forces
+        float penetration = length(contacts[i].C0);
+        if (penetration > 0.02f) // Cap at 2cm penetration
+        {
+            contacts[i].C0 = normalize(contacts[i].C0) * 0.02f;
+            penetration = 0.02f;
+        }
+
+        // Adaptive penalty based on initial penetration depth
+        // Use log scale for large penetration variations, but avoid division by zero
+        float basePenalty = 1.0f; // PENALTY_MIN
+        float logPenetration = std::log10(std::max(penetration, 0.001f));
+        float adaptivePenalty = basePenalty * std::pow(10.0f, logPenetration * 2.0f);
+        float clampedPenalty = clamp(adaptivePenalty, PENALTY_MIN, PENALTY_MAX);
+        contacts[i].penalty = float3{clampedPenalty, clampedPenalty, clampedPenalty};
+
         // Warmstart the dual variables and penalty parameters (Eq. 19)
         // Penalty is safely clamped to a minimum and maximum value
         contacts[i].lambda = contacts[i].lambda * solver->alpha * solver->gamma;
-        contacts[i].penalty = clamp(contacts[i].penalty * solver->gamma, PENALTY_MIN, PENALTY_MAX);
+        float clampedLambdaPenalty = clamp(clampedPenalty * solver->gamma, PENALTY_MIN, PENALTY_MAX);
+        contacts[i].penalty = float3{clampedLambdaPenalty, clampedLambdaPenalty, clampedLambdaPenalty};
     }
 
     return numContacts > 0;

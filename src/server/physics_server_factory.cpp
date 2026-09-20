@@ -18,5 +18,5 @@ Object *PhysicsServerFactory::create_server() {
 }
 
 void PhysicsServerFactory::_bind_methods() {
-    ClassDB::bind_method(D_METHOD("create_server"), &PhysicsServerFactory::create_server);
+    // ClassDB::bind_method(D_METHOD("create_server"), &PhysicsServerFactory::create_server);
 }

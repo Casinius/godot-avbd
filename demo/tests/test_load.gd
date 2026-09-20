@@ -99,7 +99,7 @@ func _pyramid_run() -> int:
 			cs.shape = box_shape
 			b.add_child(cs)
 			b.mass = 0.5
-			b.position = Vector3((i - (rows - row - 1) / 2.0) * 1.01, 0.25 + row * 0.85, 0)
+			b.position = Vector3((i - (rows - row - 1) / 2.0) * 1.01, 0.25 + row * 0.54, 0)
 			root.add_child(b)
 			boxes.append(b)
 

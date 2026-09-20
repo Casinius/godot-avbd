@@ -244,7 +244,40 @@ void Solver::warmstartBodies()
 // The solver's main loop: `iterations` rounds of a primal pass followed by a dual pass.
 void Solver::solveIterations(int forceCount)
 {
-    for (int it = 0; it < iterations; it++)
+    int targetIterations = iterations;
+
+    if (adaptiveIterations)
+    {
+        // Estimate total penetration error from current manifolds
+        float totalPenetration = 0.0f;
+        int penetrationCount = 0;
+        for (Force *f = forces; f != nullptr; f = f->next)
+        {
+            if (auto *m = dynamic_cast<Manifold*>(f))
+            {
+                for (int i = 0; i < m->numContacts; i++)
+                {
+                    float penetration = length(m->contacts[i].C0);
+                    if (penetration > 0.0f)
+                    {
+                        totalPenetration += penetration;
+                        penetrationCount++;
+                    }
+                }
+            }
+        }
+
+        // Adaptive iteration count: more iterations needed if penetration is large
+        if (penetrationCount > 0)
+        {
+            float avgPenetration = totalPenetration / penetrationCount;
+            targetIterations = static_cast<int>(std::round(iterations * avgPenetration / maxPenetrationError));
+        }
+        targetIterations = std::max(2, targetIterations);  // Minimum 2 iterations
+        targetIterations = std::min(targetIterations, 16); // Cap at 16 iterations
+    }
+
+    for (int it = 0; it < targetIterations; it++)
     {
         // Primal update, group by group. Every body inside a group is independent, so the
         // group is spread over the worker threads; between groups the updates stay ordered,

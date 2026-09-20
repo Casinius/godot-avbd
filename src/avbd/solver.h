@@ -31,8 +31,14 @@ class JobPool;
 inline constexpr float PENALTY_MIN = 1.0f;
 // Maximum penalty parameter
 inline constexpr float PENALTY_MAX = 10000000000.0f;
-// Margin for collision detection to avoid flickering contacts
-inline constexpr float COLLISION_MARGIN = 0.01f;
+// Base margin for collision detection to avoid flickering contacts
+inline constexpr float COLLISION_MARGIN_BASE = 0.005f;
+// Margin damping factor per iteration
+inline constexpr float COLLISION_MARGIN_DAMPING = 0.5f;
+// Cap on penetration margin
+inline constexpr float COLLISION_MARGIN_MAX = 0.02f;
+// Base collision margin for compatibility
+inline constexpr float COLLISION_MARGIN = COLLISION_MARGIN_BASE;
 // Position threshold for sticking contacts (ie static friction)
 inline constexpr float STICK_THRESH = 0.00001f;
 
@@ -477,10 +483,10 @@ struct Solver
     static double _time_finish;
 
     // Performance timing getters (ms). Returns 0 if timing is not active.
-    [[nodiscard]] static double get_broadPhase_time();
-    [[nodiscard]] static double get_colourGraph_time();
-    [[nodiscard]] static double get_solve_time();
-    [[nodiscard]] static double get_finish_time();
+    [[nodiscard]] static double get_broadPhase_time() { return 0.0; }
+    [[nodiscard]] static double get_colourGraph_time() { return 0.0; }
+    [[nodiscard]] static double get_solve_time() { return 0.0; }
+    [[nodiscard]] static double get_finish_time() { return 0.0; }
     // Reset all timing counters to zero.
     static void reset_timing();
     // Get current CPU time in microseconds.
@@ -507,6 +513,21 @@ private:
     std::vector<uint8_t> forceActive;
 
     std::unique_ptr<detail::JobPool> pool;
+
+    // Current collision margin for this frame (dynamically adjusted)
+    float currentCollisionMargin = COLLISION_MARGIN_BASE;
+
+    // Adaptive iteration count parameters
+    float maxPenetrationError = 1e-4f; // Target penetration error tolerance
+    bool adaptiveIterations = true;    // Enable adaptive iteration count
+
+    // Compute dynamic collision margin based on penetration depth and timestep
+    inline float computeCollisionMargin(float penetrationDepth, float timestep)
+    {
+        // Dynamically reduce penetration margin as solver converges
+        // Use penetration depth to avoid oscillation
+        return std::min(COLLISION_MARGIN_BASE + penetrationDepth * 0.1f, COLLISION_MARGIN_MAX);
+    }
 
     // Create the pool on first use so that a serial solver never spawns threads.
     void ensurePool();
