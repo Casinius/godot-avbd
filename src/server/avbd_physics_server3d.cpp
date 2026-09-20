@@ -2628,7 +2628,7 @@ void AVBDPhysicsServer3D::_monitor_areas() {
                 for (const avbd::Shape &shape : area_shapes) {
                     avbd::Manifold::Contact contact{};
                     avbd::float3x3 basis{};
-                    if (avbd::collideShapes(shape, body_shape, &contact, basis) > 0) {
+                    if (avbd::collideShapes(shape, body_shape, std::span<avbd::Manifold::Contact>(&contact, 1), basis) > 0) {
                         inside.push_back(body_id);
                         break;
                     }
@@ -2719,7 +2719,7 @@ void AVBDPhysicsServer3D::_monitor_areas() {
                         for (const avbd::Shape &shape : area_shapes) {
                             avbd::Manifold::Contact contact{};
                             avbd::float3x3 basis{};
-                            if (avbd::collideShapes(shape, other_shape, &contact, basis) > 0) {
+                            if (avbd::collideShapes(shape, other_shape, std::span<avbd::Manifold::Contact>(&contact, 1), basis) > 0) {
                                 overlaps = true;
                                 break;
                             }

@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+#include <array>
+#include <span>
 
 #include "avbd/maths.h"
 
@@ -378,7 +380,7 @@ struct Manifold : Force
         bool stick;
     };
 
-    Contact contacts[8];
+    std::array<Contact, 8> contacts;
     float3x3 basis; // Normal in the first row (pointing from B to A), and tangents in the second and third rows
     int numContacts;
     float friction;
@@ -390,7 +392,7 @@ struct Manifold : Force
     void updateDual(float alpha) override;
     int contactPointCount() const override { return numContacts; }
 
-    static int collide(Rigid *bodyA, Rigid *bodyB, Contact *contacts, float3x3 &basis);
+    static int collide(Rigid *bodyA, Rigid *bodyB, std::span<Contact> contacts, float3x3 &basis);
 };
 
 // Discrete shape-pair collision query: up to 8 contact points between two `Shape`s,
@@ -398,7 +400,9 @@ struct Manifold : Force
 // capacity) - exported because space queries reuse the exact path `Manifold` walks.
 // `basis` receives an orthonormal frame whose first row is the contact normal (A -> B).
 // Returns the contact count (0 = separated).
-int collideShapes(const Shape &a, const Shape &b, Manifold::Contact *contacts, float3x3 &basis);
+int collideShapes(const Shape &a, const Shape &b,
+                  std::span<Manifold::Contact> contacts,
+                  float3x3 &basis);
 
 // Work per item differs by orders of magnitude between the phases below, so each one gets
 // its own break-even batch size. Measured on a 12-core machine: one dispatch into the pool

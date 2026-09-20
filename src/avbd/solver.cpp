@@ -10,11 +10,11 @@
  */
 
 #include <cmath>
-
-#include "avbd/solver.h"
-
 #include <algorithm>
 #include <numeric>
+#include <span>
+
+#include "avbd/solver.h"
 
 #include "avbd/job_pool.hpp"
 #include "avbd/bvh/bvh.hpp"
@@ -451,10 +451,10 @@ void Solver::colourGraph()
         // sees it in `taken` and refits. Only bodies whose neighbourhood actually changed
         // pay for the first-fit search.
         int colour = body->colour;
-        if (colour < 0 || std::find(taken.begin(), taken.end(), colour) != taken.end())
+        if (colour < 0 || std::ranges::find(taken, colour) != taken.end())
         {
             colour = 0;
-            while (std::find(taken.begin(), taken.end(), colour) != taken.end())
+            while (std::ranges::find(taken, colour) != taken.end())
                 colour++;
         }
 
@@ -474,7 +474,7 @@ void Solver::colourGraph()
     std::exclusive_scan(perColour.begin(), perColour.end(), colourStart.begin(), 0);
     colourStart[colours] = static_cast<int>(updateOrder.size());
 
-    widest = perColour.empty() ? 0 : *std::max_element(perColour.begin(), perColour.end());
+    widest = perColour.empty() ? 0 : *std::ranges::max_element(perColour);
 
     std::vector<int> cursor = colourStart; // cursor[c] is the next free slot for colour c
     std::vector<Rigid *> grouped(updateOrder.size());

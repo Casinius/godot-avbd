@@ -14,6 +14,9 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <span>
+#include <array>
+#include <vector>
 
 namespace avbd {
 
@@ -198,7 +201,7 @@ inline int clipPolygonAgainstPlane(const float3* inVerts, int inCount, const flo
     return outCount;
 }
 
-inline bool addContact(const Shape& shapeA, const Shape& shapeB, Manifold::Contact* contacts, int& contactCount, float3* contactMidpoints, float3 xA, float3 xB, int featureKey)
+inline bool addContact(const Shape& shapeA, const Shape& shapeB, std::span<Manifold::Contact> contacts, int& contactCount, float3* contactMidpoints, float3 xA, float3 xB, int featureKey)
 {
     float3 midpoint = (xA + xB) * 0.5f;
 
@@ -338,7 +341,7 @@ inline void closestPointsOnSegments(const float3& p0, const float3& p1, const fl
     c1 = q0 + d2 * t;
 }
 
-inline int buildFaceManifold(const Shape& shapeA, const Shape& shapeB, const OBB& boxA, const OBB& boxB, bool referenceIsA, int referenceAxis, const float3& normalAB, Manifold::Contact* contacts)
+inline int buildFaceManifold(const Shape& shapeA, const Shape& shapeB, const OBB& boxA, const OBB& boxB, bool referenceIsA, int referenceAxis, const float3& normalAB, std::span<Manifold::Contact> contacts)
 {
     const OBB& referenceBox = referenceIsA ? boxA : boxB;
     const OBB& incidentBox = referenceIsA ? boxB : boxA;
@@ -408,7 +411,7 @@ inline int buildFaceManifold(const Shape& shapeA, const Shape& shapeB, const OBB
     return contactCount;
 }
 
-inline int buildEdgeContact(const Shape& shapeA, const Shape& shapeB, const OBB& boxA, const OBB& boxB, int axisA, int axisB, const float3& normalAB, Manifold::Contact* contacts)
+inline int buildEdgeContact(const Shape& shapeA, const Shape& shapeB, const OBB& boxA, const OBB& boxB, int axisA, int axisB, const float3& normalAB, std::span<Manifold::Contact> contacts)
 {
     float3 a0;
     float3 a1;
@@ -582,20 +585,23 @@ struct Candidate
 // Emit the deepest MAX_CONTACTS candidates. Ranking by depth rather than taking them in sampling
 // order is what keeps a contact set sensible when there are more samples than the budget: the
 // shallow ones are the ones to drop.
-inline void emitRanked(const Shape& shapeA, const Shape& shapeB, Candidate* candidates, int candidateCount,
-        Manifold::Contact* contacts, int& contactCount)
+inline void emitRanked(const Shape& shapeA, const Shape& shapeB,
+                       std::span<const Candidate> candidates,
+                       std::span<Manifold::Contact> contacts, int& contactCount)
 {
-    std::stable_sort(candidates, candidates + candidateCount,
+    // Make a copy since we need to sort the candidates
+    std::vector<Candidate> sortedCandidates(candidates.begin(), candidates.end());
+
+    std::stable_sort(sortedCandidates.begin(), sortedCandidates.end(),
             [](const Candidate& a, const Candidate& b) { return a.depth > b.depth; });
 
     float3 midpoints[MAX_CONTACTS];
     contactCount = 0;
-    for (int i = 0; i < candidateCount; ++i)
+    for (int i = 0; i < sortedCandidates.size() && contactCount < MAX_CONTACTS; ++i)
     {
-        const Candidate& c = candidates[i];
+        const Candidate& c = sortedCandidates[i];
         if (!addContact(shapeA, shapeB, contacts, contactCount, midpoints, c.xA, c.xB, i + 1))
-            if (contactCount >= MAX_CONTACTS)
-                break;
+            break;
     }
 }
 
@@ -642,7 +648,7 @@ inline void cylinderSamples(const Shape& cyl, float3* out, int& count)
 }
 
 inline int collideSphereSphere(const Shape& a, const Shape& b,
-        Manifold::Contact* contacts, float3x3& basisOut)
+        std::span<Manifold::Contact> contacts, float3x3& basisOut)
 {
     const float3 d = b.center - a.center;
     const float distSq = lengthSq(d);
@@ -663,7 +669,7 @@ inline int collideSphereSphere(const Shape& a, const Shape& b,
 
 // Sphere against box, in either order. Exact.
 inline int collideSphereBox(const Shape& a, const Shape& b, bool sphereIsA,
-        Manifold::Contact* contacts, float3x3& basisOut)
+        std::span<Manifold::Contact> contacts, float3x3& basisOut)
 {
     const Shape& sphere = sphereIsA ? a : b;
     const Shape& box = sphereIsA ? b : a;
@@ -715,7 +721,7 @@ inline int collideSphereBox(const Shape& a, const Shape& b, bool sphereIsA,
 
 // Sphere against the closest point on a solid cylinder. Exact for the curved side and both caps.
 inline int collideSphereCylinder(const Shape& a, const Shape& b, bool sphereIsA,
-        Manifold::Contact* contacts, float3x3& basisOut)
+        std::span<Manifold::Contact> contacts, float3x3& basisOut)
 {
     const Shape& sphere = sphereIsA ? a : b;
     const Shape& cyl = sphereIsA ? b : a;
@@ -745,7 +751,7 @@ inline int collideSphereCylinder(const Shape& a, const Shape& b, bool sphereIsA,
 // samples against the box, and the box's corners against the cylinder - so neither shape can slip
 // through the other however they are arranged.
 inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
-        Manifold::Contact* contacts, float3x3& basisOut)
+        std::span<Manifold::Contact> contacts, float3x3& basisOut)
 {
     const Shape& cyl = cylinderIsA ? a : b;
     const Shape& box = cylinderIsA ? b : a;
@@ -800,13 +806,13 @@ inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
     basisOut = orthonormal(-(lengthSq(normalAB) > 1.0e-12f ? normalize(normalAB) : cyl.axis));
 
     int count = 0;
-    emitRanked(a, b, candidates, candidateCount, contacts, count);
+    emitRanked(a, b, candidates, contacts, count);
     return count;
 }
 
 // Cylinder against cylinder: each one's surface samples tested against the other.
 inline int collideCylinderCylinder(const Shape& a, const Shape& b,
-        Manifold::Contact* contacts, float3x3& basisOut)
+        std::span<Manifold::Contact> contacts, float3x3& basisOut)
 {
     Candidate candidates[MAX_CANDIDATES];
     int candidateCount = 0;
@@ -846,12 +852,14 @@ inline int collideCylinderCylinder(const Shape& a, const Shape& b,
     basisOut = orthonormal(-(lengthSq(normalAB) > 1.0e-12f ? normalize(normalAB) : a.axis));
 
     int count = 0;
-    emitRanked(a, b, candidates, candidateCount, contacts, count);
+    emitRanked(a, b, candidates, contacts, count);
     return count;
 }
 } // namespace
 
-int collideShapes(const Shape& a, const Shape& b, Manifold::Contact* contacts, float3x3& basisOut)
+int collideShapes(const Shape& a, const Shape& b,
+                  std::span<Manifold::Contact> contacts,
+                  float3x3& basisOut)
 {
     // Shapes other than boxes take their own paths; box-box keeps the SAT implementation below
     // untouched, so its behaviour is bit-for-bit what it was.
@@ -936,7 +944,9 @@ int collideShapes(const Shape& a, const Shape& b, Manifold::Contact* contacts, f
     return buildFaceManifold(a, b, boxA, boxB, false, best.indexB, best.normalAB, contacts);
 }
 
-int Manifold::collide(Rigid* bodyA, Rigid* bodyB, Contact* contacts, float3x3& basisOut)
+int Manifold::collide(Rigid* bodyA, Rigid* bodyB,
+                      std::span<Manifold::Contact> contacts,
+                      float3x3& basisOut)
 {
     // Thin wrapper: flatten both bodies into shape queries and reuse the solver-free path.
     return collideShapes(makeShape(bodyA), makeShape(bodyB), contacts, basisOut);

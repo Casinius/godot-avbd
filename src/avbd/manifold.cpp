@@ -10,6 +10,7 @@
  */
 
 #include <cmath>
+#include <array>
 
 #include "avbd/solver.h"
 #include "avbd/bvh/node_storage.hpp"
@@ -27,8 +28,8 @@ bool Manifold::initialize()
     friction = std::sqrt(bodyA->friction * bodyB->friction);
 
     // Compute new contacts
-    Contact newContacts[8] = {};
-    int newNumContacts = collide(bodyA, bodyB, newContacts, basis);
+    std::array<Contact, 8> newContacts = {};
+    int newNumContacts = collide(bodyA, bodyB, std::span<Contact>(newContacts), basis);
 
     // Merge old contact data with new contacts
     for (int i = 0; i < newNumContacts; i++)
