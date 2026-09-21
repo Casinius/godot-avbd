@@ -17,6 +17,7 @@
 #include "avbd/solver.h"
 
 #include "avbd/job_pool.hpp"
+#include "avbd/list_range.hpp"
 #include "avbd/bvh/bvh.hpp"
 #include "avbd/bvh/node_storage.hpp"
 
@@ -167,8 +168,7 @@ void Solver::broadPhase()
     // bodies come and go between steps, and list order is the order the serial scan
     // walked.
     bodiesInOrder.clear();
-    for (Rigid *body = bodies; body != 0; body = body->next)
-        bodiesInOrder.push_back(body);
+    bodiesInOrder.insert(bodiesInOrder.end(), next_range(bodies).begin(), next_range(bodies).end());
 
     const int count = static_cast<int>(bodiesInOrder.size());
     if (count < 2)
@@ -561,8 +561,7 @@ void Solver::colourGraph()
 int Solver::collectForces()
 {
     forceOrder.clear();
-    for (Force *force = forces; force != 0; force = force->next)
-        forceOrder.push_back(force);
+    forceOrder.insert(forceOrder.end(), next_range(forces).begin(), next_range(forces).end());
     return static_cast<int>(forceOrder.size());
 }
 

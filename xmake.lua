@@ -56,7 +56,7 @@ local avbd_warnings = { "all", "extra" }
 -- Settings shared by both targets. Called from inside each target block, so it writes into
 -- that target's scope.
 local function avbd_common()
-    set_languages("c++20")
+    set_languages("c++23")
     set_warnings(avbd_warnings)
     add_cxflags("-Wshadow", "-Wnon-virtual-dtor")
     add_syslinks("pthread")

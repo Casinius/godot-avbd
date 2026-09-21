@@ -9,9 +9,13 @@
 
 #include "nodes/avbd_soft_world3d.hpp"
 
+#include <algorithm>
+#include <ranges>
+
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/core/object.hpp>
 
+#include "avbd/list_range.hpp"
 #include "nodes/avbd_soft_body3d.hpp"
 #include "nodes/godot_convert.hpp"
 
@@ -39,11 +43,7 @@ int AVBDSoftWorld3D::get_threads() const {
 }
 
 int AVBDSoftWorld3D::get_body_count() const {
-    int count = 0;
-    for (const avbd::Rigid *body = solver.bodies; body != nullptr; body = body->next) {
-        count++;
-    }
-    return count;
+    return static_cast<int>(std::ranges::distance(avbd::next_range(solver.bodies)));
 }
 
 void AVBDSoftWorld3D::rebuild() {
@@ -102,15 +102,11 @@ bool AVBDSoftWorld3D::_scan_changed() {
     if (scan_soft_bodies.size() != soft_bodies.size() || scan_grounds.size() != grounds.size()) {
         return true;
     }
-    for (size_t i = 0; i < scan_soft_bodies.size(); i++) {
-        if (scan_soft_bodies[i] != soft_bodies[i]) {
-            return true;
-        }
+    if (!std::ranges::equal(scan_soft_bodies, soft_bodies)) {
+        return true;
     }
-    for (size_t i = 0; i < scan_grounds.size(); i++) {
-        if (scan_grounds[i].node != grounds[i].node) {
-            return true;
-        }
+    if (!std::ranges::equal(scan_grounds, grounds, {}, &GroundEntry::node, &GroundEntry::node)) {
+        return true;
     }
     return false;
 }

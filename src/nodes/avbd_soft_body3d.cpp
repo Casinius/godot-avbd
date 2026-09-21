@@ -10,6 +10,7 @@
 #include <godot_cpp/classes/multi_mesh.hpp>
 #include <algorithm>
 #include <cmath>
+#include <ranges>
 
 #include <godot_cpp/core/class_db.hpp>
 
@@ -127,10 +128,10 @@ void AVBDSoftBody3D::_store_state() {
     if (!cells.has_value()) {
         return;
     }
-    const std::size_t count = std::min(rigids.size(), cells->size());
-    for (std::size_t i = 0; i < count; i++) {
-        (*cells)[i].position = rigids[i]->positionLin;
-        (*cells)[i].rotation = rigids[i]->positionAng;
+    // zip truncates to the shorter sequence, matching the min() count it replaced.
+    for (auto [cell, rigid] : std::views::zip(*cells, rigids)) {
+        cell.position = rigid->positionLin;
+        cell.rotation = rigid->positionAng;
     }
 }
 

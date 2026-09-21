@@ -13,6 +13,8 @@
 
 #include "server/avbd_direct_space_state3d.hpp"
 
+#include <algorithm>
+#include <ranges>
 #include <vector>
 
 #include "nodes/godot_convert.hpp"
@@ -76,16 +78,11 @@ bool deepest_contact(const avbd::Shape &a, const avbd::Shape &b, avbd::Manifold:
         return false;
     }
     // Local anchors span the penetration; the longest span is the deepest point.
-    int best = 0;
-    float best_depth = -1.0f;
-    for (int i = 0; i < count; i++) {
-        const float depth = avbd::length(contacts[i].rA - contacts[i].rB);
-        if (depth > best_depth) {
-            best_depth = depth;
-            best = i;
-        }
-    }
-    r_contact = contacts[best];
+    // max_element keeps the first of ties, matching the strict > scan it replaced.
+    const std::span span(contacts, static_cast<size_t>(count));
+    const auto best = std::ranges::max_element(span, {},
+            [](const avbd::Manifold::Contact &c) { return avbd::length(c.rA - c.rB); });
+    r_contact = *best;
     return true;
 }
 

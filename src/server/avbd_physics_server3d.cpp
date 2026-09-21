@@ -8,9 +8,12 @@
 #include "server/avbd_direct_body_state3d.hpp"
 #include "server/avbd_direct_space_state3d.hpp"
 
+#include "avbd/list_range.hpp"
+
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <ranges>
 #include <tuple>
 
 #include <godot_cpp/classes/box_shape3d.hpp>
@@ -144,16 +147,9 @@ bool AVBDPhysicsServer3D::_is_flushing_queries() const {
 
 int32_t AVBDPhysicsServer3D::_get_process_info(PhysicsServer3D::ProcessInfo p_info) {
     switch (p_info) {
-        case PhysicsServer3D::INFO_ACTIVE_OBJECTS: {
-            int32_t count = 0;
-            for (const auto &[id, body] : bodies) {
-                (void)id;
-                if (body.rigid != nullptr) {
-                    count++;
-                }
-            }
-            return count;
-        }
+        case PhysicsServer3D::INFO_ACTIVE_OBJECTS:
+            return static_cast<int32_t>(std::ranges::count_if(bodies | std::views::values,
+                    [](const BodyData &body) { return body.rigid != nullptr; }));
         case PhysicsServer3D::INFO_ISLAND_COUNT:
             return static_cast<int32_t>(spaces.size());
         case PhysicsServer3D::INFO_COLLISION_PAIRS: {
@@ -161,11 +157,9 @@ int32_t AVBDPhysicsServer3D::_get_process_info(PhysicsServer3D::ProcessInfo p_in
             int32_t count = 0;
             for (const auto &[id, space] : spaces) {
                 (void)id;
-                for (const avbd::Force *force = space.solver.forces; force != nullptr; force = force->next) {
-                    if (force->contactPointCount() > 0) {
-                        count++;
-                    }
-                }
+                count += static_cast<int32_t>(std::ranges::count_if(
+                        avbd::next_range(space.solver.forces),
+                        [](const avbd::Force *force) { return force->contactPointCount() > 0; }));
             }
             return count;
         }
@@ -527,13 +521,11 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
     // Deterministic order: ids are minted in creation order, so sorting by id makes the
     // solver's body list - and with it the Gauss-Seidel update order - a function of the
     // scene, not of unordered_map bucket layout. Two identical scenes rebuild identically.
-    std::vector<uint64_t> space_body_ids;
-    for (const auto &[id, body] : bodies) {
-        if (id_of(body.space) == space_id) {
-            space_body_ids.push_back(id);
-        }
-    }
-    std::sort(space_body_ids.begin(), space_body_ids.end());
+    std::vector<uint64_t> space_body_ids = bodies
+            | std::views::filter([&](const auto &entry) { return id_of(entry.second.space) == space_id; })
+            | std::views::keys
+            | std::ranges::to<std::vector>();
+    std::ranges::sort(space_body_ids);
 
     for (const uint64_t id : space_body_ids) {
         BodyData &body = bodies.find(id)->second;
@@ -630,12 +622,10 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
     //               on the two orthogonal axes (godot_cone_twist_joint_3d.cpp:117-139)
     // A joint axis that does not line up with a solver axis snaps to the nearest one:
     // the GenericJoint's degrees of freedom are principal axes only.
-    std::vector<uint64_t> space_joint_ids;
-    for (const auto &[id, joint] : joints) {
-        (void)joint;
-        space_joint_ids.push_back(id);
-    }
-    std::sort(space_joint_ids.begin(), space_joint_ids.end());
+    std::vector<uint64_t> space_joint_ids = joints
+            | std::views::keys
+            | std::ranges::to<std::vector>();
+    std::ranges::sort(space_joint_ids);
     for (const uint64_t joint_id : space_joint_ids) {
         const JointData &joint = joints.find(joint_id)->second;
         const BodyData *data_a = joint.body_a.is_valid() ? find_body(joint.body_a) : nullptr;
@@ -1803,22 +1793,20 @@ PhysicsDirectBodyState3D *AVBDPhysicsServer3D::_body_get_direct_state(const RID 
 
 std::vector<AVBDPhysicsServer3D::QueryCandidate> AVBDPhysicsServer3D::query_candidates(const RID &p_space,
         uint32_t p_mask) const {
-    std::vector<QueryCandidate> out;
-    const auto found = spaces.find(id_of(p_space));
-    if (found == spaces.end()) {
-        return out;
+    if (!spaces.contains(id_of(p_space))) {
+        return {};
     }
     const uint64_t space_id = id_of(p_space);
-    for (const auto &[id, body] : bodies) {
-        if (body.rigid == nullptr || id_of(body.space) != space_id) {
-            continue;
-        }
-        if ((body.rigid->collisionLayer & p_mask) == 0) {
-            continue;
-        }
-        out.push_back({body.rigid, id});
-    }
-    return out;
+    return bodies
+            | std::views::filter([&](const auto &entry) {
+                  const BodyData &body = entry.second;
+                  return body.rigid != nullptr && id_of(body.space) == space_id
+                          && (body.rigid->collisionLayer & p_mask) != 0;
+              })
+            | std::views::transform([](const auto &entry) {
+                  return QueryCandidate{entry.second.rigid, entry.first};
+              })
+            | std::ranges::to<std::vector>();
 }
 
 avbd::Rigid *AVBDPhysicsServer3D::solver_pick(const RID &p_space, avbd::float3 p_origin, avbd::float3 p_dir,
