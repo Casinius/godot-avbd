@@ -14,7 +14,9 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: configure
-      run: xmake f --asan=n --tsan=n --ubsan=n
+      run: |
+        curl -fsSL https://xmake.io/shget.text | bash
+        xmake f --asan=n --tsan=n --ubsan=n
     - name: make
       run: xmake build
     - name: make check
