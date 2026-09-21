@@ -81,9 +81,9 @@ void Builder::buildRecursive(int start, int end, int depth) noexcept {
             int bodyIndex = sortedIndices[i];
             const avbd::Rigid* body = bodies_[bodyIndex];
             float3 pos = computeAABB(body);
-            float3 min = pos;
-            float3 max = pos;
-            nodes_.createLeaf(min, max, bodyIndex);
+            float3 nodeMin = pos;
+            float3 nodeMax = pos;
+            nodes_.createLeaf(nodeMin, nodeMax, bodyIndex);
         }
         return;
     }
