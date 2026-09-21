@@ -1,0 +1,98 @@
+[gd_scene format=3 uid="uid://cmngnsh2iq66m"]
+
+[ext_resource type="Script" uid="uid://dqjm6ud8kqiwg" path="res://scenes/demo.gd" id="1_asdio"]
+
+[sub_resource type="Environment" id="Environment_1"]
+background_mode = 1
+background_color = Color(0.11, 0.12, 0.15, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.8, 0.82, 0.9, 1)
+ambient_light_energy = 0.4
+
+[sub_resource type="BoxShape3D" id="BoxShape_ground"]
+size = Vector3(40, 1, 20)
+
+[sub_resource type="BoxMesh" id="BoxMesh_ground"]
+size = Vector3(40, 1, 20)
+
+[sub_resource type="BoxShape3D" id="BoxShape_plank"]
+size = Vector3(1.5, 0.25, 2)
+
+[sub_resource type="BoxMesh" id="BoxMesh_plank"]
+size = Vector3(1.5, 0.25, 2)
+
+[sub_resource type="PhysicsMaterial" id="Mat_plank"]
+friction = 0.6
+
+[node name="Bridge" type="Node3D" unique_id=1348067571]
+script = ExtResource("1_asdio")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=279254244]
+environment = SubResource("Environment_1")
+
+[node name="Ground" type="StaticBody3D" parent="." unique_id=742933562]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -5.618807, 0)
+
+[node name="Shape" type="CollisionShape3D" parent="Ground" unique_id=2034614956]
+shape = SubResource("BoxShape_ground")
+
+[node name="Mesh" type="MeshInstance3D" parent="Ground" unique_id=1489788903]
+mesh = SubResource("BoxMesh_ground")
+
+[node name="AnchorA" type="StaticBody3D" parent="." unique_id=1466406016]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4.286, 2, 0)
+
+[node name="Shape" type="CollisionShape3D" parent="AnchorA" unique_id=204842490]
+shape = SubResource("BoxShape_plank")
+
+[node name="Mesh" type="MeshInstance3D" parent="AnchorA" unique_id=39467122]
+mesh = SubResource("BoxMesh_plank")
+
+[node name="AnchorB" type="StaticBody3D" parent="." unique_id=1913564872]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.286, 2, 0)
+
+[node name="Plank0" type="RigidBody3D" parent="." unique_id=1067052101]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.571, 2, 0)
+mass = 200.0
+physics_material_override = SubResource("Mat_plank")
+
+[node name="Shape" type="CollisionShape3D" parent="Plank0" unique_id=1624890462]
+shape = SubResource("BoxShape_plank")
+
+[node name="Mesh" type="MeshInstance3D" parent="Plank0" unique_id=430095914]
+mesh = SubResource("BoxMesh_plank")
+
+[node name="Hinge0" type="Generic6DOFJoint3D" parent="." unique_id=1084337828]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3.428, 2, 0)
+node_a = NodePath("../AnchorA")
+node_b = NodePath("../Plank0")
+
+[node name="Plank1" type="RigidBody3D" parent="." unique_id=450130514]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.857, 2, 0)
+mass = 200000.0
+physics_material_override = SubResource("Mat_plank")
+
+[node name="Shape" type="CollisionShape3D" parent="Plank1" unique_id=519141568]
+shape = SubResource("BoxShape_plank")
+
+[node name="Mesh" type="MeshInstance3D" parent="Plank1" unique_id=263502253]
+mesh = SubResource("BoxMesh_plank")
+
+[node name="Hinge1" type="Generic6DOFJoint3D" parent="." unique_id=1255235715]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.714, 2, 0)
+node_a = NodePath("../Plank0")
+node_b = NodePath("../Plank1")
+
+[node name="Plank2" type="RigidBody3D" parent="." unique_id=1436341982]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.857, 2, 0)
+physics_material_override = SubResource("Mat_plank")
+
+[node name="Plank3" type="RigidBody3D" parent="." unique_id=700750661]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.571, 2, 0)
+physics_material_override = SubResource("Mat_plank")
+
+[node name="Camera3D" type="Camera3D" parent="." unique_id=2079674130]
+transform = Transform3D(0.7071, -0.099, 0.7001, 0, 0.9901, 0.14, -0.7071, -0.099, 0.7001, 9, 6, 9)
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1270811877]
+transform = Transform3D(0.774, -0.5162, 0.3668, 0, 0.5793, 0.8151, -0.6332, -0.6309, 0.4483, 0.45, 1, 0.55)
