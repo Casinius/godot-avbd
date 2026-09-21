@@ -1,0 +1,23 @@
+name: C/C++ CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: configure
+      run: xmake f --asan=n --tsan=n --ubsan=n
+    - name: make
+      run: xmake build
+    - name: make check
+      run: xmake check
+    - name: make distcheck
+      run: echo "xmake not support"
