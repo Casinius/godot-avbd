@@ -133,28 +133,69 @@ void Solver::step()
     finishVelocities();
 }
 
+// A broad-phase candidate test: bounding spheres plus Godot's layer/mask pair rule,
+// minus pairs already joined by a force (IgnoreCollision, joints).
+static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
+{
+    const float3 dp = bodyA->positionLin - bodyB->positionLin;
+    const float reach = bodyA->radius + bodyB->radius;
+    // Godot semantics: the pair collides when either side's layer is in the other's
+    // mask (defaults 1/1 keep every pair, as before these fields existed).
+    const bool layersAllow = ((bodyA->collisionLayer & bodyB->collisionMask) != 0) ||
+            ((bodyB->collisionLayer & bodyA->collisionMask) != 0);
+    return dot(dp, dp) <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB);
+}
+
 // Contact detection. The naive O(n^2) scan over bounding spheres, as in the reference
 // implementation: enough for the low thousands of bodies, and the obvious place to add a
 // spatial hash when it is not.
 //
-// Stays on the calling thread: it appends to the force list, so running it in parallel would
-// make the manifold order - and with it the result - depend on scheduling.
+// The pair tests run in parallel over the outer body index; manifold construction stays
+// on the calling thread. That split keeps the run bit-identical to the serial scan:
+//   - A row test reads poses and `constrainedTo` lists but writes nothing, and rows are
+//     disjoint, so workers never touch the same memory.
+//   - Manifolds are prepended to the force list, so list order - and with it the dual
+//     update order and every digest - follows creation order. Candidates are collected
+//     per row, then created here in exactly the serial scan's order: ascending i, then
+//     ascending j within the row.
+// Row costs shrink linearly with i (a triangle), so contiguous blocks load-balance at
+// worst ~2:1; per-row buckets were chosen over per-worker ones because which worker runs
+// which block is the pool's business, and a row owned by exactly one block needs no lock.
 void Solver::broadPhase()
 {
-    for (Rigid *bodyA = bodies; bodyA != 0; bodyA = bodyA->next)
-    {
+    // Flatten the body list once so rows can be addressed by index. Rebuilt every call:
+    // bodies come and go between steps, and list order is the order the serial scan
+    // walked.
+    bodiesInOrder.clear();
+    for (Rigid *body = bodies; body != 0; body = body->next)
+        bodiesInOrder.push_back(body);
+
+    const int count = static_cast<int>(bodiesInOrder.size());
+    if (count < 2)
+        return;
+
+    rowCandidates.resize(count);
+    for (auto &row : rowCandidates)
+        row.clear();
+
+    auto scanRow = [this](int i) {
+        Rigid *bodyA = bodiesInOrder[i];
         for (Rigid *bodyB = bodyA->next; bodyB != 0; bodyB = bodyB->next)
-        {
-            const float3 dp = bodyA->positionLin - bodyB->positionLin;
-            const float reach = bodyA->radius + bodyB->radius;
-            // Godot semantics: the pair collides when either side's layer is in the other's
-            // mask (defaults 1/1 keep every pair, as before these fields existed).
-            const bool layersAllow = ((bodyA->collisionLayer & bodyB->collisionMask) != 0) ||
-                    ((bodyB->collisionLayer & bodyA->collisionMask) != 0);
-            if (dot(dp, dp) <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB))
-                new Manifold(this, bodyA, bodyB);
-        }
-    }
+            if (pairOverlaps(bodyA, bodyB))
+                rowCandidates[i].emplace_back(bodyA, bodyB);
+    };
+
+    // One dispatch for the whole scan; below the break-even the dispatch would cost more
+    // than the tests it saves, so the rows run inline on the calling thread.
+    if (pool != nullptr && pool->threadCount() > 1 && count >= kMinBodiesPerDispatch)
+        pool->forCount(count - 1, scanRow, kMinBodiesPerDispatch);
+    else
+        for (int i = 0; i < count - 1; i++)
+            scanRow(i);
+
+    for (int i = 0; i < count - 1; i++)
+        for (const auto &pair : rowCandidates[i])
+            new Manifold(this, pair.first, pair.second);
 }
 
 // Bring every force up to date for this step, and drop the ones that have gone inactive.
@@ -277,25 +318,58 @@ void Solver::solveIterations(int forceCount)
         targetIterations = std::min(targetIterations, 16); // Cap at 16 iterations
     }
 
-    for (int it = 0; it < targetIterations; it++)
-    {
-        // Primal update, group by group. Every body inside a group is independent, so the
-        // group is spread over the worker threads; between groups the updates stay ordered,
-        // which is the Gauss-Seidel coupling the method relies on.
-        for (int colour = 0; colour < colours; colour++)
-        {
-            const int first = colourStart[colour];
-            const int last = colourStart[colour + 1];
-            pool->forCount(last - first, [this, first](int i) {
-                updatePrimal(updateOrder[first + i]);
-            }, kMinBodiesPerDispatch);
-        }
+    // One dispatch covers every round: the barrier fences inside `iterate` carry the
+    // Gauss-Seidel ordering, so the loop body below runs the whole set, not one round.
+    iterate(targetIterations, forceCount);
+}
 
-        // Dual update: one item per force, and each force only reads the (frozen) body poses
-        // and writes its own dual state, so the whole pass is independent.
-        pool->forCount(forceCount, [this](int i) {
-            forceOrder[i]->updateDual(alpha);
-        }, kMinForcesPerDispatch);
+// One worker-loop body for the whole iteration set: `iterations` rounds of a primal pass
+// per colour followed by a dual pass, with a barrier fence at every phase boundary.
+//
+// The shape matters more than the phases: the old code re-entered the pool once per
+// colour per iteration (~45 us a dispatch), which at 8 colours x 10 iterations burned
+// ~4 ms of a 16 ms frame on synchronisation alone. Here one dispatch arms the workers
+// once per step and each boundary costs a ~1-3 us barrier instead.
+//
+// Both sync types run the identical body: NullSync (small scenes, or another solver
+// holding the loop) executes it inline in list order, which is exactly the threads=1
+// reference the digest tests compare against.
+void Solver::iterate(int targetIterations, int forceCount)
+{
+    const auto loop = [this, targetIterations, forceCount](int, auto &sync) {
+        for (int it = 0; it < targetIterations; it++)
+        {
+            for (int colour = 0; colour < colours; colour++)
+            {
+                const int first = colourStart[colour];
+                const int last = colourStart[colour + 1];
+                sync.forItems(last - first, [this, first](int i) {
+                    updatePrimal(updateOrder[first + i]);
+                });
+                sync.arriveAndWait();
+            }
+
+            // Dual update: one item per force, and each force only reads the (frozen)
+            // body poses and writes its own dual state, so the whole pass is independent.
+            sync.forItems(forceCount, [this](int i) {
+                forceOrder[i]->updateDual(alpha);
+            });
+            sync.arriveAndWait();
+        }
+    };
+
+    // Below both break-even sizes every phase would run inline anyway, so skip the
+    // dispatch entirely. Above them the loop dispatches once for the whole set.
+    const bool tiny = static_cast<int>(updateOrder.size()) < kMinBodiesPerDispatch
+            && forceCount < kMinForcesPerDispatch;
+    if (tiny)
+    {
+        detail::NullSync sync;
+        loop(0, sync);
+    }
+    else
+    {
+        pool->runLoop(loop);
     }
 }
 

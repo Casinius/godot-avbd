@@ -83,6 +83,8 @@ target("avbd")
     add_files(table.join(avbd_core, "src/nodes/*.cpp", "src/server/*.cpp"))
     add_includedirs("src")
     add_packages("godotcpp4", "thread-pool")
+    add_defines("BS_THREAD_POOL_DISABLE_EXCEPTION_HANDLING")
+    set_exceptions("none")
     -- Godot loads the library from the project's bin/ directory.
     after_build(function (target)
         local ext = is_plat("windows") and ".dll" or (is_plat("macosx") and ".dylib" or ".so")

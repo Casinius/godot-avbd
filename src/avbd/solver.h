@@ -503,6 +503,12 @@ private:
     // the ground is usually one of them.
     std::vector<Rigid *> warmstartOrder;
 
+    // Broad-phase scratch: the body list flattened to index-addressable rows, and one
+    // candidate vector per row so parallel row scans never share a vector. Rebuilt and
+    // cleared every step.
+    std::vector<Rigid *> bodiesInOrder;
+    std::vector<std::vector<std::pair<Rigid *, Rigid *>>> rowCandidates;
+
     // Bodies that take part in the primal update (movable ones), grouped by colour:
     // colour c owns updateOrder[colourStart[c] .. colourStart[c + 1]).
     std::vector<Rigid *> updateOrder;
@@ -530,7 +536,7 @@ private:
     {
         // Dynamically reduce penetration margin as solver converges
         // Use penetration depth to avoid oscillation
-        return std::min(COLLISION_MARGIN_BASE + penetrationDepth * 0.1f, COLLISION_MARGIN_MAX);
+        return std::min(COLLISION_MARGIN_BASE + penetrationDepth * 0.1f *timestep, COLLISION_MARGIN_MAX);
     }
 
     // Create the pool on first use so that a serial solver never spawns threads.
@@ -543,6 +549,10 @@ private:
     int warmstartForces();
     void warmstartBodies();
     void solveIterations(int forceCount);
+    // The whole iteration set as one persistent-worker loop: `targetIterations` rounds of
+    // per-colour primal passes plus dual passes, fenced by LoopSync barriers instead of
+    // one pool dispatch per phase. Declared here so `iterate` stays testable.
+    void iterate(int targetIterations, int forceCount);
     void finishVelocities();
     void updatePrimal(Rigid *body);
 };

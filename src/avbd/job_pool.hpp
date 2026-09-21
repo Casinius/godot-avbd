@@ -1,23 +1,46 @@
 /*
- * JobPool - the parallel-for the solver uses for its per-body phases.
+ * JobPool - the parallel machinery the solver runs its per-body phases on.
  *
  * Thin adapter over BS::thread_pool (https://github.com/bshoshany/thread-pool, MIT,
- * header-only). We use the library rather than hand-rolling a pool: it owns the queue,
- * the worker lifetime and the wait handshake, and `detach_blocks` + `wait` is exactly the
- * fork-join the solver needs.
+ * header-only). The library owns the queue, the worker lifetime and the wait
+ * handshake; what is left to us is the part no library can know: how many independent
+ * pieces of work there are, and where the phase boundaries are.
  *
- * What is left to us is the part no library can know: how many independent pieces of work
- * there are. That is what `forCount` is for.
+ * The pool itself is process-global and work-stealing-free (a plain shared queue):
+ * one Scheduler stepping N worlds must not spawn N x hardware_concurrency threads.
+ * A JobPool instance is therefore only a *budget*: the worker count this solver may
+ * claim, normalised from `Solver::threads` (0 = one per hardware thread, 1 = inline,
+ * >hardware is clamped). No thread is spawned by the constructor; the shared pool
+ * materialises on first parallel use, so a serial solver never pays for one.
  *
- * Semantics that the solver relies on:
- *   - Work items are independent, so the result never depends on how the range was split.
- *     That is what makes the simulation bit-identical for every thread count (verified in
- *     the test suite by comparing digests).
- *   - Small batches run inline on the calling thread: a dispatch costs ~10-20 us, which
- *     would dominate a scene with a handful of bodies.
- *   - One pool per Solver. Jobs never migrate between simulations, so `wait()` can be a
- *     plain "all my work is done" - no cross-solver coupling, and two worlds run
- *     independently instead of serialising on a shared pool.
+ * Two execution styles:
+ *
+ *   - forCount: a standalone fork-join. One dispatch, workers wake, split the range,
+ *     `wait()`. Costs tens of microseconds per call, so callers pass a `minItems`
+ *     break-even and fall back to an inline loop below it. Used for the phases that
+ *     run once per step (warmstart, finish).
+ *
+ *   - runLoop: a persistent-worker loop for iteration-shaped work. One dispatch arms
+ *     `threadCount()` participants (the calling thread is worker 0); every participant
+ *     runs the *whole* loop and synchronises at phase boundaries through a LoopSync
+ *     barrier instead of re-entering the pool. This is what kills the dispatch storm
+ *     of the colour-parallel Gauss-Seidel: the old shape cost one dispatch per colour
+ *     per iteration (~45 us each); the new one costs one dispatch per step plus one
+ *     ~1-3 us barrier per phase boundary.
+ *
+ * Semantics the solver relies on:
+ *   - Work items are independent, so the result never depends on how a range was split
+ *     or which worker took which item. That is what keeps the simulation bit-identical
+ *     for every thread count (verified in the test suite by comparing digests).
+ *   - Phase boundaries are explicit: `sync.arriveAndWait()` is where the next phase
+ *     observes every write of the previous one. Gauss-Seidel ordering lives entirely
+ *     in the solver's loop, not in the pool.
+ *   - runLoop calls exclude each other (a try-locked mutex). Two loops at once would
+ *     deadlock a shared queue - participants waiting on a queued task that cannot
+ *     start until a running task (itself blocked at the barrier) finishes. Godot steps
+ *     spaces one at a time, so the lock is uncontended in practice; a contended caller
+ *     degrades to running its loop inline on the calling thread, which is always
+ *     correct because the serial order is the threads=1 reference.
  *
  * This header is only included by solver.cpp: the rest of the core sees the forward
  * declaration in solver.h, so the dependency does not leak into every translation unit.
@@ -27,63 +50,196 @@
 #define AVBD_JOB_POOL_HPP
 
 #include <algorithm>
+#include <atomic>
+#include <barrier>
 #include <cstddef>
+#include <mutex>
+#include <mutex>
+#include <thread>
 
 #include <BS_thread_pool.hpp>
 
 namespace avbd::detail {
 
+// The phase-boundary synchronisers handed to a runLoop body.
+//
+// The loop body is written once against `auto &sync` and must treat every
+// `arriveAndWait()` as a hard phase fence: all workers arrive, then all proceed. Both
+// types provide `forItems`, which spreads one phase's independent items over the
+// participants (or runs them serially) - the barrier call itself stays in the solver's
+// loop so the Gauss-Seidel structure reads plainly.
+
+// Real barrier: participants pull items from a shared cursor, then rendezvous.
+class LoopSync {
+    // Rearm the work cursor for the next phase. Runs exactly once per completed phase,
+    // after every participant has arrived (so every pull of the finished phase is done)
+    // and before any participant is released (so every pull of the next phase sees 0).
+    struct CursorReset {
+        LoopSync *self;
+        void operator()() noexcept { self->cursor.store(0, std::memory_order_relaxed); }
+    };
+
+public:
+    explicit LoopSync(unsigned count) :
+            participants(count),
+            barrier(static_cast<std::ptrdiff_t>(count), CursorReset{this}) {}
+
+    LoopSync(const LoopSync &) = delete;
+    LoopSync &operator=(const LoopSync &) = delete;
+
+    // Fence: every write any worker made before its arrival is visible to every worker
+    // after the fence.
+    void arriveAndWait() {
+        barrier.arrive_and_wait();
+    }
+
+    // Run `fn(i)` for every i in [0, count), self-balanced: workers grab chunks from the
+    // shared cursor until this phase's range is drained. Items must be independent - the
+    // split varies with timing by design. The cursor is rearmed by the barrier's
+    // completion, so consecutive phases must be separated by `arriveAndWait()`, which is
+    // the loop contract anyway.
+    template <typename F>
+    void forItems(int count, F &&fn) {
+        if (count <= 0) {
+            return;
+        }
+        // ~4 chunks per participant: few atomic operations, enough chop points that a
+        // slow worker does not strand a large tail.
+        const int grain = std::max(1, count / static_cast<int>(participants * 4));
+        for (int first = cursor.fetch_add(grain, std::memory_order_relaxed); first < count;
+                first = cursor.fetch_add(grain, std::memory_order_relaxed)) {
+            const int last = std::min(count, first + grain);
+            for (int i = first; i < last; i++) {
+                fn(i);
+            }
+        }
+    }
+
+private:
+    unsigned participants;
+    std::atomic<int> cursor{0};
+    std::barrier<CursorReset> barrier;
+};
+
+// Inline stand-in for a single participant: phases already run sequentially on the
+// calling thread, so the fence is a no-op and the items run in order.
+class NullSync {
+public:
+    void arriveAndWait() {}
+
+    template <typename F>
+    void forItems(int count, F &&fn) {
+        for (int i = 0; i < count; i++) {
+            fn(i);
+        }
+    }
+};
+
+// The process-global worker pool. Materialised lazily so a serial solver never spawns
+// threads; static lifetime is safe because no Solver touches it during teardown.
+inline BS::thread_pool<> &sharedPool() {
+    static BS::thread_pool<> pool;
+    return pool;
+}
+
+// Serialises runLoop calls across all solvers, see the exclusivity note above.
+inline std::mutex &loopMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
 class JobPool {
 public:
-    // `threads` of 0 means "one worker per hardware thread".
+    // `threads` of 0 means "one worker per hardware thread", 1 means "run everything
+    // inline on the calling thread". Neither spawns anything here.
     explicit JobPool(unsigned threads) :
-            pool(threads) {}
+            desired(threads) {}
 
     JobPool(const JobPool &) = delete;
     JobPool &operator=(const JobPool &) = delete;
 
+    // Worker budget this solver may claim, clamped to what the machine has. Pure
+    // arithmetic: it never touches (or creates) the shared pool.
     unsigned threadCount() const {
-        return static_cast<unsigned>(pool.get_thread_count());
+        const unsigned hw = std::thread::hardware_concurrency();
+        const unsigned available = hw == 0 ? 1 : hw;
+        return desired == 0 ? available : std::min(desired, available);
     }
 
     // Run `fn(i)` for every i in [0, count). Returns only once all of them are done.
     //
-    // `minItems` is the smallest batch worth dispatching. One dispatch costs tens of
-    // microseconds (waking workers and synchronising), so it only pays off above a number
-    // that depends on how much work one item is: a broad-phase pair test is ~40 ns while a
-    // body's primal update is ~2 us, and one break-even count cannot serve both. Callers
-    // pass the value that matches their per-item cost.
+    // `minItems` is the smallest batch worth dispatching: one dispatch costs tens of
+    // microseconds (waking workers and synchronising), which would dominate a scene
+    // with a handful of bodies. Callers pass the value that matches their per-item
+    // cost. Items must be independent; the block split is fixed for a given count, so
+    // runs stay reproducible even though that does not change the numbers.
     template <typename F>
     void forCount(int count, F &&fn, int minItems) {
         if (count <= 0) {
             return;
         }
-        // One worker means the pool would hand the work straight back with a round trip on
-        // top, so a single-threaded solver runs everything on the calling thread.
-        if (pool.get_thread_count() <= 1 || count < minItems) {
+        // A budget of one means the pool would hand the work straight back with a round
+        // trip on top, so a single-threaded solver runs everything on the calling thread.
+        if (threadCount() <= 1 || count < minItems) {
             for (int i = 0; i < count; i++) {
                 fn(i);
             }
             return;
         }
 
-        // One block per worker, and the split of a given count never changes, so runs are
-        // reproducible. (The items are independent, so even an unbalanced split would give
-        // the same numbers - this just keeps the timing consistent too.)
-        const std::size_t blocks = std::min<std::size_t>(pool.get_thread_count(), static_cast<std::size_t>(count));
-        pool.detach_blocks(0, count, [&fn](int first, int last) {
+        const unsigned workers = threadCount();
+        const std::size_t blocks = std::min<std::size_t>(workers, static_cast<std::size_t>(count));
+        sharedPool().detach_blocks(0, count, [&fn](int first, int last) {
             for (int i = first; i < last; i++) {
                 fn(i);
             }
         }, blocks);
-        pool.wait();
+        sharedPool().wait();
+    }
+
+    // Run `fn(worker, sync)` on `threadCount()` participants at once and return only
+    // when the whole loop has finished. `worker` is the caller's index (0 on the
+    // calling thread); `sync` is a LoopSync or NullSync - write the body once against
+    // `auto &sync`. The body must be deterministic per item and fence its phases with
+    // `sync.arriveAndWait()`; see the class comments above.
+    //
+    // Degrades to an inline run when the budget is one, or when another solver is
+    // already inside a loop (the try-lock below; a second loop on a shared queue would
+    // deadlock). The inline fallback is the serial reference, so results are unchanged.
+    template <typename F>
+    void runLoop(F &&fn) {
+        const unsigned workers = threadCount();
+        if (workers <= 1) {
+            NullSync sync;
+            fn(0, sync);
+            return;
+        }
+
+        std::unique_lock<std::mutex> lock(loopMutex(), std::try_to_lock);
+        if (!lock.owns_lock()) {
+            NullSync sync;
+            fn(0, sync);
+            return;
+        }
+
+        LoopSync sync(workers);
+        for (unsigned w = 1; w < workers; ++w) {
+            sharedPool().detach_task([&sync, &fn, w] {
+                fn(static_cast<int>(w), sync);
+            });
+        }
+        fn(0, sync);
+        // The workers own no state of this frame once their task callables return, so a
+        // plain drain of the pool - rather than a per-loop latch - is the safe join: it
+        // keeps the worker bookkeeping inside BS::thread_pool's own synchronisation and
+        // lets `sync` die only after every reference to it is gone. Sequential stepping
+        // (Godot's rule) means the queue holds nothing but this loop's tasks.
+        sharedPool().wait();
     }
 
 private:
-    // `tp::none`: no task priority, no pause support - the solver needs neither, and the
-    // defaults keep the dispatch path as short as possible. The wait_deadlock_checks
-    // instrumentation is also off, which matters because it makes `wait()` slower.
-    BS::thread_pool<> pool;
+    // Normalised `Solver::threads`: 0 = all hardware threads, 1 = inline, N = at most N.
+    unsigned desired;
 };
 
 } // namespace avbd::detail
