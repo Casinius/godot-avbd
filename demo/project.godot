@@ -21,8 +21,11 @@ config/features=PackedStringArray("4.7")
 [physics]
 
 3d/run_on_separate_thread=true
-3d/physics_engine="bullet"
-3d/solver/solver_iterations=10
+common/max_physics_steps_per_frame=4
+3d/physics_engine="AVBD"
+3d/time_before_sleep=0.1
+3d/solver/default_contact_bias=0.11
+common/physics_interpolation=true
 
 [rendering]
 
