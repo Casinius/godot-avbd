@@ -16,9 +16,11 @@ jobs:
     - name: configure
       run: |
         curl -fsSL https://xmake.io/shget.text | bash
+        source ~/.xmake/profile
+        xmake f -y
         xmake f --asan=n --tsan=n --ubsan=n
     - name: make
-      run: xmake build
+      run: xmake build -y
     - name: make check
       run: xmake check
     - name: make distcheck
