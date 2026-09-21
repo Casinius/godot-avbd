@@ -15,8 +15,8 @@ jobs:
     - uses: actions/checkout@v4
     - name: configure
       run: |
-        apt update
-        apt install scons
+        sudo apt update
+        sudo apt install scons
         curl -fsSL https://xmake.io/shget.text | bash
         source ~/.xmake/profile
         xmake f -y
