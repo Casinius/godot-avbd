@@ -461,6 +461,15 @@ static void axis_locks_to_sim(uint32_t p_locks, uint8_t &r_linear, uint8_t &r_an
     }
 }
 
+template <typename Container, typename Range>
+inline Container to_container(Range&& r) {
+    return Container(std::ranges::begin(r), std::ranges::end(r));
+}
+
+// 用法
+
+
+
 // -----------------------------------------------------------------------------
 // The solver
 //
@@ -521,10 +530,10 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
     // Deterministic order: ids are minted in creation order, so sorting by id makes the
     // solver's body list - and with it the Gauss-Seidel update order - a function of the
     // scene, not of unordered_map bucket layout. Two identical scenes rebuild identically.
-    std::vector<uint64_t> space_body_ids = bodies
-            | std::views::filter([&](const auto &entry) { return id_of(entry.second.space) == space_id; })
-            | std::views::keys
-            | std::ranges::to<std::vector>();
+    std::vector<uint64_t> space_body_ids = to_container<std::vector<uint64_t>>(bodies 
+        | std::views::filter([&](const auto &entry) { return id_of(entry.second.space) == space_id; }) 
+        | std::views::keys);
+           
     std::ranges::sort(space_body_ids);
 
     for (const uint64_t id : space_body_ids) {
@@ -622,9 +631,9 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
     //               on the two orthogonal axes (godot_cone_twist_joint_3d.cpp:117-139)
     // A joint axis that does not line up with a solver axis snaps to the nearest one:
     // the GenericJoint's degrees of freedom are principal axes only.
-    std::vector<uint64_t> space_joint_ids = joints
-            | std::views::keys
-            | std::ranges::to<std::vector>();
+    std::vector<uint64_t> space_joint_ids = to_container<std::vector<uint64_t>>(joints
+            | std::views::keys);
+            
     std::ranges::sort(space_joint_ids);
     for (const uint64_t joint_id : space_joint_ids) {
         const JointData &joint = joints.find(joint_id)->second;
@@ -1797,7 +1806,7 @@ std::vector<AVBDPhysicsServer3D::QueryCandidate> AVBDPhysicsServer3D::query_cand
         return {};
     }
     const uint64_t space_id = id_of(p_space);
-    return bodies
+    return to_container<std::vector<AVBDPhysicsServer3D::QueryCandidate>>(bodies
             | std::views::filter([&](const auto &entry) {
                   const BodyData &body = entry.second;
                   return body.rigid != nullptr && id_of(body.space) == space_id
@@ -1806,7 +1815,7 @@ std::vector<AVBDPhysicsServer3D::QueryCandidate> AVBDPhysicsServer3D::query_cand
             | std::views::transform([](const auto &entry) {
                   return QueryCandidate{entry.second.rigid, entry.first};
               })
-            | std::ranges::to<std::vector>();
+    );
 }
 
 avbd::Rigid *AVBDPhysicsServer3D::solver_pick(const RID &p_space, avbd::float3 p_origin, avbd::float3 p_dir,

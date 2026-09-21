@@ -188,6 +188,7 @@ bool AVBDDirectSpaceState3D::_intersect_ray(const Vector3 &p_from, const Vector3
 int32_t AVBDDirectSpaceState3D::_intersect_point(const Vector3 &p_position, uint32_t p_collision_mask,
         bool p_collide_with_bodies, bool p_collide_with_areas,
         PhysicsServer3DExtensionShapeResult *r_results, int32_t p_max_results) {
+    (void)p_collide_with_areas;
     if (server == nullptr || r_results == nullptr || !p_collide_with_bodies || p_max_results <= 0) {
         return 0;
     }
@@ -222,6 +223,7 @@ int32_t AVBDDirectSpaceState3D::_intersect_point(const Vector3 &p_position, uint
 int32_t AVBDDirectSpaceState3D::_intersect_shape(const RID &p_shape_rid, const Transform3D &p_transform,
         const Vector3 &p_motion, double p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies,
         bool p_collide_with_areas, PhysicsServer3DExtensionShapeResult *r_results, int32_t p_max_results) {
+    (void)p_collide_with_areas;
     if (server == nullptr || r_results == nullptr || !p_collide_with_bodies || p_max_results <= 0) {
         return 0;
     }
@@ -257,6 +259,8 @@ bool AVBDDirectSpaceState3D::_cast_motion(const RID &p_shape_rid, const Transfor
         const Vector3 &p_motion, double p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies,
         bool p_collide_with_areas, float *r_closest_safe, float *r_closest_unsafe,
         PhysicsServer3DExtensionShapeRestInfo *r_info) {
+    (void)p_margin;
+    (void)p_collide_with_areas;
     (void)r_info;
     if (server == nullptr || !p_collide_with_bodies) {
         if (r_closest_safe != nullptr) {
@@ -329,6 +333,8 @@ bool AVBDDirectSpaceState3D::_cast_motion(const RID &p_shape_rid, const Transfor
 bool AVBDDirectSpaceState3D::_collide_shape(const RID &p_shape_rid, const Transform3D &p_transform,
         const Vector3 &p_motion, double p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies,
         bool p_collide_with_areas, void *r_results, int32_t p_max_results, int32_t *r_result_count) {
+    (void)p_collide_with_areas;
+    
     if (server == nullptr || r_result_count == nullptr || !p_collide_with_bodies) {
         if (r_result_count != nullptr) {
             *r_result_count = 0;
@@ -376,6 +382,7 @@ bool AVBDDirectSpaceState3D::_collide_shape(const RID &p_shape_rid, const Transf
 bool AVBDDirectSpaceState3D::_rest_info(const RID &p_shape_rid, const Transform3D &p_transform,
         const Vector3 &p_motion, double p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies,
         bool p_collide_with_areas, PhysicsServer3DExtensionShapeRestInfo *r_rest_info) {
+    (void)p_collide_with_areas;
     if (server == nullptr || r_rest_info == nullptr || !p_collide_with_bodies) {
         return false;
     }

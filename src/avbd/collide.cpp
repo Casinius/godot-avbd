@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstddef>
 #include <span>
 #include <array>
 #include <vector>
@@ -132,7 +133,7 @@ inline int chooseIncidentFaceAxis(const OBB& box, const float3& referenceNormal)
     int axis = 0;
     float best = -FLT_MAX;
 
-    for (int i = 0; i < 3; ++i)
+    for (size_t i = 0; i < 3; ++i)
     {
         float d = absDot(box.axis[i], referenceNormal);
         if (d > best)
@@ -172,7 +173,7 @@ inline int clipPolygonAgainstPlane(const float3* inVerts, int inCount, const flo
     float3 a = inVerts[inCount - 1];
     float da = dot(planeNormal, a) - planeOffset;
 
-    for (int i = 0; i < inCount; ++i)
+    for (size_t i = 0; i < static_cast<size_t>(inCount); ++i)
     {
         float3 b = inVerts[i];
         float db = dot(planeNormal, b) - planeOffset;
@@ -205,7 +206,7 @@ inline bool addContact(const Shape& shapeA, const Shape& shapeB, std::span<Manif
 {
     float3 midpoint = (xA + xB) * 0.5f;
 
-    for (int i = 0; i < contactCount; ++i)
+    for (size_t i = 0; i < static_cast<size_t>(contactCount); ++i)
     {
         float3 d = midpoint - contactMidpoints[i];
         if (lengthSq(d) < CONTACT_MERGE_DIST_SQ)
@@ -387,7 +388,7 @@ inline int buildFaceManifold(const Shape& shapeA, const Shape& shapeB, const OBB
     featurePrefix |= (referenceAxis & 0xFF) << 16;
     featurePrefix |= (incidentAxis & 0xFF) << 8;
 
-    for (int i = 0; i < count && contactCount < MAX_CONTACTS; ++i)
+    for (size_t i = 0; i < static_cast<size_t>(count) && contactCount < MAX_CONTACTS; ++i)
     {
         float3 pIncident = clip0[i];
         float distance = dot(pIncident - referenceFace.center, referenceFace.normal);
@@ -479,7 +480,7 @@ inline bool pointInBox(const Shape& box, const float3& p, float3& r_push, float&
     float bestDepth = FLT_MAX;
     int bestAxis = 0;
     float bestSign = 1.0f;
-    for (int i = 0; i < 3; ++i)
+    for (size_t i = 0; i < 3; ++i)
     {
         const float depth = box.half[i] - std::fabs(local[i]);
         if (depth <= 0.0f)
@@ -597,7 +598,7 @@ inline void emitRanked(const Shape& shapeA, const Shape& shapeB,
 
     float3 midpoints[MAX_CONTACTS];
     contactCount = 0;
-    for (int i = 0; i < sortedCandidates.size() && contactCount < MAX_CONTACTS; ++i)
+    for (size_t i = 0; i < sortedCandidates.size() && contactCount < MAX_CONTACTS; ++i)
     {
         const Candidate& c = sortedCandidates[i];
         if (!addContact(shapeA, shapeB, contacts, contactCount, midpoints, c.xA, c.xB, i + 1))
@@ -625,7 +626,7 @@ inline void cylinderSamples(const Shape& cyl, float3* out, int& count)
     {
         const float3 capCentre = cyl.center + cyl.axis * (cyl.halfHeight * (float)end);
         out[count++] = capCentre;
-        for (int i = 0; i < RIM_SAMPLES; ++i)
+        for (size_t i = 0; i < RIM_SAMPLES; ++i)
         {
             const int step = (i * 5) % RIM_SAMPLES;
             const float a = 6.28318530718f * (float)step / (float)RIM_SAMPLES;
@@ -638,7 +639,7 @@ inline void cylinderSamples(const Shape& cyl, float3* out, int& count)
     {
         const float t = -cyl.halfHeight + 2.0f * cyl.halfHeight * (float)ring / (float)AXIAL_SAMPLES;
         const float3 ringCentre = cyl.center + cyl.axis * t;
-        for (int i = 0; i < RIM_SAMPLES; ++i)
+        for (size_t i = 0; i < RIM_SAMPLES; ++i)
         {
             const int step = (i * 5) % RIM_SAMPLES;
             const float a = 6.28318530718f * (float)step / (float)RIM_SAMPLES;
@@ -765,7 +766,7 @@ inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
     int sampleCount = 0;
     cylinderSamples(cyl, samples, sampleCount);
 
-    for (int i = 0; i < sampleCount && candidateCount < MAX_CANDIDATES; ++i)
+    for (size_t i = 0; i < static_cast<size_t>(sampleCount) && candidateCount < MAX_CANDIDATES; ++i)
     {
         float3 pushOut;
         float depth;
@@ -830,7 +831,7 @@ inline int collideCylinderCylinder(const Shape& a, const Shape& b,
         int sampleCount = 0;
         cylinderSamples(from, samples, sampleCount);
 
-        for (int i = 0; i < sampleCount && candidateCount < MAX_CANDIDATES; ++i)
+        for (size_t i = 0; i < static_cast<size_t>(sampleCount) && candidateCount < MAX_CANDIDATES; ++i)
         {
             float3 pushOut;
             float surfaceDist;
@@ -899,19 +900,19 @@ int collideShapes(const Shape& a, const Shape& b,
     bestEdge.separation = -FLT_MAX;
     bestEdge.valid = false;
 
-    for (int i = 0; i < 3; ++i)
+    for (size_t i = 0; i < 3; ++i)
     {
         if (!testAxis(boxA, boxB, delta, boxA.axis[i], AXIS_FACE_A, i, -1, bestFace))
             return 0;
     }
 
-    for (int i = 0; i < 3; ++i)
+    for (size_t i = 0; i < 3; ++i)
     {
         if (!testAxis(boxA, boxB, delta, boxB.axis[i], AXIS_FACE_B, -1, i, bestFace))
             return 0;
     }
 
-    for (int i = 0; i < 3; ++i)
+    for (size_t i = 0; i < 3; ++i)
     {
         for (int j = 0; j < 3; ++j)
         {
