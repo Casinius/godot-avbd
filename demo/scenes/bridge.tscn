@@ -24,6 +24,21 @@ size = Vector3(1.5, 0.25, 2)
 [sub_resource type="PhysicsMaterial" id="Mat_plank"]
 friction = 0.6
 
+[sub_resource type="BoxMesh" id="BoxMesh_ngq5m"]
+
+[sub_resource type="ConvexPolygonShape3D" id="ConvexPolygonShape3D_im2sa"]
+points = PackedVector3Array(-0.5, -0.5, -0.5, 0.5, 0.5, 0.5, 0.5, -0.5, 0.5, 0.5, 0.5, -0.5, -0.5, 0.5, 0.5, 0.5, -0.5, -0.5, -0.5, -0.5, 0.5, -0.5, 0.5, -0.5)
+
+[sub_resource type="PrismMesh" id="PrismMesh_v3abh"]
+
+[sub_resource type="ConvexPolygonShape3D" id="ConvexPolygonShape3D_1q54l"]
+points = PackedVector3Array(-0.5, -0.5, -0.5, 0.014651676, 0.47069666, 0.47069666, 0.073521286, 0.35295743, 0.47060993, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5, -0.014651676, 0.47069666, -0.47069666, 0.5, -0.5, 0.5, -0.014651676, 0.47069666, 0.47069666, 0.014651676, 0.47069666, -0.47069666)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_3lmon"]
+
+[sub_resource type="ConvexPolygonShape3D" id="ConvexPolygonShape3D_7ct4w"]
+points = PackedVector3Array(-0.21418296, -0.94802845, -0.4511285, 0.022731654, 0.9521457, 0.49888662, 0.17148845, 0.9519953, 0.46901843, -0.12593445, 0.9526843, -0.48329136, 0.49966258, -0.95367396, -0.0068888306, -0.3876465, -0.9379602, 0.31565303, -0.48329246, 0.9526857, -0.12593003, 0.37509736, 0.9401282, -0.3298157, 0.17148845, -0.9519953, 0.46901843, 0.14078338, -0.9454848, -0.47957912, 0.4690145, 0.9520113, 0.17149934, -0.3876465, 0.9379602, 0.31565303, -0.48329246, -0.9526857, -0.12593003, -0.18351147, -0.9430759, 0.46469846, 0.40741244, -0.9469937, 0.2889825, 0.37509736, -0.9401282, -0.3298157, -0.39515373, 0.9557608, -0.3055234, -0.479555, 0.9454372, 0.1408799, 0.46469817, 0.94309926, -0.18351227, 0.14078338, 0.9454848, -0.47957912, -0.24320284, 0.9459547, 0.43649116, -0.479555, -0.9454372, 0.1408799, 0.2889712, 0.9469877, 0.4074208, -0.39515373, -0.9557608, -0.3055234, -0.006990604, -0.953641, 0.4996576, 0.49966258, 0.95367396, -0.0068888306, -0.27194828, 0.943071, -0.41921657, 0.46469817, -0.94309926, -0.18351227, -0.12593445, -0.9526843, -0.48329136, 0.31564754, 0.93797344, -0.38765055, 0.4690145, -0.9520113, 0.17149934, 0.40741244, 0.9469937, 0.2889825)
+
 [node name="Bridge" type="Node3D" unique_id=1348067571]
 script = ExtResource("1")
 
@@ -71,24 +86,6 @@ mesh = SubResource("BoxMesh_plank")
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3.428, 2, 0)
 node_a = NodePath("../AnchorA")
 node_b = NodePath("../Plank0")
-linear_limit_x/enabled = true
-linear_limit_x/upper_distance = 0.0
-linear_limit_x/lower_distance = 0.0
-linear_limit_y/enabled = true
-linear_limit_y/upper_distance = 0.0
-linear_limit_y/lower_distance = 0.0
-linear_limit_z/enabled = true
-linear_limit_z/upper_distance = 0.0
-linear_limit_z/lower_distance = 0.0
-angular_limit_x/enabled = true
-angular_limit_x/upper_angle = 0.0
-angular_limit_x/lower_angle = 0.0
-angular_limit_y/enabled = true
-angular_limit_y/upper_angle = 0.0
-angular_limit_y/lower_angle = 0.0
-angular_limit_z/enabled = true
-angular_limit_z/upper_angle = 0.0
-angular_limit_z/lower_angle = 0.0
 
 [node name="Plank1" type="RigidBody3D" parent="." unique_id=450130514]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.857, 2, 0)
@@ -104,24 +101,6 @@ mesh = SubResource("BoxMesh_plank")
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.714, 2, 0)
 node_a = NodePath("../Plank0")
 node_b = NodePath("../Plank1")
-linear_limit_x/enabled = true
-linear_limit_x/upper_distance = 0.0
-linear_limit_x/lower_distance = 0.0
-linear_limit_y/enabled = true
-linear_limit_y/upper_distance = 0.0
-linear_limit_y/lower_distance = 0.0
-linear_limit_z/enabled = true
-linear_limit_z/upper_distance = 0.0
-linear_limit_z/lower_distance = 0.0
-angular_limit_x/enabled = true
-angular_limit_x/upper_angle = 0.0
-angular_limit_x/lower_angle = 0.0
-angular_limit_y/enabled = true
-angular_limit_y/upper_angle = 0.0
-angular_limit_y/lower_angle = 0.0
-angular_limit_z/enabled = true
-angular_limit_z/upper_angle = 0.0
-angular_limit_z/lower_angle = 0.0
 
 [node name="Plank2" type="RigidBody3D" parent="." unique_id=1436341982]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.857, 2, 0)
@@ -137,24 +116,6 @@ mesh = SubResource("BoxMesh_plank")
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 2, 0)
 node_a = NodePath("../Plank1")
 node_b = NodePath("../Plank2")
-linear_limit_x/enabled = true
-linear_limit_x/upper_distance = 0.0
-linear_limit_x/lower_distance = 0.0
-linear_limit_y/enabled = true
-linear_limit_y/upper_distance = 0.0
-linear_limit_y/lower_distance = 0.0
-linear_limit_z/enabled = true
-linear_limit_z/upper_distance = 0.0
-linear_limit_z/lower_distance = 0.0
-angular_limit_x/enabled = true
-angular_limit_x/upper_angle = 0.0
-angular_limit_x/lower_angle = 0.0
-angular_limit_y/enabled = true
-angular_limit_y/upper_angle = 0.0
-angular_limit_y/lower_angle = 0.0
-angular_limit_z/enabled = true
-angular_limit_z/upper_angle = 0.0
-angular_limit_z/lower_angle = 0.0
 
 [node name="Plank3" type="RigidBody3D" parent="." unique_id=700750661]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.571, 2, 0)
@@ -170,50 +131,45 @@ mesh = SubResource("BoxMesh_plank")
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.714, 2, 0)
 node_a = NodePath("../Plank2")
 node_b = NodePath("../Plank3")
-linear_limit_x/enabled = true
-linear_limit_x/upper_distance = 0.0
-linear_limit_x/lower_distance = 0.0
-linear_limit_y/enabled = true
-linear_limit_y/upper_distance = 0.0
-linear_limit_y/lower_distance = 0.0
-linear_limit_z/enabled = true
-linear_limit_z/upper_distance = 0.0
-linear_limit_z/lower_distance = 0.0
-angular_limit_x/enabled = true
-angular_limit_x/upper_angle = 0.0
-angular_limit_x/lower_angle = 0.0
-angular_limit_y/enabled = true
-angular_limit_y/upper_angle = 0.0
-angular_limit_y/lower_angle = 0.0
-angular_limit_z/enabled = true
-angular_limit_z/upper_angle = 0.0
-angular_limit_z/lower_angle = 0.0
 
 [node name="Hinge4" type="Generic6DOFJoint3D" parent="." unique_id=183611221]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3.428, 2, 0)
 node_a = NodePath("../Plank3")
 node_b = NodePath("../AnchorB")
-linear_limit_x/enabled = true
-linear_limit_x/upper_distance = 0.0
-linear_limit_x/lower_distance = 0.0
-linear_limit_y/enabled = true
-linear_limit_y/upper_distance = 0.0
-linear_limit_y/lower_distance = 0.0
-linear_limit_z/enabled = true
-linear_limit_z/upper_distance = 0.0
-linear_limit_z/lower_distance = 0.0
-angular_limit_x/enabled = true
-angular_limit_x/upper_angle = 0.0
-angular_limit_x/lower_angle = 0.0
-angular_limit_y/enabled = true
-angular_limit_y/upper_angle = 0.0
-angular_limit_y/lower_angle = 0.0
-angular_limit_z/enabled = true
-angular_limit_z/upper_angle = 0.0
-angular_limit_z/lower_angle = 0.0
 
 [node name="Camera3D" type="Camera3D" parent="." unique_id=2079674130]
 transform = Transform3D(0.7071, -0.099, 0.7001, 0, 0.9901, 0.14, -0.7071, -0.099, 0.7001, 9, 6, 9)
 
 [node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1270811877]
 transform = Transform3D(0.774, -0.5162, 0.3668, 0, 0.5793, 0.8151, -0.6332, -0.6309, 0.4483, 0.45, 1, 0.55)
+
+[node name="RigidBody3D3" type="RigidBody3D" parent="." unique_id=1558207629]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 3.8400946, 0)
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="RigidBody3D3" unique_id=1563834026]
+mesh = SubResource("BoxMesh_ngq5m")
+skeleton = NodePath("../..")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="RigidBody3D3" unique_id=2108234031]
+shape = SubResource("ConvexPolygonShape3D_im2sa")
+
+[node name="RigidBody3D2" type="RigidBody3D" parent="." unique_id=1377121917]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.464813, 3.8400946, 0)
+
+[node name="MeshInstance3D2" type="MeshInstance3D" parent="RigidBody3D2" unique_id=1618915151]
+mesh = SubResource("PrismMesh_v3abh")
+skeleton = NodePath("../..")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="RigidBody3D2" unique_id=1403521126]
+shape = SubResource("ConvexPolygonShape3D_1q54l")
+
+[node name="RigidBody3D" type="RigidBody3D" parent="." unique_id=1023141720]
+
+[node name="MeshInstance3D3" type="MeshInstance3D" parent="RigidBody3D" unique_id=1652325206]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.7213982, 3.8400946, 0)
+mesh = SubResource("CylinderMesh_3lmon")
+skeleton = NodePath("../..")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="RigidBody3D" unique_id=471350688]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.7213982, 3.8400946, 0)
+shape = SubResource("ConvexPolygonShape3D_7ct4w")
