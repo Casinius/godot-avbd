@@ -246,7 +246,7 @@ func _punch(screen_position: Vector2) -> void:
 		var impulse_point: Vector3 = hit["position"]
 		var impulse: Vector3 = hit["normal"] * impulse_strength
 		body.apply_impulse(impulse, impulse_point)
-
+		
 
 func _reset() -> void:
 	get_tree().paused = false
