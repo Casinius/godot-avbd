@@ -72,7 +72,7 @@ jobs:
         run: xmake f -p windows --toolchain=msvc -y
 
       - name: Build project
-        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
+        shell: ${{ matrix.os == 'windows-latest' && 'pwsh' || 'bash' }}
         run: xmake build -vD
 
       - name: Package
