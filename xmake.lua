@@ -89,7 +89,7 @@ target("avbd")
     -- Godot loads the library from the project's bin/ directory.
     after_build(function (target)
         local ext = is_plat("windows") and ".dll" or (is_plat("macosx") and ".dylib" or ".so")
-        local dst = path.join(os.projectdir(), "demo", "bin", "libavbd.linux.x86_64" .. ext)
+        local dst = path.join(os.projectdir(), "demo","gdavbd", "bin", "libavbd.linux.x86_64" .. ext)
         os.mkdir(path.directory(dst))
         os.cp(target:targetfile(), dst)
     end)
