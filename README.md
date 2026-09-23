@@ -1,5 +1,8 @@
 # Godot-AVBD
 
+![Test](https://github.com/Casinius/godot-avbd/actions/workflows/c-cpp.yml/badge.svg)
+
+
 ## What is AVBD?
 
 AVBD stands for Augmented Vertex Block Descent. It is a position-based physics framework built on top of VBD, using the augmented Lagrangian method to scale the constraint force, which is about as basic as it gets in position-based physics.
