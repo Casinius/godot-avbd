@@ -31,7 +31,7 @@ jobs:
           cp ./demo/gdavbd/avbd.gdextension ./tmp/gdavbd/
           cp ./demo/gdavbd/bin/libavbd.linux.x86_64.* ./tmp/gdavbd/bin/
           cd ./tmp/          
-          zip -r ../godot-avbd-deterministic.zip
+          zip -r ../godot-avbd-deterministic.zip gdavbd
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
