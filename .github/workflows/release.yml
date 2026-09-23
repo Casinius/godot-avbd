@@ -60,7 +60,7 @@ jobs:
 
       - name: Install zip (Linux only)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zip
+        run: sudo apt-get update && sudo apt-get install -y zip scons
 
       - name: Configure xmake
         shell: bash
