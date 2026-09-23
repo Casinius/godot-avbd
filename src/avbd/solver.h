@@ -167,10 +167,10 @@ struct Block
     Block(float mass, float3 moment, float dtSq, float3 positionLin, float3 inertialLin,
           quat positionAng, quat inertialAng) noexcept :
             lhsLin(diagonal(mass, mass, mass) / dtSq),
-            lhsAng(diagonal(moment.x, moment.y, moment.z) / dtSq),
-            lhsCross{0, 0, 0, 0, 0, 0, 0, 0, 0},
+            lhsAng(diagonal(moment.x(), moment.y(), moment.z()) / dtSq),
+            lhsCross(0),
             rhsLin(diagonal(mass, mass, mass) / dtSq * (positionLin - inertialLin)),
-            rhsAng(diagonal(moment.x, moment.y, moment.z) / dtSq * (positionAng - inertialAng)) {}
+            rhsAng(diagonal(moment.x(), moment.y(), moment.z()) / dtSq * (positionAng - inertialAng)) {}
 
     // Solve for and apply the update (Eq. 4).
     void apply(Rigid &body) const noexcept;
