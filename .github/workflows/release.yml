@@ -66,10 +66,17 @@ jobs:
           xmake f -y
           xmake f --asan=n --tsan=n --ubsan=n
 
+      - name: Setup Python for Windows
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12' # 使用一个稳定版本，避免使用 3.14 等最新版
+
       - name: Configure xmake (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: xmake f -p windows --toolchain=msvc -y
+        # 添加 --python 参数，显式指向 setup-python 设置的 Python 解释器
+        run: xmake f -p windows --toolchain=msvc --python="${{ steps.setup-python.outputs.python-path }}" -y
 
       - name: Build project
         run: xmake build -vD
