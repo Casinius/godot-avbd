@@ -3,37 +3,92 @@ name: Release
 on:
   push:
     tags:
-      - 'v*' # 当推送的标签以 v 开头时触发，如 v1.0.0
-  workflow_dispatch:
+      - 'v*'          # 推送 v 开头的标签时触发，如 v1.0.0
+  workflow_dispatch:   # 支持手动触发
+
 jobs:
   build-and-release:
-    runs-on: ubuntu-latest
+    name: Build and Release on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     permissions:
-      contents: write # 必须授予写入权限，才能创建 Release
+      contents: write   # 创建 Release 需要写权限
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            artifact_name: godot-avbd-deterministic-linux.zip
+          - os: macos-latest
+            artifact_name: godot-avbd-deterministic-macos.zip
+          - os: windows-latest
+            artifact_name: godot-avbd-deterministic-windows.zip
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Install BasePack
+        with:
+          submodules: recursive   # 如果项目有子模块，建议开启
+
+      # 使用官方 Action 安装 xmake，并配置缓存
+      - name: Setup xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+          actions-cache-folder: '.xmake-cache'
+          actions-cache-key: '${{ runner.os }}-xmake'
+          package-cache: true
+          package-cache-key: '${{ runner.os }}-xmake-packages'
+          project-path: '.'
+          build-cache: true
+          build-cache-key: '${{ runner.os }}-xmake-build'
+
+      # Linux 下需要 zip 命令进行打包，macOS 自带，Windows 使用 PowerShell
+      - name: Install zip (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zip
+
+      # 配置 xmake（保留你原有的配置选项）
+      - name: Configure xmake
         run: |
-          sudo apt update
-          sudo apt install scons zip
-          curl -fsSL https://xmake.io/shget.text | bash
-          source ~/.xmake/profile
           xmake f -y
           xmake f --asan=n --tsan=n --ubsan=n
-      # 这里添加你的构建步骤，比如 npm install && npm run build
+        shell: bash
+
+      # 构建项目
       - name: Build project
+        run: xmake build -vD
+        shell: bash
+
+      # 打包：根据平台复制对应的库文件，并生成 zip
+      - name: Package
         run: |
-          xmake build
-          mkdir ./tmp
-          mkdir ./tmp/gdavbd
-          mkdir ./tmp/gdavbd/bin
-          cp ./demo/gdavbd/avbd.gdextension ./tmp/gdavbd/
-          cp ./demo/gdavbd/bin/libavbd.linux.x86_64.* ./tmp/gdavbd/bin/
-          cd ./tmp/          
-          zip -r ../godot-avbd-deterministic.zip gdavbd
-      - name: Create Release
+          mkdir -p tmp/gdavbd/bin
+          cp ./demo/gdavbd/avbd.gdextension tmp/gdavbd/
+
+          # 按平台复制动态库，请根据你项目实际生成的文件名调整通配符
+          if [ "${{ runner.os }}" == "Linux" ]; then
+            cp ./demo/gdavbd/bin/libavbd.linux.* tmp/gdavbd/bin/
+          elif [ "${{ runner.os }}" == "macOS" ]; then
+            cp ./demo/gdavbd/bin/libavbd.macos.* tmp/gdavbd/bin/
+          elif [ "${{ runner.os }}" == "Windows" ]; then
+            # Windows 下可能是 .dll 或 .lib，按实际情况调整
+            cp ./demo/gdavbd/bin/*.dll tmp/gdavbd/bin/ 2>/dev/null || \
+            cp ./demo/gdavbd/bin/*.lib tmp/gdavbd/bin/ 2>/dev/null || true
+          fi
+
+          cd tmp
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            powershell -Command "Compress-Archive -Path gdavbd -DestinationPath ../${{ matrix.artifact_name }}"
+          else
+            zip -r ../${{ matrix.artifact_name }} gdavbd
+          fi
+        shell: bash
+
+      # 上传资产到 Release（多个平台会追加到同一个 Release）
+      - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ./godot-avbd-deterministic.zip
+          files: ./${{ matrix.artifact_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
