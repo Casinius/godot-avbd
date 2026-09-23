@@ -82,7 +82,13 @@ using float3x3 = Eigen::Matrix<float,3,3>;
 using float3 = Eigen::Vector3<float>;
 
 using quat = Eigen::Quaternion<float>;
-
+[[nodiscard]] inline float3x3 diagonal(float m00, float m11, float m22) noexcept
+{
+    return float3x3{{
+        m00, 0, 0,
+        0, m11, 0,
+        0, 0, m22}};
+}
 // Solve the symmetric 6x6 system [aLin  aCross^T; aCross  aAng] x = [bLin; bAng] using Eigen::LDLT.
 // The matrix is stored as its lower triangle; we reconstruct a full 6x6 matrix for Eigen.
 inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross, float3 bLin, float3 bAng, float3 &xLin, float3 &xAng) noexcept
