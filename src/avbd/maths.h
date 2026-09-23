@@ -89,6 +89,37 @@ using quat = Eigen::Quaternion<float>;
         0, m11, 0,
         0, 0, m22}};
 }
+
+
+// // -----------------------------------------------------------------------------
+// // quat operators
+// // -----------------------------------------------------------------------------
+
+// [[nodiscard]] inline quat operator*(quat a, float b) noexcept
+// {
+//     return {a.x() * b, a.y() * b, a.z() * b, a.w() * b};
+// }
+
+// [[nodiscard]] inline quat operator/(quat a, float b) noexcept
+// {
+//     return {a.x() / b, a.y() / b, a.z() / b, a.w() / b};
+// }
+
+// [[nodiscard]] inline quat operator*(quat a, quat b) noexcept
+// {
+//     return {
+//         a.w() * b.x() + a.x() * b.w() + a.y() * b.z() - a.z() * b.y(),
+//         a.w() * b.y() - a.x() * b.z() + a.y() * b.w() + a.z() * b.x(),
+//         a.w() * b.z() + a.x() * b.y() - a.y() * b.x() + a.z() * b.w(),
+//         a.w() * b.w() - a.x() * b.x() - a.y() * b.y() - a.z() * b.z()};
+// }
+
+// [[nodiscard]] inline quat operator+(quat a, quat b) noexcept
+// {
+//     return {a.x() + b.x(), a.y() + b.y(), a.z() + b.z(), a.w() + b.w()};
+// }
+
+
 // Solve the symmetric 6x6 system [aLin  aCross^T; aCross  aAng] x = [bLin; bAng] using Eigen::LDLT.
 // The matrix is stored as its lower triangle; we reconstruct a full 6x6 matrix for Eigen.
 inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross, float3 bLin, float3 bAng, float3 &xLin, float3 &xAng) noexcept
