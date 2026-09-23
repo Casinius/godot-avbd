@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*' # 当推送的标签以 v 开头时触发，如 v1.0.0
+  workflow_dispatch:
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 必须授予写入权限，才能创建 Release
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 这里添加你的构建步骤，比如 npm install && npm run build
+      - name: Build project
+        run: |
+          xmake build
+          mkdir ./tmp
+          mkdir ./tmp/gdavbd
+          mkdir ./tmp/gdavbd/bin
+          cp ./demo/gdavbd/avbd.gdextension ./tmp/gdavbd/
+          cp ./demo/gdavbd/bin/libavbd.linux.x86_64.* ./tmp/gdavbd/bin/
+          cd ./tmp/          
+          zip -r ../godot-avbd.zip
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ./godot-avbd.zip

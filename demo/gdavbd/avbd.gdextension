@@ -7,5 +7,5 @@ reloadable = false
 
 [libraries]
 
-linux.debug.x86_64 = "res://bin/libavbd.linux.x86_64.so"
-linux.release.x86_64 = "res://bin/libavbd.linux.x86_64.so"
+linux.debug.x86_64 = "res://gdavbd/bin/libavbd.linux.x86_64.so"
+linux.release.x86_64 = "res://gdavbd/bin/libavbd.linux.x86_64.so"
