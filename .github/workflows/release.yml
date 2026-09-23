@@ -16,7 +16,7 @@ jobs:
       - name: Install BasePack
         run: |
           sudo apt update
-          sudo apt install scons
+          sudo apt install scons zip
           curl -fsSL https://xmake.io/shget.text | bash
           source ~/.xmake/profile
           xmake f -y
