@@ -118,7 +118,11 @@ using quat = Eigen::Quaternion<float>;
 // {
 //     return {a.x() + b.x(), a.y() + b.y(), a.z() + b.z(), a.w() + b.w()};
 // }
-
+[[nodiscard]] inline float3 operator-(quat a, quat b) noexcept
+{
+    const quat d = a * inverse(b);
+    return float3{d.x, d.y, d.z} * 2.0f;
+}
 
 // Solve the symmetric 6x6 system [aLin  aCross^T; aCross  aAng] x = [bLin; bAng] using Eigen::LDLT.
 // The matrix is stored as its lower triangle; we reconstruct a full 6x6 matrix for Eigen.
