@@ -120,8 +120,8 @@ using quat = Eigen::Quaternion<float>;
 // }
 [[nodiscard]] inline float3 operator-(quat a, quat b) noexcept
 {
-    const quat d = a * inverse(b);
-    return float3{d.x, d.y, d.z} * 2.0f;
+    const quat d = a * b.inverse();
+    return float3{d.x(), d.y(), d.z()} * 2.0f;
 }
 
 // Solve the symmetric 6x6 system [aLin  aCross^T; aCross  aAng] x = [bLin; bAng] using Eigen::LDLT.
