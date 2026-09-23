@@ -76,7 +76,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         # 添加 --python 参数，显式指向 setup-python 设置的 Python 解释器
-        run: xmake f -p windows --toolchain=msvc --python="${{ steps.setup-python.outputs.python-path }}" -y
+        run: xmake f -p windows --toolchain=msvc -y
 
       - name: Build project
         run: xmake build -vD
