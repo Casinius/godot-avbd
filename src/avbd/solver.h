@@ -446,6 +446,17 @@ struct Solver
     float betaAng = 100.0f;    // Penalty ramping for angular constraints
     float gamma = 0.999f;      // Warmstarting decay, < 1
 
+    // Real-time phase split: the first ceil(newtonRatio * iterations) rounds run the full
+    // Newton primal (dense 6x6 solve); the remaining rounds skip the primal entirely and
+    // run dual-only relaxation on the existing jacobians. 1.0 = original AVBD behaviour.
+    // Newton carries the stiff corrections; the dual-only tail is where the convergence
+    // is cheapest to give up.
+    float newtonRatio = 1.0f;
+    // Per-iteration multiplicative decay applied to contact penalties during the
+    // dual-only tail: a stiff penalty converges slowly under relaxation, softening it
+    // lets the cheap rounds actually converge instead of spinning. 1.0 = no decay.
+    float stiffnessDecay = 1.0f;
+
     // Worker threads for the per-body phases. 0 = one per hardware thread, 1 = run
     // everything inline on the calling thread. The result does not depend on this value:
     // the update order is fixed by the colouring, and threads only spread one colour's
@@ -585,7 +596,7 @@ private:
     // The whole iteration set as one persistent-worker loop: `targetIterations` rounds of
     // per-colour primal passes plus dual passes, fenced by LoopSync barriers instead of
     // one pool dispatch per phase. Declared here so `iterate` stays testable.
-    void iterate(int targetIterations, int forceCount);
+    void iterate(int targetIterations, int forceCount, int newtonRounds);
     void finishVelocities();
     void updatePrimal(Rigid *body);
 
