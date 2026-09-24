@@ -160,36 +160,64 @@ using quat = Eigen::Quaternion<float>;
 }
 
 // Solve the symmetric 6x6 system [aLin  aCross^T; aCross  aAng] x = [bLin;
-// bAng] using Eigen::LDLT. The matrix is stored as its lower triangle; we
-// reconstruct a full 6x6 matrix for Eigen.
+// bAng].
+//
+// Two kernels, one bounded-update policy:
+//   1. Eigen fixed-size LDLT - stack-only, ~200 ns kernel. The workhorse.
+//   2. Eigen dynamic LDLT - thread_local scratch (no steady-state allocation), different
+//      pivot rounding. Retry path when (1) is not sane.
+//   3. Zero update - last resort when neither kernel is sane.
+// "Sane" means finite and < 10 m per component: an update is velocity*dt plus a position
+// correction, so 10 m is orders past anything physical. Degenerate blocks (thin cylinders
+// standing on end produce near-singular stiffness ratios ~1e6) used to let one wild pivot
+// compound into e15-scale positions; the policy caps every solve at the physical bound.
+// The fixed kernel's rounding differs from the old dynamic-only implementation, which
+// re-anchors every state digest - accepted on the real-time branch.
 inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross, float3 bLin,
                   float3 bAng, float3 &xLin, float3 &xAng) noexcept {
+  {
+    Eigen::Matrix<float, 6, 6> A;
+    A << aLin, aCross.transpose(), aCross, aAng; // fills row-major by 3x3 blocks: [aLin aCross^T; aCross aAng]
+    Eigen::Matrix<float, 6, 1> b;
+    b << bLin, bAng;
+    const Eigen::LDLT<Eigen::Matrix<float, 6, 6>> solver(A);
+    const Eigen::Matrix<float, 6, 1> x = solver.solve(b);
+    if (x.allFinite() && x.cwiseAbs().maxCoeff() < 1.0e1f)
+    {
+      xLin = x.head<3>();
+      xAng = x.tail<3>();
+      return;
+    }
+  }
 
-  // Build 6x6 symmetric matrix [aLin  aCross^T; aCross  aAng] from custom
-  // structs
-  Eigen::MatrixXf A(6, 6);
-  // Top-left: aLin (lower triangle only)
+  thread_local Eigen::MatrixXf A(6, 6);
+  thread_local Eigen::MatrixXf b(6, 1);
+  thread_local Eigen::MatrixXf x(6, 1);
+  thread_local Eigen::LDLT<Eigen::MatrixXf> solver;
+
   A.setZero();
-  // 把 aLin / aAng 填到对应块，aCross 填到对应块，并且对称化
   A.block<3, 3>(0, 0) = aLin;
   A.block<3, 3>(3, 3) = aAng;
   A.block<3, 3>(0, 3) = aCross.transpose();
   A.block<3, 3>(3, 0) = aCross;
-  // Stack bLin and bAng into 6-vector
-  Eigen::MatrixXf b(6, 1);
   b << bLin[0], bLin[1], bLin[2], bAng[0], bAng[1], bAng[2];
 
-  // Solve using LDLT decomposition
-  Eigen::LDLT<Eigen::MatrixXf> solver(A);
-  Eigen::MatrixXf x = solver.solve(b);
+  solver.compute(A);
+  x = solver.solve(b);
+  if (x.allFinite() && x.cwiseAbs().maxCoeff() < 1.0e1f)
+  {
+    xLin[0] = x(0, 0);
+    xLin[1] = x(1, 0);
+    xLin[2] = x(2, 0);
+    xAng[0] = x(3, 0);
+    xAng[1] = x(4, 0);
+    xAng[2] = x(5, 0);
+    return;
+  }
 
-  // Extract solution into output custom structs (use parentheses for Eigen)
-  xLin[0] = x(0, 0);
-  xLin[1] = x(1, 0);
-  xLin[2] = x(2, 0);
-  xAng[0] = x(3, 0);
-  xAng[1] = x(4, 0);
-  xAng[2] = x(5, 0);
+  // Degenerate block: freeze this DOF for one iteration instead of teleporting.
+  xLin = float3{0, 0, 0};
+  xAng = float3{0, 0, 0};
 }
 
 } // namespace avbd
