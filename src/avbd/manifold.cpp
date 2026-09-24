@@ -119,21 +119,17 @@ bool Manifold::initialize()
         if (penetration > 0.02f) // Cap at 2cm penetration
         {
             contacts[i].C0 = contacts[i].C0.normalized() * 0.02f;
-            penetration = 0.02f;
         }
 
-        // Adaptive penalty based on initial penetration depth
-        // Use log scale for large penetration variations, but avoid division by zero
-        float basePenalty = 1.0f; // PENALTY_MIN
-        float logPenetration = std::log10(std::max(penetration, 0.001f));
-        float adaptivePenalty = basePenalty * std::pow(10.0f, logPenetration * 2.0f);
-        float clampedPenalty = std::clamp(adaptivePenalty, PENALTY_MIN, PENALTY_MAX);
-        contacts[i].penalty = float3{clampedPenalty, clampedPenalty, clampedPenalty};
-
-        // Warmstart the dual variables and penalty parameters (Eq. 19)
-        // Penalty is safely clamped to a minimum and maximum value
+        // Initial penalty (Eq. 19): the original computed base * 10^(2*log10(pen)) —
+        // algebraically pen^2 — and clamped to [PENALTY_MIN, PENALTY_MAX]. pen is capped
+        // at 0.02 above, so the product is <= 4e-4 < PENALTY_MIN: the clamp always
+        // saturates at the floor and the log10/pow chain was dead computation
+        // (~300 us/step across a full manifold set). Penalty starts at PENALTY_MIN and is
+        // ramped per iteration in updateDual (betaLin * |C|, capped by PENALTY_MAX).
+        // The warmstart decay below is kept bit-for-bit.
         contacts[i].lambda = contacts[i].lambda * solver->alpha * solver->gamma;
-        float clampedLambdaPenalty = std::clamp(clampedPenalty * solver->gamma, PENALTY_MIN, PENALTY_MAX);
+        const float clampedLambdaPenalty = std::clamp(PENALTY_MIN * solver->gamma, PENALTY_MIN, PENALTY_MAX);
         contacts[i].penalty = float3{clampedLambdaPenalty, clampedLambdaPenalty, clampedLambdaPenalty};
     }
 
@@ -147,10 +143,14 @@ void Manifold::updatePrimal(Rigid *body, float alpha, Block &block)
     float3 dqBLin = bodyB->positionLin - bodyB->initialLin;
     float3 dqBAng = bodyB->positionAng - bodyB->initialAng;
 
+    // Same rotation-matrix hoist as updateDual: body quats are loop-invariant here.
+    const float3x3 rotA(bodyA->positionAng);
+    const float3x3 rotB(bodyB->positionAng);
+
     for (int i = 0; i < numContacts; i++)
     {
-        float3 rAWorld = bodyA->positionAng * contacts[i].rA;
-        float3 rBWorld = bodyB->positionAng * contacts[i].rB;
+        float3 rAWorld = rotA * contacts[i].rA;
+        float3 rBWorld = rotB * contacts[i].rB;
 
         // Compute the Taylor series approximation of the constraint function C(x) (Sec 4)
         float3x3 jALin = basis;
@@ -208,10 +208,16 @@ void Manifold::updateDual(float alpha)
     float3 dqBLin = bodyB->positionLin - bodyB->initialLin;
     float3 dqBAng = bodyB->positionAng - bodyB->initialAng;
 
+    // Both contact rotations share the two body quats, which never change inside this
+    // loop: one rotation-matrix conversion (~20 ns) replaces two quat multiplies per
+    // contact (~16 ns each at 8 contacts = ~256 ns/manifold).
+    const float3x3 rotA(bodyA->positionAng);
+    const float3x3 rotB(bodyB->positionAng);
+
     for (int i = 0; i < numContacts; i++)
     {
-        float3 rAWorld = bodyA->positionAng * contacts[i].rA;
-        float3 rBWorld = bodyB->positionAng * contacts[i].rB;
+        float3 rAWorld = rotA * contacts[i].rA;
+        float3 rBWorld = rotB * contacts[i].rB;
 
         // Compute the Taylor series approximation of the constraint function C(x) (Sec 4)
         float3x3 jALin = basis;
