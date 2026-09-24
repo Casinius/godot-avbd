@@ -108,6 +108,10 @@ struct Rigid
     // is how per-body gravity modes are expressed).
     float gravity;
     bool sleeping = false;
+    // Consecutive finishVelocities() steps with both velocities under the solver's sleep
+    // thresholds; reaching sleepFrames flips `sleeping` on. Only meaningful when the body
+    // is movable and sleep_mode enables sleeping.
+    int stillFrames = 0;
 
     // Godot-style collision filtering: a pair collides when either side's layer is in the
     // other's mask. Defaults keep every pair colliding, which is what the solver did
@@ -167,10 +171,10 @@ struct Block
     Block(float mass, float3 moment, float dtSq, float3 positionLin, float3 inertialLin,
           quat positionAng, quat inertialAng) noexcept :
             lhsLin(diagonal(mass, mass, mass) / dtSq),
-            lhsAng(diagonal(moment.x, moment.y, moment.z) / dtSq),
-            lhsCross{0, 0, 0, 0, 0, 0, 0, 0, 0},
+            lhsAng(diagonal(moment.x(), moment.y(), moment.z()) / dtSq),
+            lhsCross(float3x3::Zero()),
             rhsLin(diagonal(mass, mass, mass) / dtSq * (positionLin - inertialLin)),
-            rhsAng(diagonal(moment.x, moment.y, moment.z) / dtSq * (positionAng - inertialAng)) {}
+            rhsAng(diagonal(moment.x(), moment.y(), moment.z()) / dtSq * (positionAng - inertialAng)) {}
 
     // Solve for and apply the update (Eq. 4).
     void apply(Rigid &body) const noexcept;
@@ -203,6 +207,10 @@ struct Force
     // Number of contact points this force contributes (0 for non-contact forces).
     // Used for statistics/reporting only; the solver never reads it.
     virtual int contactPointCount() const { return 0; }
+
+    // Accumulate penetration error (total) and positive-penetration contact count, in
+    // contact order, for the adaptive iteration estimate. No-op for non-contact forces.
+    virtual void accumulatePenetration(float &r_total, int &r_count) const { (void)r_total; (void)r_count; }
 
     // Whether this constraint has broken and stopped acting on its bodies. Only
     // breakable joints ever report true; every other force is permanent.
@@ -387,10 +395,21 @@ struct Manifold : Force
 
     Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB);
 
+    // Class-specific pooled allocation: manifolds churn with contact formation and
+    // separation (broad phase news them, warmstartForces deletes them), so recycled blocks
+    // avoid the heap on the hot path. The constructor still fully runs on every new
+    // expression, so a recycled block is indistinguishable from a fresh one.
+    static void *operator new(std::size_t count);
+    static void operator delete(void *ptr) noexcept;
+    // Release every cached block (called when a solver dies; blocks outlive solvers by
+    // design so a surviving solver's next contact pays no allocation).
+    static void drainPool() noexcept;
+
     bool initialize() override;
     void updatePrimal(Rigid *body, float alpha, Block &block) override;
     void updateDual(float alpha) override;
     int contactPointCount() const override { return numContacts; }
+    void accumulatePenetration(float &r_total, int &r_count) const override;
 
     static int collide(Rigid *bodyA, Rigid *bodyB, std::span<Contact> contacts, float3x3 &basis);
 };
@@ -432,6 +451,14 @@ struct Solver
     // the update order is fixed by the colouring, and threads only spread one colour's
     // independent bodies over more cores.
     int threads = 0;
+
+    // Idle detection: a movable body whose BDF1 velocities stay under both thresholds for
+    // this many consecutive steps falls asleep (velocity zeroed, Godot semantics).
+    // 0 disables automatic sleeping; the core tests rely on the default for bit-identical
+    // digests. Thresholds follow Godot's space-parameter defaults.
+    float sleepLinearThreshold = 0.1f;       // m/s
+    float sleepAngularThreshold = 0.139626f; // rad/s (Godot default: 8 deg/s)
+    int sleepFrames = 0;                     // steps below thresholds before sleeping
 
     // Heads of the two intrusive lists. Owned: `clear()` deletes through them.
     Rigid *bodies = nullptr;
@@ -503,11 +530,11 @@ private:
     // the ground is usually one of them.
     std::vector<Rigid *> warmstartOrder;
 
-    // Broad-phase scratch: the body list flattened to index-addressable rows, and one
-    // candidate vector per row so parallel row scans never share a vector. Rebuilt and
-    // cleared every step.
+    // Broad-phase scratch: the body list flattened to index-addressable order, plus the
+    // x-projected sweep entries and the candidate pair list, all rebuilt every step.
     std::vector<Rigid *> bodiesInOrder;
-    std::vector<std::vector<std::pair<Rigid *, Rigid *>>> rowCandidates;
+    std::vector<std::pair<float, int>> sweepEntries;
+    std::vector<std::pair<int, int>> sweepPairs;
 
     // Bodies that take part in the primal update (movable ones), grouped by colour:
     // colour c owns updateOrder[colourStart[c] .. colourStart[c + 1]).
@@ -521,6 +548,12 @@ private:
     // parallel initialisation.
     std::vector<Force *> forceOrder;
     std::vector<uint8_t> forceActive;
+
+    // Island scratch (rebuilt when sleep is active): body index base for the union-find,
+    // per-force body slots, and the island id of every movable body (-1 = no island).
+    std::vector<Rigid *> islandBodies;
+    std::vector<std::pair<int, int>> islandForceSlots;
+    std::vector<int> bodyIsland;
 
     std::unique_ptr<detail::JobPool> pool;
 
@@ -555,6 +588,12 @@ private:
     void iterate(int targetIterations, int forceCount);
     void finishVelocities();
     void updatePrimal(Rigid *body);
+
+    // Island-wide sleep bookkeeping (runs when sleeping is enabled): movable bodies are
+    // grouped into islands through force connectivity, and an island whose every body
+    // cleared idle detection this step puts all its members to sleep together. Prevents
+    // the partially-asleep contact chain from thrashing between states.
+    void islandSleep();
 };
 
 } // namespace avbd

@@ -21,10 +21,11 @@ config/features=PackedStringArray("4.7")
 [physics]
 
 3d/run_on_separate_thread=true
-common/max_physics_steps_per_frame=4
+common/physics_ticks_per_second=120
 3d/physics_engine="AVBD"
-3d/time_before_sleep=0.1
-3d/solver/contact_recycle_radius=0.1
+3d/time_before_sleep=0.09
+3d/solver/solver_iterations=12
+3d/solver/contact_max_allowed_penetration=0.063
 common/physics_interpolation=true
 
 [rendering]

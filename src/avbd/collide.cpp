@@ -11,10 +11,12 @@
 
 #include "avbd/solver.h"
 #include "avbd/bvh/node_storage.hpp"
+#include "avbd/maths.h"
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstddef>
+#include <ranges>
 #include <span>
 #include <array>
 #include <vector>
@@ -71,27 +73,27 @@ inline OBB makeOBB(const Shape& shape)
     box.center = shape.center;
     box.rotation = shape.rotation;
     box.half = shape.half;
-    box.axis[0] = rotate(shape.rotation, float3{ 1.0f, 0.0f, 0.0f });
-    box.axis[1] = rotate(shape.rotation, float3{ 0.0f, 1.0f, 0.0f });
-    box.axis[2] = rotate(shape.rotation, float3{ 0.0f, 0.0f, 1.0f });
+    box.axis[0] = shape.rotation * float3{1.0f, 0.0f, 0.0f};
+    box.axis[1] = shape.rotation * float3{0.0f, 1.0f, 0.0f};
+    box.axis[2] = shape.rotation * float3{0.0f, 0.0f, 1.0f};
     return box;
 }
 
 inline float absDot(float3 a, float3 b)
 {
-    return std::fabs(dot(a, b));
+    return std::fabs(a.dot(b));
 }
 
 inline float3 supportPoint(const OBB& box, const float3& dir)
 {
-    float sx = dot(dir, box.axis[0]) >= 0.0f ? 1.0f : -1.0f;
-    float sy = dot(dir, box.axis[1]) >= 0.0f ? 1.0f : -1.0f;
-    float sz = dot(dir, box.axis[2]) >= 0.0f ? 1.0f : -1.0f;
+    float sx = dir.dot(box.axis[0]) >= 0.0f ? 1.0f : -1.0f;
+    float sy = dir.dot(box.axis[1]) >= 0.0f ? 1.0f : -1.0f;
+    float sz = dir.dot(box.axis[2]) >= 0.0f ? 1.0f : -1.0f;
 
     return box.center
-        + box.axis[0] * (box.half.x * sx)
-        + box.axis[1] * (box.half.y * sy)
-        + box.axis[2] * (box.half.z * sz);
+        + box.axis[0] * (box.half.x() * sx)
+        + box.axis[1] * (box.half.y() * sy)
+        + box.axis[2] * (box.half.z() * sz);
 }
 
 inline void getFaceAxes(const OBB& box, int axisIndex, float3& u, float3& v, float& extentU, float& extentV)
@@ -100,28 +102,28 @@ inline void getFaceAxes(const OBB& box, int axisIndex, float3& u, float3& v, flo
     {
         u = box.axis[1];
         v = box.axis[2];
-        extentU = box.half.y;
-        extentV = box.half.z;
+        extentU = box.half.y();
+        extentV = box.half.z();
     }
     else if (axisIndex == 1)
     {
         u = box.axis[0];
         v = box.axis[2];
-        extentU = box.half.x;
-        extentV = box.half.z;
+        extentU = box.half.x();
+        extentV = box.half.z();
     }
     else
     {
         u = box.axis[0];
         v = box.axis[1];
-        extentU = box.half.x;
-        extentV = box.half.y;
+        extentU = box.half.x();
+        extentV = box.half.y();
     }
 }
 
 inline void buildFaceFrame(const OBB& box, int axisIndex, const float3& outwardNormal, FaceFrame& frame)
 {
-    float sign = dot(outwardNormal, box.axis[axisIndex]) >= 0.0f ? 1.0f : -1.0f;
+    float sign = outwardNormal.dot(box.axis[axisIndex]) >= 0.0f ? 1.0f : -1.0f;
     frame.axisIndex = axisIndex;
     frame.normal = box.axis[axisIndex] * sign;
     frame.center = box.center + frame.normal * box.half[axisIndex];
@@ -148,7 +150,7 @@ inline int chooseIncidentFaceAxis(const OBB& box, const float3& referenceNormal)
 
 inline void buildIncidentFace(const OBB& box, int axisIndex, const float3& referenceNormal, float3 outVerts[4])
 {
-    float sign = dot(box.axis[axisIndex], referenceNormal) > 0.0f ? -1.0f : 1.0f;
+    float sign = box.axis[axisIndex].dot(referenceNormal) > 0.0f ? -1.0f : 1.0f;
     float3 faceNormal = box.axis[axisIndex] * sign;
     float3 faceCenter = box.center + faceNormal * box.half[axisIndex];
 
@@ -171,12 +173,12 @@ inline int clipPolygonAgainstPlane(const float3* inVerts, int inCount, const flo
 
     int outCount = 0;
     float3 a = inVerts[inCount - 1];
-    float da = dot(planeNormal, a) - planeOffset;
+    float da = planeNormal.dot(a) - planeOffset;
 
     for (size_t i = 0; i < static_cast<size_t>(inCount); ++i)
     {
         float3 b = inVerts[i];
-        float db = dot(planeNormal, b) - planeOffset;
+        float db = planeNormal.dot(b) - planeOffset;
 
         bool aInside = da <= PLANE_EPSILON;
         bool bInside = db <= PLANE_EPSILON;
@@ -186,7 +188,7 @@ inline int clipPolygonAgainstPlane(const float3* inVerts, int inCount, const flo
             float t = 0.0f;
             float denom = da - db;
             if (std::fabs(denom) > SAT_AXIS_EPSILON)
-                t = clamp(da / denom, 0.0f, 1.0f);
+                t = std::clamp(da / denom, 0.0f, 1.0f);
 
             if (outCount < MAX_POLY_VERTS)
                 outVerts[outCount++] = a + (b - a) * t;
@@ -209,7 +211,7 @@ inline bool addContact(const Shape& shapeA, const Shape& shapeB, std::span<Manif
     for (size_t i = 0; i < static_cast<size_t>(contactCount); ++i)
     {
         float3 d = midpoint - contactMidpoints[i];
-        if (lengthSq(d) < CONTACT_MERGE_DIST_SQ)
+        if (d.squaredNorm() < CONTACT_MERGE_DIST_SQ)
             return false;
     }
 
@@ -221,8 +223,8 @@ inline bool addContact(const Shape& shapeA, const Shape& shapeB, std::span<Manif
 
     Manifold::Contact& c = contacts[contactCount];
     c.feature = feature;
-    c.rA = rotate(conjugate(shapeA.rotation), xA - shapeA.center);
-    c.rB = rotate(conjugate(shapeB.rotation), xB - shapeB.center);
+    c.rA = shapeA.rotation.conjugate() * (xA - shapeA.center);
+    c.rB = shapeB.rotation.conjugate() * (xB - shapeB.center);
     contactMidpoints[contactCount] = midpoint;
     ++contactCount;
 
@@ -231,26 +233,26 @@ inline bool addContact(const Shape& shapeA, const Shape& shapeB, std::span<Manif
 
 inline bool testAxis(const OBB& boxA, const OBB& boxB, const float3& delta, const float3& axis, AxisType type, int indexA, int indexB, SatAxis& best)
 {
-    float lenSq = lengthSq(axis);
+    float lenSq = axis.squaredNorm();
     if (lenSq < SAT_AXIS_EPSILON)
         return true;
 
     float invLen = 1.0f / std::sqrt(lenSq);
     float3 n = axis * invLen;
-    if (dot(n, delta) < 0.0f)
+    if (n.dot(delta) < 0.0f)
         n = -n;
 
-    float distance = std::fabs(dot(delta, n));
+    float distance = std::abs(delta.dot(n));
 
     float rA =
-        boxA.half.x * absDot(n, boxA.axis[0]) +
-        boxA.half.y * absDot(n, boxA.axis[1]) +
-        boxA.half.z * absDot(n, boxA.axis[2]);
+        boxA.half.x() * absDot(n, boxA.axis[0]) +
+        boxA.half.y() * absDot(n, boxA.axis[1]) +
+        boxA.half.z() * absDot(n, boxA.axis[2]);
 
     float rB =
-        boxB.half.x * absDot(n, boxB.axis[0]) +
-        boxB.half.y * absDot(n, boxB.axis[1]) +
-        boxB.half.z * absDot(n, boxB.axis[2]);
+        boxB.half.x() * absDot(n, boxB.axis[0]) +
+        boxB.half.y() * absDot(n, boxB.axis[1]) +
+        boxB.half.z() * absDot(n, boxB.axis[2]);
 
     float separation = distance - (rA + rB);
     if (separation > 0.0f)
@@ -274,8 +276,8 @@ inline void supportEdge(const OBB& box, int axisIndex, const float3& dir, float3
     int axis1 = (axisIndex + 1) % 3;
     int axis2 = (axisIndex + 2) % 3;
 
-    float sign1 = dot(dir, box.axis[axis1]) >= 0.0f ? 1.0f : -1.0f;
-    float sign2 = dot(dir, box.axis[axis2]) >= 0.0f ? 1.0f : -1.0f;
+    float sign1 = dir.dot(box.axis[axis1]) >= 0.0f ? 1.0f : -1.0f;
+    float sign2 = dir.dot(box.axis[axis2]) >= 0.0f ? 1.0f : -1.0f;
 
     float3 edgeCenter = box.center
         + box.axis[axis1] * (box.half[axis1] * sign1)
@@ -290,9 +292,9 @@ inline void closestPointsOnSegments(const float3& p0, const float3& p1, const fl
     float3 d1 = p1 - p0;
     float3 d2 = q1 - q0;
     float3 r = p0 - q0;
-    float a = dot(d1, d1);
-    float e = dot(d2, d2);
-    float f = dot(d2, r);
+    float a = d1.dot(d1);
+    float e = d2.dot(d2);
+    float f = d2.dot(r);
 
     float s = 0.0f;
     float t = 0.0f;
@@ -306,34 +308,34 @@ inline void closestPointsOnSegments(const float3& p0, const float3& p1, const fl
 
     if (a <= SAT_AXIS_EPSILON)
     {
-        t = clamp(f / e, 0.0f, 1.0f);
+        t = std::clamp(f / e, 0.0f, 1.0f);
     }
     else
     {
-        float c = dot(d1, r);
+        float c = d1.dot(r);
         if (e <= SAT_AXIS_EPSILON)
         {
-            s = clamp(-c / a, 0.0f, 1.0f);
+            s = std::clamp(-c / a, 0.0f, 1.0f);
         }
         else
         {
-            float b = dot(d1, d2);
+            float b = d1.dot(d2);
             float denom = a * e - b * b;
 
             if (std::fabs(denom) > SAT_AXIS_EPSILON)
-                s = clamp((b * f - c * e) / denom, 0.0f, 1.0f);
+                s = std::clamp((b * f - c * e) / denom, 0.0f, 1.0f);
 
             t = (b * s + f) / e;
 
             if (t < 0.0f)
             {
                 t = 0.0f;
-                s = clamp(-c / a, 0.0f, 1.0f);
+                s = std::clamp(-c / a, 0.0f, 1.0f);
             }
             else if (t > 1.0f)
             {
                 t = 1.0f;
-                s = clamp((b - c) / a, 0.0f, 1.0f);
+                s = std::clamp((b - c) / a, 0.0f, 1.0f);
             }
         }
     }
@@ -359,25 +361,25 @@ inline int buildFaceManifold(const Shape& shapeA, const Shape& shapeB, const OBB
     int count = 4;
 
     float3 n0 = referenceFace.u;
-    float o0 = dot(n0, referenceFace.center) + referenceFace.extentU;
+    float o0 = n0.dot(referenceFace.center) + referenceFace.extentU;
     count = clipPolygonAgainstPlane(clip0, count, n0, o0, clip1);
     if (!count)
         return 0;
 
     float3 n1 = -referenceFace.u;
-    float o1 = dot(n1, referenceFace.center) + referenceFace.extentU;
+    float o1 = n1.dot(referenceFace.center) + referenceFace.extentU;
     count = clipPolygonAgainstPlane(clip1, count, n1, o1, clip0);
     if (!count)
         return 0;
 
     float3 n2 = referenceFace.v;
-    float o2 = dot(n2, referenceFace.center) + referenceFace.extentV;
+    float o2 = n2.dot(referenceFace.center) + referenceFace.extentV;
     count = clipPolygonAgainstPlane(clip0, count, n2, o2, clip1);
     if (!count)
         return 0;
 
     float3 n3 = -referenceFace.v;
-    float o3 = dot(n3, referenceFace.center) + referenceFace.extentV;
+    float o3 = n3.dot(referenceFace.center) + referenceFace.extentV;
     count = clipPolygonAgainstPlane(clip1, count, n3, o3, clip0);
     if (!count)
         return 0;
@@ -391,7 +393,7 @@ inline int buildFaceManifold(const Shape& shapeA, const Shape& shapeB, const OBB
     for (size_t i = 0; i < static_cast<size_t>(count) && contactCount < MAX_CONTACTS; ++i)
     {
         float3 pIncident = clip0[i];
-        float distance = dot(pIncident - referenceFace.center, referenceFace.normal);
+        float distance = (pIncident - referenceFace.center).dot(referenceFace.normal);
         if (distance > PLANE_EPSILON)
             continue;
 
@@ -465,9 +467,9 @@ inline Shape makeShape(const Rigid* body)
     shape.center = body->positionLin;
     shape.rotation = body->positionAng;
     shape.half = body->size * 0.5f;
-    shape.radius = body->size.x;
-    shape.halfHeight = body->size.z * 0.5f;
-    shape.axis = rotate(body->positionAng, float3{0, 0, 1});
+    shape.radius = body->size.x();
+    shape.halfHeight = body->size.z() * 0.5f;
+    shape.axis = body->positionAng * float3{0, 0, 1};
     return shape;
 }
 
@@ -475,7 +477,7 @@ inline Shape makeShape(const Rigid* body)
 // penetration. Returns false when the point is outside.
 inline bool pointInBox(const Shape& box, const float3& p, float3& r_push, float& r_depth)
 {
-    const float3 local = rotate(conjugate(box.rotation), p - box.center);
+    const float3 local = box.rotation.conjugate() * (p - box.center);
 
     float bestDepth = FLT_MAX;
     int bestAxis = 0;
@@ -495,7 +497,7 @@ inline bool pointInBox(const Shape& box, const float3& p, float3& r_push, float&
 
     float3 localPush{0, 0, 0};
     localPush[bestAxis] = bestSign;
-    r_push = rotate(box.rotation, localPush);
+    r_push = box.rotation * localPush;
     r_depth = bestDepth;
     return true;
 }
@@ -504,35 +506,35 @@ inline bool pointInBox(const Shape& box, const float3& p, float3& r_push, float&
 // cylinder's surface to that point and the distance.
 inline float3 closestPointOnCylinder(const Shape& cyl, const float3& p, float3& r_outward, float& r_distance)
 {
-    const float3 local = rotate(conjugate(cyl.rotation), p - cyl.center);
+    const float3 local = cyl.rotation.conjugate() * (p - cyl.center);
 
     // Clamp along the axis, then radially.
-    const float t = clamp(local.y, -cyl.halfHeight, cyl.halfHeight);
-    const float2 radial{local.x, local.z};
-    const float lenSq = lengthSq(radial);
+    const float t = std::clamp(local.y(), -cyl.halfHeight, cyl.halfHeight);
+    float2 radial(local.x(), local.z());
+    const float lenSq = radial.squaredNorm();
 
     float3 closest{0, t, 0};
     if (lenSq > cyl.radius * cyl.radius)
     {
         const float scale = cyl.radius / std::sqrt(lenSq);
-        closest.x = radial.x * scale;
-        closest.y = radial.y * scale;
+        closest.x() = radial.x() * scale;
+        closest.y() = radial.y() * scale;
     }
     else if (lenSq > 1.0e-12f)
     {
-        closest.x = radial.x;
-        closest.y = radial.y;
+        closest.x() = radial.x();
+        closest.y() = radial.y();
     }
     else
     {
         // On the axis: the nearest surface point is on the radius, pick a fixed direction.
-        closest.x = cyl.radius;
+        closest.x() = cyl.radius;
     }
 
-    const float3 closestLocal = rotate(cyl.rotation, closest) + cyl.center;
+    const float3 closestLocal = cyl.rotation * closest + cyl.center;
     const float3 d = p - closestLocal;
-    r_distance = length(d);
-    r_outward = r_distance > 1.0e-9f ? d / r_distance : rotate(cyl.rotation, float3{1, 0, 0});
+    r_distance = d.norm();
+    r_outward = r_distance > 1.0e-9f ? d / r_distance : cyl.rotation * float3{1, 0, 0};
     return closestLocal;
 }
 
@@ -540,18 +542,18 @@ inline float3 closestPointOnCylinder(const Shape& cyl, const float3& p, float3& 
 // radially, whichever is closer. Returns false when the point is outside.
 inline bool pointInCylinder(const Shape& cyl, const float3& p, float3& r_push, float& r_surface)
 {
-    const float3 local = rotate(conjugate(cyl.rotation), p - cyl.center);
-    const float radialSq = lengthSq(float2{local.x, local.y});
-    if (radialSq >= cyl.radius * cyl.radius || std::fabs(local.z) >= cyl.halfHeight)
+    const float3 local = cyl.rotation.conjugate() * (p - cyl.center);
+    const float radialSq = local.x() * local.x() + local.y() * local.y();
+    if (radialSq >= cyl.radius * cyl.radius || std::fabs(local.z()) >= cyl.halfHeight)
         return false;
 
     const float radialDepth = cyl.radius - std::sqrt(radialSq);
-    const float capDepth = cyl.halfHeight - std::fabs(local.z);
+    const float capDepth = cyl.halfHeight - std::fabs(local.z());
 
     float3 pushLocal{0, 0, 0};
     if (capDepth < radialDepth)
     {
-        pushLocal.z = local.z >= 0.0f ? 1.0f : -1.0f;
+        pushLocal.z() = local.z() >= 0.0f ? 1.0f : -1.0f;
         r_surface = capDepth;
     }
     else
@@ -559,17 +561,17 @@ inline bool pointInCylinder(const Shape& cyl, const float3& p, float3& r_push, f
         const float len = std::sqrt(radialSq);
         if (len > 1.0e-6f)
         {
-            pushLocal.x = local.x / len;
-            pushLocal.y = local.y / len;
+            pushLocal.x() = local.x() / len;
+            pushLocal.y() = local.y() / len;
         }
         else
         {
-            pushLocal.x = 1.0f; // on the axis: any radial direction will do
+            pushLocal.x() = 1.0f; // on the axis: any radial direction will do
         }
         r_surface = radialDepth;
     }
 
-    r_push = rotate(cyl.rotation, pushLocal);
+    r_push = cyl.rotation * pushLocal;
     return true;
 }
 
@@ -593,15 +595,14 @@ inline void emitRanked(const Shape& shapeA, const Shape& shapeB,
     // Make a copy since we need to sort the candidates
     std::vector<Candidate> sortedCandidates(candidates.begin(), candidates.end());
 
-    std::stable_sort(sortedCandidates.begin(), sortedCandidates.end(),
-            [](const Candidate& a, const Candidate& b) { return a.depth > b.depth; });
+    std::ranges::stable_sort(sortedCandidates, std::greater{},
+            [](const Candidate& c) { return c.depth; });
 
     float3 midpoints[MAX_CONTACTS];
     contactCount = 0;
-    for (size_t i = 0; i < sortedCandidates.size() && contactCount < MAX_CONTACTS; ++i)
+    for (const Candidate& c : std::views::take(sortedCandidates, MAX_CONTACTS))
     {
-        const Candidate& c = sortedCandidates[i];
-        if (!addContact(shapeA, shapeB, contacts, contactCount, midpoints, c.xA, c.xB, i + 1))
+        if (!addContact(shapeA, shapeB, contacts, contactCount, midpoints, c.xA, c.xB, contactCount + 1))
             break;
     }
 }
@@ -618,8 +619,8 @@ inline void emitRanked(const Shape& shapeA, const Shape& shapeB,
 inline void cylinderSamples(const Shape& cyl, float3* out, int& count)
 {
     count = 0;
-    const float3 x = rotate(cyl.rotation, float3{1, 0, 0});
-    const float3 y = rotate(cyl.rotation, float3{0, 1, 0});
+    const float3 x = cyl.rotation * float3{1, 0, 0};
+    const float3 y = cyl.rotation * float3{0, 1, 0};
 
     // Both caps, centres first so a flat contact has a central point.
     for (int end = -1; end <= 1; end += 2)
@@ -652,7 +653,7 @@ inline int collideSphereSphere(const Shape& a, const Shape& b,
         std::span<Manifold::Contact> contacts, float3x3& basisOut)
 {
     const float3 d = b.center - a.center;
-    const float distSq = lengthSq(d);
+    const float distSq = d.squaredNorm();
     const float sum = a.radius + b.radius;
     if (distSq >= sum * sum)
         return 0;
@@ -675,12 +676,12 @@ inline int collideSphereBox(const Shape& a, const Shape& b, bool sphereIsA,
     const Shape& sphere = sphereIsA ? a : b;
     const Shape& box = sphereIsA ? b : a;
 
-    const float3 local = rotate(conjugate(box.rotation), sphere.center - box.center);
-    float3 clamped{clamp(local.x, -box.half.x, box.half.x), clamp(local.y, -box.half.y, box.half.y),
-            clamp(local.z, -box.half.z, box.half.z)};
-    const float3 closestLocal = rotate(box.rotation, clamped) + box.center;
+    const float3 local = box.rotation.conjugate() * (sphere.center - box.center);
+    float3 clamped{std::clamp(local.x(), -box.half.x(), box.half.x()), std::clamp(local.y(), -box.half.y(), box.half.y()),
+            std::clamp(local.z(), -box.half.z(), box.half.z())};
+    const float3 closestLocal = box.rotation * clamped + box.center;
     const float3 d = sphere.center - closestLocal;
-    const float distSq = lengthSq(d);
+    const float distSq = d.squaredNorm();
 
     if (distSq >= sphere.radius * sphere.radius)
         return 0;
@@ -733,8 +734,8 @@ inline int collideSphereCylinder(const Shape& a, const Shape& b, bool sphereIsA,
     if (distance >= sphere.radius)
         return 0;
 
-    // `outward` points from the cylinder surface towards the sphere centre, so it is the A-to-B
-    // normal only when the cylinder is A.
+// `outward` points from the cylinder surface towards the sphere centre, so it is the A-to-B
+// normal only when the cylinder is A.
     const float3 normalAB = sphereIsA ? -outward : outward;
     basisOut = orthonormal(-normalAB);
 
@@ -784,9 +785,10 @@ inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
     // Box corners inside the cylinder.
     for (int corner = 0; corner < 8 && candidateCount < MAX_CANDIDATES; ++corner)
     {
-        const float3 cornerLocal{((corner & 1) ? box.half.x : -box.half.x),
-                ((corner & 2) ? box.half.y : -box.half.y), ((corner & 4) ? box.half.z : -box.half.z)};
-        const float3 cornerWorld = rotate(box.rotation, cornerLocal) + box.center;
+        const float3 cornerLocal{float((corner & 1) ? box.half.x() : -box.half.x()),
+                float((corner & 2) ? box.half.y() : -box.half.y()),
+                float((corner & 4) ? box.half.z() : -box.half.z())};
+        const float3 cornerWorld = box.rotation * cornerLocal + box.center;
 
         float3 pushOut;
         float surfaceDist;
@@ -804,7 +806,7 @@ inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
     if (!candidateCount)
         return 0;
 
-    basisOut = orthonormal(-(lengthSq(normalAB) > 1.0e-12f ? normalize(normalAB) : cyl.axis));
+    basisOut = orthonormal(-(normalAB.squaredNorm() > 1.0e-12f ? normalAB.normalized() : cyl.axis));
 
     int count = 0;
     emitRanked(a, b, candidates, contacts, count);
@@ -850,7 +852,7 @@ inline int collideCylinderCylinder(const Shape& a, const Shape& b,
     if (!candidateCount)
         return 0;
 
-    basisOut = orthonormal(-(lengthSq(normalAB) > 1.0e-12f ? normalize(normalAB) : a.axis));
+    basisOut = orthonormal(-(normalAB.squaredNorm() > 1.0e-12f ? normalAB.normalized() : a.axis));
 
     int count = 0;
     emitRanked(a, b, candidates, contacts, count);
@@ -916,7 +918,7 @@ int collideShapes(const Shape& a, const Shape& b,
     {
         for (int j = 0; j < 3; ++j)
         {
-            float3 axis = cross(boxA.axis[i], boxB.axis[j]);
+            float3 axis = boxA.axis[i].cross(boxB.axis[j]);
             if (!testAxis(boxA, boxB, delta, axis, AXIS_EDGE, i, j, bestEdge))
                 return 0;
         }

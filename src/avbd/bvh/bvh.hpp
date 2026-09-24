@@ -25,14 +25,14 @@ namespace avbd { struct Rigid; }
 namespace bvh {
 
 // Helper functions
-using avbd::min;
-using avbd::abs;
+// using avbd::min;
+// using avbd::abs;
 using avbd::quat;
 using avbd::float3x3;
-using avbd::diagonal;
+// using avbd::diagonal;
 using std::max;
-static inline float3 rmin(float3 a, float3 b) { return {min(a.x, b.x), min(a.y, b.y), min(a.z, b.z)}; }
-static inline float3 rmax(float3 a, float3 b) { return {max(a.x, b.x), max(a.y, b.y), max(a.z, b.z)}; }
+static inline float3 rmin(float3 a, float3 b) { return {std::min(a.x(), b.x()), std::min(a.y(), b.y()), std::min(a.z(), b.z())}; }
+static inline float3 rmax(float3 a, float3 b) { return {std::max(a.x(), b.x()), std::max(a.y(), b.y()), std::max(a.z(), b.z())}; }
 
 // ============================================
 // SAH (Surface Area Heuristic) Utilities
@@ -41,9 +41,9 @@ namespace sah {
 
 /// Compute AABB surface area (constexpr for optimization)
 [[nodiscard]] constexpr inline float surfaceArea(const float3& min, const float3& max) noexcept {
-    float dx = max.x - min.x;
-    float dy = max.y - min.y;
-    float dz = max.z - min.z;
+    float dx = max.x() - min.x();
+    float dy = max.y() - min.y();
+    float dz = max.z() - min.z();
     return 2.0f * (dx * dy + dy * dz + dz * dx);
 }
 
