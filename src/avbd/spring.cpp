@@ -21,9 +21,9 @@ Spring::Spring(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, fl
     // A negative rest length means "derive it from the bodies' current pose".
     if (rest < 0.0f)
     {
-        const float3 pA = transform(p_bodyA->positionLin, p_bodyA->positionAng, rA);
-        const float3 pB = transform(p_bodyB->positionLin, p_bodyB->positionAng, rB);
-        rest = length(pA - pB);
+        const float3 pA = p_bodyA->positionLin + p_bodyA->positionAng * rA;
+        const float3 pB = p_bodyB->positionLin + p_bodyB->positionAng * rB;
+        rest = (pA - pB).norm();
     }
 }
 
@@ -31,10 +31,10 @@ Spring::Spring(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, fl
 // and its `updateDual` does nothing: hence the unnamed parameters.
 void Spring::updatePrimal(Rigid *body, float /*alpha*/, Block &block)
 {
-    float3 pA = transform(bodyA->positionLin, bodyA->positionAng, rA);
-    float3 pB = transform(bodyB->positionLin, bodyB->positionAng, rB);
+    float3 pA = bodyA->positionLin + bodyA->positionAng * rA;
+    float3 pB = bodyB->positionLin + bodyB->positionAng * rB;
     float3 d = pA - pB;
-    float dLen = length(d);
+    float dLen = d.norm();
     if (dLen <= 1.0e-6f)
         return;
 
@@ -47,22 +47,22 @@ void Spring::updatePrimal(Rigid *body, float /*alpha*/, Block &block)
     float3 jAng;
     if (body == bodyA)
     {
-        rWorld = rotate(bodyA->positionAng, rA);
+        rWorld = bodyA->positionAng * rA;
         jLin = n;
-        jAng = cross(rWorld, n);
+        jAng = rWorld.cross(n);
     }
     else
     {
-        rWorld = rotate(bodyB->positionAng, rB);
+        rWorld = bodyB->positionAng * rB;
         jLin = -n;
-        jAng = -cross(rWorld, n);
+        jAng = -rWorld.cross(n);
     }
 
     float3 F = jLin * f;
     float3 Tau = jAng * f;
-    float3x3 Kll = outer(jLin, jLin) * stiffness;
-    float3x3 Kla = outer(jAng, jLin) * stiffness;
-    float3x3 Kaa = outer(jAng, jAng) * stiffness;
+    float3x3 Kll = jLin * jLin.transpose() * stiffness;
+    float3x3 Kla = jAng * jLin.transpose() * stiffness;
+    float3x3 Kaa = jAng * jAng.transpose() * stiffness;
 
     block.lhsLin += Kll;
     block.lhsAng += Kaa;

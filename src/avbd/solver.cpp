@@ -51,9 +51,9 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
     {
         if ((body->collisionLayer & p_mask) == 0)
             continue;
-        quat invRot = conjugate(body->positionAng);
-        float3 o = rotate(invRot, origin - body->positionLin);
-        float3 d = rotate(invRot, dir);
+        quat invRot = body->positionAng.conjugate();
+        float3 o = invRot * (origin - body->positionLin);
+        float3 d = invRot * dir;
         float3 half = body->size * 0.5f;
 
         float tEnter = 0.0f;
@@ -82,8 +82,8 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
                 t1 = tmp;
             }
 
-            tEnter = max(tEnter, t0);
-            tExit = min(tExit, t1);
+            tEnter = std::max(tEnter, t0);
+            tExit = std::min(tExit, t1);
             if (tEnter > tExit)
             {
                 hit = false;
@@ -144,7 +144,7 @@ static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
     // mask (defaults 1/1 keep every pair, as before these fields existed).
     const bool layersAllow = ((bodyA->collisionLayer & bodyB->collisionMask) != 0) ||
             ((bodyB->collisionLayer & bodyA->collisionMask) != 0);
-    return dot(dp, dp) <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB);
+    return dp.squaredNorm() <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB);
 }
 
 // Contact detection. The naive O(n^2) scan over bounding spheres, as in the reference
@@ -265,8 +265,8 @@ void Solver::warmstartBodies()
 
         // Adaptive warmstart (See original VBD paper)
         const float3 accel = (body->velocityLin - body->prevVelocityLin) / dt;
-        const float accelExt = accel.z * sign(g);
-        float accelWeight = clamp(accelExt / abs(g), 0.0f, 1.0f);
+        const float accelExt = accel.z() * std::copysign(1.0f, g);
+        float accelWeight = std::clamp(accelExt / std::fabs(g), 0.0f, 1.0f);
         if (!std::isfinite(accelWeight))
             accelWeight = 0.0f;
 
@@ -298,7 +298,7 @@ void Solver::solveIterations(int forceCount)
             {
                 for (int i = 0; i < m->numContacts; i++)
                 {
-                    float penetration = length(m->contacts[i].C0);
+                    float penetration = m->contacts[i].C0.norm();
                     if (penetration > 0.0f)
                     {
                         totalPenetration += penetration;
@@ -466,7 +466,7 @@ void Solver::colourGraph()
             {
                 // Skip if sleeping and no velocity or forces
                 if (body->sleeping && 
-                    std::sqrt(body->velocityLin.x*body->velocityLin.x + body->velocityLin.y*body->velocityLin.y + body->velocityLin.z*body->velocityLin.z) == 0.0f && 
+                    body->velocityLin.squaredNorm() == 0.0f && 
                     body->forces == nullptr)
                 {
                     should_update = false;
@@ -476,7 +476,7 @@ void Solver::colourGraph()
             {
                 // Start in sleep, wake up if velocity or forces are present
                 if (!body->sleeping && 
-                    std::sqrt(body->velocityLin.x*body->velocityLin.x + body->velocityLin.y*body->velocityLin.y + body->velocityLin.z*body->velocityLin.z) == 0.0f && 
+                    body->velocityLin.squaredNorm() == 0.0f && 
                     body->forces == nullptr)
                 {
                     should_update = false;

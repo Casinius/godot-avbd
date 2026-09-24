@@ -148,7 +148,7 @@ void AVBDSoftBody3D::_build(avbd::Solver &p_solver, const Transform3D &p_node_in
     // build arrived at is carried over whenever the resolution is unchanged.
     const bool reuse = cells.has_value() && cells->size() == static_cast<std::size_t>(count);
     if (!reuse) {
-        cells = std::vector<Cell>(count, Cell{avbd::float3{0, 0, 0}, avbd::quat{0, 0, 0, 1}});
+        cells = std::vector<Cell>(count, Cell{avbd::float3{0, 0, 0}, avbd::quat::Identity()});
     }
 
     // Keep the MultiMesh in step with the lattice parameters.
@@ -177,7 +177,7 @@ void AVBDSoftBody3D::_build(avbd::Solver &p_solver, const Transform3D &p_node_in
         const float cx = static_cast<float>(x) - static_cast<float>(nx - 1) * 0.5f;
         const float cy = static_cast<float>(y) - static_cast<float>(ny - 1) * 0.5f;
         const float cz = static_cast<float>(z) - static_cast<float>(nz - 1) * 0.5f;
-        return Vector3(cx * spacing.x, cy * spacing.y, cz * spacing.z);
+        return Vector3(cx * spacing.x(), cy * spacing.y(), cz * spacing.z());
     };
 
     rigids.assign(count, nullptr);
@@ -187,7 +187,7 @@ void AVBDSoftBody3D::_build(avbd::Solver &p_solver, const Transform3D &p_node_in
                 const int index = cell_index(x, y, z);
 
                 avbd::float3 position;
-                avbd::quat rotation{0, 0, 0, 1};
+                avbd::quat rotation = avbd::quat::Identity();
                 if (reuse) {
                     position = (*cells)[index].position;
                     rotation = (*cells)[index].rotation;

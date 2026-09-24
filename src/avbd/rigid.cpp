@@ -11,6 +11,7 @@
 
 #include "avbd/solver.h"
 #include "avbd/bvh/node_storage.hpp"
+#include <cmath>
 
 namespace avbd {
 
@@ -21,7 +22,7 @@ Rigid::Rigid(Solver *p_solver, float3 p_size, float p_density, float p_friction,
 
 Rigid::Rigid(Solver *p_solver, float3 p_size, ShapeType p_shape, float p_density, float p_friction,
         float3 p_position, float3 p_velocity)
-    : solver(p_solver), forces(0), next(0), positionLin(p_position), positionAng({ 0, 0, 0, 1 }),
+    : solver(p_solver), forces(0), next(0), positionLin(p_position), positionAng(quat::Identity()),
     velocityLin(p_velocity), velocityAng({ 0, 0, 0 }), prevVelocityLin(p_velocity), size(p_size),
     shape(p_shape), friction(p_friction), gravity(p_solver->gravity)
 {
@@ -52,7 +53,7 @@ Rigid::Rigid(Solver *p_solver, float3 p_size, ShapeType p_shape, float p_density
             const float radial = mass * (3.0f * r * r + h * h) / 12.0f; // about local X and Y
             moment = float3{radial, radial, axial};
             // Bounding radius of the whole cylinder: half the diagonal of its box.
-            radius = length(float3{r, h * 0.5f, r});
+            radius = std::sqrt(float3(r, h * 0.5f, r).dot(float3(r, h * 0.5f, r)));
             break;
         }
 
@@ -65,7 +66,7 @@ Rigid::Rigid(Solver *p_solver, float3 p_size, ShapeType p_shape, float p_density
                 (p_size.x() * p_size.x() + p_size.z() * p_size.z()) / 12.0f * mass,
                 (p_size.x() * p_size.x() + p_size.y() * p_size.y()) / 12.0f * mass
             };
-            radius = length(p_size * 0.5f);
+            radius = std::sqrt((p_size * 0.5f).dot((p_size*0.5f)));
             break;
         }
     }

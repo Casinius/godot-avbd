@@ -37,7 +37,7 @@ inline avbd::float3 to_sim(const godot::Vector3 &v) {
 }
 
 inline godot::Vector3 to_godot(const avbd::float3 &v) {
-    return godot::Vector3(v.x, v.z, -v.y);
+    return godot::Vector3(v.x(), v.z(), -v.y());
 }
 
 // A direction expressed on a Godot axis, in solver space. Anything that names an *axis index*
@@ -65,11 +65,13 @@ inline avbd::float3 to_sim_extents(const godot::Vector3 &v) {
 // --- rotations ---------------------------------------------------------------
 
 inline avbd::quat to_sim(const godot::Quaternion &q) {
-    return avbd::quat{q.x, -q.z, q.y, q.w};
+    // Eigen's four-scalar Quaternion constructor is (w, x, y, z); the component mapping is
+    // solver (x, y, z) = Godot (x, -z, y).
+    return avbd::quat(q.w, q.x, -q.z, q.y);
 }
 
 inline godot::Quaternion to_godot(const avbd::quat &q) {
-    return godot::Quaternion(q.x, q.z, -q.y, q.w);
+    return godot::Quaternion(q.x(), q.z(), -q.y(), q.w());
 }
 
 // A basis rotated into solver space, normalised (AVBD quaternions integrate by
