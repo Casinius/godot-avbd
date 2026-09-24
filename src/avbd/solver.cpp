@@ -339,7 +339,11 @@ void Solver::solveIterations(int forceCount)
 
     // One dispatch covers every round: the barrier fences inside `iterate` carry the
     // Gauss-Seidel ordering, so the loop body below runs the whole set, not one round.
-    iterate(targetIterations, forceCount);
+    // newtonRatio splits the set: the leading rounds run primal + dual, the tail runs
+    // dual-only relaxation (optionally with penalty decay via stiffnessDecay).
+    const int newtonRounds = std::clamp(
+            static_cast<int>(std::ceil(newtonRatio * static_cast<float>(targetIterations))), 0, targetIterations);
+    iterate(targetIterations, forceCount, newtonRounds);
 }
 
 // One worker-loop body for the whole iteration set: `iterations` rounds of a primal pass
@@ -353,24 +357,47 @@ void Solver::solveIterations(int forceCount)
 // Both sync types run the identical body: NullSync (small scenes, or another solver
 // holding the loop) executes it inline in list order, which is exactly the threads=1
 // reference the digest tests compare against.
-void Solver::iterate(int targetIterations, int forceCount)
+void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
 {
-    const auto loop = [this, targetIterations, forceCount](int, auto &sync) {
+    const auto loop = [this, targetIterations, forceCount, newtonRounds](int, auto &sync) {
         for (int it = 0; it < targetIterations; it++)
         {
-            for (int colour = 0; colour < colours; colour++)
+            const bool newton = it < newtonRounds;
+            if (newton)
             {
-                const int first = colourStart[colour];
-                const int last = colourStart[colour + 1];
-                sync.forItems(last - first, [this, first](int i) {
-                    updatePrimal(updateOrder[first + i]);
-                });
-                sync.arriveAndWait();
+                for (int colour = 0; colour < colours; colour++)
+                {
+                    const int first = colourStart[colour];
+                    const int last = colourStart[colour + 1];
+                    sync.forItems(last - first, [this, first](int i) {
+                        updatePrimal(updateOrder[first + i]);
+                    });
+                    sync.arriveAndWait();
+                }
             }
 
             // Dual update: one item per force, and each force only reads the (frozen)
             // body poses and writes its own dual state, so the whole pass is independent.
             // Frozen constraints have nothing to update: every input they read is parked.
+            // In the impulse tail, decay the contact penalties first (stiffnessDecay < 1):
+            // relaxation converges poorly against a stiff ramp, softening lets the cheap
+            // rounds finish the job the Newton rounds started.
+            if (!newton && stiffnessDecay < 1.0f)
+            {
+                const float decay = stiffnessDecay;
+                const float cap = PENALTY_MAX;
+                sync.forItems(forceCount, [this, decay, cap](int i) {
+                    Force *f = forceOrder[i];
+                    // contactPointCount() > 0 iff the force is a Manifold; other forces
+                    // keep their own penalty ramp untouched.
+                    if (f->contactPointCount() > 0) {
+                        Manifold *m = static_cast<Manifold *>(f);
+                        for (int ci = 0, n = m->numContacts; ci < n; ++ci)
+                            m->contacts[ci].penalty = (m->contacts[ci].penalty * decay).cwiseMin(float3{cap, cap, cap});
+                    }
+                });
+                sync.arriveAndWait();
+            }
             sync.forItems(forceCount, [this](int i) {
                 if (!constraintFrozen(forceOrder[i]))
                     forceOrder[i]->updateDual(alpha);
