@@ -87,7 +87,7 @@ namespace avbd {
 
 using float3x3 = Eigen::Matrix<float, 3, 3>;
 using float3 = Eigen::Vector3<float>;
-
+using float2 = Eigen::Vector2<float>;
 using quat = Eigen::Quaternion<float>;
 [[nodiscard]] inline float3x3 diagonal(float m00, float m11, float m22) noexcept
 {
@@ -97,6 +97,23 @@ using quat = Eigen::Quaternion<float>;
          0.0f, 0.0f, m22;
     return m;
 }
+
+// Right-handed orthonormal frame with the given unit vector as its first ROW (the contact
+// normal). Row-major on purpose: the manifold code treats basis.row(0) as the normal.
+[[nodiscard]] inline float3x3 orthonormal(float3 normal) noexcept
+{
+    float3 t1 = std::fabs(normal.x()) > std::fabs(normal.z())
+            ? float3{-normal.y(), normal.x(), 0}
+            : float3{0, -normal.z(), normal.y()};
+    t1 = t1.normalized();
+    const float3 t2 = normal.cross(t1);
+    float3x3 m;
+    m.row(0) = normal;
+    m.row(1) = t1;
+    m.row(2) = t2;
+    return m;
+}
+
 // //
 // -----------------------------------------------------------------------------
 // // quat operators
@@ -129,6 +146,17 @@ using quat = Eigen::Quaternion<float>;
 [[nodiscard]] inline float3 operator-(quat a, quat b) noexcept {
   const quat d = a * b.inverse();
   return float3{d.x(), d.y(), d.z()} * 2.0f;
+}
+
+// First-order quaternion integration, as the original custom maths did: half of omega (as a
+// pure quaternion) left-multiplied, then renormalised. The added rotation vector is the same
+// small-angle quantity `operator-(quat, quat)` measures.
+[[nodiscard]] inline quat operator+(quat a, float3 b) noexcept {
+  // Eigen's four-scalar Quaternion constructor is (w, x, y, z): a pure quaternion has w = 0.
+  const quat omega(0.0f, b.x(), b.y(), b.z());
+  quat result;
+  result.coeffs() = a.coeffs() + (omega * a).coeffs() * 0.5f;
+  return result.normalized();
 }
 
 // Solve the symmetric 6x6 system [aLin  aCross^T; aCross  aAng] x = [bLin;

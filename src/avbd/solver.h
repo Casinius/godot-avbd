@@ -168,7 +168,7 @@ struct Block
           quat positionAng, quat inertialAng) noexcept :
             lhsLin(diagonal(mass, mass, mass) / dtSq),
             lhsAng(diagonal(moment.x(), moment.y(), moment.z()) / dtSq),
-            lhsCross(0),
+            lhsCross(float3x3::Zero()),
             rhsLin(diagonal(mass, mass, mass) / dtSq * (positionLin - inertialLin)),
             rhsAng(diagonal(moment.x(), moment.y(), moment.z()) / dtSq * (positionAng - inertialAng)) {}
 

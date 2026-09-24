@@ -68,7 +68,7 @@ Vector3 AVBDDirectBodyState3D::_get_inverse_inertia() const {
         return Vector3();
     }
     const avbd::float3 moment = rigid->moment;
-    return to_godot(avbd::float3{1.0f / moment.x, 1.0f / moment.y, 1.0f / moment.z});
+    return to_godot(avbd::float3{1.0f / moment.x(), 1.0f / moment.y(), 1.0f / moment.z()});
 }
 
 Basis AVBDDirectBodyState3D::_get_inverse_inertia_tensor() const {
@@ -119,7 +119,7 @@ Vector3 AVBDDirectBodyState3D::_get_velocity_at_local_position(const Vector3 &p_
         return Vector3();
     }
     const avbd::float3 r = to_sim(p_local_position);
-    const avbd::float3 velocity = rigid->velocityLin + avbd::cross(rigid->velocityAng, r);
+    const avbd::float3 velocity = rigid->velocityLin + rigid->velocityAng.cross(r);
     return to_godot(velocity);
 }
 
@@ -136,19 +136,19 @@ void AVBDDirectBodyState3D::_apply_impulse(const Vector3 &p_impulse, const Vecto
     const avbd::float3 impulse = to_sim(p_impulse);
     const avbd::float3 r = to_sim(p_position);
     rigid->velocityLin += impulse / rigid->mass;
-    const avbd::float3 torque = avbd::cross(r, impulse);
-    const avbd::float3 local = avbd::rotate(avbd::conjugate(rigid->positionAng), torque);
-    const avbd::float3 delta{local.x / rigid->moment.x, local.y / rigid->moment.y, local.z / rigid->moment.z};
-    rigid->velocityAng += avbd::rotate(rigid->positionAng, delta);
+    const avbd::float3 torque = r.cross(impulse);
+    const avbd::float3 local = rigid->positionAng.conjugate() * torque;
+    const avbd::float3 delta{local.x() / rigid->moment.x(), local.y() / rigid->moment.y(), local.z() / rigid->moment.z()};
+    rigid->velocityAng += rigid->positionAng * delta;
 }
 
 void AVBDDirectBodyState3D::_apply_torque_impulse(const Vector3 &p_impulse) {
     if (rigid == nullptr || rigid->mass <= 0.0f) {
         return;
     }
-    const avbd::float3 local = avbd::rotate(avbd::conjugate(rigid->positionAng), to_sim(p_impulse));
-    const avbd::float3 delta{local.x / rigid->moment.x, local.y / rigid->moment.y, local.z / rigid->moment.z};
-    rigid->velocityAng += avbd::rotate(rigid->positionAng, delta);
+    const avbd::float3 local = rigid->positionAng.conjugate() * to_sim(p_impulse);
+    const avbd::float3 delta{local.x() / rigid->moment.x(), local.y() / rigid->moment.y(), local.z() / rigid->moment.z()};
+    rigid->velocityAng += rigid->positionAng * delta;
 }
 
 void AVBDDirectBodyState3D::_apply_central_force(const Vector3 &p_force) {
@@ -247,7 +247,7 @@ Vector3 AVBDDirectBodyState3D::_get_contact_local_velocity_at_position(int32_t p
     }
     const Vector3 world = server != nullptr ? server->body_state_contact_position(body_rid, p_contact_idx) : Vector3();
     const avbd::float3 r = to_sim(world - to_godot(rigid->positionLin));
-    return to_godot(rigid->velocityLin + avbd::cross(rigid->velocityAng, r));
+    return to_godot(rigid->velocityLin + rigid->velocityAng.cross(r));
 }
 
 RID AVBDDirectBodyState3D::_get_contact_collider(int32_t p_contact_idx) const {

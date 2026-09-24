@@ -76,11 +76,11 @@ static int count_contact_points(const Solver &s) {
 }
 
 static bool finite(const Rigid *b) {
-    return std::isfinite(b->positionLin.x) && std::isfinite(b->positionLin.y) && std::isfinite(b->positionLin.z) &&
-           std::isfinite(b->positionAng.x) && std::isfinite(b->positionAng.y) && std::isfinite(b->positionAng.z) &&
-           std::isfinite(b->positionAng.w) && std::isfinite(b->velocityLin.x) && std::isfinite(b->velocityLin.y) &&
-           std::isfinite(b->velocityLin.z) && std::isfinite(b->velocityAng.x) && std::isfinite(b->velocityAng.y) &&
-           std::isfinite(b->velocityAng.z);
+    return std::isfinite(b->positionLin.x()) && std::isfinite(b->positionLin.y()) && std::isfinite(b->positionLin.z()) &&
+           std::isfinite(b->positionAng.x()) && std::isfinite(b->positionAng.y()) && std::isfinite(b->positionAng.z()) &&
+           std::isfinite(b->positionAng.w()) && std::isfinite(b->velocityLin.x()) && std::isfinite(b->velocityLin.y()) &&
+           std::isfinite(b->velocityLin.z()) && std::isfinite(b->velocityAng.x()) && std::isfinite(b->velocityAng.y()) &&
+           std::isfinite(b->velocityAng.z());
 }
 
 static bool all_finite(const Solver &s) {
@@ -95,9 +95,9 @@ static bool all_finite(const Solver &s) {
 static float max_abs_position(const Solver &s) {
     float m = 0.0f;
     for (const Rigid *b = s.bodies; b != nullptr; b = b->next) {
-        m = std::max(m, std::fabs(b->positionLin.x));
-        m = std::max(m, std::fabs(b->positionLin.y));
-        m = std::max(m, std::fabs(b->positionLin.z));
+        m = std::max(m, std::fabs(b->positionLin.x()));
+        m = std::max(m, std::fabs(b->positionLin.y()));
+        m = std::max(m, std::fabs(b->positionLin.z()));
     }
     return m;
 }
@@ -135,11 +135,11 @@ static void test_rest_contact() {
     // Ground slab is 1 thick, centred on z = 0, so its top face is z = 0.5 and a
     // 1x1x1 box rests with its centre at z = 1.0. AVBD is a soft-penalty method:
     // a small penetration is expected (COLLISION_MARGIN is 1 cm).
-    const float rest_z = box->positionLin.z;
+    const float rest_z = box->positionLin.z();
     const float penetration = 1.0f - rest_z;
     report(std::fabs(penetration) <= 0.02f, "rest contact", "z=%.5f (surface 0.5 + half 0.5), penetration=%.5f", rest_z,
             penetration);
-    report(std::fabs(box->velocityLin.z) <= 0.05f, "rest velocity", "vz=%.5f", box->velocityLin.z);
+    report(std::fabs(box->velocityLin.z()) <= 0.05f, "rest velocity", "vz=%.5f", box->velocityLin.z());
     report(all_finite(s), "rest finite", "bodies=%d contacts=%d", count_bodies(s), count_contact_points(s));
 }
 
@@ -167,16 +167,16 @@ static void test_stack_stability() {
     float worst_interface = 0.0f; // penetration between two boxes
     float worst_lateral = 0.0f;
     for (size_t i = 0; i < boxes.size(); i++) {
-        const float z = boxes[i]->positionLin.z;
+        const float z = boxes[i]->positionLin.z();
         // Ideal: the bottom box's centre is one half-height above the slab's top
         // face (1.0), and each box above sits exactly one box-height higher.
-        const float penetration = (i == 0) ? 1.0f - z : 1.0f - (z - boxes[i - 1]->positionLin.z);
+        const float penetration = (i == 0) ? 1.0f - z : 1.0f - (z - boxes[i - 1]->positionLin.z());
         if (i == 0) {
             worst_ground = penetration;
         } else {
             worst_interface = std::max(worst_interface, penetration);
         }
-        worst_lateral = std::max(worst_lateral, std::hypot(boxes[i]->positionLin.x, boxes[i]->positionLin.y));
+        worst_lateral = std::max(worst_lateral, std::hypot(boxes[i]->positionLin.x(), boxes[i]->positionLin.y()));
     }
 
     report(worst_ground <= 0.02f, "stack on ground", "bottom box penetration = %.5f m", worst_ground);
@@ -202,12 +202,12 @@ static RampResult ramp_run(float mu, float seconds) {
     Solver s;
     new Rigid(&s, {100, 100, 1}, 0.0f, mu, {0, 0, 0});
 
-    const float angle = rad(20.0f);
+    const float angle = 20.0f * float(M_PI) / 180.0f;
     Rigid *ramp = new Rigid(&s, {40, 24, 1}, 0.0f, mu, {0, 0, 6});
-    ramp->positionAng = {0, std::sin(angle * 0.5f), 0, std::cos(angle * 0.5f)};
+    ramp->positionAng = quat(Eigen::AngleAxisf(angle, float3::UnitY()));
 
-    const float3 tangent = normalize(rotate(ramp->positionAng, float3{1, 0, 0}));
-    const float3 normal = normalize(rotate(ramp->positionAng, float3{0, 0, 1}));
+    const float3 tangent = (ramp->positionAng * float3{1, 0, 0}).normalized();
+    const float3 normal = (ramp->positionAng * float3{0, 0, 1}).normalized();
     // Ramp half thickness (0.5) + box half (0.5) + a small drop gap.
     const float3 start = ramp->positionLin + tangent * -5.0f + normal * 1.05f;
     Rigid *box = new Rigid(&s, {1, 1, 1}, 1.0f, mu, start);
@@ -221,7 +221,7 @@ static RampResult ramp_run(float mu, float seconds) {
 
     const float3 total = box->positionLin - start;
     const float3 late = box->positionLin - before;
-    return {std::hypot(total.x, total.y), std::hypot(late.x, late.y), length(box->velocityLin)};
+    return {std::hypot(total.x(), total.y()), std::hypot(late.x(), late.y()), box->velocityLin.norm()};
 }
 
 static void test_friction() {
@@ -262,14 +262,14 @@ static void test_hard_joints() {
     for (size_t i = 0; i < joints.size(); i++) {
         Rigid *a = (i == 0) ? anchor : links[i - 1];
         Rigid *b = links[i];
-        const float3 ca = transform(a->positionLin, a->positionAng, float3{0, 0, -0.5f});
-        const float3 cb = transform(b->positionLin, b->positionAng, float3{0, 0, 0.5f});
-        worst = std::max(worst, length(ca - cb));
+        const float3 ca = a->positionLin + a->positionAng * float3{0, 0, -0.5f};
+        const float3 cb = b->positionLin + b->positionAng * float3{0, 0, 0.5f};
+        worst = std::max(worst, (ca - cb).norm());
     }
 
     report(worst <= 0.01f, "hard joint error", "max anchor separation = %.6f m (link = 1 m)", worst);
-    report(links[3]->positionLin.z < anchor->positionLin.z, "chain hangs", "tail z=%.4f below anchor z=%.4f",
-            links[3]->positionLin.z, anchor->positionLin.z);
+    report(links[3]->positionLin.z() < anchor->positionLin.z(), "chain hangs", "tail z=%.4f below anchor z=%.4f",
+            links[3]->positionLin.z(), anchor->positionLin.z());
     report(all_finite(s), "joints finite", "bodies=%d joints=%d", count_bodies(s), count_forces(s));
 }
 
@@ -329,9 +329,9 @@ static void test_soft_lattice() {
 
     float worst = 0.0f;
     for (size_t i = 0; i < joints.size(); i++) {
-        const float3 ca = transform(links[i].a->positionLin, links[i].a->positionAng, links[i].ra);
-        const float3 cb = transform(links[i].b->positionLin, links[i].b->positionAng, links[i].rb);
-        worst = std::max(worst, length(ca - cb));
+        const float3 ca = links[i].a->positionLin + links[i].a->positionAng * links[i].ra;
+        const float3 cb = links[i].b->positionLin + links[i].b->positionAng * links[i].rb;
+        worst = std::max(worst, (ca - cb).norm());
     }
 
     report(worst <= 0.05f, "lattice joint error", "max joint separation = %.5f m (rest length 0)", worst);
@@ -524,7 +524,7 @@ static void test_generic_hinge() {
         s.step();
         worstLocked = std::max(worstLocked, std::fabs(rig.joint->angularValue(0)));
         worstLocked = std::max(worstLocked, std::fabs(rig.joint->angularValue(2)));
-        worstHub = std::max(worstHub, length(rig.joint->anchorA() - rig.joint->anchorB()));
+        worstHub = std::max(worstHub, (rig.joint->anchorA() - rig.joint->anchorB()).norm());
     }
 
     report(worstLocked <= 0.01f, "hinge locked axes hold through 24 turns",
@@ -549,7 +549,7 @@ static void test_generic_hinge() {
     for (int i = 0; i < 120; i++)
         slow.step();
 
-    const float kept = slowRig.body->velocityAng.y;
+    const float kept = slowRig.body->velocityAng.y();
     report(kept >= 0.98f, "free axle keeps its spin", "%.4f rad/s of 1.0 after 2 s (%.1f%%)", kept,
             100.0f * kept);
 }
@@ -575,7 +575,7 @@ static void test_spin_retention() {
 
         // How much of the rotation is lost is set by the angle turned per step: the recovery
         // vector is 2*sin(x/2)/x short. At 10 rad/s (0.167 rad per step) most of it goes.
-        const float retained = body->velocityAng.y / c.spin;
+        const float retained = body->velocityAng.y() / c.spin;
         if (c.spin == 1.0f)
             worstShortfall = 1.0f - retained;
         report(retained > 0.5f && retained <= 1.0001f, "spin decays monotonically with rate",
@@ -685,20 +685,20 @@ static void test_generic_ball_socket() {
         rig.setAxis(i, true, AxisMode::Free);
     }
 
-    const float initial = length(rig.joint->anchorA() - rig.joint->anchorB());
+    const float initial = (rig.joint->anchorA() - rig.joint->anchorB()).norm();
     rig.body->velocityLin = {1.5f, 0, 0}; // set it swinging
 
     float worst = 0.0f;
     for (int i = 0; i < 300; i++) {
         s.step();
-        worst = std::max(worst, length(rig.joint->anchorA() - rig.joint->anchorB()));
+        worst = std::max(worst, (rig.joint->anchorA() - rig.joint->anchorB()).norm());
     }
 
     report(initial <= 1.0e-5f, "socket anchors start together", "initial separation = %.7f m", initial);
     report(worst <= 0.01f, "socket holds under a swinging moment",
             "worst anchor separation = %.5f m while swinging", worst);
-    report(rig.body->positionLin.z < -0.5f, "socket hangs the body below its hub",
-            "body centre at z = %.4f (starts at -1)", rig.body->positionLin.z);
+    report(rig.body->positionLin.z() < -0.5f, "socket hangs the body below its hub",
+            "body centre at z = %.4f (starts at -1)", rig.body->positionLin.z());
 }
 
 // A body that starts out rotated. This is the case that hid the deviation bug: every other test
@@ -713,7 +713,7 @@ static void test_generic_rotated_rest_pose() {
     Rigid *wheel = new Rigid(&s, {0.3f, 0.3f, 0.16f}, ShapeType::Cylinder, 500.0f, 0.9f, {0, 0, 9.0f});
     // Turned so the cylinder's axis points along world X: the pose the joint is created in is not
     // the identity.
-    wheel->positionAng = normalize(quat{0, std::sin(-0.7853982f), 0, std::cos(-0.7853982f)});
+    wheel->positionAng = quat(Eigen::AngleAxisf(-0.7853982f, float3::UnitY()));
 
     GenericJoint *joint = new GenericJoint(&s, anchor, wheel, {0, 0, 1.0f}, {0, 0, 0});
     for (int i = 0; i < 3; i++) {
@@ -751,8 +751,8 @@ static void test_generic_rotated_rest_pose() {
             "worst locked-axis drift = %.5f rad over 10 s of spinning (unbounded before: NaN)", worstLocked);
     report(worstPenalty < 1.0e5f, "locked axes do not inflate",
             "peak penalty = %.1f (unbounded it reached 41138 and tore the joint apart)", worstPenalty);
-    report(std::isfinite(wheel->velocityAng.x), "rotated rest pose stays finite",
-            "axle spin = %.3f rad/s after 10 s", wheel->velocityAng.x);
+    report(std::isfinite(wheel->velocityAng.x()), "rotated rest pose stays finite",
+            "axle spin = %.3f rad/s after 10 s", wheel->velocityAng.x());
 }
 
 // A free axis with no spring is genuinely free: nothing may fight an applied spin.
@@ -769,8 +769,8 @@ static void test_generic_free_axis() {
         s.step();
 
     const float3 w = rig.body->velocityAng;
-    report(std::fabs(w.x - 0.4f) <= 0.02f && std::fabs(w.y - 0.5f) <= 0.02f && std::fabs(w.z - 0.6f) <= 0.02f,
-            "free axes are free", "spin (%.4f %.4f %.4f) started at (0.4 0.5 0.6)", w.x, w.y, w.z);
+    report(std::fabs(w.x() - 0.4f) <= 0.02f && std::fabs(w.y() - 0.5f) <= 0.02f && std::fabs(w.z() - 0.6f) <= 0.02f,
+            "free axes are free", "spin (%.4f %.4f %.4f) started at (0.4 0.5 0.6)", w.x(), w.y(), w.z());
 }
 
 
@@ -788,23 +788,23 @@ static float restHeight(ShapeType shape, float3 size, quat orientation, int step
     body->positionAng = orientation;
     for (int i = 0; i < steps; i++)
         s.step();
-    return body->positionLin.z;
+    return body->positionLin.z();
 }
 
 static void test_round_shapes_rest() {
     // Sphere: centre one radius above the ground (ground top is z = 0).
-    const float sphere = restHeight(ShapeType::Sphere, {0.5f, 0, 0}, {0, 0, 0, 1});
+    const float sphere = restHeight(ShapeType::Sphere, {0.5f, 0, 0}, quat::Identity());
     report(std::fabs(sphere - 0.5f) <= 0.05f, "sphere rests at its radius",
             "centre z = %.4f (radius 0.5, penetration %.4f)", sphere, 0.5f - sphere);
 
     // Cylinder on its cap: centre half a height up. The axis is local Z, already vertical.
-    const float capped = restHeight(ShapeType::Cylinder, {0.5f, 0.5f, 1.0f}, {0, 0, 0, 1});
+    const float capped = restHeight(ShapeType::Cylinder, {0.5f, 0.5f, 1.0f}, quat::Identity());
     report(std::fabs(capped - 0.5f) <= 0.06f, "cylinder rests on its cap",
             "centre z = %.4f (half height 0.5, penetration %.4f)", capped, 0.5f - capped);
 
     // Cylinder on its side: rotated so the axis is horizontal, the round side touches and the
     // centre sits one radius up. This is the wheel case.
-    const quat toSide = normalize(quat{std::sin(0.7853982f), 0, 0, std::cos(0.7853982f)});
+    const quat toSide = quat(Eigen::AngleAxisf(0.7853982f, float3::UnitX()));
     const float onSide = restHeight(ShapeType::Cylinder, {0.5f, 0.5f, 1.0f}, toSide);
     report(std::fabs(onSide - 0.5f) <= 0.06f, "cylinder rests on its side",
             "centre z = %.4f (radius 0.5, penetration %.4f)", onSide, 0.5f - onSide);
@@ -816,7 +816,7 @@ static void test_round_shapes_rest() {
     Rigid *upper = new Rigid(&s, {0.5f, 0, 0}, ShapeType::Sphere, 1000.0f, 0.5f, {0, 0, 2.5f});
     for (int i = 0; i < 500; i++)
         s.step();
-    const float gap = upper->positionLin.z - lower->positionLin.z;
+    const float gap = upper->positionLin.z() - lower->positionLin.z();
     report(std::fabs(gap - 1.0f) <= 0.12f, "sphere stacks on sphere",
             "centre separation = %.4f (two radii = 1.0, penetration %.4f)", gap, 1.0f - gap);
 }
@@ -834,11 +834,11 @@ static void test_round_shape_rolls() {
         s.step();
     wheel->velocityAng = {20.0f, 0, 0};
 
-    const float startY = wheel->positionLin.y;
+    const float startY = wheel->positionLin.y();
     for (int i = 0; i < 120; i++)
         s.step();
-    const float travelled = wheel->positionLin.y - startY;
-    const float spin = wheel->velocityAng.x;
+    const float travelled = wheel->positionLin.y() - startY;
+    const float spin = wheel->velocityAng.x();
 
     // Rolling without slipping means the contact point is stationary: v_centre + w x r = 0. With
     // the axle along +X the contact sits at -Z, so w x r is +Y and the centre must move -Y. A
@@ -860,9 +860,9 @@ static void shape_of(const Rigid *b, Shape &s) {
     s.center = b->positionLin;
     s.rotation = b->positionAng;
     s.half = b->size * 0.5f;
-    s.radius = b->size.x;
-    s.halfHeight = b->size.z * 0.5f;
-    s.axis = rotate(b->positionAng, float3{0, 0, 1});
+    s.radius = b->size.x();
+    s.halfHeight = b->size.z() * 0.5f;
+    s.axis = b->positionAng * float3{0, 0, 1};
 }
 
 static void check_pair_equivalent(Rigid *a, Rigid *b, const char *name) {
@@ -881,13 +881,13 @@ static void check_pair_equivalent(Rigid *a, Rigid *b, const char *name) {
     bool same = nBody == nShape;
     float worst = 0.0f;
     for (int i = 0; same && i < nBody; i++) {
-        worst = std::max(worst, length(viaBody[i].rA - viaShape[i].rA));
-        worst = std::max(worst, length(viaBody[i].rB - viaShape[i].rB));
+        worst = std::max(worst, (viaBody[i].rA - viaShape[i].rA).norm());
+        worst = std::max(worst, (viaBody[i].rB - viaShape[i].rB).norm());
         same = worst <= 1.0e-5f;
     }
     for (int r = 0; same && r < 3; r++) {
         for (int c = 0; c < 3; c++) {
-            worst = std::max(worst, std::fabs(basisBody[r][c] - basisShape[r][c]));
+            worst = std::max(worst, std::fabs(basisBody(r, c) - basisShape(r, c)));
             same = worst <= 1.0e-5f;
         }
     }
@@ -899,7 +899,7 @@ static void test_collide_shapes_equivalence() {
     // Penetrating box pair, one rotated: exercises the SAT + clipping path.
     Rigid *boxA = new Rigid(&s, {1, 1, 1}, 0.0f, 0.5f, {0, 0, 0});
     Rigid *boxB = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0.3f, 0.2f, 0.9f});
-    boxB->positionAng = normalize(quat{0.1f, 0.2f, -0.05f, 1.0f});
+    boxB->positionAng = quat(Eigen::AngleAxisf(0.35f, float3{0.196f, 0.392f, -0.098f}.normalized()));
     check_pair_equivalent(boxA, boxB, "collideShapes matches (box-box)");
 
     // Sphere penetrating a box from above: exercises the closest-point path.
@@ -929,10 +929,10 @@ static void test_layer_mask() {
 
     step_n(s, 240);
 
-    report(std::fabs(compatible->positionLin.z - 1.0f) <= 0.02f, "compatible layers collide",
-            "rest z=%.4f (slab top 0.5 + half 0.5)", compatible->positionLin.z);
-    report(filtered->positionLin.z < 0.5f, "incompatible layers pass through",
-            "fallen to z=%.4f after 4 s (no contact possible: layer 2 vs 1)", filtered->positionLin.z);
+    report(std::fabs(compatible->positionLin.z() - 1.0f) <= 0.02f, "compatible layers collide",
+            "rest z=%.4f (slab top 0.5 + half 0.5)", compatible->positionLin.z());
+    report(filtered->positionLin.z() < 0.5f, "incompatible layers pass through",
+            "fallen to z=%.4f after 4 s (no contact possible: layer 2 vs 1)", filtered->positionLin.z());
 }
 
 // ---------------------------------------------------------------------------
@@ -955,15 +955,15 @@ static void test_axis_lock() {
 
     step_n(s, 240);
 
-    report(std::fabs(locked->positionLin.z - z0) <= 1.0e-4f, "locked axis hovers",
-            "z=%.6f (spawn %.1f, no fall in 4 s)", locked->positionLin.z, z0);
-    report(std::fabs(locked->velocityLin.z) <= 1.0e-4f, "locked axis no gravity",
-            "vz=%.6f", locked->velocityLin.z);
-    report(freeFall->positionLin.z < z0 - 3.0f, "unlocked control falls",
-            "control z=%.4f", freeFall->positionLin.z);
-    report(std::fabs(spinLocked->positionAng.x) <= 1.0e-4f && std::fabs(spinLocked->velocityAng.x) <= 1.0e-4f,
+    report(std::fabs(locked->positionLin.z() - z0) <= 1.0e-4f, "locked axis hovers",
+            "z=%.6f (spawn %.1f, no fall in 4 s)", locked->positionLin.z(), z0);
+    report(std::fabs(locked->velocityLin.z()) <= 1.0e-4f, "locked axis no gravity",
+            "vz=%.6f", locked->velocityLin.z());
+    report(freeFall->positionLin.z() < z0 - 3.0f, "unlocked control falls",
+            "control z=%.4f", freeFall->positionLin.z());
+    report(std::fabs(spinLocked->positionAng.x()) <= 1.0e-4f && std::fabs(spinLocked->velocityAng.x()) <= 1.0e-4f,
             "locked angular axis resists spin",
-            "qx=%.6f wx=%.6f", spinLocked->positionAng.x, spinLocked->velocityAng.x);
+            "qx=%.6f wx=%.6f", spinLocked->positionAng.x(), spinLocked->velocityAng.x());
 }
 
 // ---------------------------------------------------------------------------
@@ -983,10 +983,10 @@ static void test_pick_mask() {
     Rigid *all = s.pick(origin, dir, local);
     Rigid *masked = s.pick(origin, dir, local, 1u);
 
-    report(all != nullptr && std::fabs(all->positionLin.z - 3.0f) < 1.0e-3f, "pick hits nearest",
-            "hit z=%.4f (blocker at 3)", all ? all->positionLin.z : -1.0f);
-    report(masked != nullptr && std::fabs(masked->positionLin.z) < 1.0e-3f, "pick mask skips",
-            "mask=1 hit z=%.4f (ground at 0)", masked ? masked->positionLin.z : -1.0f);
+    report(all != nullptr && std::fabs(all->positionLin.z() - 3.0f) < 1.0e-3f, "pick hits nearest",
+            "hit z=%.4f (blocker at 3)", all ? all->positionLin.z() : -1.0f);
+    report(masked != nullptr && std::fabs(masked->positionLin.z()) < 1.0e-3f, "pick mask skips",
+            "mask=1 hit z=%.4f (ground at 0)", masked ? masked->positionLin.z() : -1.0f);
 }
 
 // ---------------------------------------------------------------------------
