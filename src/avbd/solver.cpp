@@ -334,7 +334,7 @@ void Solver::solveIterations(int forceCount)
             targetIterations = static_cast<int>(std::round(iterations * avgPenetration / maxPenetrationError));
         }
         targetIterations = std::max(2, targetIterations);  // Minimum 2 iterations
-        targetIterations = std::min(targetIterations, 16); // Cap at 16 iterations
+        targetIterations = std::min(targetIterations, 16); // Cap at 16 iterations (Jolt/Godot use 8, but their impulse solver is 10x cheaper per round; AVBD's dense blocks need the room - the convergence early-exit is the intended way to skip cheap rounds)
     }
 
     // One dispatch covers every round: the barrier fences inside `iterate` carry the
@@ -359,7 +359,15 @@ void Solver::solveIterations(int forceCount)
 // reference the digest tests compare against.
 void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
 {
-    const auto loop = [this, targetIterations, forceCount, newtonRounds](int, auto &sync) {
+    // Convergence early exit: measure the residual at the end of a Newton round; when it
+    // stops improving (delta below the threshold or rising), the remaining rounds would
+    // burn cycles on float noise. Measured only at the Newton boundary - the impulse tail
+    // converges slowly by design, so its delta is checked against its own, much looser
+    // scale. 0 disables the check.
+    float prevResidual = 0.0f;
+    int roundsRun = 0;
+    std::atomic<bool> converged{false};
+    const auto loop = [this, targetIterations, forceCount, newtonRounds, &prevResidual, &roundsRun, &converged](int workerIndex, auto &sync) {
         for (int it = 0; it < targetIterations; it++)
         {
             const bool newton = it < newtonRounds;
@@ -403,6 +411,28 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
                     forceOrder[i]->updateDual(alpha);
             });
             sync.arriveAndWait();
+            ++roundsRun;
+
+            // Convergence probe after a Newton round: a full primal pass is expensive, so
+            // skip further rounds when the residual stops shrinking. Only the calling
+            // thread (worker 0) evaluates the reduction - workers are inside the same
+            // barrier-protected phase structure, and the shared verdict flag is read by
+            // everyone at the top of the next round, so all participants exit together
+            // (barrier participation counts must stay equal).
+            if (workerIndex == 0 && convergenceThreshold > 0.0f && it + 1 < targetIterations)
+            {
+                float total = 0.0f;
+                int count = 0;
+                for (Force *f = forces; f != nullptr; f = f->next)
+                    f->accumulatePenetration(total, count);
+                const float residual = count > 0 ? total / count : 0.0f;
+                converged.store(prevResidual - residual < convergenceThreshold,
+                        std::memory_order_relaxed);
+                prevResidual = residual;
+            }
+            // Shared verdict: every participant sees the same value after the fence above.
+            if (converged.load(std::memory_order_relaxed))
+                return;
         }
     };
 
