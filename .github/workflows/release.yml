@@ -106,15 +106,4 @@ jobs:
             zip -r ../${{ matrix.artifact_name }} gdavbd
           fi
 
-      # === 上传到 Release，使用上面计算出的 tag ===
-      - name: Upload Release Asset
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.tag_name }}
-          name: ${{ steps.tag.outputs.tag_name }}
-          # 非 v* tag 时标记为 prerelease（可选）
-          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-          fail_on_unmatched_files: true
-          files: ./${{ matrix.artifact_name }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+   
