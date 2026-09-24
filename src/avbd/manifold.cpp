@@ -11,6 +11,8 @@
 
 #include <cmath>
 #include <array>
+#include <mutex>
+#include <vector>
 
 #include "avbd/solver.h"
 #include "avbd/bvh/node_storage.hpp"
@@ -20,6 +22,50 @@ namespace avbd {
 Manifold::Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB)
     : Force(p_solver, p_bodyA, p_bodyB), numContacts(0)
 {
+}
+
+namespace {
+// Function-local statics: no static-initialisation-order hazards, and the vector's own
+// destructor frees anything still cached at process exit.
+std::vector<void *> &manifoldFreeList()
+{
+    static std::vector<void *> list;
+    return list;
+}
+std::mutex &manifoldPoolMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+} // namespace
+
+void *Manifold::operator new(std::size_t count)
+{
+    if (count != sizeof(Manifold))
+        return ::operator new(count);
+    std::lock_guard<std::mutex> lock(manifoldPoolMutex());
+    std::vector<void *> &list = manifoldFreeList();
+    if (list.empty())
+        return ::operator new(sizeof(Manifold));
+    void *ptr = list.back();
+    list.pop_back();
+    return ptr;
+}
+
+void Manifold::operator delete(void *ptr) noexcept
+{
+    if (ptr == nullptr)
+        return;
+    std::lock_guard<std::mutex> lock(manifoldPoolMutex());
+    manifoldFreeList().push_back(ptr);
+}
+
+void Manifold::drainPool() noexcept
+{
+    std::lock_guard<std::mutex> lock(manifoldPoolMutex());
+    for (void *ptr : manifoldFreeList())
+        ::operator delete(ptr);
+    manifoldFreeList().clear();
 }
 
 bool Manifold::initialize()
@@ -207,6 +253,22 @@ void Manifold::updateDual(float alpha)
             contacts[i].penalty[1] = std::min(contacts[i].penalty[1] + solver->betaLin * std::fabs(C[1]), PENALTY_MAX);
             contacts[i].penalty[2] = std::min(contacts[i].penalty[2] + solver->betaLin * std::fabs(C[2]), PENALTY_MAX);
             contacts[i].stick = float2{C[1], C[2]}.norm() < STICK_THRESH;
+        }
+    }
+}
+
+// Accumulate this manifold's penetration error for the adaptive iteration estimate.
+// Same loop, comparison and accumulation order as the dynamic_cast block it replaces
+// in solveIterations, so the floating-point sequence is unchanged.
+void Manifold::accumulatePenetration(float &r_total, int &r_count) const
+{
+    for (int i = 0; i < numContacts; i++)
+    {
+        const float penetration = contacts[i].C0.norm();
+        if (penetration > 0.0f)
+        {
+            r_total += penetration;
+            r_count++;
         }
     }
 }

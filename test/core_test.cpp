@@ -990,6 +990,25 @@ static void test_pick_mask() {
 }
 
 // ---------------------------------------------------------------------------
+// Idle sleep: a settled stack of sleep-enabled boxes must fall asleep on its own
+// (Solver::sleepFrames idle detection), and sleeping must not corrupt state. The core
+// suite default keeps sleepFrames = 0, so this is opt-in behaviour.
+// ---------------------------------------------------------------------------
+static void test_idle_sleep() {
+    Solver s;
+    s.sleepFrames = 5;
+    new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
+    Rigid *a = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f});
+    Rigid *b = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 1.5f});
+    a->sleep_mode = 1;
+    b->sleep_mode = 1;
+    step_n(s, 120);
+    report(a->sleeping && b->sleeping, "idle bodies fall asleep",
+            "a=%d b=%d", a->sleeping, b->sleeping);
+    report(all_finite(s), "sleeping stack stays finite", "bodies=%d", count_bodies(s));
+}
+
+// ---------------------------------------------------------------------------
 // CLI helpers
 // ---------------------------------------------------------------------------
 static void list_scenes() {
@@ -1158,6 +1177,7 @@ int main(int argc, char **argv) {
     test_layer_mask();
     test_axis_lock();
     test_pick_mask();
+    test_idle_sleep();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

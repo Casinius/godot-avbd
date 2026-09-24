@@ -590,10 +590,9 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
         body.rigid->collisionMask = body.collision_mask;
         axis_locks_to_sim(body.axis_locks, body.rigid->axisLockLinear, body.rigid->axisLockAngular);
         body.rigid->sleeping = body.sleeping;
-        // Solver sleep modes: 0 = never sleeps, 1 = may sleep. Sleep is manual this round:
-        // the solver has no idle detection, so "can sleep" only opens the gate.
-        // HACK: Disable sleep entirely for pyramid stability testing
-        body.rigid->sleep_mode = 0;  // SLEEP_MODE_NEVER
+        // Solver sleep modes: 0 = never sleeps, 1 = may sleep. Idle detection lives in the
+        // solver (Solver::sleepFrames); can_sleep only opens the gate.
+        body.rigid->sleep_mode = body.can_sleep ? 1 : 0;
         body.rigid->gravity = space->solver.gravity * static_cast<float>(body.gravity_scale);
     }
 
@@ -967,6 +966,8 @@ void AVBDPhysicsServer3D::_step(double p_step) {
         space.solver.betaAng = static_cast<float>(space.beta_angular);
         space.solver.gamma = static_cast<float>(space.gamma);
         space.solver.threads = space.threads;
+        // Idle-sleep horizon: 30 steps at the usual 60 Hz tick = Godot's 0.5 s default.
+        space.solver.sleepFrames = 30;
 
         // Forces accumulated since the last step (persistent constant_* plus one-shot frame
         // ones) become velocity changes now, so the solver integrates them with everything else.
@@ -1077,6 +1078,10 @@ void AVBDPhysicsServer3D::_step(double p_step) {
             body.transform = transform;
             body.linear_velocity = to_godot(rigid->velocityLin);
             body.angular_velocity = to_godot(rigid->velocityAng);
+            // Keep the host copy in step with the solver's sleep state: the pre-step sync
+            // writes body.sleeping back into body.rigid->sleeping, so a solver-side sleep
+            // decision would otherwise be overwritten on the next step.
+            body.sleeping = rigid->sleeping;
 
             // Godot 4.x sync contract (verified against 4.7 sources): the callable receives
             // exactly one argument - the PhysicsDirectBodyState3D. The engine reads transform,
@@ -1555,6 +1560,9 @@ void AVBDPhysicsServer3D::_body_set_state(const RID &p_body, PhysicsServer3D::Bo
                 body->rigid->positionLin = avbd::float3{static_cast<float>(t.origin.x),
                         static_cast<float>(-t.origin.z), static_cast<float>(t.origin.y)};
                 body->rigid->positionAng = to_sim(t.basis.get_rotation_quaternion());
+                // External teleports wake a sleeping body (Godot semantics).
+                body->rigid->sleeping = false;
+                body->rigid->stillFrames = 0;
             }
             break;
 
@@ -1564,6 +1572,9 @@ void AVBDPhysicsServer3D::_body_set_state(const RID &p_body, PhysicsServer3D::Bo
                 const Vector3 &v = body->linear_velocity;
                 body->rigid->velocityLin = avbd::float3{static_cast<float>(v.x), static_cast<float>(-v.z),
                         static_cast<float>(v.y)};
+                // An explicit velocity assignment wakes a sleeping body (Godot semantics).
+                body->rigid->sleeping = false;
+                body->rigid->stillFrames = 0;
             }
             break;
 
@@ -1573,6 +1584,8 @@ void AVBDPhysicsServer3D::_body_set_state(const RID &p_body, PhysicsServer3D::Bo
                 const Vector3 &w = body->angular_velocity;
                 body->rigid->velocityAng = avbd::float3{static_cast<float>(w.x), static_cast<float>(-w.z),
                         static_cast<float>(w.y)};
+                body->rigid->sleeping = false;
+                body->rigid->stillFrames = 0;
             }
             break;
 
