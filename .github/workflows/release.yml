@@ -79,7 +79,7 @@ jobs:
         run: |
           python -m pip install scons==4.9.1
           xmake f -p windows --toolchain=msvc -y
-
+          cat 'C:\Users\runneradmin\AppData\Local\.xmake\cache\packages\2609\g\godotcpp4\4.1\installdir.failed\logs\install.txt'
       - name: Build project
         run: xmake build -vD
 
