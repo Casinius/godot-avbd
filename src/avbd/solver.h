@@ -457,6 +457,12 @@ struct Solver
     // lets the cheap rounds actually converge instead of spinning. 1.0 = no decay.
     float stiffnessDecay = 1.0f;
 
+    // Early-exit threshold on the mean penetration residual: when a Newton round
+    // improves the average residual by less than this (or worsens it), the iteration set
+    // ends early - remaining rounds would polish float noise at full price. 0 disables
+    // the check (default: bit-identical iteration counts). Realistic value ~1e-5.
+    float convergenceThreshold = 0.0f;
+
     // Worker threads for the per-body phases. 0 = one per hardware thread, 1 = run
     // everything inline on the calling thread. The result does not depend on this value:
     // the update order is fixed by the colouring, and threads only spread one colour's
