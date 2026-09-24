@@ -11,6 +11,7 @@
 
 #include "avbd/solver.h"
 #include "avbd/bvh/node_storage.hpp"
+#include <cmath>
 
 namespace avbd {
 
@@ -21,7 +22,7 @@ Rigid::Rigid(Solver *p_solver, float3 p_size, float p_density, float p_friction,
 
 Rigid::Rigid(Solver *p_solver, float3 p_size, ShapeType p_shape, float p_density, float p_friction,
         float3 p_position, float3 p_velocity)
-    : solver(p_solver), forces(0), next(0), positionLin(p_position), positionAng({ 0, 0, 0, 1 }),
+    : solver(p_solver), forces(0), next(0), positionLin(p_position), positionAng(quat::Identity()),
     velocityLin(p_velocity), velocityAng({ 0, 0, 0 }), prevVelocityLin(p_velocity), size(p_size),
     shape(p_shape), friction(p_friction), gravity(p_solver->gravity)
 {
@@ -35,7 +36,7 @@ Rigid::Rigid(Solver *p_solver, float3 p_size, ShapeType p_shape, float p_density
     {
         case ShapeType::Sphere:
         {
-            const float r = p_size.x;
+            const float r = p_size.x();
             mass = (4.0f / 3.0f) * 3.14159265358979f * r * r * r * p_density;
             const float i = 0.4f * mass * r * r; // 2/5 m r^2
             moment = float3{i, i, i};
@@ -45,27 +46,27 @@ Rigid::Rigid(Solver *p_solver, float3 p_size, ShapeType p_shape, float p_density
 
         case ShapeType::Cylinder:
         {
-            const float r = p_size.x;
-            const float h = p_size.z;
+            const float r = p_size.x();
+            const float h = p_size.z();
             mass = 3.14159265358979f * r * r * h * p_density;
             const float axial = 0.5f * mass * r * r;                    // about the local Z axis
             const float radial = mass * (3.0f * r * r + h * h) / 12.0f; // about local X and Y
             moment = float3{radial, radial, axial};
             // Bounding radius of the whole cylinder: half the diagonal of its box.
-            radius = length(float3{r, h * 0.5f, r});
+            radius = std::sqrt(float3(r, h * 0.5f, r).dot(float3(r, h * 0.5f, r)));
             break;
         }
 
         case ShapeType::Box:
         default:
         {
-            mass = p_size.x * p_size.y * p_size.z * p_density;
+            mass = p_size.x() * p_size.y() * p_size.z() * p_density;
             moment = float3 {
-                (p_size.y * p_size.y + p_size.z * p_size.z) / 12.0f * mass,
-                (p_size.x * p_size.x + p_size.z * p_size.z) / 12.0f * mass,
-                (p_size.x * p_size.x + p_size.y * p_size.y) / 12.0f * mass
+                (p_size.y() * p_size.y() + p_size.z() * p_size.z()) / 12.0f * mass,
+                (p_size.x() * p_size.x() + p_size.z() * p_size.z()) / 12.0f * mass,
+                (p_size.x() * p_size.x() + p_size.y() * p_size.y()) / 12.0f * mass
             };
-            radius = length(p_size * 0.5f);
+            radius = std::sqrt((p_size * 0.5f).dot((p_size*0.5f)));
             break;
         }
     }

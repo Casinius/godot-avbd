@@ -21,7 +21,7 @@ namespace bvh::builder {
 static inline float3 computeAABB(const avbd::Rigid* body) noexcept {
     // Simplified AABB - in a real implementation, this would use the actual shape bounds
     float3 pos = body->positionLin;
-    return {pos.x, pos.y, pos.z};
+    return {pos.x(), pos.y(), pos.z()};
 }
 
 // ============================================
@@ -54,13 +54,13 @@ void Builder::buildRecursive(int start, int end, int depth) noexcept {
         int bodyIndex = sortedIndices[i];
         const avbd::Rigid* body = bodies_[bodyIndex];
         float3 pos = computeAABB(body);
-        min = {std::min(min.x, pos.x), std::min(min.y, pos.y), std::min(min.z, pos.z)};
-        max = {std::max(max.x, pos.x), std::max(max.y, pos.y), std::max(max.z, pos.z)};
+        min = {std::min(min.x(), pos.x()), std::min(min.y(), pos.y()), std::min(min.z(), pos.z())};
+        max = {std::max(max.x(), pos.x()), std::max(max.y(), pos.y()), std::max(max.z(), pos.z())};
     }
 
     // Simple split: divide on the axis with largest span
-    float3 span = {max.x - min.x, max.y - min.y, max.z - min.z};
-    int splitAxis = span.x >= span.y ? (span.x >= span.z ? 0 : 2) : (span.y >= span.z ? 1 : 2);
+    float3 span = {max.x() - min.x(), max.y() - min.y(), max.z() - min.z()};
+    int splitAxis = span.x() >= span.y() ? (span.x() >= span.z() ? 0 : 2) : (span.y() >= span.z() ? 1 : 2);
     float splitPos = min[splitAxis] + span[splitAxis] * 0.5f;
 
     // Find split position

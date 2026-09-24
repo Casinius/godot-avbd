@@ -19,11 +19,9 @@ namespace avbd {
 inline float3x3 geometricStiffnessBallSocket(int k, float3 v)
 {
     float3x3 m = diagonal(-v[k], -v[k], -v[k]);
-
-    m[0][k] += v[0];
-    m[1][k] += v[1];
-    m[2][k] += v[2];
-
+    m(0, k) += v[0];
+    m(1, k) += v[1];
+    m(2, k) += v[2];
     return m;
 }
 
@@ -38,26 +36,42 @@ Joint::Joint(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, floa
 
     // Scale the angular constraint by the size of the bodies it connects, so that its
     // stiffness is meaningful independently of how big they are.
-    torqueArm = lengthSq((p_bodyA ? p_bodyA->size : float3{0, 0, 0}) + p_bodyB->size);
+    torqueArm = ((p_bodyA ? p_bodyA->size : float3{0, 0, 0}) + p_bodyB->size).squaredNorm();
 }
 
 bool Joint::initialize()
 {
     // Store constraint function at beginnning of timestep C(x-)
     // Note: if bodyA is null, it is assumed that the joint connects a body to the world space position rA
-    C0Lin = (bodyA ? transform(bodyA->positionLin, bodyA->positionAng, rA) : rA) - transform(bodyB->positionLin, bodyB->positionAng, rB);
-    C0Ang = ((bodyA ? bodyA->positionAng : quat{ 0, 0, 0, 1 }) - bodyB->positionAng) * torqueArm;
+    C0Lin = (bodyA ? bodyA->positionLin + bodyA->positionAng * rA : rA) - (bodyB->positionLin + bodyB->positionAng * rB);
+    C0Ang = ((bodyA ? bodyA->positionAng : quat::Identity()) - bodyB->positionAng) * torqueArm;
 
     // Warmstart the dual variables and penalty parameters (Eq. 19)
     // Penalty is safely clamped to a minimum and maximum value
     lambdaLin = lambdaLin * solver->alpha * solver->gamma;
     lambdaAng = lambdaAng * solver->alpha * solver->gamma;
-    penaltyLin = clamp(penaltyLin * solver->gamma, PENALTY_MIN, PENALTY_MAX);
-    penaltyAng = clamp(penaltyAng * solver->gamma, PENALTY_MIN, PENALTY_MAX);
+    penaltyLin = float3{
+        std::clamp(penaltyLin.x() * solver->gamma, PENALTY_MIN, PENALTY_MAX),
+        std::clamp(penaltyLin.y() * solver->gamma, PENALTY_MIN, PENALTY_MAX),
+        std::clamp(penaltyLin.z() * solver->gamma, PENALTY_MIN, PENALTY_MAX)
+    };
+    penaltyAng = float3{
+        std::clamp(penaltyAng.x() * solver->gamma, PENALTY_MIN, PENALTY_MAX),
+        std::clamp(penaltyAng.y() * solver->gamma, PENALTY_MIN, PENALTY_MAX),
+        std::clamp(penaltyAng.z() * solver->gamma, PENALTY_MIN, PENALTY_MAX)
+    };
 
     // Clamp penalty to material stiffness
-    penaltyLin = min(penaltyLin, stiffnessLin);
-    penaltyAng = min(penaltyAng, stiffnessAng);
+    penaltyLin = float3{
+        std::min(penaltyLin.x(), stiffnessLin),
+        std::min(penaltyLin.y(), stiffnessLin),
+        std::min(penaltyLin.z(), stiffnessLin)
+    };
+    penaltyAng = float3{
+        std::min(penaltyAng.x(), stiffnessAng),
+        std::min(penaltyAng.y(), stiffnessAng),
+        std::min(penaltyAng.z(), stiffnessAng)
+    };
 
     return !broken;
 }
@@ -65,11 +79,11 @@ bool Joint::initialize()
 void Joint::updatePrimal(Rigid *body, float alpha, Block &block)
 {
     // Linear constraint
-    if (lengthSq(penaltyLin) > 0)
+    if (penaltyLin.squaredNorm() > 0)
     {
         // Compute constraint and jacobians
-        float3x3 K = diagonal(penaltyLin.x, penaltyLin.y, penaltyLin.z);
-        float3 C = (bodyA ? transform(bodyA->positionLin, bodyA->positionAng, rA) : rA) - transform(bodyB->positionLin, bodyB->positionAng, rB);
+        float3x3 K = diagonal(penaltyLin.x(), penaltyLin.y(), penaltyLin.z());
+        float3 C = (bodyA ? bodyA->positionLin + bodyA->positionAng * rA : rA) - (bodyB->positionLin + bodyB->positionAng * rB);
         
         // Stabilization
         if (std::isinf(stiffnessLin))
@@ -79,12 +93,28 @@ void Joint::updatePrimal(Rigid *body, float alpha, Block &block)
         float3 F = K * C + lambdaLin;
 
         // Choose jacobian depending on input body
-        float3x3 jLin = body == bodyA ? float3x3{ 1, 0, 0, 0, 1, 0, 0, 0, 1 } : float3x3{ -1, 0, 0, 0, -1, 0, 0, 0, -1 };
-        float3x3 jAng = body == bodyA ? skew(-rotate(bodyA->positionAng, rA)) : skew(rotate(bodyB->positionAng, rB));
+        float3x3 negIdentity(-float3x3::Identity());
+        float3x3 jLin = body == bodyA ? float3x3::Identity() : negIdentity;
+        // Cross-product (skew-symmetric) matrix of the world-space moment arm.
+        float3x3 jAng;
+        if (body == bodyA)
+        {
+            const float3 r = -(bodyA->positionAng * rA);
+            jAng <<    0, -r.z(),  r.y(),
+                   r.z(),      0, -r.x(),
+                  -r.y(),  r.x(),      0;
+        }
+        else
+        {
+            const float3 r = bodyB->positionAng * rB;
+            jAng <<    0, -r.z(),  r.y(),
+                   r.z(),      0, -r.x(),
+                  -r.y(),  r.x(),      0;
+        }
 
         // Stamp into LHS
-        float3x3 jLinT = transpose(jLin);
-        float3x3 jAngT = transpose(jAng);
+        float3x3 jLinT = jLin.transpose();
+        float3x3 jAngT = jAng.transpose();
         float3x3 jAngTk = jAngT * K;
 
         block.lhsLin += jLinT * K * jLin;
@@ -92,12 +122,12 @@ void Joint::updatePrimal(Rigid *body, float alpha, Block &block)
         block.lhsCross += jAngTk * jLin;
 
         // Diagonal approximation for higher order terms
-        float3 r = body == bodyA ? rotate(bodyA->positionAng, rA) : -rotate(bodyB->positionAng, rB);
+        float3 r = body == bodyA ? bodyA->positionAng * rA : -(bodyB->positionAng * rB);
         float3x3 H = 
             geometricStiffnessBallSocket(0, r) * F[0] +
             geometricStiffnessBallSocket(1, r) * F[1] +
             geometricStiffnessBallSocket(2, r) * F[2];
-        block.lhsAng += diagonalize(H);
+        block.lhsAng += diagonal(H(0, 0), H(1, 1), H(2, 2));
 
         // Stamp into RHS
         block.rhsLin += jLinT * F;
@@ -105,11 +135,11 @@ void Joint::updatePrimal(Rigid *body, float alpha, Block &block)
     }
 
     // Angular constraint
-    if (lengthSq(penaltyAng) > 0)
+    if (penaltyAng.squaredNorm() > 0)
     {
         // Compute constraint and jacobians
-        float3x3 K = diagonal(penaltyAng.x, penaltyAng.y, penaltyAng.z);
-        float3 C = ((bodyA ? bodyA->positionAng : quat{ 0, 0, 0, 1 }) - bodyB->positionAng) * torqueArm;
+        float3x3 K = diagonal(penaltyAng.x(), penaltyAng.y(), penaltyAng.z());
+        float3 C = ((bodyA ? bodyA->positionAng : quat::Identity()) - bodyB->positionAng) * torqueArm;
 
         // Stabilization
         if (std::isinf(stiffnessAng))
@@ -119,13 +149,16 @@ void Joint::updatePrimal(Rigid *body, float alpha, Block &block)
         float3 F = K * C + lambdaAng;
 
         // Choose jacobian depending on input body
-        float3x3 jAng = (body == bodyA ? float3x3{ 1, 0, 0, 0, 1, 0, 0, 0, 1 } : float3x3{ -1, 0, 0, 0, -1, 0, 0, 0, -1 }) * torqueArm;
+        float3x3 identity = float3x3::Identity();
+        float3x3 negIdentity;
+        negIdentity << 0.0f, 0.0f, 0.0f, 0.0f, -1.0f, 0.0f, 0.0f, 0.0f, -1.0f;
+        float3x3 jAng = (body == bodyA ? identity : negIdentity) * torqueArm;
 
         // Stamp into LHS
-        block.lhsAng += transpose(jAng) * K * jAng;
+        block.lhsAng += jAng.transpose() * K * jAng;
 
         // Stamp into RHS
-        block.rhsAng += transpose(jAng) * F;
+        block.rhsAng += jAng.transpose() * F;
     }
 }
 
@@ -141,11 +174,11 @@ void Joint::breakNow()
 void Joint::updateDual(float alpha)
 {
     // Linear constraint
-    if (lengthSq(penaltyLin) > 0)
+    if (penaltyLin.squaredNorm() > 0)
     {
         // Compute constraint and jacobians
-        float3x3 K = diagonal(penaltyLin.x, penaltyLin.y, penaltyLin.z);
-        float3 C = (bodyA ? transform(bodyA->positionLin, bodyA->positionAng, rA) : rA) - transform(bodyB->positionLin, bodyB->positionAng, rB);
+        float3x3 K = diagonal(penaltyLin.x(), penaltyLin.y(), penaltyLin.z());
+        float3 C = (bodyA ? bodyA->positionLin + bodyA->positionAng * rA : rA) - (bodyB->positionLin + bodyB->positionAng * rB);
 
         if (std::isinf(stiffnessLin))
         {
@@ -160,15 +193,17 @@ void Joint::updateDual(float alpha)
         }
 
         // Update the penalty parameter and clamp to material stiffness if we are within the force bounds (Eq. 16)
-        penaltyLin = min(penaltyLin + abs(C) * solver->betaLin, min(stiffnessLin, PENALTY_MAX));
-    }
+        penaltyLin = (penaltyLin + C.cwiseAbs() * solver->betaLin).cwiseMin(float3{stiffnessLin, stiffnessLin, stiffnessLin}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
 
+        // Angular
+        penaltyAng = (penaltyAng + C.cwiseAbs() * solver->betaAng).cwiseMin(float3{stiffnessAng, stiffnessAng, stiffnessAng}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
+    }
     // Angular constraint
-    if (lengthSq(penaltyAng) > 0)
+    if (penaltyAng.squaredNorm() > 0)
     {
         // Compute constraint and jacobians
-        float3x3 K = diagonal(penaltyAng.x, penaltyAng.y, penaltyAng.z);
-        float3 C = ((bodyA ? bodyA->positionAng : quat{ 0, 0, 0, 1 }) - bodyB->positionAng) * torqueArm;
+        float3x3 K = diagonal(penaltyAng.x(), penaltyAng.y(), penaltyAng.z());
+        float3 C = ((bodyA ? bodyA->positionAng : quat::Identity()) - bodyB->positionAng) * torqueArm;
 
         if (std::isinf(stiffnessAng))
         {
@@ -183,11 +218,11 @@ void Joint::updateDual(float alpha)
         }
 
         // Update the penalty parameter and clamp to material stiffness if we are within the force bounds (Eq. 16)
-        penaltyAng = min(penaltyAng + abs(C) * solver->betaAng, min(stiffnessAng, PENALTY_MAX));
+        penaltyAng = (penaltyAng + C.cwiseAbs() * solver->betaAng).cwiseMin(float3{stiffnessAng, stiffnessAng, stiffnessAng}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
     }
 
     // Fracture test
-    if (lengthSq(lambdaAng) > fracture * fracture)
+    if (lambdaAng.squaredNorm() > fracture * fracture)
     {
         penaltyLin = { 0, 0, 0 };
         penaltyAng = { 0, 0, 0 };

@@ -30,6 +30,10 @@ Solver::Solver()
 Solver::~Solver()
 {
     clear();
+    // Release the contact-block cache this solver's churn filled. Blocks outlive their
+    // solver on purpose (a destroyed contact is recycled by the next one), but when the
+    // whole simulation shuts down the cache must not leak.
+    Manifold::drainPool();
 }
 
 Rigid *Solver::pick(float3 origin, float3 dir, float3 &local)
@@ -51,9 +55,9 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
     {
         if ((body->collisionLayer & p_mask) == 0)
             continue;
-        quat invRot = conjugate(body->positionAng);
-        float3 o = rotate(invRot, origin - body->positionLin);
-        float3 d = rotate(invRot, dir);
+        quat invRot = body->positionAng.conjugate();
+        float3 o = invRot * (origin - body->positionLin);
+        float3 d = invRot * dir;
         float3 half = body->size * 0.5f;
 
         float tEnter = 0.0f;
@@ -82,8 +86,8 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
                 t1 = tmp;
             }
 
-            tEnter = max(tEnter, t0);
-            tExit = min(tExit, t1);
+            tEnter = std::max(tEnter, t0);
+            tExit = std::min(tExit, t1);
             if (tEnter > tExit)
             {
                 hit = false;
@@ -144,29 +148,25 @@ static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
     // mask (defaults 1/1 keep every pair, as before these fields existed).
     const bool layersAllow = ((bodyA->collisionLayer & bodyB->collisionMask) != 0) ||
             ((bodyB->collisionLayer & bodyA->collisionMask) != 0);
-    return dot(dp, dp) <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB);
+    return dp.squaredNorm() <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB);
 }
 
-// Contact detection. The naive O(n^2) scan over bounding spheres, as in the reference
-// implementation: enough for the low thousands of bodies, and the obvious place to add a
-// spatial hash when it is not.
+// Contact detection: sort-and-sweep over the x axis. Every body becomes one interval
+// [x - r, x + r] (r = bounding-sphere radius); two bodies can only overlap in 3D if their
+// intervals overlap on x, so a single sorted scan yields a candidate superset that the
+// exact `pairOverlaps` test then filters. With sorted poses this is O(n + c) against the
+// old O(n^2) row scan; the sort itself is O(n log n) but almost-sorted input costs
+// near-linear passes in insertion sort.
 //
-// The pair tests run in parallel over the outer body index; manifold construction stays
-// on the calling thread. That split keeps the run bit-identical to the serial scan:
-//   - A row test reads poses and `constrainedTo` lists but writes nothing, and rows are
-//     disjoint, so workers never touch the same memory.
-//   - Manifolds are prepended to the force list, so list order - and with it the dual
-//     update order and every digest - follows creation order. Candidates are collected
-//     per row, then created here in exactly the serial scan's order: ascending i, then
-//     ascending j within the row.
-// Row costs shrink linearly with i (a triangle), so contiguous blocks load-balance at
-// worst ~2:1; per-row buckets were chosen over per-worker ones because which worker runs
-// which block is the pool's business, and a row owned by exactly one block needs no lock.
+// Determinism: the sweep yields pairs in ascending (min-index, other) order - for a fixed
+// body list exactly the same order the row scan produced (ascending i, then ascending j
+// within the row) - so manifold creation order, the dual-update order and every digest are
+// unchanged. `constrainedTo` reads only each body's own force list, so the filter pass
+// could run in parallel; at ~1 us per 1000 pairs it is not worth a dispatch.
 void Solver::broadPhase()
 {
-    // Flatten the body list once so rows can be addressed by index. Rebuilt every call:
-    // bodies come and go between steps, and list order is the order the serial scan
-    // walked.
+    // Flatten the body list once so candidates can be addressed by index. Rebuilt every
+    // call: bodies come and go between steps.
     bodiesInOrder.clear();
     bodiesInOrder.insert(bodiesInOrder.end(), next_range(bodies).begin(), next_range(bodies).end());
 
@@ -174,28 +174,58 @@ void Solver::broadPhase()
     if (count < 2)
         return;
 
-    rowCandidates.resize(count);
-    for (auto &row : rowCandidates)
-        row.clear();
+    sweepEntries.resize(count);
+    for (int i = 0; i < count; i++)
+    {
+        const Rigid *body = bodiesInOrder[i];
+        sweepEntries[i] = {body->positionLin.x() - body->radius, i};
+    }
+    std::sort(sweepEntries.begin(), sweepEntries.end());
 
-    auto scanRow = [this](int i) {
+    sweepPairs.clear();
+    for (int a = 0; a < count; a++)
+    {
+        const auto [intervalEndA, i] = sweepEntries[a];
+        (void)intervalEndA;
+        const Rigid *bodyA = bodiesInOrder[i];
+        for (int b = a + 1; b < count; b++)
+        {
+            const auto [intervalStartB, j] = sweepEntries[b];
+            // Entry keys are interval starts (x - r): once B's interval starts after A's
+            // ends, every later candidate starts even further right - stop scanning A.
+            if (intervalStartB > bodyA->positionLin.x() + bodyA->radius)
+                break;
+            // Pairs are emitted with i < j: the row scan's (i, j) pairs also satisfy
+            // i < j because bodyB walks strictly after bodyA in the list.
+            sweepPairs.emplace_back(std::minmax(i, j));
+        }
+    }
+
+    // Ascending pair order = the row scan's creation order. std::sort on the (already
+    // nearly ordered) list is a cheap safety net for candidates the x-sweep finds in
+    // x order rather than index order.
+    std::sort(sweepPairs.begin(), sweepPairs.end());
+    for (const auto &[i, j] : sweepPairs)
+    {
         Rigid *bodyA = bodiesInOrder[i];
-        for (Rigid *bodyB = bodyA->next; bodyB != 0; bodyB = bodyB->next)
-            if (pairOverlaps(bodyA, bodyB))
-                rowCandidates[i].emplace_back(bodyA, bodyB);
-    };
+        Rigid *bodyB = bodiesInOrder[j];
+        if (pairOverlaps(bodyA, bodyB))
+            new Manifold(this, bodyA, bodyB);
+    }
+}
 
-    // One dispatch for the whole scan; below the break-even the dispatch would cost more
-    // than the tests it saves, so the rows run inline on the calling thread.
-    if (pool != nullptr && pool->threadCount() > 1 && count >= kMinBodiesPerDispatch)
-        pool->forCount(count - 1, scanRow, kMinBodiesPerDispatch);
-    else
-        for (int i = 0; i < count - 1; i++)
-            scanRow(i);
-
-    for (int i = 0; i < count - 1; i++)
-        for (const auto &pair : rowCandidates[i])
-            new Manifold(this, pair.first, pair.second);
+// A constraint is frozen when neither of its bodies can move this step. Joints and springs
+// stay out of this path: their initialize() does more than refresh contacts (initial
+// error, spring setup), and the core suite pins their per-scene force counts. Manifolds
+// between parked bodies (static or already asleep) are the pure case - the colouring
+// already skips such bodies in the primal pass - and freezing their bookkeeping is the
+// sleep win: a settled scene stops paying SAT refresh + dual updates for all its contacts.
+static bool constraintFrozen(const Force *f)
+{
+    if (f->contactPointCount() <= 0)
+        return false; // joints / springs / soft constraints keep their exact behaviour
+    const auto awake = [](const Rigid *b) { return b != nullptr && b->mass > 0.0f && !b->sleeping; };
+    return !awake(f->bodyA) && !awake(f->bodyB);
 }
 
 // Bring every force up to date for this step, and drop the ones that have gone inactive.
@@ -211,7 +241,9 @@ int Solver::warmstartForces()
     int forceCount = collectForces();
     forceActive.resize(forceCount);
     pool->forCount(forceCount, [this](int i) {
-        forceActive[i] = forceOrder[i]->initialize() ? 1 : 0;
+        Force *f = forceOrder[i];
+        // Frozen constraints keep their state verbatim; nothing they read can move.
+        forceActive[i] = constraintFrozen(f) || f->initialize() ? 1 : 0;
     }, kMinForcesPerDispatch);
 
     for (int i = 0; i < forceCount; i++)
@@ -265,8 +297,8 @@ void Solver::warmstartBodies()
 
         // Adaptive warmstart (See original VBD paper)
         const float3 accel = (body->velocityLin - body->prevVelocityLin) / dt;
-        const float accelExt = accel.z * sign(g);
-        float accelWeight = clamp(accelExt / abs(g), 0.0f, 1.0f);
+        const float accelExt = accel.z() * std::copysign(1.0f, g);
+        float accelWeight = std::clamp(accelExt / std::fabs(g), 0.0f, 1.0f);
         if (!std::isfinite(accelWeight))
             accelWeight = 0.0f;
 
@@ -293,20 +325,7 @@ void Solver::solveIterations(int forceCount)
         float totalPenetration = 0.0f;
         int penetrationCount = 0;
         for (Force *f = forces; f != nullptr; f = f->next)
-        {
-            if (auto *m = dynamic_cast<Manifold*>(f))
-            {
-                for (int i = 0; i < m->numContacts; i++)
-                {
-                    float penetration = length(m->contacts[i].C0);
-                    if (penetration > 0.0f)
-                    {
-                        totalPenetration += penetration;
-                        penetrationCount++;
-                    }
-                }
-            }
-        }
+            f->accumulatePenetration(totalPenetration, penetrationCount);
 
         // Adaptive iteration count: more iterations needed if penetration is large
         if (penetrationCount > 0)
@@ -351,8 +370,10 @@ void Solver::iterate(int targetIterations, int forceCount)
 
             // Dual update: one item per force, and each force only reads the (frozen)
             // body poses and writes its own dual state, so the whole pass is independent.
+            // Frozen constraints have nothing to update: every input they read is parked.
             sync.forItems(forceCount, [this](int i) {
-                forceOrder[i]->updateDual(alpha);
+                if (!constraintFrozen(forceOrder[i]))
+                    forceOrder[i]->updateDual(alpha);
             });
             sync.arriveAndWait();
         }
@@ -405,7 +426,106 @@ void Solver::finishVelocities()
                     body->velocityAng[k] = 0.0f;
             }
         }
+        // Idle detection: a movable, non-sleeping body whose velocities stayed under both
+        // thresholds for sleepFrames consecutive steps falls asleep (velocity zeroed,
+        // Godot semantics). Only touches this body's fields, so it is safe inside the
+        // parallel dispatch and deterministic regardless of thread count.
+        if (sleepFrames > 0 && body->mass > 0 && !body->sleeping)
+        {
+            if (body->velocityLin.squaredNorm() < sleepLinearThreshold * sleepLinearThreshold &&
+                    body->velocityAng.squaredNorm() < sleepAngularThreshold * sleepAngularThreshold)
+                ++body->stillFrames;
+            else
+                body->stillFrames = 0;
+            if (body->stillFrames >= sleepFrames)
+            {
+                body->sleeping = true;
+                body->velocityLin = float3{0, 0, 0};
+                body->velocityAng = float3{0, 0, 0};
+            }
+        }
     }, kMinBodiesPerDispatch);
+}
+
+// Island-wide sleep bookkeeping. Movable, sleep-enabled bodies are grouped into islands
+// through force connectivity (union-find over the flattened body list; static bodies and
+// sleep_mode == NEVER bodies join nothing and never propagate). An island where every
+// member cleared idle detection this step (stillFrames >= sleepFrames or already
+// sleeping) is put to sleep as a unit: Godot semantics, and it removes the
+// partially-assembled-chain edge case where the bottom box qualifies a step before the
+// boxes above it. Deterministic: the union-find walks the force list in list order and
+// the minimum-body-index island representative is independent of visit order.
+void Solver::islandSleep()
+{
+    // Only bodies that can sleep join an island. With the default sleepFrames = 0 this
+    // whole pass is skipped by the caller, so the core suite (which never sets
+    // sleep_mode) is unaffected.
+    islandBodies.clear();
+    for (Rigid *body = bodies; body != 0; body = body->next)
+        if (body->mass > 0 && body->sleep_mode == 1)
+            islandBodies.push_back(body);
+
+    const int count = static_cast<int>(islandBodies.size());
+    if (count < 2)
+        return;
+
+    std::vector<int> parent(count);
+    for (int i = 0; i < count; ++i)
+        parent[i] = i;
+    auto find = [&parent](int x) {
+        while (parent[x] != x)
+            x = parent[x] = parent[parent[x]];
+        return x;
+    };
+
+    // Slot lookup: map body pointer -> island index once (sorted pointers + binary
+    // search), then each force is two O(log n) lookups. The map is rebuilt each call:
+    // bodies enter and leave the island set as sleep_mode and mass change.
+    islandForceSlots.clear();
+    std::vector<Rigid *> sorted = islandBodies;
+    std::sort(sorted.begin(), sorted.end());
+    for (Force *f = forces; f != 0; f = f->next)
+    {
+        const auto slotOf = [&sorted](Rigid *b) -> int {
+            const auto it = std::lower_bound(sorted.begin(), sorted.end(), b);
+            return (it != sorted.end() && *it == b) ? static_cast<int>(it - sorted.begin()) : -1;
+        };
+        const int ia = slotOf(f->bodyA);
+        const int ib = slotOf(f->bodyB);
+        if (ia >= 0 && ib >= 0)
+            islandForceSlots.emplace_back(ia, ib);
+    }
+
+    for (const auto &[ia, ib] : islandForceSlots)
+        parent[find(ia)] = find(ib);
+
+    // Compose islands: representative -> aggregate state.
+    // islandAwake[r] = true iff any member is awake; islandStill[r] = min stillFrames.
+    std::vector<char> islandAwake(count, 0);
+    std::vector<int> islandStill(count, INT_MAX);
+    for (int i = 0; i < count; ++i)
+    {
+        const int r = find(i);
+        if (!islandBodies[i]->sleeping)
+            islandAwake[r] = 1;
+        islandStill[r] = std::min(islandStill[r], islandBodies[i]->stillFrames);
+    }
+
+    // Sleep whole islands whose every member has cleared idle detection; leave mixed or
+    // awake islands exactly as they are (the per-body wake-up pass above already ran).
+    for (int i = 0; i < count; ++i)
+    {
+        const int r = find(i);
+        if (islandAwake[r] || islandStill[r] < sleepFrames)
+            continue;
+        Rigid *body = islandBodies[i];
+        if (!body->sleeping)
+        {
+            body->sleeping = true;
+            body->velocityLin = float3{0, 0, 0};
+            body->velocityAng = float3{0, 0, 0};
+        }
+    }
 }
 
 // The primal half of one iteration for a single body (Eqs. 4-6): assemble the 6x6 system
@@ -447,16 +567,46 @@ void Solver::colourGraph()
     warmstartOrder.clear();
     updateOrder.clear();
 
+    // Wake-up pass: a sleeping body (sleep_mode enabled) sharing a force with a moving
+    // movable body is woken before selection, so it re-enters this step's update set.
+    // A neighbour that is itself below the idle thresholds is not a disturbance: stacks
+    // must be allowed to fall asleep together, one body at a time. Serial and read-only
+    // over the force adjacency apart from the examined body itself, so the outcome is
+    // fixed regardless of thread count.
+    if (sleepFrames > 0)
+    {
+        const float lin2 = sleepLinearThreshold * sleepLinearThreshold;
+        const float ang2 = sleepAngularThreshold * sleepAngularThreshold;
+        for (Rigid *body = bodies; body != 0; body = body->next)
+        {
+            if (!body->sleeping || body->sleep_mode != 1)
+                continue;
+            for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
+            {
+                Rigid *other = (f->bodyA == body) ? f->bodyB : f->bodyA;
+                if (other != 0 && other->mass > 0 && !other->sleeping &&
+                        (other->velocityLin.squaredNorm() > lin2 ||
+                                other->velocityAng.squaredNorm() > ang2))
+                {
+                    body->sleeping = false;
+                    body->stillFrames = 0;
+                    break;
+                }
+            }
+        }
+        islandSleep();
+    }
+
     // Every body is warmed up; only movable ones are updated. Static bodies are excluded
     // from the colouring: they are never moved, so they take no part in the update order
     // and cannot conflict with anything.
     for (Rigid *body = bodies; body != 0; body = body->next)
     {
         warmstartOrder.push_back(body);
-        
+
         // Sleep mode support (Godot 4.7 API)
         // SLEEP_MODE_NEVER: always update
-        // SLEEP_MODE_SLEEP: update if velocity is zero and no forces
+        // SLEEP_MODE_SLEEP: update unless idle detection has put it to sleep
         // SLEEP_MODE_START_IN_SLEEP: start in sleep
         if (body->mass > 0)
         {
@@ -464,19 +614,17 @@ void Solver::colourGraph()
             bool should_update = true;
             if (body->sleep_mode == 1) // SLEEP_MODE_SLEEP
             {
-                // Skip if sleeping and no velocity or forces
-                if (body->sleeping && 
-                    std::sqrt(body->velocityLin.x*body->velocityLin.x + body->velocityLin.y*body->velocityLin.y + body->velocityLin.z*body->velocityLin.z) == 0.0f && 
-                    body->forces == nullptr)
-                {
+                // Idle detection (finishVelocities) is the only way into sleep here;
+                // a sleeping body with contacts stays out of the update set until the
+                // wake-up pass above re-admits it.
+                if (body->sleeping)
                     should_update = false;
-                }
             }
             else if (body->sleep_mode == 2) // SLEEP_MODE_START_IN_SLEEP
             {
                 // Start in sleep, wake up if velocity or forces are present
                 if (!body->sleeping && 
-                    std::sqrt(body->velocityLin.x*body->velocityLin.x + body->velocityLin.y*body->velocityLin.y + body->velocityLin.z*body->velocityLin.z) == 0.0f && 
+                    body->velocityLin.squaredNorm() == 0.0f && 
                     body->forces == nullptr)
                 {
                     should_update = false;

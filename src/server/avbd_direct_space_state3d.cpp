@@ -37,9 +37,9 @@ avbd::Shape shape_of(const avbd::Rigid &b) {
     s.center = b.positionLin;
     s.rotation = b.positionAng;
     s.half = b.size * 0.5f;
-    s.radius = b.size.x;
-    s.halfHeight = b.size.z * 0.5f;
-    s.axis = avbd::rotate(b.positionAng, avbd::float3{0, 0, 1});
+    s.radius = b.size.x();
+    s.halfHeight = b.size.z() * 0.5f;
+    s.axis = b.positionAng * avbd::float3{0, 0, 1};
     return s;
 }
 
@@ -64,7 +64,7 @@ avbd::Shape query_shape_of(const AVBDPhysicsServer3D::ShapeData &data, const Tra
     }
     s.center = to_sim(p_transform.origin);
     s.rotation = to_sim(p_transform.basis.get_rotation_quaternion());
-    s.axis = avbd::rotate(s.rotation, avbd::float3{0, 0, 1});
+    s.axis = s.rotation * avbd::float3{0, 0, 1};
     return s;
 }
 
@@ -81,14 +81,14 @@ bool deepest_contact(const avbd::Shape &a, const avbd::Shape &b, avbd::Manifold:
     // max_element keeps the first of ties, matching the strict > scan it replaced.
     const std::span span(contacts, static_cast<size_t>(count));
     const auto best = std::ranges::max_element(span, {},
-            [](const avbd::Manifold::Contact &c) { return avbd::length(c.rA - c.rB); });
+            [](const avbd::Manifold::Contact &c) { return static_cast<avbd::float3>(c.rA - c.rB).norm(); });
     r_contact = *best;
     return true;
 }
 
 // World-space (solver frame) position of body A's contact anchor.
 avbd::float3 contact_world_a(const avbd::Rigid &a, const avbd::Manifold::Contact &c) {
-    return a.positionLin + avbd::rotate(a.positionAng, c.rA);
+    return a.positionLin + a.positionAng * c.rA;
 }
 
 // The normal from A to B as a Godot-space vector.
@@ -96,7 +96,7 @@ Vector3 contact_normal_godot(const avbd::float3x3 &basis) {
     // Row 0 of the basis is the contact normal pointing from B to A; Godot's convention
     // (PhysicsServer3DExtensionRayResult.normal) is the surface normal facing the query,
     // which is from B towards A here as well - it is what the built-in server reports.
-    return to_godot(basis[0]);
+    return to_godot(avbd::float3{basis(0, 0), basis(0, 1), basis(0, 2)});
 }
 
 } // namespace
@@ -114,7 +114,7 @@ bool AVBDDirectSpaceState3D::_intersect_ray(const Vector3 &p_from, const Vector3
     avbd::float3 origin = to_sim(p_from);
     avbd::float3 end = to_sim(p_to);
     avbd::float3 dir = end - origin;
-    const float max_distance = avbd::length(dir);
+    const float max_distance = dir.norm();
     if (max_distance <= 1.0e-6f) {
         return false;
     }
@@ -128,8 +128,8 @@ bool AVBDDirectSpaceState3D::_intersect_ray(const Vector3 &p_from, const Vector3
         return false;
     }
 
-    const avbd::float3 world_hit = hit->positionLin + avbd::rotate(hit->positionAng, local);
-    const float distance = avbd::length(world_hit - origin);
+    const avbd::float3 world_hit = hit->positionLin + hit->positionAng * local;
+    const float distance = (world_hit - origin).norm();
     if (distance > max_distance) {
         return false;
     }
@@ -144,7 +144,7 @@ bool AVBDDirectSpaceState3D::_intersect_ray(const Vector3 &p_from, const Vector3
         probe.type = avbd::ShapeType::Sphere;
         probe.radius = 1.0e-3f;
         probe.center = origin;
-        probe.rotation = avbd::quat{0, 0, 0, 1};
+        probe.rotation = avbd::quat::Identity();
         probe.axis = avbd::float3{0, 0, 1};
         for (const AVBDPhysicsServer3D::QueryCandidate &candidate : server->query_candidates(space, p_collision_mask)) {
             if (!deepest_contact(probe, shape_of(*candidate.rigid), contact, basis)) {
@@ -168,9 +168,9 @@ bool AVBDDirectSpaceState3D::_intersect_ray(const Vector3 &p_from, const Vector3
     probe.radius = 1.0e-3f;
     probe.center = world_hit - dir * 1.0e-3f;
     probe.rotation = hit->positionAng;
-    probe.axis = avbd::rotate(hit->positionAng, avbd::float3{0, 0, 1});
+    probe.axis = hit->positionAng * avbd::float3{0, 0, 1};
     if (deepest_contact(probe, shape_of(*hit), contact, basis)) {
-        normal = to_godot(basis[0] * -1.0f);
+        normal = to_godot(avbd::float3{-basis(0, 0), -basis(0, 1), -basis(0, 2)});
         if (normal.dot(p_to - p_from) > 0.0) {
             normal = -normal; // face the query origin
         }
@@ -198,7 +198,7 @@ int32_t AVBDDirectSpaceState3D::_intersect_point(const Vector3 &p_position, uint
     probe.type = avbd::ShapeType::Sphere;
     probe.radius = 1.0e-3f;
     probe.center = to_sim(p_position);
-    probe.rotation = avbd::quat{0, 0, 0, 1};
+    probe.rotation = avbd::quat::Identity();
     probe.axis = avbd::float3{0, 0, 1};
 
     int32_t count = 0;
@@ -366,9 +366,9 @@ bool AVBDDirectSpaceState3D::_collide_shape(const RID &p_shape_rid, const Transf
         }
         any = true;
         if (pairs < max_pairs) {
-            const avbd::float3 world_a = query.center + avbd::rotate(query.rotation, contact.rA);
+            const avbd::float3 world_a = query.center + query.rotation * contact.rA;
             const avbd::Rigid &b = *candidate.rigid;
-            const avbd::float3 world_b = b.positionLin + avbd::rotate(b.positionAng, contact.rB);
+            const avbd::float3 world_b = b.positionLin + b.positionAng * contact.rB;
             points[pairs * 2 + 0] = to_godot(world_a);
             points[pairs * 2 + 1] = to_godot(world_b);
             pairs++;
@@ -404,13 +404,13 @@ bool AVBDDirectSpaceState3D::_rest_info(const RID &p_shape_rid, const Transform3
         if (!deepest_contact(query, shape_of(*candidate.rigid), contact, basis)) {
             continue;
         }
-        const float depth = avbd::length(contact.rA - contact.rB);
+        const float depth = (contact.rA - contact.rB).norm();
         if (depth <= best_depth) {
             continue;
         }
         best_depth = depth;
         found = true;
-        const avbd::float3 world_a = query.center + avbd::rotate(query.rotation, contact.rA);
+        const avbd::float3 world_a = query.center + query.rotation * contact.rA;
         r_rest_info->point = to_godot(world_a);
         r_rest_info->normal = contact_normal_godot(basis);
         r_rest_info->rid = server->solver_pick_rid(space, candidate.rigid);

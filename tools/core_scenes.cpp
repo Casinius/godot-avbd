@@ -48,12 +48,12 @@ void sceneStaticFriction(Solver *solver)
     solver->clear();
     new Rigid(solver, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
 
-    const float angle = rad(30.0f);
+    const float angle = 30.0f * float(M_PI) / 180.0f;
     Rigid *ramp = new Rigid(solver, {40, 24, 1}, 0.0f, 1.0f, {0, 0, 3});
-    ramp->positionAng = {0, sinf(angle * 0.5f), 0, cosf(angle * 0.5f)};
+    ramp->positionAng = quat(Eigen::AngleAxisf(angle, float3::UnitY()));
 
-    float3 rampTangent = normalize(rotate(ramp->positionAng, float3{1, 0, 0}));
-    float3 rampNormal = normalize(rotate(ramp->positionAng, float3{0, 0, 1}));
+    float3 rampTangent = (ramp->positionAng * float3{1, 0, 0}).normalized();
+    float3 rampNormal = (ramp->positionAng * float3{0, 0, 1}).normalized();
 
     for (int i = 0; i <= 10; i++)
     {
