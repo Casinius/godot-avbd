@@ -151,22 +151,19 @@ static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
     return dp.squaredNorm() <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB);
 }
 
-// Contact detection: sort-and-sweep over the x axis. Every body becomes one interval
-// [x - r, x + r] (r = bounding-sphere radius); two bodies can only overlap in 3D if their
-// intervals overlap on x, so a single sorted scan yields a candidate superset that the
-// exact `pairOverlaps` test then filters. With sorted poses this is O(n + c) against the
-// old O(n^2) row scan; the sort itself is O(n log n) but almost-sorted input costs
-// near-linear passes in insertion sort.
+// Contact detection: SAH BVH over per-body bounding spheres, rebuilt every step.
 //
-// Determinism: the sweep yields pairs in ascending (min-index, other) order - for a fixed
-// body list exactly the same order the row scan produced (ascending i, then ascending j
-// within the row) - so manifold creation order, the dual-update order and every digest are
-// unchanged. `constrainedTo` reads only each body's own force list, so the filter pass
-// could run in parallel; at ~1 us per 1000 pairs it is not worth a dispatch.
+// The old x-axis sweep emitted 28k candidate pairs on a 40-layer resting wall (x cannot
+// discriminate a z-pile); the BVH partitions in 3D so the candidate list tracks the real
+// contact surface instead of the pile depth.
+//
+// Determinism: leaf indices follow the solver's body list order and the builder splits
+// by a geometric median with a stable swap partition, so the tree is a pure function of
+// the body set. Pairs are collected from a deterministic in-order traversal, sorted
+// ascending (min-index, other), and created in that order - matching the pair order of
+// the old sweep path, so manifold order and digests stay comparable.
 void Solver::broadPhase()
 {
-    // Flatten the body list once so candidates can be addressed by index. Rebuilt every
-    // call: bodies come and go between steps.
     bodiesInOrder.clear();
     bodiesInOrder.insert(bodiesInOrder.end(), next_range(bodies).begin(), next_range(bodies).end());
 
@@ -174,37 +171,76 @@ void Solver::broadPhase()
     if (count < 2)
         return;
 
-    sweepEntries.resize(count);
-    for (int i = 0; i < count; i++)
-    {
-        const Rigid *body = bodiesInOrder[i];
-        sweepEntries[i] = {body->positionLin.x() - body->radius, i};
-    }
-    std::sort(sweepEntries.begin(), sweepEntries.end());
+    // Rebuild the tree from scratch each step: O(n log n), cheap relative to the SAT
+    // work it prunes, and its shape is a pure function of the body set (deterministic).
+    bvhNodes.clear();
+    bvhNodes.reserve(count * 2);
 
-    sweepPairs.clear();
-    for (int a = 0; a < count; a++)
+    std::vector<int> indices(count);
+    for (int i = 0; i < count; ++i)
+        indices[i] = i;
+
+    std::vector<const Rigid *> bodiesPtr;
+    bodiesPtr.reserve(count);
+    for (Rigid *b : bodiesInOrder)
+        bodiesPtr.push_back(b);
+
+    bvh::builder::Builder builder(bvhNodes, indices, bodiesPtr);
+    const int rootIdx = builder.build();
+    if (rootIdx < 0)
+        return;
+
+    // In-order traversal collects the leaves; leaf body indices are a permutation of
+    // 0..count-1, so sorting leaf indices by body index gives a deterministic order.
+    std::vector<int> leaves;
+    leaves.reserve(count);
     {
-        const auto [intervalEndA, i] = sweepEntries[a];
-        (void)intervalEndA;
-        const Rigid *bodyA = bodiesInOrder[i];
-        for (int b = a + 1; b < count; b++)
+        std::vector<int> todo;
+        todo.push_back(rootIdx);
+        while (!todo.empty())
         {
-            const auto [intervalStartB, j] = sweepEntries[b];
-            // Entry keys are interval starts (x - r): once B's interval starts after A's
-            // ends, every later candidate starts even further right - stop scanning A.
-            if (intervalStartB > bodyA->positionLin.x() + bodyA->radius)
-                break;
-            // Pairs are emitted with i < j: the row scan's (i, j) pairs also satisfy
-            // i < j because bodyB walks strictly after bodyA in the list.
+            const int node = todo.back();
+            todo.pop_back();
+            const int l = bvhNodes.left()[node];
+            const int r = bvhNodes.right()[node];
+            if (l < 0 && r < 0)
+            {
+                leaves.push_back(node);
+                continue;
+            }
+            if (r >= 0)
+                todo.push_back(r);
+            if (l >= 0)
+                todo.push_back(l);
+        }
+    }
+
+    // Pair every leaf whose AABB overlaps another's (descending-sort style: each leaf
+    // against all later leaves in the deterministic order). Sorting the final pair list
+    // ascending (min-index, other) matches the sweep path's manifold creation order.
+    sweepPairs.clear();
+    for (size_t a = 0; a < leaves.size(); ++a)
+    {
+        const int na = leaves[a];
+        const float3 &aMin = bvhNodes.boundsMin()[na];
+        const float3 &aMax = bvhNodes.boundsMax()[na];
+        for (size_t b = a + 1; b < leaves.size(); ++b)
+        {
+            const int nb = leaves[b];
+            const float3 &bMin = bvhNodes.boundsMin()[nb];
+            if (bMin.x() > aMax.x() || bMin.y() > aMax.y() || bMin.z() > aMax.z())
+                continue;
+            const float3 &bMax = bvhNodes.boundsMax()[nb];
+            if (bMax.x() < aMin.x() || bMax.y() < aMin.y() || bMax.z() < aMin.z())
+                continue;
+            const int i = bvhNodes.bodyIndex()[na];
+            const int j = bvhNodes.bodyIndex()[nb];
             sweepPairs.emplace_back(std::minmax(i, j));
         }
     }
 
-    // Ascending pair order = the row scan's creation order. std::sort on the (already
-    // nearly ordered) list is a cheap safety net for candidates the x-sweep finds in
-    // x order rather than index order.
     std::sort(sweepPairs.begin(), sweepPairs.end());
+    sweepPairs.erase(std::unique(sweepPairs.begin(), sweepPairs.end()), sweepPairs.end());
     for (const auto &[i, j] : sweepPairs)
     {
         Rigid *bodyA = bodiesInOrder[i];

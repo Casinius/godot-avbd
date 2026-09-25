@@ -18,6 +18,7 @@
 #include <span>
 
 #include "avbd/maths.h"
+#include "avbd/bvh/node_storage.hpp"
 
 // Forward declarations
 namespace bvh::nodes { class NodeStorage; }
@@ -571,10 +572,10 @@ private:
     // the ground is usually one of them.
     std::vector<Rigid *> warmstartOrder;
 
-    // Broad-phase scratch: the body list flattened to index-addressable order, plus the
-    // x-projected sweep entries and the candidate pair list, all rebuilt every step.
+    // Broad-phase: the body list flattened to index-addressable order (rebuilt every
+    // step), plus the BVH built over those bodies and the candidate pair list.
     std::vector<Rigid *> bodiesInOrder;
-    std::vector<std::pair<float, int>> sweepEntries;
+    bvh::nodes::NodeStorage bvhNodes;
     std::vector<std::pair<int, int>> sweepPairs;
 
     // Bodies that take part in the primal update (movable ones), grouped by colour:
