@@ -37,7 +37,7 @@ const quat kIdentity = quat::Identity();
 
 const float3 &frameAxis(int p_axis)
 {
-    static const float3 axes[3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    static const std::array<float3, 3> axes = {float3(1, 0, 0), float3(0, 1, 0), float3(0, 0, 1)};
     return axes[p_axis];
 }
 
@@ -276,8 +276,8 @@ bool GenericJoint::initialize()
 {
     // Record where each degree of freedom starts the step, and warm-start its dual state
     // (Eq. 19), exactly as Joint does.
-    float angularValue_[3];
-    angularValues(angularValue_);
+    std::array<float, 3> angularValue_;
+    angularValues(angularValue_.data());
 
     const float3 offset = frameOrientation().conjugate() * (anchorA() - anchorB());
 
@@ -305,8 +305,8 @@ void GenericJoint::updatePrimal(Rigid *body, float alpha, Block &block)
 
     // Measurements, in the joint frame.
     const float3 offset = qA.conjugate() * (anchorA() - anchorB());
-    float angularValue_[3];
-    angularValues(angularValue_);
+    std::array<float, 3> angularValue_;
+    angularValues(angularValue_.data());
 
     // Every Jacobian flips sign with the body it is stamped into.
     const bool isA = body == bodyA;
@@ -340,8 +340,8 @@ void GenericJoint::updatePrimal(Rigid *body, float alpha, Block &block)
 
 void GenericJoint::updateDual(float alpha)
 {
-    float angularValue_[3];
-    angularValues(angularValue_);
+    std::array<float, 3> angularValue_;
+    angularValues(angularValue_.data());
 
     const float3 offset = frameOrientation().conjugate() * (anchorA() - anchorB());
 
