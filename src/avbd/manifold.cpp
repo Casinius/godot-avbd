@@ -267,10 +267,10 @@ void Manifold::updateDual(float alpha)
         float3x3 jBLin = -basis;
         // Row i of the angular jacobian is the moment arm crossed with row i of the linear one.
         float3x3 jAAng, jBAng;
-        for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
         {
-            jAAng.row(i) = rAWorld.cross(jALin.row(i));
-            jBAng.row(i) = rBWorld.cross(jBLin.row(i));
+            jAAng.row(j) = rAWorld.cross(jALin.row(j));
+            jBAng.row(j) = rBWorld.cross(jBLin.row(j));
         }
 
         float3x3 K = diagonal(contacts[i].penalty.x(), contacts[i].penalty.y(), contacts[i].penalty.z());
