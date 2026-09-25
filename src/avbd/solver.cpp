@@ -151,17 +151,18 @@ static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
     return dp.squaredNorm() <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB);
 }
 
-// Contact detection: SAH BVH over per-body bounding spheres, rebuilt every step.
+// Contact detection: Morton LBVH (implicit heap layout), rebuilt every step.
 //
 // The old x-axis sweep emitted 28k candidate pairs on a 40-layer resting wall (x cannot
-// discriminate a z-pile); the BVH partitions in 3D so the candidate list tracks the real
-// contact surface instead of the pile depth.
+// discriminate a z-pile); the Morton tree partitions in 3D so the candidate list tracks
+// the real contact surface. Bodies are ordered by 64-bit Morton code - a pure function
+// of the scene bounds and positions - and the code-sorted order is mapped into the
+// implicit heap layout of a complete binary tree: node i has children 2i+1 / 2i+2, no
+// left/right/parent arrays, best-possible cache behaviour for a pointer-free BVH.
 //
-// Determinism: leaf indices follow the solver's body list order and the builder splits
-// by a geometric median with a stable swap partition, so the tree is a pure function of
-// the body set. Pairs are collected from a deterministic in-order traversal, sorted
-// ascending (min-index, other), and created in that order - matching the pair order of
-// the old sweep path, so manifold order and digests stay comparable.
+// Determinism: leaf order is the Morton-sorted body order, pair collection is leaf
+// order, and the final pair list is sorted ascending (min-index, other) - the same
+// manifold creation order contract as the sweep path.
 void Solver::broadPhase()
 {
     bodiesInOrder.clear();
@@ -170,11 +171,6 @@ void Solver::broadPhase()
     const int count = static_cast<int>(bodiesInOrder.size());
     if (count < 2)
         return;
-
-    // Rebuild the tree from scratch each step: O(n log n), cheap relative to the SAT
-    // work it prunes, and its shape is a pure function of the body set (deterministic).
-    bvhNodes.clear();
-    bvhNodes.reserve(count * 2);
 
     std::vector<int> indices(count);
     for (int i = 0; i < count; ++i)
@@ -186,47 +182,28 @@ void Solver::broadPhase()
         bodiesPtr.push_back(b);
 
     bvh::builder::Builder builder(bvhNodes, indices, bodiesPtr);
-    const int rootIdx = builder.build();
-    if (rootIdx < 0)
+    const int leafCount = builder.buildLBVH();
+    if (leafCount < 2)
         return;
+    const int padded = 1;
+    int p = 1;
+    while (p < leafCount)
+        p <<= 1;
+    const int firstLeaf = p - 1;
+    (void)padded;
 
-    // In-order traversal collects the leaves; leaf body indices are a permutation of
-    // 0..count-1, so sorting leaf indices by body index gives a deterministic order.
-    std::vector<int> leaves;
-    leaves.reserve(count);
-    {
-        std::vector<int> todo;
-        todo.push_back(rootIdx);
-        while (!todo.empty())
-        {
-            const int node = todo.back();
-            todo.pop_back();
-            const int l = bvhNodes.left()[node];
-            const int r = bvhNodes.right()[node];
-            if (l < 0 && r < 0)
-            {
-                leaves.push_back(node);
-                continue;
-            }
-            if (r >= 0)
-                todo.push_back(r);
-            if (l >= 0)
-                todo.push_back(l);
-        }
-    }
-
-    // Pair every leaf whose AABB overlaps another's (descending-sort style: each leaf
-    // against all later leaves in the deterministic order). Sorting the final pair list
-    // ascending (min-index, other) matches the sweep path's manifold creation order.
+    // Leaf slots [firstLeaf, firstLeaf + leafCount) in Morton-sorted order; collect them
+    // and pair each against all later slots (AABB overlap prune). The final sort keeps
+    // the ascending (min-index, other) manifold order.
     sweepPairs.clear();
-    for (size_t a = 0; a < leaves.size(); ++a)
+    for (int a = 0; a < leafCount; ++a)
     {
-        const int na = leaves[a];
+        const int na = firstLeaf + a;
         const float3 &aMin = bvhNodes.boundsMin()[na];
         const float3 &aMax = bvhNodes.boundsMax()[na];
-        for (size_t b = a + 1; b < leaves.size(); ++b)
+        for (int b = a + 1; b < leafCount; ++b)
         {
-            const int nb = leaves[b];
+            const int nb = firstLeaf + b;
             const float3 &bMin = bvhNodes.boundsMin()[nb];
             if (bMin.x() > aMax.x() || bMin.y() > aMax.y() || bMin.z() > aMax.z())
                 continue;
