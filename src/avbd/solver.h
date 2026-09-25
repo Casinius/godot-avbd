@@ -18,6 +18,7 @@
 #include <span>
 
 #include "avbd/maths.h"
+#include "avbd/bvh/node_storage.hpp"
 
 // Forward declarations
 namespace bvh::nodes { class NodeStorage; }
@@ -393,6 +394,23 @@ struct Manifold : Force
     int numContacts;
     float friction;
 
+    // Incremental jacobian cache: world-space moment arms + angular jacobians captured
+    // at the last full assembly, plus the body rotations at capture time. The drift test
+    // is per BODY (rotations are loop-invariant across a manifold's contacts): rebuild
+    // everything when either rotation moved more than jacobianRebuildDistance (unit-
+    // column distance ~ 2 sin(angle/2)). Invalidated by initialize() (new contact set).
+    struct JacobianCache
+    {
+        float3 rAWorld;
+        float3 rBWorld;
+        float3x3 jAAng;
+        float3x3 jBAng;
+    };
+    std::array<JacobianCache, 8> jacobianCache;
+    float3x3 rotACaptured = float3x3::Identity(); // body rotations at capture
+    float3x3 rotBCaptured = float3x3::Identity();
+    bool jacobiansCached = false;
+
     Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB);
 
     // Class-specific pooled allocation: manifolds churn with contact formation and
@@ -445,6 +463,30 @@ struct Solver
     float betaLin = 10000.0f;  // Penalty ramping for linear constraints
     float betaAng = 100.0f;    // Penalty ramping for angular constraints
     float gamma = 0.999f;      // Warmstarting decay, < 1
+
+    // Real-time phase split: the first ceil(newtonRatio * iterations) rounds run the full
+    // Newton primal (dense 6x6 solve); the remaining rounds skip the primal entirely and
+    // run dual-only relaxation on the existing jacobians. 1.0 = original AVBD behaviour.
+    // Newton carries the stiff corrections; the dual-only tail is where the convergence
+    // is cheapest to give up.
+    float newtonRatio = 1.0f;
+    // Per-iteration multiplicative decay applied to contact penalties during the
+    // dual-only tail: a stiff penalty converges slowly under relaxation, softening it
+    // lets the cheap rounds actually converge instead of spinning. 1.0 = no decay.
+    float stiffnessDecay = 1.0f;
+
+    // Early-exit threshold on the mean penetration residual: when a Newton round
+    // improves the average residual by less than this (or worsens it), the iteration set
+    // ends early - remaining rounds would polish float noise at full price. 0 disables
+    // the check (default: bit-identical iteration counts). Realistic value ~1e-5.
+    float convergenceThreshold = 0.0f;
+
+    // Incremental jacobian rebuild distance (metres): after the first Newton round
+    // assembles a contact's angular jacobian, later rounds reuse it while the contact's
+    // world-space moment arms have drifted less than this from the captured values.
+    // 0 disables caching (full assembly every round; default, bit-identical digests).
+    // Realistic value 1e-4 (0.1 mm): in-iteration arm drift is millimetre-scale.
+    float jacobianRebuildDistance = 0.0f;
 
     // Worker threads for the per-body phases. 0 = one per hardware thread, 1 = run
     // everything inline on the calling thread. The result does not depend on this value:
@@ -530,10 +572,10 @@ private:
     // the ground is usually one of them.
     std::vector<Rigid *> warmstartOrder;
 
-    // Broad-phase scratch: the body list flattened to index-addressable order, plus the
-    // x-projected sweep entries and the candidate pair list, all rebuilt every step.
+    // Broad-phase: the body list flattened to index-addressable order (rebuilt every
+    // step), plus the BVH built over those bodies and the candidate pair list.
     std::vector<Rigid *> bodiesInOrder;
-    std::vector<std::pair<float, int>> sweepEntries;
+    bvh::nodes::NodeStorage bvhNodes;
     std::vector<std::pair<int, int>> sweepPairs;
 
     // Bodies that take part in the primal update (movable ones), grouped by colour:
@@ -585,7 +627,7 @@ private:
     // The whole iteration set as one persistent-worker loop: `targetIterations` rounds of
     // per-colour primal passes plus dual passes, fenced by LoopSync barriers instead of
     // one pool dispatch per phase. Declared here so `iterate` stays testable.
-    void iterate(int targetIterations, int forceCount);
+    void iterate(int targetIterations, int forceCount, int newtonRounds);
     void finishVelocities();
     void updatePrimal(Rigid *body);
 

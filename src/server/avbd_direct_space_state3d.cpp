@@ -86,10 +86,10 @@ bool deepest_contact(const avbd::Shape &a, const avbd::Shape &b, avbd::Manifold:
     return true;
 }
 
-// World-space (solver frame) position of body A's contact anchor.
-avbd::float3 contact_world_a(const avbd::Rigid &a, const avbd::Manifold::Contact &c) {
-    return a.positionLin + a.positionAng * c.rA;
-}
+// // World-space (solver frame) position of body A's contact anchor.
+// avbd::float3 contact_world_a(const avbd::Rigid &a, const avbd::Manifold::Contact &c) {
+//     return a.positionLin + a.positionAng * c.rA;
+// }
 
 // The normal from A to B as a Godot-space vector.
 Vector3 contact_normal_godot(const avbd::float3x3 &basis) {

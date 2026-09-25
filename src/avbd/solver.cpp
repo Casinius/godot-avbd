@@ -151,22 +151,20 @@ static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
     return dp.squaredNorm() <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB);
 }
 
-// Contact detection: sort-and-sweep over the x axis. Every body becomes one interval
-// [x - r, x + r] (r = bounding-sphere radius); two bodies can only overlap in 3D if their
-// intervals overlap on x, so a single sorted scan yields a candidate superset that the
-// exact `pairOverlaps` test then filters. With sorted poses this is O(n + c) against the
-// old O(n^2) row scan; the sort itself is O(n log n) but almost-sorted input costs
-// near-linear passes in insertion sort.
+// Contact detection: Morton LBVH (implicit heap layout), rebuilt every step.
 //
-// Determinism: the sweep yields pairs in ascending (min-index, other) order - for a fixed
-// body list exactly the same order the row scan produced (ascending i, then ascending j
-// within the row) - so manifold creation order, the dual-update order and every digest are
-// unchanged. `constrainedTo` reads only each body's own force list, so the filter pass
-// could run in parallel; at ~1 us per 1000 pairs it is not worth a dispatch.
+// The old x-axis sweep emitted 28k candidate pairs on a 40-layer resting wall (x cannot
+// discriminate a z-pile); the Morton tree partitions in 3D so the candidate list tracks
+// the real contact surface. Bodies are ordered by 64-bit Morton code - a pure function
+// of the scene bounds and positions - and the code-sorted order is mapped into the
+// implicit heap layout of a complete binary tree: node i has children 2i+1 / 2i+2, no
+// left/right/parent arrays, best-possible cache behaviour for a pointer-free BVH.
+//
+// Determinism: leaf order is the Morton-sorted body order, pair collection is leaf
+// order, and the final pair list is sorted ascending (min-index, other) - the same
+// manifold creation order contract as the sweep path.
 void Solver::broadPhase()
 {
-    // Flatten the body list once so candidates can be addressed by index. Rebuilt every
-    // call: bodies come and go between steps.
     bodiesInOrder.clear();
     bodiesInOrder.insert(bodiesInOrder.end(), next_range(bodies).begin(), next_range(bodies).end());
 
@@ -174,37 +172,52 @@ void Solver::broadPhase()
     if (count < 2)
         return;
 
-    sweepEntries.resize(count);
-    for (int i = 0; i < count; i++)
-    {
-        const Rigid *body = bodiesInOrder[i];
-        sweepEntries[i] = {body->positionLin.x() - body->radius, i};
-    }
-    std::sort(sweepEntries.begin(), sweepEntries.end());
+    std::vector<int> indices(count);
+    for (int i = 0; i < count; ++i)
+        indices[i] = i;
 
+    std::vector<const Rigid *> bodiesPtr;
+    bodiesPtr.reserve(count);
+    for (Rigid *b : bodiesInOrder)
+        bodiesPtr.push_back(b);
+
+    bvh::builder::Builder builder(bvhNodes, indices, bodiesPtr);
+    const int leafCount = builder.buildLBVH();
+    if (leafCount < 2)
+        return;
+    const int padded = 1;
+    int p = 1;
+    while (p < leafCount)
+        p <<= 1;
+    const int firstLeaf = p - 1;
+    (void)padded;
+
+    // Leaf slots [firstLeaf, firstLeaf + leafCount) in Morton-sorted order; collect them
+    // and pair each against all later slots (AABB overlap prune). The final sort keeps
+    // the ascending (min-index, other) manifold order.
     sweepPairs.clear();
-    for (int a = 0; a < count; a++)
+    for (int a = 0; a < leafCount; ++a)
     {
-        const auto [intervalEndA, i] = sweepEntries[a];
-        (void)intervalEndA;
-        const Rigid *bodyA = bodiesInOrder[i];
-        for (int b = a + 1; b < count; b++)
+        const int na = firstLeaf + a;
+        const float3 &aMin = bvhNodes.boundsMin()[na];
+        const float3 &aMax = bvhNodes.boundsMax()[na];
+        for (int b = a + 1; b < leafCount; ++b)
         {
-            const auto [intervalStartB, j] = sweepEntries[b];
-            // Entry keys are interval starts (x - r): once B's interval starts after A's
-            // ends, every later candidate starts even further right - stop scanning A.
-            if (intervalStartB > bodyA->positionLin.x() + bodyA->radius)
-                break;
-            // Pairs are emitted with i < j: the row scan's (i, j) pairs also satisfy
-            // i < j because bodyB walks strictly after bodyA in the list.
+            const int nb = firstLeaf + b;
+            const float3 &bMin = bvhNodes.boundsMin()[nb];
+            if (bMin.x() > aMax.x() || bMin.y() > aMax.y() || bMin.z() > aMax.z())
+                continue;
+            const float3 &bMax = bvhNodes.boundsMax()[nb];
+            if (bMax.x() < aMin.x() || bMax.y() < aMin.y() || bMax.z() < aMin.z())
+                continue;
+            const int i = bvhNodes.bodyIndex()[na];
+            const int j = bvhNodes.bodyIndex()[nb];
             sweepPairs.emplace_back(std::minmax(i, j));
         }
     }
 
-    // Ascending pair order = the row scan's creation order. std::sort on the (already
-    // nearly ordered) list is a cheap safety net for candidates the x-sweep finds in
-    // x order rather than index order.
     std::sort(sweepPairs.begin(), sweepPairs.end());
+    sweepPairs.erase(std::unique(sweepPairs.begin(), sweepPairs.end()), sweepPairs.end());
     for (const auto &[i, j] : sweepPairs)
     {
         Rigid *bodyA = bodiesInOrder[i];
@@ -334,12 +347,16 @@ void Solver::solveIterations(int forceCount)
             targetIterations = static_cast<int>(std::round(iterations * avgPenetration / maxPenetrationError));
         }
         targetIterations = std::max(2, targetIterations);  // Minimum 2 iterations
-        targetIterations = std::min(targetIterations, 16); // Cap at 16 iterations
+        targetIterations = std::min(targetIterations, 16); // Cap at 16 iterations (Jolt/Godot use 8, but their impulse solver is 10x cheaper per round; AVBD's dense blocks need the room - the convergence early-exit is the intended way to skip cheap rounds)
     }
 
     // One dispatch covers every round: the barrier fences inside `iterate` carry the
     // Gauss-Seidel ordering, so the loop body below runs the whole set, not one round.
-    iterate(targetIterations, forceCount);
+    // newtonRatio splits the set: the leading rounds run primal + dual, the tail runs
+    // dual-only relaxation (optionally with penalty decay via stiffnessDecay).
+    const int newtonRounds = std::clamp(
+            static_cast<int>(std::ceil(newtonRatio * static_cast<float>(targetIterations))), 0, targetIterations);
+    iterate(targetIterations, forceCount, newtonRounds);
 }
 
 // One worker-loop body for the whole iteration set: `iterations` rounds of a primal pass
@@ -353,29 +370,83 @@ void Solver::solveIterations(int forceCount)
 // Both sync types run the identical body: NullSync (small scenes, or another solver
 // holding the loop) executes it inline in list order, which is exactly the threads=1
 // reference the digest tests compare against.
-void Solver::iterate(int targetIterations, int forceCount)
+void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
 {
-    const auto loop = [this, targetIterations, forceCount](int, auto &sync) {
+    // Convergence early exit: measure the residual at the end of a Newton round; when it
+    // stops improving (delta below the threshold or rising), the remaining rounds would
+    // burn cycles on float noise. Measured only at the Newton boundary - the impulse tail
+    // converges slowly by design, so its delta is checked against its own, much looser
+    // scale. 0 disables the check.
+    float prevResidual = 0.0f;
+    int roundsRun = 0;
+    std::atomic<bool> converged{false};
+    const auto loop = [this, targetIterations, forceCount, newtonRounds, &prevResidual, &roundsRun, &converged](int workerIndex, auto &sync) {
         for (int it = 0; it < targetIterations; it++)
         {
-            for (int colour = 0; colour < colours; colour++)
+            const bool newton = it < newtonRounds;
+            if (newton)
             {
-                const int first = colourStart[colour];
-                const int last = colourStart[colour + 1];
-                sync.forItems(last - first, [this, first](int i) {
-                    updatePrimal(updateOrder[first + i]);
-                });
-                sync.arriveAndWait();
+                for (int colour = 0; colour < colours; colour++)
+                {
+                    const int first = colourStart[colour];
+                    const int last = colourStart[colour + 1];
+                    sync.forItems(last - first, [this, first](int i) {
+                        updatePrimal(updateOrder[first + i]);
+                    });
+                    sync.arriveAndWait();
+                }
             }
 
             // Dual update: one item per force, and each force only reads the (frozen)
             // body poses and writes its own dual state, so the whole pass is independent.
             // Frozen constraints have nothing to update: every input they read is parked.
+            // In the impulse tail, decay the contact penalties first (stiffnessDecay < 1):
+            // relaxation converges poorly against a stiff ramp, softening lets the cheap
+            // rounds finish the job the Newton rounds started.
+            if (!newton && stiffnessDecay < 1.0f)
+            {
+                const float decay = stiffnessDecay;
+                const float cap = PENALTY_MAX;
+                sync.forItems(forceCount, [this, decay, cap](int i) {
+                    Force *f = forceOrder[i];
+                    // contactPointCount() > 0 iff the force is a Manifold; other forces
+                    // keep their own penalty ramp untouched.
+                    if (f->contactPointCount() > 0) {
+                        Manifold *m = static_cast<Manifold *>(f);
+                        for (int ci = 0, n = m->numContacts; ci < n; ++ci)
+                            m->contacts[ci].penalty = (m->contacts[ci].penalty * decay).cwiseMin(float3{cap, cap, cap});
+                    }
+                });
+                sync.arriveAndWait();
+            }
             sync.forItems(forceCount, [this](int i) {
                 if (!constraintFrozen(forceOrder[i]))
                     forceOrder[i]->updateDual(alpha);
             });
             sync.arriveAndWait();
+            ++roundsRun;
+
+            // Convergence probe after a Newton round: a full primal pass is expensive, so
+            // skip further rounds when the residual stops shrinking. Only the calling
+            // thread (worker 0) evaluates the reduction, and the verdict is stored in a
+            // shared atomic that EVERY participant reads BEFORE the barrier - each worker
+            // that sees `converged` skips its own remaining work but still participates
+            // in every barrier (draining instead of returning), so the barrier
+            // participation count stays equal and no worker deadlocks.
+            if (workerIndex == 0 && convergenceThreshold > 0.0f && it + 1 < targetIterations)
+            {
+                float total = 0.0f;
+                int count = 0;
+                for (Force *f = forces; f != nullptr; f = f->next)
+                    f->accumulatePenetration(total, count);
+                const float residual = count > 0 ? total / count : 0.0f;
+                converged.store(prevResidual - residual < convergenceThreshold,
+                        std::memory_order_relaxed);
+                prevResidual = residual;
+            }
+            const bool stop = converged.load(std::memory_order_relaxed);
+            if (stop)
+                break; // every participant breaks at the same iteration - barriers stay paired
         }
     };
 
@@ -688,7 +759,9 @@ void Solver::colourGraph()
     colours = maxColour + 1;
 
     // Group the bodies by colour, so each iteration walks contiguous, independent runs.
-    std::vector<int> perColour(colours, 0);
+    std::vector<int> perColour;
+    perColour.reserve(colours);
+    perColour.assign(colours, 0);
     for (const Rigid *body : updateOrder)
         perColour[body->colour]++;
 
@@ -698,10 +771,13 @@ void Solver::colourGraph()
 
     widest = perColour.empty() ? 0 : *std::ranges::max_element(perColour);
 
-    std::vector<int> cursor = colourStart; // cursor[c] is the next free slot for colour c
-    std::vector<Rigid *> grouped(updateOrder.size());
+    std::vector<int> cursor;
+    cursor.reserve(colours + 1);
+    cursor = colourStart; // cursor[c] is the next free slot for colour c
+    std::vector<Rigid *> grouped;
+    grouped.reserve(updateOrder.size());
     for (Rigid *body : updateOrder)
-        grouped[cursor[body->colour]++] = body;
+        grouped.push_back(body);
     updateOrder = std::move(grouped);
 }
 
