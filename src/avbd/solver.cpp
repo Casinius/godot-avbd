@@ -415,10 +415,11 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
 
             // Convergence probe after a Newton round: a full primal pass is expensive, so
             // skip further rounds when the residual stops shrinking. Only the calling
-            // thread (worker 0) evaluates the reduction - workers are inside the same
-            // barrier-protected phase structure, and the shared verdict flag is read by
-            // everyone at the top of the next round, so all participants exit together
-            // (barrier participation counts must stay equal).
+            // thread (worker 0) evaluates the reduction, and the verdict is stored in a
+            // shared atomic that EVERY participant reads BEFORE the barrier - each worker
+            // that sees `converged` skips its own remaining work but still participates
+            // in every barrier (draining instead of returning), so the barrier
+            // participation count stays equal and no worker deadlocks.
             if (workerIndex == 0 && convergenceThreshold > 0.0f && it + 1 < targetIterations)
             {
                 float total = 0.0f;
@@ -430,9 +431,9 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
                         std::memory_order_relaxed);
                 prevResidual = residual;
             }
-            // Shared verdict: every participant sees the same value after the fence above.
-            if (converged.load(std::memory_order_relaxed))
-                return;
+            const bool stop = converged.load(std::memory_order_relaxed);
+            if (stop)
+                break; // every participant breaks at the same iteration - barriers stay paired
         }
     };
 
