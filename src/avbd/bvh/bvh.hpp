@@ -82,9 +82,10 @@ public:
             std::span<const avbd::Rigid* const> bodies, int maxDepth = 64) noexcept
         : nodes_(nodes), bodyIndices_(bodyIndices), bodies_(bodies), maxDepth_(maxDepth) {}
 
-    void build() noexcept {
-        if (bodyIndices_.empty()) return;
-        buildRecursive(0, static_cast<int>(bodyIndices_.size()), 0);
+    // Builds the tree and returns the root node index.
+    int build() noexcept {
+        if (bodyIndices_.empty()) return -1;
+        return buildRange(std::vector<int>(bodyIndices_.begin(), bodyIndices_.end()), 0);
     }
 
 private:
@@ -93,7 +94,8 @@ private:
     std::span<const avbd::Rigid* const> bodies_;
     int maxDepth_;
 
-    void buildRecursive(int start, int end, int depth) noexcept;
+    // Returns the node index of the subtree root for this index range.
+    int buildRange(std::vector<int> local, int depth) noexcept;
 };
 
 } // namespace builder

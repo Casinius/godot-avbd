@@ -16,81 +16,71 @@
 namespace bvh::builder {
 
 // ============================================
-// Helper: Calculate AABB for a range of bodies
+// Helper: Calculate bounding-sphere center and AABB for a body
 // ============================================
-static inline float3 computeAABB(const avbd::Rigid* body) noexcept {
-    // Simplified AABB - in a real implementation, this would use the actual shape bounds
-    float3 pos = body->positionLin;
-    return {pos.x(), pos.y(), pos.z()};
+static inline float3 computeAABBCenter(const avbd::Rigid* body) noexcept {
+    return body->positionLin;
+}
+static inline float computeAABBRadius(const avbd::Rigid* body) noexcept {
+    return body->radius;
+}
+static inline void computeAABB(const avbd::Rigid* body, float3& min, float3& max) noexcept {
+    const float r = body->radius;
+    min = {body->positionLin.x() - r, body->positionLin.y() - r, body->positionLin.z() - r};
+    max = {body->positionLin.x() + r, body->positionLin.y() + r, body->positionLin.z() + r};
 }
 
 // ============================================
 // Build Recursive Implementation
 // ============================================
-void Builder::buildRecursive(int start, int end, int depth) noexcept {
-    int count = end - start;
+// Returns the node index of the subtree root for this range of body indices.
+int Builder::buildRange(std::vector<int> local, int depth) noexcept {
+    const int count = static_cast<int>(local.size());
 
-    // If we have a single body, create a leaf node
     if (count == 1) {
-        int bodyIndex = bodyIndices_[start];
+        const int bodyIndex = local[0];
         const avbd::Rigid* body = bodies_[bodyIndex];
-        float3 pos = computeAABB(body);
-        float3 min = pos;
-        float3 max = pos;
-        nodes_.createLeaf(min, max, bodyIndex);
-        return;
+        float3 min, max;
+        computeAABB(body, min, max);
+        return nodes_.createLeaf(min, max, bodyIndex);
     }
 
-    // Otherwise, find the best split
-    // TODO: Implement SAH-based split
-    // For now, use a simple axis-aligned split
+    // Split on the axis with largest span of bounding-sphere centres.
     float3 min = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
     float3 max = {std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
 
-    // Create a copy of the indices for sorting
-    std::vector<int> sortedIndices(bodyIndices_.begin(), bodyIndices_.end());
-
     for (int i = 0; i < count; ++i) {
-        int bodyIndex = sortedIndices[i];
-        const avbd::Rigid* body = bodies_[bodyIndex];
-        float3 pos = computeAABB(body);
-        min = {std::min(min.x(), pos.x()), std::min(min.y(), pos.y()), std::min(min.z(), pos.z())};
-        max = {std::max(max.x(), pos.x()), std::max(max.y(), pos.y()), std::max(max.z(), pos.z())};
+        const float3 c = computeAABBCenter(bodies_[local[i]]);
+        min = {std::min(min.x(), c.x()), std::min(min.y(), c.y()), std::min(min.z(), c.z())};
+        max = {std::max(max.x(), c.x()), std::max(max.y(), c.y()), std::max(max.z(), c.z())};
     }
 
-    // Simple split: divide on the axis with largest span
-    float3 span = {max.x() - min.x(), max.y() - min.y(), max.z() - min.z()};
-    int splitAxis = span.x() >= span.y() ? (span.x() >= span.z() ? 0 : 2) : (span.y() >= span.z() ? 1 : 2);
-    float splitPos = min[splitAxis] + span[splitAxis] * 0.5f;
+    const float3 span = {max.x() - min.x(), max.y() - min.y(), max.z() - min.z()};
+    const int splitAxis = span.x() >= span.y() ? (span.x() >= span.z() ? 0 : 2) : (span.y() >= span.z() ? 1 : 2);
+    const float splitPos = min[splitAxis] + span[splitAxis] * 0.5f;
 
-    // Find split position
     int splitPosIdx = 0;
     for (int i = 0; i < count; ++i) {
-        int bodyIndex = sortedIndices[i];
-        const avbd::Rigid* body = bodies_[bodyIndex];
-        float3 pos = computeAABB(body);
-        if (pos[splitAxis] < splitPos) {
-            std::swap(sortedIndices[i], sortedIndices[splitPosIdx]);
+        if (computeAABBCenter(bodies_[local[i]])[splitAxis] < splitPos) {
+            std::swap(local[i], local[splitPosIdx]);
             ++splitPosIdx;
         }
     }
+    // Degenerate partition (all centres on one side): median split keeps the tree
+    // balanced and the recursion terminating.
+    if (splitPosIdx == 0 || splitPosIdx == count)
+        splitPosIdx = count / 2;
 
-    // If split didn't partition (all bodies on one side), make a leaf
-    if (splitPosIdx == 0 || splitPosIdx == count) {
-        for (int i = 0; i < count; ++i) {
-            int bodyIndex = sortedIndices[i];
-            const avbd::Rigid* body = bodies_[bodyIndex];
-            float3 pos = computeAABB(body);
-            float3 nodeMin = pos;
-            float3 nodeMax = pos;
-            nodes_.createLeaf(nodeMin, nodeMax, bodyIndex);
-        }
-        return;
-    }
+    // Sub-ranges recurse on their own copies; the (const) span is never written.
+    std::vector<int> leftLocal(local.begin(), local.begin() + splitPosIdx);
+    std::vector<int> rightLocal(local.begin() + splitPosIdx, local.end());
 
-    // Recursively build children
-    buildRecursive(start, start + splitPosIdx, depth + 1);
-    buildRecursive(start + splitPosIdx, end, depth + 1);
+    const int leftNode = buildRange(std::move(leftLocal), depth + 1);
+    const int rightNode = buildRange(std::move(rightLocal), depth + 1);
+
+    const float3 mn = rmin(nodes_.boundsMin()[leftNode], nodes_.boundsMin()[rightNode]);
+    const float3 mx = rmax(nodes_.boundsMax()[leftNode], nodes_.boundsMax()[rightNode]);
+    return nodes_.createInternal(mn, mx, leftNode, rightNode);
 }
 
 } // namespace bvh::builder
