@@ -393,6 +393,23 @@ struct Manifold : Force
     int numContacts;
     float friction;
 
+    // Incremental jacobian cache: world-space moment arms + angular jacobians captured
+    // at the last full assembly, plus the body rotations at capture time. The drift test
+    // is per BODY (rotations are loop-invariant across a manifold's contacts): rebuild
+    // everything when either rotation moved more than jacobianRebuildDistance (unit-
+    // column distance ~ 2 sin(angle/2)). Invalidated by initialize() (new contact set).
+    struct JacobianCache
+    {
+        float3 rAWorld;
+        float3 rBWorld;
+        float3x3 jAAng;
+        float3x3 jBAng;
+    };
+    std::array<JacobianCache, 8> jacobianCache;
+    float3x3 rotACaptured = float3x3::Identity(); // body rotations at capture
+    float3x3 rotBCaptured = float3x3::Identity();
+    bool jacobiansCached = false;
+
     Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB);
 
     // Class-specific pooled allocation: manifolds churn with contact formation and
@@ -462,6 +479,13 @@ struct Solver
     // ends early - remaining rounds would polish float noise at full price. 0 disables
     // the check (default: bit-identical iteration counts). Realistic value ~1e-5.
     float convergenceThreshold = 0.0f;
+
+    // Incremental jacobian rebuild distance (metres): after the first Newton round
+    // assembles a contact's angular jacobian, later rounds reuse it while the contact's
+    // world-space moment arms have drifted less than this from the captured values.
+    // 0 disables caching (full assembly every round; default, bit-identical digests).
+    // Realistic value 1e-4 (0.1 mm): in-iteration arm drift is millimetre-scale.
+    float jacobianRebuildDistance = 0.0f;
 
     // Worker threads for the per-body phases. 0 = one per hardware thread, 1 = run
     // everything inline on the calling thread. The result does not depend on this value:
