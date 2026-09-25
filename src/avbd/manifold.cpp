@@ -73,6 +73,9 @@ bool Manifold::initialize()
     // Compute friction
     friction = std::sqrt(bodyA->friction * bodyB->friction);
 
+    // New contact set: cached jacobians describe the old geometry, drop them.
+    jacobiansCached = false;
+
     // Compute new contacts
     std::array<Contact, 8> newContacts = {};
     int newNumContacts = collide(bodyA, bodyB, std::span<Contact>(newContacts), basis);
@@ -147,24 +150,64 @@ void Manifold::updatePrimal(Rigid *body, float alpha, Block &block)
     const float3x3 rotA(bodyA->positionAng);
     const float3x3 rotB(bodyB->positionAng);
 
+    // Incremental jacobian caching: the angular jacobian is a function of the world-space
+    // moment arms only (rows are rWorld x basis.row(i)), and the arms move between
+    // iterations solely because the body rotations do. The drift test is per BODY (the
+    // two body rotations are loop-invariant): hoisted out of the contact loop so the
+    // per-contact work in the cached path is a straight copy of the cached jacobians.
+    const bool cacheable = solver->jacobianRebuildDistance > 0.0f;
+    const float rebuild2 = solver->jacobianRebuildDistance * solver->jacobianRebuildDistance;
+    const float3 dA = rotA.col(0) - rotACaptured.col(0);
+    const float3 dB = rotB.col(0) - rotBCaptured.col(0);
+    const bool cacheUsable = cacheable && jacobiansCached &&
+            dA.squaredNorm() <= rebuild2 && dB.squaredNorm() <= rebuild2;
+
     for (int i = 0; i < numContacts; i++)
     {
-        float3 rAWorld = rotA * contacts[i].rA;
-        float3 rBWorld = rotB * contacts[i].rB;
+        JacobianCache &cache = jacobianCache[i];
 
-        // Compute the Taylor series approximation of the constraint function C(x) (Sec 4)
-        float3x3 jALin = basis;
-        float3x3 jBLin = -basis;
-        // Row i of the angular jacobian is the moment arm crossed with row i of the linear one
-        // (the original custom float3x3 was row-major; Eigen's .row() keeps the semantics).
+        float3 rAWorld, rBWorld;
         float3x3 jAAng, jBAng;
-        for (int i = 0; i < 3; i++)
+        if (cacheUsable)
         {
-            jAAng.row(i) = rAWorld.cross(jALin.row(i));
-            jBAng.row(i) = rBWorld.cross(jBLin.row(i));
+            rAWorld = cache.rAWorld;
+            rBWorld = cache.rBWorld;
+            jAAng = cache.jAAng;
+            jBAng = cache.jBAng;
+        }
+        else
+        {
+            rAWorld = rotA * contacts[i].rA;
+            rBWorld = rotB * contacts[i].rB;
+
+            // Compute the Taylor series approximation of the constraint function C(x) (Sec 4)
+            const float3x3 jALin = basis;
+            const float3x3 jBLin = -basis;
+            // Row i of the angular jacobian is the moment arm crossed with row i of the linear one
+            // (the original custom float3x3 was row-major; Eigen's .row() keeps the semantics).
+            for (int r = 0; r < 3; r++)
+            {
+                jAAng.row(r) = rAWorld.cross(jALin.row(r));
+                jBAng.row(r) = rBWorld.cross(jBLin.row(r));
+            }
+
+            if (cacheable)
+            {
+                cache.rAWorld = rAWorld;
+                cache.rBWorld = rBWorld;
+                cache.jAAng = jAAng;
+                cache.jBAng = jBAng;
+                if (i == numContacts - 1) {
+                    rotACaptured = rotA;
+                    rotBCaptured = rotB;
+                    jacobiansCached = true;
+                }
+            }
         }
 
-        float3x3 K = diagonal(contacts[i].penalty.x(), contacts[i].penalty.y(), contacts[i].penalty.z());
+        const float3x3 K = diagonal(contacts[i].penalty.x(), contacts[i].penalty.y(), contacts[i].penalty.z());
+        const float3x3 jALin = basis;
+        const float3x3 jBLin = -basis;
         float3 C = contacts[i].C0 * (1 - alpha) + jALin * dqALin + jBLin * dqBLin + jAAng * dqAAng + jBAng * dqBAng;
 
         // Compute force
@@ -224,10 +267,10 @@ void Manifold::updateDual(float alpha)
         float3x3 jBLin = -basis;
         // Row i of the angular jacobian is the moment arm crossed with row i of the linear one.
         float3x3 jAAng, jBAng;
-        for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
         {
-            jAAng.row(i) = rAWorld.cross(jALin.row(i));
-            jBAng.row(i) = rBWorld.cross(jBLin.row(i));
+            jAAng.row(j) = rAWorld.cross(jALin.row(j));
+            jBAng.row(j) = rBWorld.cross(jBLin.row(j));
         }
 
         float3x3 K = diagonal(contacts[i].penalty.x(), contacts[i].penalty.y(), contacts[i].penalty.z());

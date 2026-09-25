@@ -24,67 +24,6 @@
 #include <cstddef>
 
 namespace avbd {
-
-// -----------------------------------------------------------------------------
-// Math types
-//
-// Plain aggregates: no constructors, no invariants to break, so they stay
-// trivially copyable and cheap to pass by value. Component access goes through
-// `operator[]`, which spells the field out rather than aliasing the struct's
-// address as an array - that trick is undefined behaviour, and it was the only
-// reason this header needed the C-style casts it used to contain. With a
-// constant index the comparison folds away entirely.
-// -----------------------------------------------------------------------------
-
-// struct float2
-// {
-//     float x, y;
-
-//     float &operator[](std::size_t i) noexcept { return i == 0 ? x : y; }
-//     const float &operator[](std::size_t i) const noexcept { return i == 0 ? x
-//     : y; }
-// };
-
-// struct float3
-// {
-//     float x, y, z;
-
-//     float &operator[](std::size_t i) noexcept { return i == 0 ? x : (i == 1 ?
-//     y : z); } const float &operator[](std::size_t i) const noexcept { return
-//     i == 0 ? x : (i == 1 ? y : z); }
-// };
-
-// struct quat
-// {
-//     float x, y, z, w;
-
-//     float &operator[](std::size_t i) noexcept { return i == 0 ? x : (i == 1 ?
-//     y : (i == 2 ? z : w)); } const float &operator[](std::size_t i) const
-//     noexcept { return i == 0 ? x : (i == 1 ? y : (i == 2 ? z : w)); }
-// };
-
-// struct float2x2
-// {
-//     float2 row[2];
-
-//     float2 &operator[](std::size_t i) noexcept { return row[i]; }
-//     const float2 &operator[](std::size_t i) const noexcept { return row[i]; }
-
-//     [[nodiscard]] float2 col(std::size_t i) const noexcept { return
-//     float2{row[0,i], row[1,i]}; }
-// };
-
-// struct float3x3
-// {
-//     float3 row[3];
-
-//     float3 &operator[](std::size_t i) noexcept { return row[i]; }
-//     const float3 &operator[](std::size_t i) const noexcept { return row[i]; }
-
-//     [[nodiscard]] float3 col(std::size_t i) const noexcept { return
-//     float3{row[0,i], row[1,i], row[2,i]}; }
-// };
-
 using float3x3 = Eigen::Matrix<float, 3, 3>;
 using float3 = Eigen::Vector3<float>;
 using float2 = Eigen::Vector2<float>;
@@ -113,36 +52,6 @@ using quat = Eigen::Quaternion<float>;
     m.row(2) = t2;
     return m;
 }
-
-// //
-// -----------------------------------------------------------------------------
-// // quat operators
-// //
-// -----------------------------------------------------------------------------
-
-// [[nodiscard]] inline quat operator*(quat a, float b) noexcept
-// {
-//     return {a.x() * b, a.y() * b, a.z() * b, a.w() * b};
-// }
-
-// [[nodiscard]] inline quat operator/(quat a, float b) noexcept
-// {
-//     return {a.x() / b, a.y() / b, a.z() / b, a.w() / b};
-// }
-
-// [[nodiscard]] inline quat operator*(quat a, quat b) noexcept
-// {
-//     return {
-//         a.w() * b.x() + a.x() * b.w() + a.y() * b.z() - a.z() * b.y(),
-//         a.w() * b.y() - a.x() * b.z() + a.y() * b.w() + a.z() * b.x(),
-//         a.w() * b.z() + a.x() * b.y() - a.y() * b.x() + a.z() * b.w(),
-//         a.w() * b.w() - a.x() * b.x() - a.y() * b.y() - a.z() * b.z()};
-// }
-
-// [[nodiscard]] inline quat operator+(quat a, quat b) noexcept
-// {
-//     return {a.x() + b.x(), a.y() + b.y(), a.z() + b.z(), a.w() + b.w()};
-// }
 [[nodiscard]] inline float3 operator-(quat a, quat b) noexcept {
   const quat d = a * b.inverse();
   return float3{d.x(), d.y(), d.z()} * 2.0f;

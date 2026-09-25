@@ -197,6 +197,14 @@ protected:
         double beta_angular = 100.0;
         double gamma = 0.999;
         int substeps = 1;
+        // Fraction of solver iterations that run the full Newton primal (6x6 dense
+        // solve); the rest run as cheap sequential-impulse-style dual-only passes.
+        // 1.0 = original AVBD behaviour. Real-time scenes trade accuracy for speed here.
+        double newton_ratio = 1.0;
+        // Per-iteration multiplicative decay applied to contact penalties once the
+        // Newton phase ends: stiff-penalty tails converge slowly, softening them lets the
+        // cheaper iterations finish the job. 1.0 = no decay (original behaviour).
+        double stiffness_decay = 1.0;
 
         // Debug contacts collected during the last step (world space, Godot frame).
 

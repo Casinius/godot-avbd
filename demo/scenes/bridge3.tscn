@@ -48,9 +48,6 @@ shape = SubResource("BoxShape_plank")
 [node name="Mesh" type="MeshInstance3D" parent="AnchorA" unique_id=39467122]
 mesh = SubResource("BoxMesh_plank")
 
-[node name="AnchorB" type="StaticBody3D" parent="." unique_id=1913564872]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.286, 2, 0)
-
 [node name="Plank0" type="RigidBody3D" parent="." unique_id=1067052101]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.571, 2, 0)
 mass = 200.0
@@ -82,14 +79,6 @@ mesh = SubResource("BoxMesh_plank")
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.714, 2, 0)
 node_a = NodePath("../Plank0")
 node_b = NodePath("../Plank1")
-
-[node name="Plank2" type="RigidBody3D" parent="." unique_id=1436341982]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.857, 2, 0)
-physics_material_override = SubResource("Mat_plank")
-
-[node name="Plank3" type="RigidBody3D" parent="." unique_id=700750661]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.571, 2, 0)
-physics_material_override = SubResource("Mat_plank")
 
 [node name="Camera3D" type="Camera3D" parent="." unique_id=2079674130]
 transform = Transform3D(0.7071, -0.099, 0.7001, 0, 0.9901, 0.14, -0.7071, -0.099, 0.7001, 9, 6, 9)

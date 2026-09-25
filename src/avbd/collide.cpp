@@ -355,37 +355,37 @@ inline int buildFaceManifold(const Shape& shapeA, const Shape& shapeB, const OBB
 
     int incidentAxis = chooseIncidentFaceAxis(incidentBox, referenceFace.normal);
 
-    float3 clip0[MAX_POLY_VERTS];
-    float3 clip1[MAX_POLY_VERTS];
-    buildIncidentFace(incidentBox, incidentAxis, referenceFace.normal, clip0);
+    std::array<float3, MAX_POLY_VERTS> clip0;
+    std::array<float3, MAX_POLY_VERTS> clip1;
+    buildIncidentFace(incidentBox, incidentAxis, referenceFace.normal, clip0.data());
     int count = 4;
 
     float3 n0 = referenceFace.u;
     float o0 = n0.dot(referenceFace.center) + referenceFace.extentU;
-    count = clipPolygonAgainstPlane(clip0, count, n0, o0, clip1);
+    count = clipPolygonAgainstPlane(clip0.data(), count, n0, o0, clip1.data());
     if (!count)
         return 0;
 
     float3 n1 = -referenceFace.u;
     float o1 = n1.dot(referenceFace.center) + referenceFace.extentU;
-    count = clipPolygonAgainstPlane(clip1, count, n1, o1, clip0);
+    count = clipPolygonAgainstPlane(clip1.data(), count, n1, o1, clip0.data());
     if (!count)
         return 0;
 
     float3 n2 = referenceFace.v;
     float o2 = n2.dot(referenceFace.center) + referenceFace.extentV;
-    count = clipPolygonAgainstPlane(clip0, count, n2, o2, clip1);
+    count = clipPolygonAgainstPlane(clip0.data(), count, n2, o2, clip1.data());
     if (!count)
         return 0;
 
     float3 n3 = -referenceFace.v;
     float o3 = n3.dot(referenceFace.center) + referenceFace.extentV;
-    count = clipPolygonAgainstPlane(clip1, count, n3, o3, clip0);
+    count = clipPolygonAgainstPlane(clip1.data(), count, n3, o3, clip0.data());
     if (!count)
         return 0;
 
     int contactCount = 0;
-    float3 contactMidpoints[MAX_CONTACTS];
+    std::array<float3, MAX_CONTACTS> contactMidpoints;
     int featurePrefix = (referenceIsA ? AXIS_FACE_A : AXIS_FACE_B) << 24;
     featurePrefix |= (referenceAxis & 0xFF) << 16;
     featurePrefix |= (incidentAxis & 0xFF) << 8;
@@ -401,14 +401,14 @@ inline int buildFaceManifold(const Shape& shapeA, const Shape& shapeB, const OBB
         float3 xA = referenceIsA ? pReference : pIncident;
         float3 xB = referenceIsA ? pIncident : pReference;
 
-        addContact(shapeA, shapeB, contacts, contactCount, contactMidpoints, xA, xB, featurePrefix | (i & 0xFF));
+        addContact(shapeA, shapeB, contacts, contactCount, contactMidpoints.data(), xA, xB, featurePrefix | (i & 0xFF));
     }
 
     if (!contactCount)
     {
         float3 xA = supportPoint(boxA, normalAB);
         float3 xB = supportPoint(boxB, -normalAB);
-        addContact(shapeA, shapeB, contacts, contactCount, contactMidpoints, xA, xB, featurePrefix);
+        addContact(shapeA, shapeB, contacts, contactCount, contactMidpoints.data(), xA, xB, featurePrefix);
     }
 
     return contactCount;
@@ -428,15 +428,15 @@ inline int buildEdgeContact(const Shape& shapeA, const Shape& shapeB, const OBB&
     closestPointsOnSegments(a0, a1, b0, b1, xA, xB);
 
     int contactCount = 0;
-    float3 contactMidpoints[MAX_CONTACTS];
+    std::array<float3, MAX_CONTACTS> contactMidpoints;
     int featureKey = (AXIS_EDGE << 24) | ((axisA & 0xFF) << 8) | (axisB & 0xFF);
-    addContact(shapeA, shapeB, contacts, contactCount, contactMidpoints, xA, xB, featureKey);
+    addContact(shapeA, shapeB, contacts, contactCount, contactMidpoints.data(), xA, xB, featureKey);
 
     if (!contactCount)
     {
         xA = supportPoint(boxA, normalAB);
         xB = supportPoint(boxB, -normalAB);
-        addContact(shapeA, shapeB, contacts, contactCount, contactMidpoints, xA, xB, featureKey);
+        addContact(shapeA, shapeB, contacts, contactCount, contactMidpoints.data(), xA, xB, featureKey);
     }
 
     return contactCount;
@@ -598,11 +598,11 @@ inline void emitRanked(const Shape& shapeA, const Shape& shapeB,
     std::ranges::stable_sort(sortedCandidates, std::greater{},
             [](const Candidate& c) { return c.depth; });
 
-    float3 midpoints[MAX_CONTACTS];
+    std::array<float3, MAX_CONTACTS> midpoints;
     contactCount = 0;
     for (const Candidate& c : std::views::take(sortedCandidates, MAX_CONTACTS))
     {
-        if (!addContact(shapeA, shapeB, contacts, contactCount, midpoints, c.xA, c.xB, contactCount + 1))
+        if (!addContact(shapeA, shapeB, contacts, contactCount, midpoints.data(), c.xA, c.xB, contactCount + 1))
             break;
     }
 }
@@ -663,8 +663,8 @@ inline int collideSphereSphere(const Shape& a, const Shape& b,
     basisOut = orthonormal(-normalAB);
 
     int count = 0;
-    float3 midpoints[MAX_CONTACTS];
-    addContact(a, b, contacts, count, midpoints, a.center + normalAB * a.radius,
+    std::array<float3, MAX_CONTACTS> midpoints;
+    addContact(a, b, contacts, count, midpoints.data(), a.center + normalAB * a.radius,
             b.center - normalAB * b.radius, 1);
     return count;
 }
@@ -716,8 +716,8 @@ inline int collideSphereBox(const Shape& a, const Shape& b, bool sphereIsA,
     const float3 xB = sphereIsA ? onBox : onSphere;
 
     int count = 0;
-    float3 midpoints[MAX_CONTACTS];
-    addContact(a, b, contacts, count, midpoints, xA, xB, 1);
+    std::array<float3, MAX_CONTACTS> midpoints;
+    addContact(a, b, contacts, count, midpoints.data(), xA, xB, 1);
     return count;
 }
 
@@ -744,8 +744,8 @@ inline int collideSphereCylinder(const Shape& a, const Shape& b, bool sphereIsA,
     const float3 xB = sphereIsA ? onCylinder : onSphere;
 
     int count = 0;
-    float3 midpoints[MAX_CONTACTS];
-    addContact(a, b, contacts, count, midpoints, xA, xB, 1);
+    std::array<float3, MAX_CONTACTS> midpoints;
+    addContact(a, b, contacts, count, midpoints.data(), xA, xB, 1);
     return count;
 }
 
@@ -758,7 +758,7 @@ inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
     const Shape& cyl = cylinderIsA ? a : b;
     const Shape& box = cylinderIsA ? b : a;
 
-    Candidate candidates[MAX_CANDIDATES];
+    std::array<Candidate, MAX_CANDIDATES> candidates;
     int candidateCount = 0;
     float3 normalAB{0, 0, 0};
 
@@ -817,7 +817,7 @@ inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
 inline int collideCylinderCylinder(const Shape& a, const Shape& b,
         std::span<Manifold::Contact> contacts, float3x3& basisOut)
 {
-    Candidate candidates[MAX_CANDIDATES];
+    std::array<Candidate, MAX_CANDIDATES> candidates;
     int candidateCount = 0;
     float3 normalAB{0, 0, 0};
 

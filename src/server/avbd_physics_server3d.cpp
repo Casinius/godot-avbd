@@ -232,12 +232,14 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     }
 
     p_space.threads = static_cast<int>(settings->get_setting("physics/avbd/threads", 0));
-    p_space.iterations = static_cast<int>(settings->get_setting("physics/avbd/iterations", 10));
+    p_space.iterations = static_cast<int>(settings->get_setting("physics/avbd/iterations", 4));
     p_space.alpha = settings->get_setting("physics/avbd/alpha", 0.99);
     p_space.beta_linear = settings->get_setting("physics/avbd/beta_linear", 10000.0);
     p_space.beta_angular = settings->get_setting("physics/avbd/beta_angular", 100.0);
     p_space.gamma = settings->get_setting("physics/avbd/gamma", 0.999);
-    p_space.substeps = static_cast<int>(settings->get_setting("physics/avbd/substeps", 1));
+    p_space.substeps = static_cast<int>(settings->get_setting("physics/avbd/substeps", 2));
+    p_space.newton_ratio = settings->get_setting("physics/avbd/newton_ratio", 1.0);
+    p_space.stiffness_decay = settings->get_setting("physics/avbd/stiffness_decay", 0.8);
 }
 
 void AVBDPhysicsServer3D::_space_set_active(const RID &p_space, bool p_active) {
@@ -966,6 +968,9 @@ void AVBDPhysicsServer3D::_step(double p_step) {
         space.solver.betaAng = static_cast<float>(space.beta_angular);
         space.solver.gamma = static_cast<float>(space.gamma);
         space.solver.threads = space.threads;
+        // Newton/impulse phase split and tail-stiffness decay (real-time trade-off knobs).
+        space.solver.newtonRatio = static_cast<float>(std::clamp(space.newton_ratio, 0.0, 1.0));
+        space.solver.stiffnessDecay = static_cast<float>(std::clamp(space.stiffness_decay, 0.0, 1.0));
         // Idle-sleep horizon: 30 steps at the usual 60 Hz tick = Godot's 0.5 s default.
         space.solver.sleepFrames = 30;
 
