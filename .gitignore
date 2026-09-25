@@ -18,3 +18,4 @@ demo/bin/
 *.res
 *.scn
 .cache/
+.omp/

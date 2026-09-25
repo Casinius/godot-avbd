@@ -74,6 +74,7 @@ mesh = SubResource("BoxMesh_plank")
 
 [node name="Plank0" type="RigidBody3D" parent="." unique_id=1067052101]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.571, 2, 0)
+mass = 5.0
 physics_material_override = SubResource("Mat_plank")
 
 [node name="Shape" type="CollisionShape3D" parent="Plank0" unique_id=1624890462]
@@ -89,6 +90,7 @@ node_b = NodePath("../Plank0")
 
 [node name="Plank1" type="RigidBody3D" parent="." unique_id=450130514]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.857, 2, 0)
+mass = 20.0
 physics_material_override = SubResource("Mat_plank")
 
 [node name="Shape" type="CollisionShape3D" parent="Plank1" unique_id=519141568]
@@ -101,9 +103,12 @@ mesh = SubResource("BoxMesh_plank")
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.714, 2, 0)
 node_a = NodePath("../Plank0")
 node_b = NodePath("../Plank1")
+angular_limit_z/softness = 0.11
+angular_limit_z/damping = 4.71
 
 [node name="Plank2" type="RigidBody3D" parent="." unique_id=1436341982]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.857, 2, 0)
+mass = 10.0
 physics_material_override = SubResource("Mat_plank")
 
 [node name="Shape" type="CollisionShape3D" parent="Plank2" unique_id=377058077]
@@ -119,6 +124,7 @@ node_b = NodePath("../Plank2")
 
 [node name="Plank3" type="RigidBody3D" parent="." unique_id=700750661]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.571, 2, 0)
+mass = 2.0
 physics_material_override = SubResource("Mat_plank")
 
 [node name="Shape" type="CollisionShape3D" parent="Plank3" unique_id=167514437]
@@ -131,6 +137,7 @@ mesh = SubResource("BoxMesh_plank")
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.714, 2, 0)
 node_a = NodePath("../Plank2")
 node_b = NodePath("../Plank3")
+angular_limit_y/softness = 0.11
 
 [node name="Hinge4" type="Generic6DOFJoint3D" parent="." unique_id=183611221]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3.428, 2, 0)
@@ -155,6 +162,7 @@ shape = SubResource("ConvexPolygonShape3D_im2sa")
 
 [node name="RigidBody3D2" type="RigidBody3D" parent="." unique_id=1377121917]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.464813, 3.8400946, 0)
+mass = 101.0
 
 [node name="MeshInstance3D2" type="MeshInstance3D" parent="RigidBody3D2" unique_id=1618915151]
 mesh = SubResource("PrismMesh_v3abh")
@@ -164,6 +172,8 @@ skeleton = NodePath("../..")
 shape = SubResource("ConvexPolygonShape3D_1q54l")
 
 [node name="RigidBody3D" type="RigidBody3D" parent="." unique_id=1023141720]
+transform = Transform3D(0.18046777, 0.9835809, 0, -0.9835809, 0.18046777, 0, 0, 0, 1, -5.6044226, 2.7672021, 0)
+mass = 202.0
 
 [node name="MeshInstance3D3" type="MeshInstance3D" parent="RigidBody3D" unique_id=1652325206]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.7213982, 3.8400946, 0)

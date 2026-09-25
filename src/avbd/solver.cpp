@@ -759,7 +759,9 @@ void Solver::colourGraph()
     colours = maxColour + 1;
 
     // Group the bodies by colour, so each iteration walks contiguous, independent runs.
-    std::vector<int> perColour(colours, 0);
+    std::vector<int> perColour;
+    perColour.reserve(colours);
+    perColour.assign(colours, 0);
     for (const Rigid *body : updateOrder)
         perColour[body->colour]++;
 
@@ -769,10 +771,13 @@ void Solver::colourGraph()
 
     widest = perColour.empty() ? 0 : *std::ranges::max_element(perColour);
 
-    std::vector<int> cursor = colourStart; // cursor[c] is the next free slot for colour c
-    std::vector<Rigid *> grouped(updateOrder.size());
+    std::vector<int> cursor;
+    cursor.reserve(colours + 1);
+    cursor = colourStart; // cursor[c] is the next free slot for colour c
+    std::vector<Rigid *> grouped;
+    grouped.reserve(updateOrder.size());
     for (Rigid *body : updateOrder)
-        grouped[cursor[body->colour]++] = body;
+        grouped.push_back(body);
     updateOrder = std::move(grouped);
 }
 

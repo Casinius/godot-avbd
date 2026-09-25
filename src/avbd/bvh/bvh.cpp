@@ -140,10 +140,11 @@ int Builder::buildLBVH()
     const float scale = 2097151.0f / std::max({extent.x(), extent.y(), extent.z(), 1e-6f});
 
     // Morton codes per body index, then sort body indices by code.
-    std::vector<std::pair<uint64_t, int>> coded(n);
+    std::vector<std::pair<uint64_t, int>> coded;
+    coded.reserve(n);
     for (int i = 0; i < n; ++i) {
         const float3 c = bodies_[i]->positionLin;
-        coded[i] = {morton::morton3D(c.x(), c.y(), c.z(), lo.x(), scale), i};
+        coded.emplace_back(morton::morton3D(c.x(), c.y(), c.z(), lo.x(), scale), i);
     }
     std::sort(coded.begin(), coded.end(),
             [](const auto &a, const auto &b) { return a.first < b.first; });

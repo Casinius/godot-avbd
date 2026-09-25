@@ -231,15 +231,15 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
         return;
     }
 
-    p_space.threads = static_cast<int>(settings->get_setting("physics/avbd/threads", 12));
+    p_space.threads = static_cast<int>(settings->get_setting("physics/avbd/threads", 0));
     p_space.iterations = static_cast<int>(settings->get_setting("physics/avbd/iterations", 4));
     p_space.alpha = settings->get_setting("physics/avbd/alpha", 0.99);
     p_space.beta_linear = settings->get_setting("physics/avbd/beta_linear", 10000.0);
     p_space.beta_angular = settings->get_setting("physics/avbd/beta_angular", 100.0);
     p_space.gamma = settings->get_setting("physics/avbd/gamma", 0.999);
-    p_space.substeps = static_cast<int>(settings->get_setting("physics/avbd/substeps", 4));
-    p_space.newton_ratio = settings->get_setting("physics/avbd/newton_ratio", 0.5);
-    p_space.stiffness_decay = settings->get_setting("physics/avbd/stiffness_decay", 1.0);
+    p_space.substeps = static_cast<int>(settings->get_setting("physics/avbd/substeps", 2));
+    p_space.newton_ratio = settings->get_setting("physics/avbd/newton_ratio", 1.0);
+    p_space.stiffness_decay = settings->get_setting("physics/avbd/stiffness_decay", 0.8);
 }
 
 void AVBDPhysicsServer3D::_space_set_active(const RID &p_space, bool p_active) {
