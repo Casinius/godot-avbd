@@ -26,6 +26,7 @@ common/physics_ticks_per_second=240
 3d/time_before_sleep=0.09
 3d/solver/solver_iterations=4
 3d/solver/contact_max_allowed_penetration=0.063
+3d/physics_interpolation/scene_traversal="Legacy"
 common/physics_interpolation=true
 
 [rendering]
