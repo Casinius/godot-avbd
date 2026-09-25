@@ -26,7 +26,6 @@ size = Vector3(1, 0.5, 1)
 
 [node name="Pyramid" type="Node3D" unique_id=760670950]
 script = ExtResource("1_dustt")
-impulse_strength = 5.0
 stats_interval = 999.0
 
 [node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=116734390]
