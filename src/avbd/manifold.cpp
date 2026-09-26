@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -25,47 +26,42 @@ Manifold::Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB)
 }
 
 namespace {
-// Function-local statics: no static-initialisation-order hazards, and the vector's own
-// destructor frees anything still cached at process exit.
-std::vector<void *> &manifoldFreeList()
-{
-    static std::vector<void *> list;
-    return list;
-}
-std::mutex &manifoldPoolMutex()
-{
-    static std::mutex mutex;
-    return mutex;
-}
+// Manifold pool with simple mutex for correctness
+static std::mutex poolMutex;
+static std::vector<void *> poolFreeList;
 } // namespace
 
 void *Manifold::operator new(std::size_t count)
 {
     if (count != sizeof(Manifold))
         return ::operator new(count);
-    std::lock_guard<std::mutex> lock(manifoldPoolMutex());
-    std::vector<void *> &list = manifoldFreeList();
-    if (list.empty())
-        return ::operator new(sizeof(Manifold));
-    void *ptr = list.back();
-    list.pop_back();
-    return ptr;
+
+    std::lock_guard<std::mutex> lock(poolMutex);
+    if (!poolFreeList.empty())
+    {
+        void *ptr = poolFreeList.back();
+        poolFreeList.pop_back();
+        return ptr;
+    }
+
+    return ::operator new(sizeof(Manifold));
 }
 
 void Manifold::operator delete(void *ptr) noexcept
 {
     if (ptr == nullptr)
         return;
-    std::lock_guard<std::mutex> lock(manifoldPoolMutex());
-    manifoldFreeList().push_back(ptr);
+
+    std::lock_guard<std::mutex> lock(poolMutex);
+    poolFreeList.push_back(ptr);
 }
 
 void Manifold::drainPool() noexcept
 {
-    std::lock_guard<std::mutex> lock(manifoldPoolMutex());
-    for (void *ptr : manifoldFreeList())
+    std::lock_guard<std::mutex> lock(poolMutex);
+    for (void *ptr : poolFreeList)
         ::operator delete(ptr);
-    manifoldFreeList().clear();
+    poolFreeList.clear();
 }
 
 bool Manifold::initialize()

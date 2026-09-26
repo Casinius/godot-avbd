@@ -50,7 +50,7 @@ mesh = SubResource("BoxMesh_plank")
 
 [node name="Plank0" type="RigidBody3D" parent="." unique_id=1067052101]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.571, 2, 0)
-mass = 200.0
+mass = 1.407
 physics_material_override = SubResource("Mat_plank")
 
 [node name="Shape" type="CollisionShape3D" parent="Plank0" unique_id=1624890462]
