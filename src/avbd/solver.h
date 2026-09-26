@@ -620,7 +620,8 @@ private:
     int collectForces();
 
     // The phases of a step, in the order `step()` runs them.
-    void broadPhase();
+    template <typename SyncType>
+    void broadPhase(SyncType &sync);
     int warmstartForces();
     void warmstartBodies();
     void solveIterations(int forceCount);

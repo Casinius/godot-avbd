@@ -11,9 +11,13 @@
 
 #pragma once
 
+// cppcheck-suppress missingIncludeSystem
 #include <vector>
+// cppcheck-suppress missingIncludeSystem
 #include <span>
+// cppcheck-suppress missingIncludeSystem
 #include <limits>
+// cppcheck-suppress missingIncludeSystem
 #include <algorithm>
 
 #include "avbd/maths.h"

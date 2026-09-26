@@ -11,6 +11,7 @@
 
 #include "bvh.hpp"
 #include "avbd/solver.h"
+// cppcheck-suppress missingIncludeSystem
 #include <algorithm>
 
 namespace bvh::builder {

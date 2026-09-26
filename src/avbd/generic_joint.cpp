@@ -23,6 +23,7 @@
  * stamped through both halves of the system at once - see stampAxis.
  */
 
+// cppcheck-suppress missingIncludeSystem
 #include <cmath>
 
 #include "avbd/solver.h"

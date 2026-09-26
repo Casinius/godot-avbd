@@ -12,13 +12,21 @@
 #include "avbd/solver.h"
 #include "avbd/bvh/node_storage.hpp"
 #include "avbd/maths.h"
+// cppcheck-suppress missingIncludeSystem
 #include <algorithm>
+// cppcheck-suppress missingIncludeSystem
 #include <cfloat>
+// cppcheck-suppress missingIncludeSystem
 #include <cmath>
+// cppcheck-suppress missingIncludeSystem
 #include <cstddef>
+// cppcheck-suppress missingIncludeSystem
 #include <ranges>
+// cppcheck-suppress missingIncludeSystem
 #include <span>
+// cppcheck-suppress missingIncludeSystem
 #include <array>
+// cppcheck-suppress missingIncludeSystem
 #include <vector>
 
 namespace avbd {
@@ -48,23 +56,23 @@ struct OBB
 
 struct SatAxis
 {
-    AxisType type;
-    int indexA;
-    int indexB;
-    float separation;
-    float3 normalAB;
-    bool valid;
+    AxisType type{};
+    int indexA{};
+    int indexB{};
+    float separation{};
+    float3 normalAB{};
+    bool valid{};
 };
 
 struct FaceFrame
 {
-    int axisIndex;
-    float3 normal;
-    float3 center;
-    float3 u;
-    float3 v;
-    float extentU;
-    float extentV;
+    int axisIndex{};
+    float3 normal{};
+    float3 center{};
+    float3 u{};
+    float3 v{};
+    float extentU{};
+    float extentV{};
 };
 
 inline OBB makeOBB(const Shape& shape)
@@ -579,10 +587,10 @@ inline bool pointInCylinder(const Shape& cyl, const float3& p, float3& r_push, f
 // decides whether it is worth keeping.
 struct Candidate
 {
-    float3 xA;
-    float3 xB;
-    float3 normal; // points from the shape the sample belongs to, outwards
-    float depth;
+    float3 xA{};
+    float3 xB{};
+    float3 normal{}; // points from the shape the sample belongs to, outwards
+    float depth{};
 };
 
 // Emit the deepest MAX_CONTACTS candidates. Ranking by depth rather than taking them in sampling

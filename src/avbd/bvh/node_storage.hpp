@@ -11,7 +11,9 @@
 
 #pragma once
 
+// cppcheck-suppress missingIncludeSystem
 #include <vector>
+// cppcheck-suppress missingIncludeSystem
 #include <span>
 
 #include "avbd/maths.h"
@@ -78,10 +80,10 @@ public:
         boundsMax_.resize(nodeCount);
         bodyIndex_.resize(nodeCount, -1);
     }
-    void setImplicitLeaf(int slot, const float3& min, const float3& max, int bodyIndex) noexcept {
+    void setImplicitLeaf(int slot, const float3& min, const float3& max, int bodyIdx) noexcept {
         boundsMin_[slot] = min;
         boundsMax_[slot] = max;
-        bodyIndex_[slot] = bodyIndex;
+        bodyIndex_[slot] = bodyIdx;
     }
     void setImplicitInternalBounds(int slot, const float3& min, const float3& max) noexcept {
         boundsMin_[slot] = min;
@@ -89,12 +91,9 @@ public:
     }
 
     // Node creation (SafeC++: returns int, no nullptr)
-    int createLeaf(const float3& min, const float3& max, int bodyIndex) noexcept;
-    int createInternal(const float3& min, const float3& max, int left, int right, int parent = -1) noexcept;
+    int createLeaf(const float3& min, const float3& max, int bodyIdx) noexcept;
+    int createInternal(const float3& min, const float3& max, int leftIdx, int rightIdx, int parentIdx = -1) noexcept;
     void updateBounds(int nodeId, const float3& min, const float3& max) noexcept;
-
-private:
-    int addNode(const float3& min, const float3& max, int left, int right, int parent, int bodyIndex) noexcept;
 };
 
 } // namespace nodes

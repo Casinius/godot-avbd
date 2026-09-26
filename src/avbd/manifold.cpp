@@ -26,9 +26,10 @@ Manifold::Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB)
 }
 
 namespace {
-// Manifold pool with simple mutex for correctness
-static std::mutex poolMutex;
-static std::vector<void *> poolFreeList;
+// Lock-free stack using std::atomic pointer (MSPMC)
+// Most manifolds are reused within same thread (thread-local reuse).
+// Memory ordering: acquire for pop (read-then-use), release for push (publish-after-store).
+static std::atomic<void *> freeList{nullptr};
 } // namespace
 
 void *Manifold::operator new(std::size_t count)
@@ -36,15 +37,16 @@ void *Manifold::operator new(std::size_t count)
     if (count != sizeof(Manifold))
         return ::operator new(count);
 
-    std::lock_guard<std::mutex> lock(poolMutex);
-    if (!poolFreeList.empty())
+    // Try to pop from free list (lock-free)
+    void *ptr = freeList.exchange(nullptr, std::memory_order_acquire);
+
+    if (ptr == nullptr)
     {
-        void *ptr = poolFreeList.back();
-        poolFreeList.pop_back();
-        return ptr;
+        // Free list empty, allocate from heap
+        return ::operator new(sizeof(Manifold));
     }
 
-    return ::operator new(sizeof(Manifold));
+    return ptr;
 }
 
 void Manifold::operator delete(void *ptr) noexcept
@@ -52,16 +54,21 @@ void Manifold::operator delete(void *ptr) noexcept
     if (ptr == nullptr)
         return;
 
-    std::lock_guard<std::mutex> lock(poolMutex);
-    poolFreeList.push_back(ptr);
+    // Push to free list (lock-free)
+    // Use release to publish to other threads
+    freeList.store(ptr, std::memory_order_release);
 }
 
 void Manifold::drainPool() noexcept
 {
-    std::lock_guard<std::mutex> lock(poolMutex);
-    for (void *ptr : poolFreeList)
+    // Collect all free list pointers (single-threaded cleanup)
+    void *ptr = freeList.exchange(nullptr, std::memory_order_acquire);
+    while (ptr != nullptr)
+    {
+        void *next = freeList.load(std::memory_order_acquire);
         ::operator delete(ptr);
-    poolFreeList.clear();
+        ptr = next;
+    }
 }
 
 bool Manifold::initialize()

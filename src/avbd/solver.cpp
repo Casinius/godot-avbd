@@ -130,7 +130,20 @@ void Solver::step()
 {
     ensurePool();
 
-    broadPhase();
+    // Broad phase is parallelized via LoopSync barrier
+    if (this->threads > 1)
+    {
+        // Parallel mode: use LoopSync barrier
+        avbd::detail::LoopSync sync(this->threads);
+        broadPhase(sync);
+    }
+    else
+    {
+        // Serial mode: use NullSync (no barrier, no overhead)
+        avbd::detail::NullSync sync;
+        broadPhase(sync);
+    }
+
     const int forceCount = warmstartForces();
     colourGraph();
     warmstartBodies();
@@ -163,7 +176,8 @@ static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
 // Determinism: leaf order is the Morton-sorted body order, pair collection is leaf
 // order, and the final pair list is sorted ascending (min-index, other) - the same
 // manifold creation order contract as the sweep path.
-void Solver::broadPhase()
+template <typename SyncType>
+void Solver::broadPhase(SyncType &sync)
 {
     bodiesInOrder.clear();
     bodiesInOrder.insert(bodiesInOrder.end(), next_range(bodies).begin(), next_range(bodies).end());
@@ -196,29 +210,39 @@ void Solver::broadPhase()
     // and pair each against all later slots (AABB overlap prune). The final sort keeps
     // the ascending (min-index, other) manifold order.
     sweepPairs.clear();
-    // Parallel AABB overlap pruning - O(N²) pairwise check, parallelized over pairs
-    // Note: For small leafCount (< 200), this may be slower than serial due to overhead
-    // TODO: Consider chunking strategy for better scalability on large scenes
+    // Parallel AABB overlap pruning using LoopSync barrier.
+    // Each worker processes a chunk of leaf pairs; barrier ensures completion before sort.
     const int totalPairs = leafCount * (leafCount - 1) / 2;
-    for (int a = 0; a < leafCount; ++a)
-    {
+    sync.forItems(totalPairs, [this, firstLeaf, leafCount](int i) {
+        // Map 1D index to 2D (a, b) with a < b
+        int a, b;
+        int offset = 0;
+        int a_temp = 0;
+        while (offset + (leafCount - a_temp - 1) <= i)
+        {
+            offset += leafCount - a_temp - 1;
+            a_temp++;
+        }
+        a = a_temp;
+        b = a + 1 + (i - offset);
+
         const int na = firstLeaf + a;
+        const int nb = firstLeaf + b;
         const float3 aMin = bvhNodes.boundsMin()[na];
         const float3 aMax = bvhNodes.boundsMax()[na];
-        for (int b = a + 1; b < leafCount; ++b)
-        {
-            const int nb = firstLeaf + b;
-            const float3 bMin = bvhNodes.boundsMin()[nb];
-            if (bMin.x() > aMax.x() || bMin.y() > aMax.y() || bMin.z() > aMax.z())
-                continue;
-            const float3 bMax = bvhNodes.boundsMax()[nb];
-            if (bMax.x() < aMin.x() || bMax.y() < aMin.y() || bMax.z() < aMin.z())
-                continue;
-            const int i = bvhNodes.bodyIndex()[na];
-            const int j = bvhNodes.bodyIndex()[nb];
-            sweepPairs.emplace_back(std::minmax(i, j));
-        }
-    }
+        const float3 bMin = bvhNodes.boundsMin()[nb];
+        const float3 bMax = bvhNodes.boundsMax()[nb];
+
+        // AABB overlap prune (6 comparisons, early exit on fail)
+        if (bMin.x() > aMax.x() || bMin.y() > aMax.y() || bMin.z() > aMax.z() ||
+            bMax.x() < aMin.x() || bMax.y() < aMin.y() || bMax.z() < aMin.z())
+            return; // No overlap, skip
+
+        const int iIdx = bvhNodes.bodyIndex()[na];
+        const int jIdx = bvhNodes.bodyIndex()[nb];
+        sweepPairs.emplace_back(std::minmax(iIdx, jIdx));
+    });
+    sync.arriveAndWait();
 
     std::sort(sweepPairs.begin(), sweepPairs.end());
     sweepPairs.erase(std::unique(sweepPairs.begin(), sweepPairs.end()), sweepPairs.end());
@@ -390,6 +414,11 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
             const bool newton = it < newtonRounds;
             if (newton)
             {
+                // Primal pass per colour: colour groups are independent (no cross-colour writes
+                // within same iteration). Each colour's updates read previous colour's dual state,
+                // which is published via the barrier before this colour starts. Barrier at iteration
+                // boundary ensures Gauss-Seidel ordering across Newton rounds. Parallel per-colour
+                // is safe and fast: same pattern as colour-parallel Gauss-Seidel.
                 for (int colour = 0; colour < colours; colour++)
                 {
                     const int first = colourStart[colour];
@@ -423,6 +452,10 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
                 });
                 sync.arriveAndWait();
             }
+            // Dual pass: each force reads frozen body poses and writes its own dual state.
+            // Forces are independent (no cross-force writes in updateDual), so the whole
+            // pass is parallelizable. The barrier ensures all writes are visible before
+            // the next phase (primal pass reads updated duals).
             sync.forItems(forceCount, [this](int i) {
                 if (!constraintFrozen(forceOrder[i]))
                     forceOrder[i]->updateDual(alpha);

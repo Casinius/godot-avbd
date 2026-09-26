@@ -102,6 +102,24 @@ target("avbd_core_test")
     add_includedirs("src", "tools")
     add_packages("thread-pool","eigen")
 
+-- Parallelization deterministic test: verifies bit-identical results across thread counts.
+target("test_parallel")
+    avbd_common()
+    set_kind("binary")
+    add_files("tools/test_parallel.cpp")
+    add_includedirs("src")
+    add_packages("thread-pool","eigen")
+    add_deps("avbd")
+
+-- Simple parallelization test: verifies parallel code compiles and runs without errors.
+target("test_parallel_simple")
+    avbd_common()
+    set_kind("binary")
+    add_files("tools/test_parallel_simple.cpp")
+    add_includedirs("src")
+    add_packages("thread-pool","eigen")
+    add_deps("avbd")
+
 -- Constraint composition tests (Godot headless, inside the demo project).
 target("avbd_constraint_tests")
     set_kind("phony")
