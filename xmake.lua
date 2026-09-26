@@ -60,15 +60,15 @@ local function avbd_common()
     set_warnings(avbd_warnings)
     add_cxflags("-Wshadow", "-Wnon-virtual-dtor")
     add_syslinks("pthread")
-    if has_config("asan") then
+    if has_config("asan") and is_plat("linux") then
         add_cxflags("-fsanitize=address", { force = true })
         add_ldflags("-fsanitize=address", { force = true })
     end
-    if has_config("ubsan") then
+    if has_config("ubsan") and is_plat("linux") then
         add_cxflags("-fsanitize=undefined", { force = true })
         add_ldflags("-fsanitize=undefined", { force = true })
     end
-    if has_config("tsan") then
+    if has_config("tsan") and is_plat("linux") then
         add_cxflags("-fsanitize=thread", { force = true })
         add_ldflags("-fsanitize=thread", { force = true })
     end
