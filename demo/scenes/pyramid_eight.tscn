@@ -26,7 +26,7 @@ size = Vector3(1, 0.5, 1)
 
 [node name="Pyramid" type="Node3D" unique_id=760670950]
 script = ExtResource("1_uhcuh")
-impulse_strength = 5.0
+impulse_strength = 120.0
 stats_interval = 999.0
 
 [node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=116734390]
@@ -2143,9 +2143,6 @@ mesh = SubResource("BoxMesh_box")
 
 [node name="Camera3D" type="Camera3D" parent="." unique_id=1720599791]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.49371338, 5.0879, 10.171942)
-
-[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1476433844]
-transform = Transform3D(0.774, -0.5162, 0.3668, 0, 0.5793, 0.8151, -0.6332, -0.6309, 0.4483, 0.45, 1, 0.55)
 
 [node name="Box210" type="RigidBody3D" parent="." unique_id=1624202241]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -9.595, 12.063272, 0)
@@ -6350,9 +6347,6 @@ mesh = SubResource("BoxMesh_box")
 [node name="Camera3D2" type="Camera3D" parent="." unique_id=6531340]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 15.459579, 10.976112, 10.171942)
 
-[node name="DirectionalLight3D2" type="DirectionalLight3D" parent="." unique_id=1644053643]
-transform = Transform3D(0.77399296, -0.51613694, 0.3667937, 0, 0.5792752, 0.8151321, -0.63319427, -0.6309065, 0.44835487, 15.415867, 6.888212, 0.55)
-
 [node name="Box630" type="RigidBody3D" parent="." unique_id=2045778325]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 5.370866, 17.951485, 0)
 physics_material_override = SubResource("Mat_box")
@@ -10555,9 +10549,6 @@ mesh = SubResource("BoxMesh_box")
 
 [node name="Camera3D3" type="Camera3D" parent="." unique_id=1967446126]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.49371338, 30.526175, 10.171942)
-
-[node name="DirectionalLight3D3" type="DirectionalLight3D" parent="." unique_id=313426924]
-transform = Transform3D(0.77399296, -0.5161369, 0.3667937, 0, 0.57927513, 0.8151321, -0.63319427, -0.63090646, 0.44835487, 0.45, 26.438274, 0.55)
 
 [node name="Box1050" type="RigidBody3D" parent="." unique_id=652647244]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -9.595, 37.50155, 0)

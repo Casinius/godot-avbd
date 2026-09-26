@@ -1,49 +1,56 @@
 /*
  * JobPool - the parallel machinery the solver runs its per-body phases on.
  *
- * Thin adapter over BS::thread_pool (https://github.com/bshoshany/thread-pool, MIT,
- * header-only). The library owns the queue, the worker lifetime and the wait
- * handshake; what is left to us is the part no library can know: how many independent
- * pieces of work there are, and where the phase boundaries are.
+ * Thin adapter over BS::thread_pool v5.1.0 (https://github.com/bshoshany/thread-pool,
+ * MIT, header-only, C++17). The library owns the queue, the worker lifetime and the
+ * wait handshake; what is left to us is the part no library can know: how many
+ * independent pieces of work there are, and where the phase boundaries are.
  *
- * The pool itself is process-global and work-stealing-free (a plain shared queue):
- * one Scheduler stepping N worlds must not spawn N x hardware_concurrency threads.
- * A JobPool instance is therefore only a *budget*: the worker count this solver may
- * claim, normalised from `Solver::threads` (0 = one per hardware thread, 1 = inline,
- * >hardware is clamped). No thread is spawned by the constructor; the shared pool
- * materialises on first parallel use, so a serial solver never pays for one.
+ * THREAD COUNT:
+ * - Process-global shared pool (not per-solver)
+ * - Lazy initialization on first parallel use
+ * - Worker count = min(hardware_concurrency, threads parameter)
+ * - >hardware is clamped to hardware_concurrency
+ * - Serial solvers (threads=1) never spawn threads
  *
- * Two execution styles:
+ * EXECUTION STYLES:
+ * - forCount: fork-join, one dispatch, workers split range, wait()
+ *   - Break-even minItems=256 to avoid dispatch overhead
+ *   - Used for phases running once per step (warmstart, finish)
  *
- *   - forCount: a standalone fork-join. One dispatch, workers wake, split the range,
- *     `wait()`. Costs tens of microseconds per call, so callers pass a `minItems`
- *     break-even and fall back to an inline loop below it. Used for the phases that
- *     run once per step (warmstart, finish).
+ * - runLoop: persistent-worker loop, iteration-shaped work
+ *   - One dispatch arms threadCount() participants (calling thread is worker 0)
+ *   - Each participant runs whole loop, synchronizes at phase boundaries via LoopSync barrier
+ *   - Eliminates dispatch storm for colour-parallel Gauss-Seidel
+ *   - Barrier cost: ~1-3 µs per phase boundary
  *
- *   - runLoop: a persistent-worker loop for iteration-shaped work. One dispatch arms
- *     `threadCount()` participants (the calling thread is worker 0); every participant
- *     runs the *whole* loop and synchronises at phase boundaries through a LoopSync
- *     barrier instead of re-entering the pool. This is what kills the dispatch storm
- *     of the colour-parallel Gauss-Seidel: the old shape cost one dispatch per colour
- *     per iteration (~45 us each); the new one costs one dispatch per step plus one
- *     ~1-3 us barrier per phase boundary.
+ * WORK DISTRIBUTION:
+ * - Process-global queue, no work stealing (flat queue)
+ * - Fixed chunking: cursor-based with 4 chunks/participant
+ * - Atomic<int> fetch_add for work stealing (limited)
+ * - Load imbalance possible when work distribution uneven
  *
- * Semantics the solver relies on:
- *   - Work items are independent, so the result never depends on how a range was split
- *     or which worker took which item. That is what keeps the simulation bit-identical
- *     for every thread count (verified in the test suite by comparing digests).
- *   - Phase boundaries are explicit: `sync.arriveAndWait()` is where the next phase
- *     observes every write of the previous one. Gauss-Seidel ordering lives entirely
- *     in the solver's loop, not in the pool.
- *   - runLoop calls exclude each other (a try-locked mutex). Two loops at once would
- *     deadlock a shared queue - participants waiting on a queued task that cannot
- *     start until a running task (itself blocked at the barrier) finishes. Godot steps
- *     spaces one at a time, so the lock is uncontended in practice; a contended caller
- *     degrades to running its loop inline on the calling thread, which is always
- *     correct because the serial order is the threads=1 reference.
+ * PHASE BOUNDARIES:
+ * - LoopSync barrier ensures all workers finish before next phase
+ * - Barrier is lightweight (~1-3 µs) and non-blocking
+ * - Barriers prevent race conditions in Gauss-Seidel ordering
+ * - Each barrier corresponds to a sync.arriveAndWait() call
  *
- * This header is only included by solver.cpp: the rest of the core sees the forward
- * declaration in solver.h, so the dependency does not leak into every translation unit.
+ * THREAD SAFETY:
+ * - runLoop calls are exclusive (try-locked mutex)
+ * - Two loops at once would deadlock on shared queue
+ * - Godot steps one solver at a time, so lock uncontended in practice
+ * - Contended callers degrade to running loop inline (threads=1 reference)
+ *
+ * MEMORY MODEL:
+ * - std::memory_order_relaxed for cursor updates (no ordering needed)
+ * - std::memory_order_acquire/release for barrier sync
+ * - Thread-local Eigen scratch avoids false sharing
+ * - Pool-based Manifold allocation avoids heap churn
+ *
+ * THIS HEADER IS ONLY INCLUDED BY SOLVER.CPP
+ * The rest of the core sees the forward declaration in solver.h
+ * to avoid leaking thread pool dependency into every translation unit.
  */
 
 #ifndef AVBD_JOB_POOL_HPP

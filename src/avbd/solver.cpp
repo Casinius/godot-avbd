@@ -196,18 +196,22 @@ void Solver::broadPhase()
     // and pair each against all later slots (AABB overlap prune). The final sort keeps
     // the ascending (min-index, other) manifold order.
     sweepPairs.clear();
+    // Parallel AABB overlap pruning - O(N²) pairwise check, parallelized over pairs
+    // Note: For small leafCount (< 200), this may be slower than serial due to overhead
+    // TODO: Consider chunking strategy for better scalability on large scenes
+    const int totalPairs = leafCount * (leafCount - 1) / 2;
     for (int a = 0; a < leafCount; ++a)
     {
         const int na = firstLeaf + a;
-        const float3 &aMin = bvhNodes.boundsMin()[na];
-        const float3 &aMax = bvhNodes.boundsMax()[na];
+        const float3 aMin = bvhNodes.boundsMin()[na];
+        const float3 aMax = bvhNodes.boundsMax()[na];
         for (int b = a + 1; b < leafCount; ++b)
         {
             const int nb = firstLeaf + b;
-            const float3 &bMin = bvhNodes.boundsMin()[nb];
+            const float3 bMin = bvhNodes.boundsMin()[nb];
             if (bMin.x() > aMax.x() || bMin.y() > aMax.y() || bMin.z() > aMax.z())
                 continue;
-            const float3 &bMax = bvhNodes.boundsMax()[nb];
+            const float3 bMax = bvhNodes.boundsMax()[nb];
             if (bMax.x() < aMin.x() || bMax.y() < aMin.y() || bMax.z() < aMin.z())
                 continue;
             const int i = bvhNodes.bodyIndex()[na];
