@@ -73,26 +73,10 @@ public:
     [[nodiscard]] int countLeaves() const noexcept;
     [[nodiscard]] int root() const noexcept { return 0; }
 
-    // Implicit (heap) layout support: resize to an exact node count and write nodes by
-    // index. Children of node i are 2i+1 / 2i+2 by construction - no left/right arrays.
-    void resizeImplicit(int nodeCount) noexcept {
-        boundsMin_.resize(nodeCount);
-        boundsMax_.resize(nodeCount);
-        bodyIndex_.resize(nodeCount, -1);
-    }
-    void setImplicitLeaf(int slot, const float3& min, const float3& max, int bodyIdx) noexcept {
-        boundsMin_[slot] = min;
-        boundsMax_[slot] = max;
-        bodyIndex_[slot] = bodyIdx;
-    }
-    void setImplicitInternalBounds(int slot, const float3& min, const float3& max) noexcept {
-        boundsMin_[slot] = min;
-        boundsMax_[slot] = max;
-    }
-
     // Node creation (SafeC++: returns int, no nullptr)
     int createLeaf(const float3& min, const float3& max, int bodyIdx) noexcept;
     int createInternal(const float3& min, const float3& max, int leftIdx, int rightIdx, int parentIdx = -1) noexcept;
+    [[nodiscard]] bool isLeaf(int nodeId) const noexcept { return bodyIndex_[nodeId] >= 0; }
     void updateBounds(int nodeId, const float3& min, const float3& max) noexcept;
 };
 

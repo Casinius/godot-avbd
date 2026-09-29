@@ -233,6 +233,10 @@ inline bool addContact(const Shape& shapeA, const Shape& shapeB, std::span<Manif
     c.feature = feature;
     c.rA = shapeA.rotation.conjugate() * (xA - shapeA.center);
     c.rB = shapeB.rotation.conjugate() * (xB - shapeB.center);
+    c.C0 = float3{0.0f, 0.0f, 0.0f};
+    c.penalty = float3{0.0f, 0.0f, 0.0f};
+    c.lambda = float3{0.0f, 0.0f, 0.0f};
+    c.stick = false;
     contactMidpoints[contactCount] = midpoint;
     ++contactCount;
 

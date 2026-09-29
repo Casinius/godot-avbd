@@ -572,7 +572,7 @@ private:
     // the ground is usually one of them.
     std::vector<Rigid *> warmstartOrder;
 
-    // Broad-phase: the body list flattened to index-addressable order (rebuilt every
+    // Broad phase: the body list flattened to index-addressable order (rebuilt every
     // step), plus the BVH built over those bodies and the candidate pair list.
     std::vector<Rigid *> bodiesInOrder;
     bvh::nodes::NodeStorage bvhNodes;
@@ -620,8 +620,7 @@ private:
     int collectForces();
 
     // The phases of a step, in the order `step()` runs them.
-    template <typename SyncType>
-    void broadPhase(SyncType &sync);
+    void broadPhase();
     int warmstartForces();
     void warmstartBodies();
     void solveIterations(int forceCount);

@@ -195,13 +195,42 @@ void AVBDPhysicsServer3D::_free_rid(const RID &p_rid) {
         spaces.erase(space_found);
         return;
     }
-    if (bodies.erase(id) > 0) {
+    const auto body_found = bodies.find(id);
+    if (body_found != bodies.end()) {
+        const uint64_t space_id = id_of(body_found->second.space);
+        if (body_found->second.space.is_valid()) {
+            space_rebuild_pending[space_id] = true;
+        }
+        for (auto joint_it = joints.begin(); joint_it != joints.end();) {
+            if (joint_it->second.body_a == p_rid || joint_it->second.body_b == p_rid) {
+                joint_it = joints.erase(joint_it);
+            } else {
+                ++joint_it;
+            }
+        }
+        for (auto &[other_id, other] : bodies) {
+            (void)other_id;
+            other.exceptions.erase(std::remove(other.exceptions.begin(), other.exceptions.end(), id),
+                    other.exceptions.end());
+        }
+        bodies.erase(body_found);
         return;
     }
     if (shapes.erase(id) > 0) {
         return;
     }
-    if (joints.erase(id) > 0) {
+    const auto joint_found = joints.find(id);
+    if (joint_found != joints.end()) {
+        const JointData &joint = joint_found->second;
+        const BodyData *body_a = find_body(joint.body_a);
+        const BodyData *body_b = find_body(joint.body_b);
+        if (body_a != nullptr && body_a->space.is_valid()) {
+            space_rebuild_pending[id_of(body_a->space)] = true;
+        }
+        if (body_b != nullptr && body_b->space.is_valid()) {
+            space_rebuild_pending[id_of(body_b->space)] = true;
+        }
+        joints.erase(joint_found);
         return;
     }
     areas.erase(id);

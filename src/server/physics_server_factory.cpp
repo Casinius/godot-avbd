@@ -12,7 +12,7 @@
 
 using namespace godot;
 
-Object *PhysicsServerFactory::create_server() {
+PhysicsServer3D* PhysicsServerFactory::create_server() {
     UtilityFunctions::print("AVBD physics server: factory invoked - the engine selected AVBD");
     return memnew(AVBDPhysicsServer3D);
 }

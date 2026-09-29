@@ -92,9 +92,8 @@ public:
         return buildRange(std::vector<int>(bodyIndices_.begin(), bodyIndices_.end()), 0);
     }
 
-    // Morton LBVH: implicit heap layout in `nodes` (children of i are 2i+1 / 2i+2),
-    // balanced by construction. Returns the number of leaves stored (also the offset of
-    // the first leaf slot: leaves live at [padded-1 .. padded-2+n] of the node arrays).
+    // Builds a compact binary Morton tree with explicit child indices. Returns the root
+    // node index, or -1 when there are no bodies.
     int buildLBVH();
 
 private:

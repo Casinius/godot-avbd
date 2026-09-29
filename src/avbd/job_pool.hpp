@@ -105,6 +105,7 @@ public:
     // split varies with timing by design. The cursor is rearmed by the barrier's
     // completion, so consecutive phases must be separated by `arriveAndWait()`, which is
     // the loop contract anyway.
+    //
     template <typename F>
     void forItems(int count, F &&fn) {
         if (count <= 0) {
@@ -166,7 +167,7 @@ public:
     JobPool &operator=(const JobPool &) = delete;
 
     // Worker budget this solver may claim, clamped to what the machine has. Pure
-    // arithmetic: it never touches (or creates) the shared pool.
+    // Arithmetic only: it never touches (or creates) the shared pool.
     unsigned threadCount() const {
         const unsigned hw = std::thread::hardware_concurrency();
         const unsigned available = hw == 0 ? 1 : hw;

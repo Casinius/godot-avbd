@@ -12,7 +12,6 @@
 #include <cmath>
 #include <array>
 #include <atomic>
-#include <mutex>
 #include <vector>
 
 #include "avbd/solver.h"
@@ -21,54 +20,35 @@
 namespace avbd {
 
 Manifold::Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB)
-    : Force(p_solver, p_bodyA, p_bodyB), numContacts(0)
+    : Force(p_solver, p_bodyA, p_bodyB), contacts{}, basis(float3x3::Identity()), numContacts(0), friction(0.0f),
+      jacobianCache{}, rotACaptured(float3x3::Identity()), rotBCaptured(float3x3::Identity()), jacobiansCached(false)
 {
 }
 
 namespace {
-// Lock-free stack using std::atomic pointer (MSPMC)
-// Most manifolds are reused within same thread (thread-local reuse).
-// Memory ordering: acquire for pop (read-then-use), release for push (publish-after-store).
+// One cached block; force-list mutation and solver destruction are serialized.
 static std::atomic<void *> freeList{nullptr};
-} // namespace
+}
 
 void *Manifold::operator new(std::size_t count)
 {
     if (count != sizeof(Manifold))
         return ::operator new(count);
-
-    // Try to pop from free list (lock-free)
     void *ptr = freeList.exchange(nullptr, std::memory_order_acquire);
-
-    if (ptr == nullptr)
-    {
-        // Free list empty, allocate from heap
-        return ::operator new(sizeof(Manifold));
-    }
-
-    return ptr;
+    return ptr != nullptr ? ptr : ::operator new(sizeof(Manifold));
 }
 
 void Manifold::operator delete(void *ptr) noexcept
 {
-    if (ptr == nullptr)
-        return;
-
-    // Push to free list (lock-free)
-    // Use release to publish to other threads
-    freeList.store(ptr, std::memory_order_release);
+    if (ptr != nullptr)
+        freeList.store(ptr, std::memory_order_release);
 }
 
 void Manifold::drainPool() noexcept
 {
-    // Collect all free list pointers (single-threaded cleanup)
     void *ptr = freeList.exchange(nullptr, std::memory_order_acquire);
-    while (ptr != nullptr)
-    {
-        void *next = freeList.load(std::memory_order_acquire);
+    if (ptr != nullptr)
         ::operator delete(ptr);
-        ptr = next;
-    }
 }
 
 bool Manifold::initialize()

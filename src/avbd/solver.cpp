@@ -130,19 +130,7 @@ void Solver::step()
 {
     ensurePool();
 
-    // Broad phase is parallelized via LoopSync barrier
-    if (this->threads > 1)
-    {
-        // Parallel mode: use LoopSync barrier
-        avbd::detail::LoopSync sync(this->threads);
-        broadPhase(sync);
-    }
-    else
-    {
-        // Serial mode: use NullSync (no barrier, no overhead)
-        avbd::detail::NullSync sync;
-        broadPhase(sync);
-    }
+    broadPhase();
 
     const int forceCount = warmstartForces();
     colourGraph();
@@ -176,8 +164,7 @@ static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
 // Determinism: leaf order is the Morton-sorted body order, pair collection is leaf
 // order, and the final pair list is sorted ascending (min-index, other) - the same
 // manifold creation order contract as the sweep path.
-template <typename SyncType>
-void Solver::broadPhase(SyncType &sync)
+void Solver::broadPhase()
 {
     bodiesInOrder.clear();
     bodiesInOrder.insert(bodiesInOrder.end(), next_range(bodies).begin(), next_range(bodies).end());
@@ -196,56 +183,77 @@ void Solver::broadPhase(SyncType &sync)
         bodiesPtr.push_back(b);
 
     bvh::builder::Builder builder(bvhNodes, indices, bodiesPtr);
-    const int leafCount = builder.buildLBVH();
-    if (leafCount < 2)
+    const int root = builder.buildLBVH();
+    if (root < 0 || bvhNodes.size() < 2)
         return;
-    const int padded = 1;
-    int p = 1;
-    while (p < leafCount)
-        p <<= 1;
-    const int firstLeaf = p - 1;
-    (void)padded;
 
-    // Leaf slots [firstLeaf, firstLeaf + leafCount) in Morton-sorted order; collect them
-    // and pair each against all later slots (AABB overlap prune). The final sort keeps
-    // the ascending (min-index, other) manifold order.
+    const auto boundsOverlap = [this](int a, int b) {
+        const float3 aMin = bvhNodes.boundsMin(a);
+        const float3 aMax = bvhNodes.boundsMax(a);
+        const float3 bMin = bvhNodes.boundsMin(b);
+        const float3 bMax = bvhNodes.boundsMax(b);
+        return !(bMin.x() > aMax.x() || bMin.y() > aMax.y() || bMin.z() > aMax.z() ||
+                bMax.x() < aMin.x() || bMax.y() < aMin.y() || bMax.z() < aMin.z());
+    };
+
     sweepPairs.clear();
-    // Parallel AABB overlap pruning using LoopSync barrier.
-    // Each worker processes a chunk of leaf pairs; barrier ensures completion before sort.
-    const int totalPairs = leafCount * (leafCount - 1) / 2;
-    sync.forItems(totalPairs, [this, firstLeaf, leafCount](int i) {
-        // Map 1D index to 2D (a, b) with a < b
-        int a, b;
-        int offset = 0;
-        int a_temp = 0;
-        while (offset + (leafCount - a_temp - 1) <= i)
+    std::vector<std::pair<int, int>> pending;
+    pending.emplace_back(root, root);
+    while (!pending.empty())
+    {
+        const auto [a, b] = pending.back();
+        pending.pop_back();
+        if (a == b)
         {
-            offset += leafCount - a_temp - 1;
-            a_temp++;
+            if (bvhNodes.isLeaf(a))
+                continue;
+            const int left = bvhNodes.left()[a];
+            const int right = bvhNodes.right()[a];
+            pending.emplace_back(left, left);
+            pending.emplace_back(left, right);
+            pending.emplace_back(right, right);
+            continue;
         }
-        a = a_temp;
-        b = a + 1 + (i - offset);
-
-        const int na = firstLeaf + a;
-        const int nb = firstLeaf + b;
-        const float3 aMin = bvhNodes.boundsMin()[na];
-        const float3 aMax = bvhNodes.boundsMax()[na];
-        const float3 bMin = bvhNodes.boundsMin()[nb];
-        const float3 bMax = bvhNodes.boundsMax()[nb];
-
-        // AABB overlap prune (6 comparisons, early exit on fail)
-        if (bMin.x() > aMax.x() || bMin.y() > aMax.y() || bMin.z() > aMax.z() ||
-            bMax.x() < aMin.x() || bMax.y() < aMin.y() || bMax.z() < aMin.z())
-            return; // No overlap, skip
-
-        const int iIdx = bvhNodes.bodyIndex()[na];
-        const int jIdx = bvhNodes.bodyIndex()[nb];
-        sweepPairs.emplace_back(std::minmax(iIdx, jIdx));
-    });
-    sync.arriveAndWait();
+        if (!boundsOverlap(a, b))
+            continue;
+        const bool aLeaf = bvhNodes.isLeaf(a);
+        const bool bLeaf = bvhNodes.isLeaf(b);
+        if (aLeaf && bLeaf)
+        {
+            sweepPairs.push_back(std::minmax(bvhNodes.bodyIndex(a), bvhNodes.bodyIndex(b)));
+            continue;
+        }
+        if (aLeaf)
+        {
+            const int left = bvhNodes.left()[b];
+            const int right = bvhNodes.right()[b];
+            pending.emplace_back(a, left);
+            pending.emplace_back(a, right);
+        }
+        else if (bLeaf)
+        {
+            const int left = bvhNodes.left()[a];
+            const int right = bvhNodes.right()[a];
+            pending.emplace_back(left, b);
+            pending.emplace_back(right, b);
+        }
+        else
+        {
+            const int leftA = bvhNodes.left()[a];
+            const int rightA = bvhNodes.right()[a];
+            const int leftB = bvhNodes.left()[b];
+            const int rightB = bvhNodes.right()[b];
+            pending.emplace_back(leftA, leftB);
+            pending.emplace_back(leftA, rightB);
+            pending.emplace_back(rightA, leftB);
+            pending.emplace_back(rightA, rightB);
+        }
+    }
 
     std::sort(sweepPairs.begin(), sweepPairs.end());
     sweepPairs.erase(std::unique(sweepPairs.begin(), sweepPairs.end()), sweepPairs.end());
+
+
     for (const auto &[i, j] : sweepPairs)
     {
         Rigid *bodyA = bodiesInOrder[i];
@@ -481,6 +489,12 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
                         std::memory_order_relaxed);
                 prevResidual = residual;
             }
+            // Publish the worker-0 convergence decision before any participant decides
+            // whether to leave the loop. Without this fence, one worker can observe the
+            // flag while another still sees the previous value and enters a different
+            // set of barrier phases.
+            if (convergenceThreshold > 0.0f && it + 1 < targetIterations)
+                sync.arriveAndWait();
             const bool stop = converged.load(std::memory_order_relaxed);
             if (stop)
                 break; // every participant breaks at the same iteration - barriers stay paired
@@ -808,13 +822,10 @@ void Solver::colourGraph()
 
     widest = perColour.empty() ? 0 : *std::ranges::max_element(perColour);
 
-    std::vector<int> cursor;
-    cursor.reserve(colours + 1);
-    cursor = colourStart; // cursor[c] is the next free slot for colour c
-    std::vector<Rigid *> grouped;
-    grouped.reserve(updateOrder.size());
+    std::vector<int> cursor = colourStart; // cursor[c] is the next free slot for colour c
+    std::vector<Rigid *> grouped(updateOrder.size());
     for (Rigid *body : updateOrder)
-        grouped.push_back(body);
+        grouped[cursor[body->colour]++] = body;
     updateOrder = std::move(grouped);
 }
 

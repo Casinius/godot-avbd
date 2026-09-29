@@ -84,24 +84,8 @@ int Builder::buildRange(std::vector<int> local, int depth) noexcept {
     return nodes_.createInternal(mn, mx, leftNode, rightNode);
 }
 
-// Morton LBVH: implicit heap layout over a complete binary tree with `padded` =
-// next_pow2(n) leaf slots. Bodies are ordered by Morton code (a pure function of the
-// scene bounds and positions - deterministic), leaves are filled in Morton order into
-// slots [padded-1, padded-1+n), and internal slots [0, padded-1) aggregate their
-// children. Slot arithmetic (children = 2i+1 / 2i+2) IS the tree.
-//
-// Returns the leaf count; the first leaf slot is padded - 1.
-// ============================================
-// Morton LBVH Builder: implicit heap layout, balanced by construction
-// ============================================
-//
-// 64-bit 3D Morton codes (21 bits per axis) over the scene bounds; bodies are sorted by
-// code, and the code range is split by binary search (equivalent to a radix tree split,
-// which is what makes LBVH O(n log n) with near-balanced depth). Nodes live in the
-// implicit heap layout of a *complete* binary tree over `padded` = next_pow2(leafCount)
-// leaves: node i has children 2i+1 / 2i+2, leaves occupy slots [padded-1, padded-1+n).
-// No left/right/parent arrays - the layout IS the tree. Empty slots (when n < padded)
-// are marked bodyIndex = -1 with degenerate bounds and never probed.
+// Morton LBVH: compact binary nodes built over contiguous ranges of Morton-sorted leaves.
+// Every stored node is valid and carries explicit child indices; no power-of-two padding.
 namespace morton {
 
 inline uint64_t expandBits21(uint32_t v) noexcept {
@@ -148,51 +132,34 @@ int Builder::buildLBVH()
         coded.emplace_back(morton::morton3D(c.x(), c.y(), c.z(), lo.x(), scale), i);
     }
     std::sort(coded.begin(), coded.end(),
-            [](const auto &a, const auto &b) { return a.first < b.first; });
+            [](const auto &a, const auto &b) {
+                if (a.first != b.first)
+                    return a.first < b.first;
+                return a.second < b.second;
+            });
 
-    int padded = 1;
-    while (padded < n)
-        padded <<= 1;
-
-    // Leaf slots live at [padded - 1, padded - 1 + n); unused trailing slots stay
-    // degenerate. Internal slots [0, padded - 1) aggregate bottom-up.
     nodes_.clear();
-    nodes_.resizeImplicit(padded * 2 - 1);
+    nodes_.reserve(2 * n - 1);
+    std::vector<int> sortedBodies;
+    sortedBodies.reserve(n);
+    for (const auto &[code, bodyIndex] : coded)
+        sortedBodies.push_back(bodyIndex);
 
-    float3 allMin = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
-    float3 allMax = {std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
-    for (int i = 0; i < n; ++i) {
-        const avbd::Rigid *body = bodies_[coded[i].second];
-        float3 mn, mx;
-        computeAABB(body, mn, mx);
-        nodes_.setImplicitLeaf(padded - 1 + i, mn, mx, coded[i].second);
-        allMin = rmin(allMin, mn);
-        allMax = rmax(allMax, mx);
-    }
-
-    // Aggregate internal nodes bottom-up, right-to-left so children always exist first.
-    for (int slot = padded - 2; slot >= 0; --slot) {
-        const int l = 2 * slot + 1, r = 2 * slot + 2;
-        const float3 lmn = l < padded * 2 - 1 ? nodes_.boundsMin()[l] : allMin;
-        const float3 lmx = l < padded * 2 - 1 ? nodes_.boundsMax()[l] : allMax;
-        const float3 rmn = r < padded * 2 - 1 ? nodes_.boundsMin()[r] : allMin;
-        const float3 rmx = r < padded * 2 - 1 ? nodes_.boundsMax()[r] : allMax;
-        // Empty child slots (beyond n) carry max/lowest bounds; skip them in the union
-        // so a mostly-empty tree does not poison its ancestors with inverted boxes.
-        float3 mn, mx;
-        const bool lValid = l >= padded - 1 ? (l - (padded - 1)) < n : true;
-        const bool rValid = r >= padded - 1 ? (r - (padded - 1)) < n : true;
-        if (lValid && rValid) {
-            mn = rmin(lmn, rmn);
-            mx = rmax(lmx, rmx);
-        } else if (lValid) {
-            mn = lmn; mx = lmx;
-        } else {
-            mn = rmn; mx = rmx;
+    const auto build = [&](auto &&self, int begin, int end) -> int {
+        if (end - begin == 1) {
+            const avbd::Rigid *body = bodies_[sortedBodies[begin]];
+            float3 mn, mx;
+            computeAABB(body, mn, mx);
+            return nodes_.createLeaf(mn, mx, sortedBodies[begin]);
         }
-        nodes_.setImplicitInternalBounds(slot, mn, mx);
-    }
-    return n;
+        const int mid = begin + (end - begin) / 2;
+        const int left = self(self, begin, mid);
+        const int right = self(self, mid, end);
+        const float3 mn = rmin(nodes_.boundsMin(left), nodes_.boundsMin(right));
+        const float3 mx = rmax(nodes_.boundsMax(left), nodes_.boundsMax(right));
+        return nodes_.createInternal(mn, mx, left, right);
+    };
+    return build(build, 0, n);
 }
 
 
