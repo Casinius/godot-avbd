@@ -69,6 +69,11 @@ struct SplitResult {
 // ============================================
 namespace builder {
 
+struct LBVHScratch {
+    std::vector<std::pair<uint64_t, int>> coded;
+    std::vector<int> sortedBodies;
+};
+
 // Forward declaration
 class Builder;
 
@@ -83,8 +88,9 @@ namespace builder {
 class Builder {
 public:
     Builder(bvh::nodes::NodeStorage& nodes, std::span<const int> bodyIndices,
-            std::span<const avbd::Rigid* const> bodies, int maxDepth = 64) noexcept
-        : nodes_(nodes), bodyIndices_(bodyIndices), bodies_(bodies), maxDepth_(maxDepth) {}
+            std::span<const avbd::Rigid* const> bodies, LBVHScratch* scratch = nullptr,
+            int maxDepth = 64) noexcept
+        : nodes_(nodes), bodyIndices_(bodyIndices), bodies_(bodies), scratch_(scratch), maxDepth_(maxDepth) {}
 
     // Builds the tree and returns the root node index.
     int build() noexcept {
@@ -100,6 +106,7 @@ private:
     bvh::nodes::NodeStorage& nodes_;
     std::span<const int> bodyIndices_;
     std::span<const avbd::Rigid* const> bodies_;
+    LBVHScratch* scratch_;
     int maxDepth_;
 
     // Returns the node index of the subtree root for this index range.

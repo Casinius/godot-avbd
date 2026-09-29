@@ -19,6 +19,7 @@
 
 #include "avbd/maths.h"
 #include "avbd/bvh/node_storage.hpp"
+#include "avbd/bvh/bvh.hpp"
 
 // Forward declarations
 namespace bvh::nodes { class NodeStorage; }
@@ -550,18 +551,18 @@ struct Solver
     void updateBvh();
 
     // Performance timing counters (ms).
-    static double _time_broadPhase;
-    static double _time_colourGraph;
-    static double _time_solve;
-    static double _time_finish;
+    double _time_broadPhase = 0.0;
+    double _time_colourGraph = 0.0;
+    double _time_solve = 0.0;
+    double _time_finish = 0.0;
 
-    // Performance timing getters (ms). Returns 0 if timing is not active.
-    [[nodiscard]] static double get_broadPhase_time() { return 0.0; }
-    [[nodiscard]] static double get_colourGraph_time() { return 0.0; }
-    [[nodiscard]] static double get_solve_time() { return 0.0; }
-    [[nodiscard]] static double get_finish_time() { return 0.0; }
+    // Performance timing getters (ms), reporting the most recent step.
+    [[nodiscard]] double get_broadPhase_time() const { return _time_broadPhase; }
+    [[nodiscard]] double get_colourGraph_time() const { return _time_colourGraph; }
+    [[nodiscard]] double get_solve_time() const { return _time_solve; }
+    [[nodiscard]] double get_finish_time() const { return _time_finish; }
     // Reset all timing counters to zero.
-    static void reset_timing();
+    void reset_timing();
     // Get current CPU time in microseconds.
     static double get_time();
 
@@ -575,8 +576,12 @@ private:
     // Broad phase: the body list flattened to index-addressable order (rebuilt every
     // step), plus the BVH built over those bodies and the candidate pair list.
     std::vector<Rigid *> bodiesInOrder;
+    std::vector<const Rigid *> bodiesPtr;
+    std::vector<int> broadPhaseIndices;
+    bvh::builder::LBVHScratch bvhScratch;
     bvh::nodes::NodeStorage bvhNodes;
     std::vector<std::pair<int, int>> sweepPairs;
+    std::vector<std::pair<int, int>> pendingPairs;
 
     // Bodies that take part in the primal update (movable ones), grouped by colour:
     // colour c owns updateOrder[colourStart[c] .. colourStart[c + 1]).

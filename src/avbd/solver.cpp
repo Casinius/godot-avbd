@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <numeric>
 #include <span>
+#include <chrono>
 
 #include "avbd/solver.h"
 
@@ -126,17 +127,41 @@ void Solver::clear()
         delete bodies;
 }
 
+double Solver::get_time()
+{
+    return static_cast<double>(std::chrono::steady_clock::now().time_since_epoch().count()) /
+            static_cast<double>(std::chrono::steady_clock::period::den) * 1.0e6;
+}
+
+void Solver::reset_timing()
+{
+    _time_broadPhase = 0.0;
+    _time_colourGraph = 0.0;
+    _time_solve = 0.0;
+    _time_finish = 0.0;
+}
+
 void Solver::step()
 {
     ensurePool();
 
+    double start = get_time();
     broadPhase();
+    _time_broadPhase = get_time() - start;
 
+    start = get_time();
     const int forceCount = warmstartForces();
     colourGraph();
+    _time_colourGraph = get_time() - start;
+
+    start = get_time();
     warmstartBodies();
     solveIterations(forceCount);
+    _time_solve = get_time() - start;
+
+    start = get_time();
     finishVelocities();
+    _time_finish = get_time() - start;
 }
 
 // A broad-phase candidate test: bounding spheres plus Godot's layer/mask pair rule,
@@ -173,16 +198,17 @@ void Solver::broadPhase()
     if (count < 2)
         return;
 
-    std::vector<int> indices(count);
+    broadPhaseIndices.clear();
+    broadPhaseIndices.reserve(count);
     for (int i = 0; i < count; ++i)
-        indices[i] = i;
+        broadPhaseIndices.push_back(i);
 
-    std::vector<const Rigid *> bodiesPtr;
+    bodiesPtr.clear();
     bodiesPtr.reserve(count);
     for (Rigid *b : bodiesInOrder)
         bodiesPtr.push_back(b);
 
-    bvh::builder::Builder builder(bvhNodes, indices, bodiesPtr);
+    bvh::builder::Builder builder(bvhNodes, broadPhaseIndices, bodiesPtr, &bvhScratch);
     const int root = builder.buildLBVH();
     if (root < 0 || bvhNodes.size() < 2)
         return;
@@ -197,21 +223,21 @@ void Solver::broadPhase()
     };
 
     sweepPairs.clear();
-    std::vector<std::pair<int, int>> pending;
-    pending.emplace_back(root, root);
-    while (!pending.empty())
+    pendingPairs.clear();
+    pendingPairs.emplace_back(root, root);
+    while (!pendingPairs.empty())
     {
-        const auto [a, b] = pending.back();
-        pending.pop_back();
+        const auto [a, b] = pendingPairs.back();
+        pendingPairs.pop_back();
         if (a == b)
         {
             if (bvhNodes.isLeaf(a))
                 continue;
             const int left = bvhNodes.left()[a];
             const int right = bvhNodes.right()[a];
-            pending.emplace_back(left, left);
-            pending.emplace_back(left, right);
-            pending.emplace_back(right, right);
+            pendingPairs.emplace_back(left, left);
+            pendingPairs.emplace_back(left, right);
+            pendingPairs.emplace_back(right, right);
             continue;
         }
         if (!boundsOverlap(a, b))
@@ -227,15 +253,15 @@ void Solver::broadPhase()
         {
             const int left = bvhNodes.left()[b];
             const int right = bvhNodes.right()[b];
-            pending.emplace_back(a, left);
-            pending.emplace_back(a, right);
+            pendingPairs.emplace_back(a, left);
+            pendingPairs.emplace_back(a, right);
         }
         else if (bLeaf)
         {
             const int left = bvhNodes.left()[a];
             const int right = bvhNodes.right()[a];
-            pending.emplace_back(left, b);
-            pending.emplace_back(right, b);
+            pendingPairs.emplace_back(left, b);
+            pendingPairs.emplace_back(right, b);
         }
         else
         {
@@ -243,10 +269,10 @@ void Solver::broadPhase()
             const int rightA = bvhNodes.right()[a];
             const int leftB = bvhNodes.left()[b];
             const int rightB = bvhNodes.right()[b];
-            pending.emplace_back(leftA, leftB);
-            pending.emplace_back(leftA, rightB);
-            pending.emplace_back(rightA, leftB);
-            pending.emplace_back(rightA, rightB);
+            pendingPairs.emplace_back(leftA, leftB);
+            pendingPairs.emplace_back(leftA, rightB);
+            pendingPairs.emplace_back(rightA, leftB);
+            pendingPairs.emplace_back(rightA, rightB);
         }
     }
 

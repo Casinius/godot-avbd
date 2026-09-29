@@ -112,12 +112,20 @@ int Builder::buildLBVH()
 {
     const int n = static_cast<int>(bodyIndices_.size());
     if (n == 0)
-        return 0;
+        return -1;
+
+    LBVHScratch localScratch;
+    LBVHScratch &scratch = scratch_ ? *scratch_ : localScratch;
+    auto &coded = scratch.coded;
+    auto &sortedBodies = scratch.sortedBodies;
+    coded.clear();
+    sortedBodies.clear();
 
     // Scene bounds over the bounding-sphere centres.
     float3 lo = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
     float3 hi = {std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
-    for (const avbd::Rigid *b : bodies_) {
+    for (const int bodyIndex : bodyIndices_) {
+        const avbd::Rigid *b = bodies_[bodyIndex];
         lo = {std::min(lo.x(), b->positionLin.x()), std::min(lo.y(), b->positionLin.y()), std::min(lo.z(), b->positionLin.z())};
         hi = {std::max(hi.x(), b->positionLin.x()), std::max(hi.y(), b->positionLin.y()), std::max(hi.z(), b->positionLin.z())};
     }
@@ -125,11 +133,10 @@ int Builder::buildLBVH()
     const float scale = 2097151.0f / std::max({extent.x(), extent.y(), extent.z(), 1e-6f});
 
     // Morton codes per body index, then sort body indices by code.
-    std::vector<std::pair<uint64_t, int>> coded;
     coded.reserve(n);
-    for (int i = 0; i < n; ++i) {
-        const float3 c = bodies_[i]->positionLin;
-        coded.emplace_back(morton::morton3D(c.x(), c.y(), c.z(), lo.x(), scale), i);
+    for (const int bodyIndex : bodyIndices_) {
+        const float3 c = bodies_[bodyIndex]->positionLin;
+        coded.emplace_back(morton::morton3D(c.x(), c.y(), c.z(), lo.x(), scale), bodyIndex);
     }
     std::sort(coded.begin(), coded.end(),
             [](const auto &a, const auto &b) {
@@ -140,7 +147,6 @@ int Builder::buildLBVH()
 
     nodes_.clear();
     nodes_.reserve(2 * n - 1);
-    std::vector<int> sortedBodies;
     sortedBodies.reserve(n);
     for (const auto &[code, bodyIndex] : coded)
         sortedBodies.push_back(bodyIndex);
