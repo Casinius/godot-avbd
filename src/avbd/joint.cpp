@@ -43,8 +43,8 @@ bool Joint::initialize()
 {
     // Store constraint function at beginnning of timestep C(x-)
     // Note: if bodyA is null, it is assumed that the joint connects a body to the world space position rA
-    C0Lin = (bodyA ? bodyA->positionLin + bodyA->positionAng * rA : rA) - (bodyB->positionLin + bodyB->positionAng * rB);
-    C0Ang = ((bodyA ? bodyA->positionAng : quat::Identity()) - bodyB->positionAng) * torqueArm;
+    C0Lin = (bodyA ? (*bodyA)->positionLin + (*bodyA)->positionAng * rA : rA) - (bodyB ? (*bodyB)->positionLin + (*bodyB)->positionAng * rB : rB);
+    C0Ang = ((bodyA ? (*bodyA)->positionAng : quat::Identity()) - (bodyB ? (*bodyB)->positionAng : quat::Identity())) * torqueArm;
 
     // Warmstart the dual variables and penalty parameters (Eq. 19)
     // Penalty is safely clamped to a minimum and maximum value
@@ -83,7 +83,7 @@ void Joint::updatePrimal(Rigid *body, float alpha, Block &block)
     {
         // Compute constraint and jacobians
         float3x3 K = diagonal(penaltyLin.x(), penaltyLin.y(), penaltyLin.z());
-        float3 C = (bodyA ? bodyA->positionLin + bodyA->positionAng * rA : rA) - (bodyB->positionLin + bodyB->positionAng * rB);
+        float3 C = (bodyA ? (*bodyA)->positionLin + (*bodyA)->positionAng * rA : rA) - (bodyB ? (*bodyB)->positionLin + (*bodyB)->positionAng * rB : rB);
         
         // Stabilization
         if (std::isinf(stiffnessLin))
@@ -99,14 +99,14 @@ void Joint::updatePrimal(Rigid *body, float alpha, Block &block)
         float3x3 jAng;
         if (body == bodyA)
         {
-            const float3 r = -(bodyA->positionAng * rA);
+            const quat q = bodyA ? (*bodyA)->positionAng : quat::Identity(); const float3 r = q - q;
             jAng <<    0, -r.z(),  r.y(),
                    r.z(),      0, -r.x(),
                   -r.y(),  r.x(),      0;
         }
         else
         {
-            const float3 r = bodyB->positionAng * rB;
+            const float3 r = (*bodyB)->positionAng * rB;
             jAng <<    0, -r.z(),  r.y(),
                    r.z(),      0, -r.x(),
                   -r.y(),  r.x(),      0;
@@ -122,7 +122,7 @@ void Joint::updatePrimal(Rigid *body, float alpha, Block &block)
         block.lhsCross += jAngTk * jLin;
 
         // Diagonal approximation for higher order terms
-        float3 r = body == bodyA ? bodyA->positionAng * rA : -(bodyB->positionAng * rB);
+        float3 r = body == *bodyA ? quat::Identity() - (*bodyA)->positionAng : (*bodyB)->positionAng - quat::Identity();
         float3x3 H = 
             geometricStiffnessBallSocket(0, r) * F[0] +
             geometricStiffnessBallSocket(1, r) * F[1] +
@@ -139,7 +139,7 @@ void Joint::updatePrimal(Rigid *body, float alpha, Block &block)
     {
         // Compute constraint and jacobians
         float3x3 K = diagonal(penaltyAng.x(), penaltyAng.y(), penaltyAng.z());
-        float3 C = ((bodyA ? bodyA->positionAng : quat::Identity()) - bodyB->positionAng) * torqueArm;
+        float3 C = ((bodyA ? (*bodyA)->positionAng : quat::Identity()) - (bodyB ? (*bodyB)->positionAng : quat::Identity())) * torqueArm;
 
         // Stabilization
         if (std::isinf(stiffnessAng))
@@ -178,7 +178,7 @@ void Joint::updateDual(float alpha)
     {
         // Compute constraint and jacobians
         float3x3 K = diagonal(penaltyLin.x(), penaltyLin.y(), penaltyLin.z());
-        float3 C = (bodyA ? bodyA->positionLin + bodyA->positionAng * rA : rA) - (bodyB->positionLin + bodyB->positionAng * rB);
+        float3 C = (bodyA ? (*bodyA)->positionLin + (*bodyA)->positionAng * rA : rA) - (bodyB ? (*bodyB)->positionLin + (*bodyB)->positionAng * rB : rB);
 
         if (std::isinf(stiffnessLin))
         {
@@ -203,7 +203,7 @@ void Joint::updateDual(float alpha)
     {
         // Compute constraint and jacobians
         float3x3 K = diagonal(penaltyAng.x(), penaltyAng.y(), penaltyAng.z());
-        float3 C = ((bodyA ? bodyA->positionAng : quat::Identity()) - bodyB->positionAng) * torqueArm;
+        float3 C = ((bodyA ? (*bodyA)->positionAng : quat::Identity()) - (bodyB ? (*bodyB)->positionAng : quat::Identity())) * torqueArm;
 
         if (std::isinf(stiffnessAng))
         {

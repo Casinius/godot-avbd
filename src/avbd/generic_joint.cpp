@@ -54,19 +54,19 @@ GenericJoint::GenericJoint(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, flo
 
 quat GenericJoint::frameOrientation() const
 {
-    return bodyA ? bodyA->positionAng : kIdentity;
+    return bodyA ? (*bodyA)->positionAng : kIdentity;
 }
 
 
 
 float3 GenericJoint::anchorA() const
 {
-    return bodyA ? bodyA->positionLin + bodyA->positionAng * rA : rA;
+    return bodyA ? (*bodyA)->positionLin + (*bodyA)->positionAng * rA : rA;
 }
 
 float3 GenericJoint::anchorB() const
 {
-    return bodyB->positionLin + bodyB->positionAng * rB;
+    return (*bodyB)->positionLin + (*bodyB)->positionAng * rB;
 }
 
 // Remove the twist about axis `p_axis` from `p_dev`, writing its angle to `r_angle`.
@@ -112,7 +112,7 @@ void GenericJoint::angularValues(float p_out[3]) const
     // the current one gives identity exactly when the bodies are back where they started, and its
     // axis-angle in A's frame is what each degree of freedom measures.
     const quat qA = frameOrientation();
-    const quat relativeNow = qA.conjugate() * bodyB->positionAng.normalized();
+    const quat relativeNow = qA.conjugate() * (*bodyB)->positionAng.normalized();
     quat dev = rest.normalized() * relativeNow.conjugate();
 
     // The twist about every non-locked axis belongs to that axis - a spring or a limit reads
@@ -302,7 +302,7 @@ void GenericJoint::updatePrimal(Rigid *body, float alpha, Block &block)
 {
     const quat qA = frameOrientation();
     const float3 rAWorld = qA * rA;
-    const float3 rBWorld = bodyB->positionAng * rB;
+    const float3 rBWorld = (*bodyB)->positionAng * rB;
 
     // Measurements, in the joint frame.
     const float3 offset = qA.conjugate() * (anchorA() - anchorB());
@@ -316,11 +316,11 @@ void GenericJoint::updatePrimal(Rigid *body, float alpha, Block &block)
 
     // Relative motion of the two anchors, for spring damping: the rate of change of the linear
     // measurements, so that damping always opposes the spring.
-    const float3 vA = bodyA ? bodyA->velocityLin + bodyA->velocityAng.cross(rAWorld) : float3{0, 0, 0};
-    const float3 vB = bodyB->velocityLin + bodyB->velocityAng.cross(rBWorld);
+    const float3 vA = bodyA ? (*bodyA)->velocityLin + (*bodyA)->velocityAng.cross(rAWorld) : float3{0, 0, 0};
+    const float3 vB = (*bodyB)->velocityLin + (*bodyB)->velocityAng.cross(rBWorld);
     const float3 relativeVelocity = vA - vB;
-    const float3 wA = bodyA ? bodyA->velocityAng : float3{0, 0, 0};
-    const float3 wB = bodyB->velocityAng;
+    const float3 wA = bodyA ? (*bodyA)->velocityAng : float3{0, 0, 0};
+    const float3 wB = (*bodyB)->velocityAng;
 
     for (int i = 0; i < 3; i++)
     {
@@ -373,8 +373,8 @@ void GenericJoint::updateDual(float alpha)
 
             // Grow the penalty only up to what the solver can actually resolve; see penaltyLimit.
             const float3 axisDir = frameOrientation() * frameAxis(i);
-            float cap = penaltyLimit(bodyB, axisDir, k == 1);
-            if (bodyA != 0) cap = std::min(cap, penaltyLimit(bodyA, axisDir, k == 1));
+            float cap = penaltyLimit(*bodyB, axisDir, k == 1);
+            if (bodyA.has_value()) cap = std::min(cap, penaltyLimit(*bodyA, axisDir, k == 1));
             axis.penalty = std::clamp(axis.penalty + std::abs(C) * betas[k], 0.0f, cap);
         }
     }

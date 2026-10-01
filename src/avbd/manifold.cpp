@@ -54,14 +54,14 @@ void Manifold::drainPool() noexcept
 bool Manifold::initialize()
 {
     // Compute friction
-    friction = std::sqrt(bodyA->friction * bodyB->friction);
+    friction = std::sqrt((*bodyA)->friction * (*bodyB)->friction);
 
     // New contact set: cached jacobians describe the old geometry, drop them.
     jacobiansCached = false;
 
     // Compute new contacts
     std::array<Contact, 8> newContacts = {};
-    int newNumContacts = collide(bodyA, bodyB, std::span<Contact>(newContacts), basis);
+    int newNumContacts = collide(*bodyA, *bodyB, std::span<Contact>(newContacts), basis);
 
     // Merge old contact data with new contacts
     for (int i = 0; i < newNumContacts; i++)
@@ -96,8 +96,8 @@ bool Manifold::initialize()
     for (int i = 0; i < numContacts; i++)
     {
         // Error at q-
-        float3 xA = bodyA->positionLin + bodyA->positionAng * contacts[i].rA;
-        float3 xB = bodyB->positionLin + bodyB->positionAng * contacts[i].rB;
+        float3 xA = (*bodyA)->positionLin + (*bodyA)->positionAng * contacts[i].rA;
+        float3 xB = (*bodyB)->positionLin + (*bodyB)->positionAng * contacts[i].rB;
         contacts[i].C0 = basis * (xA - xB) + float3{COLLISION_MARGIN, 0, 0};
 
         // Clamp penetration to avoid excessive penalty forces
@@ -124,14 +124,14 @@ bool Manifold::initialize()
 
 void Manifold::updatePrimal(Rigid *body, float alpha, Block &block)
 {
-    float3 dqALin = bodyA->positionLin - bodyA->initialLin;
-    float3 dqAAng = bodyA->positionAng - bodyA->initialAng;
-    float3 dqBLin = bodyB->positionLin - bodyB->initialLin;
-    float3 dqBAng = bodyB->positionAng - bodyB->initialAng;
+    float3 dqALin = (*bodyA)->positionLin - (*bodyA)->initialLin;
+    float3 dqAAng = (*bodyA)->positionAng - (*bodyA)->initialAng;
+    float3 dqBLin = (*bodyB)->positionLin - (*bodyB)->initialLin;
+    float3 dqBAng = (*bodyB)->positionAng - (*bodyB)->initialAng;
 
     // Same rotation-matrix hoist as updateDual: body quats are loop-invariant here.
-    const float3x3 rotA(bodyA->positionAng);
-    const float3x3 rotB(bodyB->positionAng);
+    const float3x3 rotA((*bodyA)->positionAng);
+    const float3x3 rotB((*bodyB)->positionAng);
 
     // Incremental jacobian caching: the angular jacobian is a function of the world-space
     // moment arms only (rows are rWorld x basis.row(i)), and the arms move between
@@ -229,16 +229,16 @@ void Manifold::updatePrimal(Rigid *body, float alpha, Block &block)
 
 void Manifold::updateDual(float alpha)
 {
-    float3 dqALin = bodyA->positionLin - bodyA->initialLin;
-    float3 dqAAng = bodyA->positionAng - bodyA->initialAng;
-    float3 dqBLin = bodyB->positionLin - bodyB->initialLin;
-    float3 dqBAng = bodyB->positionAng - bodyB->initialAng;
+    float3 dqALin = (*bodyA)->positionLin - (*bodyA)->initialLin;
+    float3 dqAAng = (*bodyA)->positionAng - (*bodyA)->initialAng;
+    float3 dqBLin = (*bodyB)->positionLin - (*bodyB)->initialLin;
+    float3 dqBAng = (*bodyB)->positionAng - (*bodyB)->initialAng;
 
     // Both contact rotations share the two body quats, which never change inside this
     // loop: one rotation-matrix conversion (~20 ns) replaces two quat multiplies per
     // contact (~16 ns each at 8 contacts = ~256 ns/manifold).
-    const float3x3 rotA(bodyA->positionAng);
-    const float3x3 rotB(bodyB->positionAng);
+    const float3x3 rotA((*bodyA)->positionAng);
+    const float3x3 rotB((*bodyB)->positionAng);
 
     for (int i = 0; i < numContacts; i++)
     {

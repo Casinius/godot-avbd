@@ -1110,7 +1110,7 @@ static void test_incremental_colouring() {
 
     bool conflictFree = true;
     for (const Force *f = s.forces; f != nullptr; f = f->next) {
-        if (f->bodyA->colour >= 0 && f->bodyB->colour >= 0 && f->bodyA->colour == f->bodyB->colour)
+        if ((*f->bodyA)->colour >= 0 && (*f->bodyB)->colour >= 0 && (*f->bodyA)->colour == (*f->bodyB)->colour)
             conflictFree = false;
     }
     report(conflictFree, "colouring conflict-free", "forces=%d colours=%d", count_forces(s), s.colourCount());

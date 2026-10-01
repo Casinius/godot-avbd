@@ -28,7 +28,11 @@ func bench_stack_10() -> Variant:
 		boxes.append(add_body(root, "Box%d" % i, Vector3.ONE, Vector3(0, 1.0 + i * 1.0, 0), 1.0, 0.8))
 
 	# Wait for 600 physics ticks
+	var start_time := OS.get_ticks_msec()
 	await steps(STEPS_10BOXES)
+	var end_time := OS.get_ticks_msec()
+	var elapsed_time_ms := end_time - start_time
+	var elapsed_time := elapsed_time_ms / 1000.0
 
 	var worst_y := 0.0
 	var worst_interface := 0.0
@@ -40,16 +44,13 @@ func bench_stack_10() -> Variant:
 		worst_interface = maxf(worst_interface, penetration)
 		worst_lateral = maxf(worst_lateral, Vector2(pos.x, pos.z).length())
 
-	# Performance timing: wall clock time
-	# TODO: Implement real timing measurement when OS API works in headless mode
-	var elapsed_time := float(STEPS_10BOXES) / 60.0  # Assume 60 Hz tick rate
-
 	var evidence := {
 		"height_error": worst_y,
 		"penetration": worst_interface,
 		"drift": worst_lateral,
-		"wall_time_ms": elapsed_time * 1000.0,
-		"steps_per_second": 60.0,
+		"wall_time_ms": elapsed_time_ms,
+		"wall_time_s": elapsed_time,
+		"steps_per_second": STEPS_10BOXES / elapsed_time,
 		"active_bodies": boxes.size() + 1,
 		"iterations": ProjectSettings.get_setting("avbd/iterations"),
 		"beta_linear": ProjectSettings.get_setting("avbd/beta_linear"),
@@ -69,7 +70,11 @@ func bench_stack_5() -> Variant:
 	for i in 5:
 		boxes.append(add_body(root, "Box%d" % i, Vector3.ONE, Vector3(0, 1.0 + i * 1.0, 0), 1.0, 0.8))
 
+	var start_time := OS.get_ticks_msec()
 	await steps(STEPS_5BOXES)
+	var end_time := OS.get_ticks_msec()
+	var elapsed_time_ms := end_time - start_time
+	var elapsed_time := elapsed_time_ms / 1000.0
 
 	var worst_y := 0.0
 	var worst_interface := 0.0
@@ -81,16 +86,13 @@ func bench_stack_5() -> Variant:
 		worst_interface = maxf(worst_interface, penetration)
 		worst_lateral = maxf(worst_lateral, Vector2(pos.x, pos.z).length())
 
-	# Performance timing: wall clock time
-	# TODO: Implement real timing measurement when OS API works in headless mode
-	var elapsed_time := float(STEPS_5BOXES) / 60.0  # Assume 60 Hz tick rate
-
 	var evidence := {
 		"height_error": worst_y,
 		"penetration": worst_interface,
 		"drift": worst_lateral,
-		"wall_time_ms": elapsed_time * 1000.0,
-		"steps_per_second": 60.0,
+		"wall_time_ms": elapsed_time_ms,
+		"wall_time_s": elapsed_time,
+		"steps_per_second": STEPS_5BOXES / elapsed_time,
 		"active_bodies": boxes.size() + 1,
 		"iterations": ProjectSettings.get_setting("avbd/iterations"),
 		"beta_linear": ProjectSettings.get_setting("avbd/beta_linear"),

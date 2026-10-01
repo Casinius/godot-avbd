@@ -40,7 +40,7 @@ class AVBDSoftBody3D;
 class AVBDSoftWorld3D : public Node3D {
     GDCLASS(AVBDSoftWorld3D, Node3D)
 
-    double gravity = 9.8;
+    double gravity = static_cast<double>(avbd::constants::default_gravity);
     int threads = 0;
 
     avbd::Solver solver;

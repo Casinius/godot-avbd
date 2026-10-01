@@ -46,6 +46,10 @@ option("tsan")
     set_default(false)
     set_showmenu(true)
     set_description("Build with ThreadSanitizer")
+option("leaksanitizer")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Build with LeakSanitizer (C++20)")
 
 -- Warnings are errors of intent: the tree builds clean at this level, and a new warning
 -- should be dealt with rather than accumulated.
@@ -71,6 +75,10 @@ local function avbd_common()
     if has_config("tsan") and is_plat("linux") then
         add_cxflags("-fsanitize=thread", { force = true })
         add_ldflags("-fsanitize=thread", { force = true })
+    end
+    if has_config("leaksanitizer") and is_plat("linux") then
+        add_cxflags("-fsanitize=leak", { force = true })
+        add_ldflags("-fsanitize=leak", { force = true })
     end
 end
 
@@ -116,6 +124,42 @@ target("test_parallel_simple")
     avbd_common()
     set_kind("binary")
     add_files("tools/test_parallel_simple.cpp")
+    add_includedirs("src")
+    add_packages("thread-pool","eigen")
+    add_deps("avbd")
+
+-- LeakSanitizer test: simple memory leak detection
+target("test_leaksanitizer")
+    avbd_common()
+    set_kind("binary")
+    add_files("tools/test_leaksanitizer.cpp")
+    add_includedirs("src")
+    add_packages("thread-pool","eigen")
+    add_deps("avbd")
+
+-- Solver leak test: verify solver internals are leak-free
+target("test_solver_leak_free")
+    avbd_common()
+    set_kind("binary")
+    add_files("tools/test_solver_leak_free.cpp")
+    add_includedirs("src")
+    add_packages("thread-pool","eigen")
+    add_deps("avbd")
+
+-- Simple leak test: quick sanity check
+target("test_minimal_leak")
+    avbd_common()
+    set_kind("binary")
+    add_files("tools/test_minimal_leak.cpp")
+    add_includedirs("src")
+    add_packages("thread-pool","eigen")
+    add_deps("avbd")
+
+-- Comprehensive leak test: verify all fixes work
+target("test_comprehensive_leak")
+    avbd_common()
+    set_kind("binary")
+    add_files("tools/test_comprehensive_leak.cpp")
     add_includedirs("src")
     add_packages("thread-pool","eigen")
     add_deps("avbd")

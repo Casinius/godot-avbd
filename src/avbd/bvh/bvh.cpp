@@ -10,6 +10,7 @@
  */
 
 #include "bvh.hpp"
+#include <optional>
 #include "avbd/solver.h"
 // cppcheck-suppress missingIncludeSystem
 #include <algorithm>
@@ -35,7 +36,7 @@ static inline void computeAABB(const avbd::Rigid* body, float3& min, float3& max
 // Build Recursive Implementation
 // ============================================
 // Returns the node index of the subtree root for this range of body indices.
-int Builder::buildRange(std::vector<int> local, int depth) noexcept {
+[[nodiscard]] std::optional<int> Builder::buildRange(std::vector<int> local, int depth) noexcept {
     const int count = static_cast<int>(local.size());
 
     if (count == 1) {
@@ -76,12 +77,13 @@ int Builder::buildRange(std::vector<int> local, int depth) noexcept {
     std::vector<int> leftLocal(local.begin(), local.begin() + splitPosIdx);
     std::vector<int> rightLocal(local.begin() + splitPosIdx, local.end());
 
-    const int leftNode = buildRange(std::move(leftLocal), depth + 1);
-    const int rightNode = buildRange(std::move(rightLocal), depth + 1);
+    const std::optional<int> leftNode = buildRange(std::move(leftLocal), depth + 1);
+    const std::optional<int> rightNode = buildRange(std::move(rightLocal), depth + 1);
 
-    const float3 mn = rmin(nodes_.boundsMin()[leftNode], nodes_.boundsMin()[rightNode]);
-    const float3 mx = rmax(nodes_.boundsMax()[leftNode], nodes_.boundsMax()[rightNode]);
-    return nodes_.createInternal(mn, mx, leftNode, rightNode);
+    const float3 mn = rmin(nodes_.boundsMin()[*leftNode], nodes_.boundsMin()[*rightNode]);
+    const float3 mx = rmax(nodes_.boundsMax()[*leftNode], nodes_.boundsMax()[*rightNode]);
+    if (!leftNode || !rightNode) return std::nullopt;
+    return nodes_.createInternal(mn, mx, *leftNode, *rightNode);
 }
 
 // Morton LBVH: compact binary nodes built over contiguous ranges of Morton-sorted leaves.
@@ -108,11 +110,11 @@ inline uint64_t morton3D(float x, float y, float z, float lo, float scale) noexc
 } // namespace morton
 
 
-int Builder::buildLBVH()
+[[nodiscard]] std::optional<int> Builder::buildLBVH()
 {
     const int n = static_cast<int>(bodyIndices_.size());
     if (n == 0)
-        return -1;
+        return std::nullopt;
 
     LBVHScratch localScratch;
     LBVHScratch &scratch = scratch_ ? *scratch_ : localScratch;
@@ -151,7 +153,7 @@ int Builder::buildLBVH()
     for (const auto &[code, bodyIndex] : coded)
         sortedBodies.push_back(bodyIndex);
 
-    const auto build = [&](auto &&self, int begin, int end) -> int {
+    const auto build = [&](auto &&self, int begin, int end) -> std::optional<int> {
         if (end - begin == 1) {
             const avbd::Rigid *body = bodies_[sortedBodies[begin]];
             float3 mn, mx;
@@ -159,11 +161,11 @@ int Builder::buildLBVH()
             return nodes_.createLeaf(mn, mx, sortedBodies[begin]);
         }
         const int mid = begin + (end - begin) / 2;
-        const int left = self(self, begin, mid);
-        const int right = self(self, mid, end);
-        const float3 mn = rmin(nodes_.boundsMin(left), nodes_.boundsMin(right));
-        const float3 mx = rmax(nodes_.boundsMax(left), nodes_.boundsMax(right));
-        return nodes_.createInternal(mn, mx, left, right);
+        const std::optional<int> left = self(self, begin, mid);
+        const std::optional<int> right = self(self, mid, end);
+        const float3 mn = rmin(nodes_.boundsMin(*left), nodes_.boundsMin(*right));
+        const float3 mx = rmax(nodes_.boundsMax(*left), nodes_.boundsMax(*right));
+        return nodes_.createInternal(mn, mx, *left, *right);
     };
     return build(build, 0, n);
 }

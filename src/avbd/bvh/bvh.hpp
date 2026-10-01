@@ -93,14 +93,15 @@ public:
         : nodes_(nodes), bodyIndices_(bodyIndices), bodies_(bodies), scratch_(scratch), maxDepth_(maxDepth) {}
 
     // Builds the tree and returns the root node index.
-    int build() noexcept {
-        if (bodyIndices_.empty()) return -1;
+    // SafeC++: returns std::optional<int>, no nullptr or -1.
+    [[nodiscard]] std::optional<int> build() noexcept {
+        if (bodyIndices_.empty()) return std::nullopt;
         return buildRange(std::vector<int>(bodyIndices_.begin(), bodyIndices_.end()), 0);
     }
 
     // Builds a compact binary Morton tree with explicit child indices. Returns the root
-    // node index, or -1 when there are no bodies.
-    int buildLBVH();
+    // node index, or std::nullopt when there are no bodies.
+    [[nodiscard]] std::optional<int> buildLBVH();
 
 private:
     bvh::nodes::NodeStorage& nodes_;
@@ -110,7 +111,8 @@ private:
     int maxDepth_;
 
     // Returns the node index of the subtree root for this index range.
-    int buildRange(std::vector<int> local, int depth) noexcept;
+    // SafeC++: returns std::optional<int>, no nullptr or -1.
+    [[nodiscard]] std::optional<int> buildRange(std::vector<int> local, int depth) noexcept;
 };
 
 } // namespace builder

@@ -15,6 +15,8 @@
 #include <vector>
 // cppcheck-suppress missingIncludeSystem
 #include <span>
+// cppcheck-suppress missingIncludeSystem
+#include <optional>
 
 #include "avbd/maths.h"
 
@@ -73,9 +75,9 @@ public:
     [[nodiscard]] int countLeaves() const noexcept;
     [[nodiscard]] int root() const noexcept { return 0; }
 
-    // Node creation (SafeC++: returns int, no nullptr)
-    int createLeaf(const float3& min, const float3& max, int bodyIdx) noexcept;
-    int createInternal(const float3& min, const float3& max, int leftIdx, int rightIdx, int parentIdx = -1) noexcept;
+    // Node creation (SafeC++: returns std::optional<int>, no nullptr or -1)
+    [[nodiscard]] std::optional<int> createLeaf(const float3& min, const float3& max, int bodyIdx) noexcept;
+    [[nodiscard]] std::optional<int> createInternal(const float3& min, const float3& max, int leftIdx, int rightIdx, int parentIdx = -1) noexcept;
     [[nodiscard]] bool isLeaf(int nodeId) const noexcept { return bodyIndex_[nodeId] >= 0; }
     void updateBounds(int nodeId, const float3& min, const float3& max) noexcept;
 };

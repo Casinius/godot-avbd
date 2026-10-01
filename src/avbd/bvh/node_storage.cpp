@@ -19,9 +19,9 @@ int NodeStorage::countLeaves() const noexcept {
     return static_cast<int>(bodyIndex_.size());
 }
 
-int NodeStorage::createLeaf(const float3& min, const float3& max, int bodyIdx) noexcept {
+std::optional<int> NodeStorage::createLeaf(const float3& min, const float3& max, int bodyIdx) noexcept {
     // Allocate a new node
-    int nodeId = static_cast<int>(bodyIndex_.size());
+    const int nodeId = static_cast<int>(bodyIndex_.size());
 
     boundsMin_.push_back(min);
     boundsMax_.push_back(max);
@@ -33,9 +33,9 @@ int NodeStorage::createLeaf(const float3& min, const float3& max, int bodyIdx) n
     return nodeId;
 }
 
-int NodeStorage::createInternal(const float3& min, const float3& max, int leftIdx, int rightIdx, int parentIdx) noexcept {
+std::optional<int> NodeStorage::createInternal(const float3& min, const float3& max, int leftIdx, int rightIdx, int parentIdx) noexcept {
     // Allocate a new node
-    int nodeId = static_cast<int>(bodyIndex_.size());
+    const int nodeId = static_cast<int>(bodyIndex_.size());
 
     boundsMin_.push_back(min);
     boundsMax_.push_back(max);

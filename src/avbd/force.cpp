@@ -15,7 +15,7 @@
 namespace avbd {
 
 Force::Force(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB)
-    : solver(p_solver), bodyA(p_bodyA), bodyB(p_bodyB), nextA(0), nextB(0)
+    : solver(p_solver), bodyA(p_bodyA), bodyB(p_bodyB), nextA(nullptr), nextB(nullptr)
 {
     // Add to the solver's linked list
     next = p_solver->forces;
@@ -46,7 +46,7 @@ Force::~Force()
     // Remove from body linked lists
     if (bodyA)
     {
-        p = &bodyA->forces;
+        p = &(*bodyA)->forces;
         while (*p != this)
             p = (*p)->bodyA == bodyA ? &(*p)->nextA : &(*p)->nextB;
         *p = nextA;
@@ -54,7 +54,7 @@ Force::~Force()
 
     if (bodyB)
     {
-        p = &bodyB->forces;
+        p = &(*bodyB)->forces;
         while (*p != this)
             p = (*p)->bodyA == bodyB ? &(*p)->nextA : &(*p)->nextB;
         *p = nextB;

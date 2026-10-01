@@ -120,11 +120,22 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
 
 void Solver::clear()
 {
+    // Drain Manifold pool before deleting forces
+    Manifold::drainPool();
+
     while (forces)
-        delete forces;
+    {
+        // Explicitly destroy and deallocate force - destructor only unlinks from lists
+        forces->~Force();
+        ::operator delete(forces);
+    }
 
     while (bodies)
-        delete bodies;
+    {
+        // Explicitly destroy and deallocate body - destructor only unlinks from lists
+        bodies->~Rigid();
+        ::operator delete(bodies);
+    }
 }
 
 double Solver::get_time()
@@ -168,12 +179,12 @@ void Solver::step()
 // minus pairs already joined by a force (IgnoreCollision, joints).
 static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
 {
-    const float3 dp = bodyA->positionLin - bodyB->positionLin;
-    const float reach = bodyA->radius + bodyB->radius;
+    const float3 dp = (*bodyA).positionLin - (*bodyB).positionLin;
+    const float reach = (*bodyA).radius + (*bodyB).radius;
     // Godot semantics: the pair collides when either side's layer is in the other's
     // mask (defaults 1/1 keep every pair, as before these fields existed).
-    const bool layersAllow = ((bodyA->collisionLayer & bodyB->collisionMask) != 0) ||
-            ((bodyB->collisionLayer & bodyA->collisionMask) != 0);
+    const bool layersAllow = (((*bodyA).collisionLayer & (*bodyB).collisionMask) != 0) ||
+            (((*bodyB).collisionLayer & (*bodyA).collisionMask) != 0);
     return dp.squaredNorm() <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB);
 }
 
@@ -209,8 +220,8 @@ void Solver::broadPhase()
         bodiesPtr.push_back(b);
 
     bvh::builder::Builder builder(bvhNodes, broadPhaseIndices, bodiesPtr, &bvhScratch);
-    const int root = builder.buildLBVH();
-    if (root < 0 || bvhNodes.size() < 2)
+    const std::optional<int> root = builder.buildLBVH();
+    if (!root || bvhNodes.size() < 2)
         return;
 
     const auto boundsOverlap = [this](int a, int b) {
@@ -224,7 +235,7 @@ void Solver::broadPhase()
 
     sweepPairs.clear();
     pendingPairs.clear();
-    pendingPairs.emplace_back(root, root);
+    pendingPairs.emplace_back(root.value(), root.value());
     while (!pendingPairs.empty())
     {
         const auto [a, b] = pendingPairs.back();
@@ -299,7 +310,7 @@ static bool constraintFrozen(const Force *f)
 {
     if (f->contactPointCount() <= 0)
         return false; // joints / springs / soft constraints keep their exact behaviour
-    const auto awake = [](const Rigid *b) { return b != nullptr && b->mass > 0.0f && !b->sleeping; };
+    const auto awake = [](const std::optional<Rigid*> b) { return b.has_value() && (*b)->mass > 0.0f && !(*b)->sleeping; };
     return !awake(f->bodyA) && !awake(f->bodyB);
 }
 
@@ -324,7 +335,11 @@ int Solver::warmstartForces()
     for (int i = 0; i < forceCount; i++)
     {
         if (!forceActive[i])
-            delete forceOrder[i]; // unlinks itself from the solver and both bodies
+        {
+            // Actually delete the force - destructor only unlinks, we need to deallocate
+            forceOrder[i]->~Force();
+            ::operator delete(forceOrder[i]);
+        }
     }
 
     forceCount = collectForces(); // the sweep above invalidated the index
@@ -546,6 +561,9 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
 // bodies too, so their bookkeeping matches, though only movable ones get a new velocity.
 void Solver::finishVelocities()
 {
+    // Drain Manifold pool to prevent memory buildup - Manifolds use a free list allocator
+    Manifold::drainPool();
+
     const int count = static_cast<int>(warmstartOrder.size());
     pool->forCount(count, [this](int i) {
         Rigid *body = warmstartOrder[i];
@@ -638,8 +656,8 @@ void Solver::islandSleep()
             const auto it = std::lower_bound(sorted.begin(), sorted.end(), b);
             return (it != sorted.end() && *it == b) ? static_cast<int>(it - sorted.begin()) : -1;
         };
-        const int ia = slotOf(f->bodyA);
-        const int ib = slotOf(f->bodyB);
+        const int ia = f->bodyA.has_value() ? slotOf(*f->bodyA) : -1;
+        const int ib = f->bodyB.has_value() ? slotOf(*f->bodyB) : -1;
         if (ia >= 0 && ib >= 0)
             islandForceSlots.emplace_back(ia, ib);
     }
@@ -731,7 +749,7 @@ void Solver::colourGraph()
                 continue;
             for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
             {
-                Rigid *other = (f->bodyA == body) ? f->bodyB : f->bodyA;
+                Rigid *other = (f->bodyA == body) ? f->bodyB.value_or(nullptr) : f->bodyA.value_or(nullptr);
                 if (other != 0 && other->mass > 0 && !other->sleeping &&
                         (other->velocityLin.squaredNorm() > lin2 ||
                                 other->velocityAng.squaredNorm() > ang2))
@@ -810,7 +828,7 @@ void Solver::colourGraph()
         taken.clear();
         for (Force *force = body->forces; force != 0; force = (force->bodyA == body) ? force->nextA : force->nextB)
         {
-            Rigid *other = (force->bodyA == body) ? force->bodyB : force->bodyA;
+            Rigid *other = (force->bodyA == body) ? force->bodyB.value_or(nullptr) : force->bodyA.value_or(nullptr);
             if (other != 0 && other->colour >= 0)
                 taken.push_back(other->colour);
         }
@@ -858,6 +876,9 @@ void Solver::colourGraph()
 // Fill `forceOrder` with the solver's forces, so the phases can address them by index.
 int Solver::collectForces()
 {
+    // Drain the Manifold free list to avoid leaks - Manifolds use a custom allocator
+    Manifold::drainPool();
+
     forceOrder.clear();
     forceOrder.insert(forceOrder.end(), next_range(forces).begin(), next_range(forces).end());
     return static_cast<int>(forceOrder.size());

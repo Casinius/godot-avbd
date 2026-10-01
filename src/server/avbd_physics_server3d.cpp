@@ -8,6 +8,7 @@
 #include "server/avbd_direct_body_state3d.hpp"
 #include "server/avbd_direct_space_state3d.hpp"
 
+#include "avbd/constants.hpp"
 #include "avbd/list_range.hpp"
 
 #include <cmath>
@@ -51,6 +52,10 @@ constexpr int FLAG_ENABLE_LINEAR = 3;
 // integer id written into the RID's opaque bytes through the pointer godot-cpp does expose. The
 // engine only ever hands these values back to us, so the encoding is ours to choose - but it must
 // round-trip, which is what id_of() checks by reading them back.
+//
+// Safety: verify at compile time that our id fits in the RID's native storage.
+static_assert(sizeof(uint64_t) <= sizeof(void *),
+              "RID native pointer must be at least 8 bytes to store a uint64_t id");
 // -----------------------------------------------------------------------------
 
 RID AVBDPhysicsServer3D::make_rid(uint64_t p_id) const {
@@ -300,7 +305,7 @@ void AVBDPhysicsServer3D::read_project_gravity(SpaceData &p_space) {
         return;
     }
 
-    float magnitude = static_cast<float>(settings->get_setting("physics/3d/default_gravity", 9.8));
+    float magnitude = static_cast<float>(settings->get_setting("physics/3d/default_gravity", static_cast<double>(avbd::constants::default_gravity)));
     const Vector3 direction = settings->get_setting("physics/3d/default_gravity_vector", Vector3(0, -1, 0));
 
     // AVBD is Z-up with gravity along -Z, so the projection of Godot's gravity vector onto Godot's
@@ -351,7 +356,7 @@ PackedVector3Array AVBDPhysicsServer3D::_space_get_contacts(const RID &p_space) 
             continue;
         }
         // Walk the manifold's stored contacts: rA/rB are local offsets from each body.
-        const avbd::Rigid *a = force->bodyA;
+        const avbd::Rigid *a = force->bodyA.value_or(nullptr);
         const avbd::Manifold *manifold = static_cast<const avbd::Manifold *>(force);
         for (int i = 0; i < count; i++) {
             const avbd::float3 world = a->positionLin + a->positionAng * manifold->contacts[i].rA;
@@ -527,10 +532,10 @@ float AVBDPhysicsServer3D::density_for(const BodyData &p_body) {
     double volume = 0.0;
     switch (shape.type) {
         case PhysicsServer3D::SHAPE_SPHERE:
-            volume = (4.0 / 3.0) * 3.14159265358979 * shape.radius * shape.radius * shape.radius;
+            volume = avbd::constants::four_thirds_pi_d * shape.radius * shape.radius * shape.radius;
             break;
         case PhysicsServer3D::SHAPE_CYLINDER:
-            volume = 3.14159265358979 * shape.radius * shape.radius * shape.height;
+            volume = avbd::constants::pi_d * shape.radius * shape.radius * shape.height;
             break;
         default:
             volume = shape.extents.x * shape.extents.y * shape.extents.z;
@@ -1067,8 +1072,8 @@ void AVBDPhysicsServer3D::_step(double p_step) {
                     continue;
                 }
                 const avbd::Manifold *manifold = static_cast<const avbd::Manifold *>(force);
-                const auto it_a = rigid_map.find(force->bodyA);
-                const auto it_b = rigid_map.find(force->bodyB);
+                const auto it_a = rigid_map.find(force->bodyA.value_or(nullptr));
+                const auto it_b = rigid_map.find(force->bodyB.value_or(nullptr));
                 BodyData *data[2] = {it_a != rigid_map.end() ? it_a->second : nullptr,
                         it_b != rigid_map.end() ? it_b->second : nullptr};
 
@@ -1078,7 +1083,7 @@ void AVBDPhysicsServer3D::_step(double p_step) {
                         continue;
                     }
                     const BodyData *other = data[side == 0 ? 1 : 0];
-                    const avbd::Rigid *self_rigid = side == 0 ? force->bodyA : force->bodyB;
+                    const avbd::Rigid *self_rigid = side == 0 ? force->bodyA.value_or(nullptr) : force->bodyB.value_or(nullptr);
                     for (int c = 0; c < count && static_cast<int32_t>(fill->frame_contacts.size()) < fill->max_contacts_reported; c++) {
                         const avbd::float3 world = self_rigid->positionLin
                                 + self_rigid->positionAng

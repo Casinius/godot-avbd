@@ -31,8 +31,8 @@ Spring::Spring(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, fl
 // and its `updateDual` does nothing: hence the unnamed parameters.
 void Spring::updatePrimal(Rigid *body, float /*alpha*/, Block &block)
 {
-    float3 pA = bodyA->positionLin + bodyA->positionAng * rA;
-    float3 pB = bodyB->positionLin + bodyB->positionAng * rB;
+    const float3 pA = (*bodyA)->positionLin + (*bodyA)->positionAng * rA;
+    const float3 pB = (*bodyB)->positionLin + (*bodyB)->positionAng * rB;
     float3 d = pA - pB;
     float dLen = d.norm();
     if (dLen <= 1.0e-6f)
@@ -45,15 +45,15 @@ void Spring::updatePrimal(Rigid *body, float /*alpha*/, Block &block)
     float3 rWorld;
     float3 jLin;
     float3 jAng;
-    if (body == bodyA)
+    if (body == *bodyA)
     {
-        rWorld = bodyA->positionAng * rA;
+        rWorld = (*bodyA)->positionAng * rA;
         jLin = n;
         jAng = rWorld.cross(n);
     }
     else
     {
-        rWorld = bodyB->positionAng * rB;
+        rWorld = (*bodyB)->positionAng * rB;
         jLin = -n;
         jAng = -rWorld.cross(n);
     }

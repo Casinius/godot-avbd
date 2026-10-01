@@ -17,6 +17,7 @@
 #include <array>
 #include <span>
 
+#include "avbd/constants.hpp"
 #include "avbd/maths.h"
 #include "avbd/bvh/node_storage.hpp"
 #include "avbd/bvh/bvh.hpp"
@@ -186,8 +187,8 @@ struct Block
 struct Force
 {
     Solver *solver;
-    Rigid *bodyA;
-    Rigid *bodyB;
+    std::optional<Rigid*> bodyA;
+    std::optional<Rigid*> bodyB;
     Force *nextA;
     Force *nextB;
     Force *next;
@@ -457,7 +458,7 @@ struct Solver
     // Parameter defaults. Tuned for metre/kilogram/second scenes; `beta*` in particular is
     // unit dependent, which is why they are exposed rather than fixed.
     float dt = 1.0f / 60.0f; // Timestep
-    float gravity = -10.0f;  // Gravity, along -Z
+    float gravity = -constants::default_gravity;  // Gravity, along -Z (negative = downward)
     int iterations = 10;     // Solver iterations per step
 
     float alpha = 0.99f;    // Stabilization parameter, in (0, 1]
@@ -608,7 +609,7 @@ private:
     float currentCollisionMargin = COLLISION_MARGIN_BASE;
 
     // Adaptive iteration count parameters
-    float maxPenetrationError = 1e-4f; // Target penetration error tolerance
+    float maxPenetrationError = constants::max_penetration_error; // Target penetration error tolerance
     bool adaptiveIterations = true;    // Enable adaptive iteration count
 
     // Compute dynamic collision margin based on penetration depth and timestep

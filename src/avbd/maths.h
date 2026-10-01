@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "avbd/constants.hpp"
 #include "Eigen/Core"
 #include "Eigen/Geometry"
 #include <Eigen/Dense>
@@ -91,7 +92,7 @@ inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross, float3 bLin,
     b << bLin, bAng;
     const Eigen::LDLT<Eigen::Matrix<float, 6, 6>> solver(A);
     const Eigen::Matrix<float, 6, 1> x = solver.solve(b);
-    if (x.allFinite() && x.cwiseAbs().maxCoeff() < 1.0e1f)
+    if (x.allFinite() && x.cwiseAbs().maxCoeff() < constants::solve_sanity_bound)
     {
       xLin = x.head<3>();
       xAng = x.tail<3>();
@@ -113,7 +114,7 @@ inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross, float3 bLin,
 
   solver.compute(A);
   x = solver.solve(b);
-  if (x.allFinite() && x.cwiseAbs().maxCoeff() < 1.0e1f)
+  if (x.allFinite() && x.cwiseAbs().maxCoeff() < constants::solve_sanity_bound)
   {
     xLin[0] = x(0, 0);
     xLin[1] = x(1, 0);
