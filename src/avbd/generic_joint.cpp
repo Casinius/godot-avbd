@@ -83,8 +83,8 @@ static void removeTwist(quat &p_dev, int p_axis, float &r_angle)
 
     // Pure twist quaternion: vector part is the projection onto n, w unchanged. Eigen's
     // four-scalar Quaternion constructor is (w, x, y, z).
-    const quat twist(p_dev.w(),
-            p_dev.x() * proj, p_dev.y() * proj, p_dev.z() * proj);
+    const float3 vecPart = proj * n;
+    const quat twist(p_dev.w(), vecPart.x(), vecPart.y(), vecPart.z());
     if (twist.norm() <= 1.0e-12f)
     {
         r_angle = 0.0f;
@@ -112,8 +112,8 @@ void GenericJoint::angularValues(float p_out[3]) const
     // the current one gives identity exactly when the bodies are back where they started, and its
     // axis-angle in A's frame is what each degree of freedom measures.
     const quat qA = frameOrientation();
-    const quat relativeNow = qA.conjugate() * (*bodyB)->positionAng.normalized();
-    quat dev = rest.normalized() * relativeNow.conjugate();
+    const quat relativeNow = qA.conjugate() * ((*bodyB)->positionAng.norm() > 1e-12f ? (*bodyB)->positionAng.normalized() : quat::Identity());
+    quat dev = rest * relativeNow.conjugate();
 
     // The twist about every non-locked axis belongs to that axis - a spring or a limit reads
     // its angle - and must not be visible to the locked ones. Removing one twist is exact; with

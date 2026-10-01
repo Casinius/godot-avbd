@@ -53,8 +53,9 @@ void Manifold::drainPool() noexcept
 
 bool Manifold::initialize()
 {
-    // Compute friction
-    friction = std::sqrt((*bodyA)->friction * (*bodyB)->friction);
+    // Compute friction: clamp product to avoid NaN from sqrt of negative value
+    float fProd = (*bodyA)->friction * (*bodyB)->friction;
+    friction = (fProd >= 0) ? std::sqrt(fProd) : 0.0f;
 
     // New contact set: cached jacobians describe the old geometry, drop them.
     jacobiansCached = false;
@@ -139,11 +140,18 @@ void Manifold::updatePrimal(Rigid *body, float alpha, Block &block)
     // two body rotations are loop-invariant): hoisted out of the contact loop so the
     // per-contact work in the cached path is a straight copy of the cached jacobians.
     const bool cacheable = solver->jacobianRebuildDistance > 0.0f;
-    const float rebuild2 = solver->jacobianRebuildDistance * solver->jacobianRebuildDistance;
-    const float3 dA = rotA.col(0) - rotACaptured.col(0);
-    const float3 dB = rotB.col(0) - rotBCaptured.col(0);
+    // Check rotation drift for all three axes by comparing full rotation matrices
+    // Compute maximum difference across all columns
+    const float diffA = std::max({(rotA - rotACaptured).cwiseAbs().col(0).maxCoeff(),
+                                 (rotA - rotACaptured).cwiseAbs().col(1).maxCoeff(),
+                                 (rotA - rotACaptured).cwiseAbs().col(2).maxCoeff()});
+    const float diffB = std::max({(rotB - rotBCaptured).cwiseAbs().col(0).maxCoeff(),
+                                 (rotB - rotBCaptured).cwiseAbs().col(1).maxCoeff(),
+                                 (rotB - rotBCaptured).cwiseAbs().col(2).maxCoeff()});
+    // Cache is usable if all axes haven't drifted beyond threshold
     const bool cacheUsable = cacheable && jacobiansCached &&
-            dA.squaredNorm() <= rebuild2 && dB.squaredNorm() <= rebuild2;
+            diffA <= solver->jacobianRebuildDistance &&
+            diffB <= solver->jacobianRebuildDistance;
 
     for (int i = 0; i < numContacts; i++)
     {

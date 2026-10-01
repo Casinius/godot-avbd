@@ -45,7 +45,12 @@ using quat = Eigen::Quaternion<float>;
     float3 t1 = std::fabs(normal.x()) > std::fabs(normal.z())
             ? float3{-normal.y(), normal.x(), 0}
             : float3{0, -normal.z(), normal.y()};
-    t1 = t1.normalized();
+    // Check if t1 has valid norm before normalization to avoid NaN
+    if (t1.squaredNorm() < 1e-12f) {
+        t1 = float3{1, 0, 0};  // Fallback to X-axis if t1 is zero
+    } else {
+        t1 = t1.normalized();
+    }
     const float3 t2 = normal.cross(t1);
     float3x3 m;
     m.row(0) = normal;
@@ -66,7 +71,11 @@ using quat = Eigen::Quaternion<float>;
   const quat omega(0.0f, b.x(), b.y(), b.z());
   quat result;
   result.coeffs() = a.coeffs() + (omega * a).coeffs() * 0.5f;
-  return result.normalized();
+  // Validate quaternion before normalization to avoid NaN from zero/near-zero quaternions
+  if (result.norm() > 1e-12f) {
+    return result.normalized();
+  }
+  return quat::Identity();  // Return identity for zero/near-zero quaternion
 }
 
 // Solve the symmetric 6x6 system [aLin  aCross^T; aCross  aAng] x = [bLin;

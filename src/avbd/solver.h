@@ -16,6 +16,7 @@
 #include <vector>
 #include <array>
 #include <span>
+#include <mutex>
 
 #include "avbd/constants.hpp"
 #include "avbd/maths.h"
@@ -495,6 +496,9 @@ struct Solver
     // the update order is fixed by the colouring, and threads only spread one colour's
     // independent bodies over more cores.
     int threads = 0;
+
+    // Mutex to synchronize step/clear/destruction with job pool work to prevent data races
+    mutable std::mutex stepMutex;
 
     // Idle detection: a movable body whose BDF1 velocities stay under both thresholds for
     // this many consecutive steps falls asleep (velocity zeroed, Godot semantics).

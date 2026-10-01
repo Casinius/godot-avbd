@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <execution>
 #include <numeric>
 #include <span>
 #include <chrono>
@@ -26,6 +27,10 @@ namespace avbd {
 
 Solver::Solver()
 {
+    // Validate timestep: NaN/Inf causes numerical instability; dt <= 0 breaks assumptions
+    if (!std::isfinite(dt) || dt <= 0.0f) {
+        dt = 1.0f / 60.0f;  // Clamp to default 60 FPS timestep
+    }
 }
 
 Solver::~Solver()
@@ -120,14 +125,14 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
 
 void Solver::clear()
 {
+    std::lock_guard<std::mutex> lock(stepMutex);  // Synchronize clear with job work
     // Drain Manifold pool before deleting forces
     Manifold::drainPool();
 
     while (forces)
     {
-        // Explicitly destroy and deallocate force - destructor only unlinks from lists
-        forces->~Force();
-        ::operator delete(forces);
+        // Delete the force - virtual destructor handles derived types correctly
+        delete forces;
     }
 
     while (bodies)
@@ -154,6 +159,7 @@ void Solver::reset_timing()
 
 void Solver::step()
 {
+    std::lock_guard<std::mutex> lock(stepMutex);  // Synchronize step with job work
     ensurePool();
 
     double start = get_time();
@@ -336,9 +342,8 @@ int Solver::warmstartForces()
     {
         if (!forceActive[i])
         {
-            // Actually delete the force - destructor only unlinks, we need to deallocate
-            forceOrder[i]->~Force();
-            ::operator delete(forceOrder[i]);
+            // Delete the force - virtual destructor handles derived types correctly
+            delete forceOrder[i];
         }
     }
 
@@ -455,9 +460,9 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
     // converges slowly by design, so its delta is checked against its own, much looser
     // scale. 0 disables the check.
     float prevResidual = 0.0f;
-    int roundsRun = 0;
+    bool firstRound = true;
     std::atomic<bool> converged{false};
-    const auto loop = [this, targetIterations, forceCount, newtonRounds, &prevResidual, &roundsRun, &converged](int workerIndex, auto &sync) {
+    const auto loop = [this, targetIterations, forceCount, newtonRounds, &prevResidual, &firstRound, &converged](int workerIndex, auto &sync) {
         for (int it = 0; it < targetIterations; it++)
         {
             const bool newton = it < newtonRounds;
@@ -509,8 +514,7 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
                 if (!constraintFrozen(forceOrder[i]))
                     forceOrder[i]->updateDual(alpha);
             });
-            sync.arriveAndWait();
-            ++roundsRun;
+                sync.arriveAndWait();
 
             // Convergence probe after a Newton round: a full primal pass is expensive, so
             // skip further rounds when the residual stops shrinking. Only the calling
@@ -519,7 +523,7 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
             // that sees `converged` skips its own remaining work but still participates
             // in every barrier (draining instead of returning), so the barrier
             // participation count stays equal and no worker deadlocks.
-            if (workerIndex == 0 && convergenceThreshold > 0.0f && it + 1 < targetIterations)
+            if (workerIndex == 0 && convergenceThreshold > 0.0f && it + 1 < targetIterations && !firstRound)
             {
                 float total = 0.0f;
                 int count = 0;
@@ -529,6 +533,7 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
                 converged.store(prevResidual - residual < convergenceThreshold,
                         std::memory_order_relaxed);
                 prevResidual = residual;
+                firstRound = false;
             }
             // Publish the worker-0 convergence decision before any participant decides
             // whether to leave the loop. Without this fence, one worker can observe the
@@ -710,7 +715,10 @@ void Block::apply(Rigid &body) const noexcept
 
 void Solver::updatePrimal(Rigid *body)
 {
-    Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
+    // FIXED: Normalize mass matrix by dt, not dt²
+    // Position-based dynamics: mass matrix should scale linearly with timestep
+    // Using dt² causes numerical instability with small timesteps (slower performance)
+    Block block(body->mass, body->moment, dt, body->positionLin, body->inertialLin,
             body->positionAng, body->inertialAng);
 
     for (Force *force = body->forces; force != 0; force = (force->bodyA == body) ? force->nextA : force->nextB)

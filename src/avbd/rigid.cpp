@@ -27,6 +27,16 @@ Rigid::Rigid(Solver *p_solver, float3 p_size, ShapeType p_shape, float p_density
     velocityLin(p_velocity), velocityAng({ 0, 0, 0 }), prevVelocityLin(p_velocity), size(p_size),
     shape(p_shape), friction(p_friction), gravity(p_solver->gravity)
 {
+    // Validate body dimensions: must be finite and non-zero to avoid division by zero or NaN
+    if (!std::isfinite(p_size.x()) || !std::isfinite(p_size.y()) || !std::isfinite(p_size.z()) ||
+        p_size.x() <= 0.0f || p_size.y() <= 0.0f || p_size.z() <= 0.0f) {
+        p_size = float3{0.01f, 0.01f, 0.01f};  // Clamp to default minimum
+    }
+    // Validate density: must be finite and positive
+    if (!std::isfinite(p_density) || p_density <= 0.0f) {
+        p_density = 1.0f;  // Clamp to default
+    }
+
     // Add to linked list
     next = p_solver->bodies;
     p_solver->bodies = this;

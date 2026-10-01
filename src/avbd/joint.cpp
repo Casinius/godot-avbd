@@ -99,7 +99,7 @@ void Joint::updatePrimal(Rigid *body, float alpha, Block &block)
         float3x3 jAng;
         if (body == bodyA)
         {
-            const quat q = bodyA ? (*bodyA)->positionAng : quat::Identity(); const float3 r = q - q;
+            const float3 r = (*bodyA)->positionAng * rA;
             jAng <<    0, -r.z(),  r.y(),
                    r.z(),      0, -r.x(),
                   -r.y(),  r.x(),      0;
@@ -150,8 +150,7 @@ void Joint::updatePrimal(Rigid *body, float alpha, Block &block)
 
         // Choose jacobian depending on input body
         float3x3 identity = float3x3::Identity();
-        float3x3 negIdentity;
-        negIdentity << 0.0f, 0.0f, 0.0f, 0.0f, -1.0f, 0.0f, 0.0f, 0.0f, -1.0f;
+        float3x3 negIdentity = -float3x3::Identity();
         float3x3 jAng = (body == bodyA ? identity : negIdentity) * torqueArm;
 
         // Stamp into LHS
@@ -196,7 +195,8 @@ void Joint::updateDual(float alpha)
         penaltyLin = (penaltyLin + C.cwiseAbs() * solver->betaLin).cwiseMin(float3{stiffnessLin, stiffnessLin, stiffnessLin}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
 
         // Angular
-        penaltyAng = (penaltyAng + C.cwiseAbs() * solver->betaAng).cwiseMin(float3{stiffnessAng, stiffnessAng, stiffnessAng}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
+        float3 C_ang = ((bodyA ? (*bodyA)->positionAng : quat::Identity()) - (bodyB ? (*bodyB)->positionAng : quat::Identity())).imag() * torqueArm;
+        penaltyAng = (penaltyAng + C_ang.cwiseAbs() * solver->betaAng).cwiseMin(float3{stiffnessAng, stiffnessAng, stiffnessAng}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
     }
     // Angular constraint
     if (penaltyAng.squaredNorm() > 0)
