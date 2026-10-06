@@ -1,0 +1,104 @@
+[gd_scene format=3 uid="uid://c0putnk1p74gs"]
+
+[ext_resource type="Script" uid="uid://ci4um4tvykon4" path="res://scenes/car_demo.gd" id="1_car"]
+
+[sub_resource type="PhysicsMaterial" id="Material_car"]
+friction = 0.9
+
+[sub_resource type="BoxMesh" id="Mesh_chassis"]
+size = Vector3(1.8, 0.6, 3.6)
+
+[sub_resource type="BoxShape3D" id="Shape_chassis"]
+size = Vector3(1.8, 0.6, 3.6)
+
+[sub_resource type="StandardMaterial3D" id="Material_wheel"]
+albedo_color = Color(0.03, 0.03, 0.035, 1)
+
+[sub_resource type="CylinderMesh" id="Mesh_wheel"]
+height = 0.18
+radial_segments = 16
+
+[sub_resource type="Environment" id="Environment_car"]
+background_mode = 1
+background_color = Color(0.08, 0.1, 0.14, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.8, 0.84, 0.95, 1)
+ambient_light_energy = 0.55
+
+[sub_resource type="BoxShape3D" id="Shape_ground"]
+size = Vector3(60, 1, 60)
+
+[sub_resource type="BoxMesh" id="Mesh_ground"]
+size = Vector3(60, 1, 60)
+
+[node name="CarDemo" type="Node3D" unique_id=138200657]
+
+[node name="Chassis" type="RigidBody3D" parent="." unique_id=976529845]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.05, 0)
+mass = 900.0
+physics_material_override = SubResource("Material_car")
+script = ExtResource("1_car")
+
+[node name="ChassisShape" type="CollisionShape3D" parent="Chassis"]
+shape = SubResource("Shape_chassis")
+
+[node name="ChassisMesh" type="MeshInstance3D" parent="Chassis" unique_id=669004374]
+mesh = SubResource("Mesh_chassis")
+
+[node name="FrontLeftRay" type="RayCast3D" parent="Chassis" unique_id=539623861]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.72, -0.15, -1.2)
+target_position = Vector3(0, -0.85, 0)
+
+[node name="FrontRightRay" type="RayCast3D" parent="Chassis" unique_id=48879154]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.72, -0.15, -1.2)
+target_position = Vector3(0, -0.85, 0)
+
+[node name="RearLeftRay" type="RayCast3D" parent="Chassis" unique_id=491789386]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.72, -0.15, 1.2)
+target_position = Vector3(0, -0.85, 0)
+
+[node name="RearRightRay" type="RayCast3D" parent="Chassis" unique_id=18903583]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.72, -0.15, 1.2)
+target_position = Vector3(0, -0.85, 0)
+
+[node name="WheelFrontLeft" type="MeshInstance3D" parent="Chassis" unique_id=265812687]
+transform = Transform3D(-3.6199901e-06, -1, 0, 1, -3.6199901e-06, 0, 0, 0, 1, -0.72, -0.6, -1.2)
+material_override = SubResource("Material_wheel")
+mesh = SubResource("Mesh_wheel")
+
+[node name="WheelFrontRight" type="MeshInstance3D" parent="Chassis" unique_id=1911847256]
+transform = Transform3D(-3.6199901e-06, -1, 0, 1, -3.6199901e-06, 0, 0, 0, 1, 0.72, -0.6, -1.2)
+material_override = SubResource("Material_wheel")
+mesh = SubResource("Mesh_wheel")
+
+[node name="WheelRearLeft" type="MeshInstance3D" parent="Chassis" unique_id=1524436444]
+transform = Transform3D(-3.6199901e-06, -1, 0, 1, -3.6199901e-06, 0, 0, 0, 1, -0.72, -0.6, 1.2)
+material_override = SubResource("Material_wheel")
+mesh = SubResource("Mesh_wheel")
+
+[node name="WheelRearRight" type="MeshInstance3D" parent="Chassis" unique_id=661486654]
+transform = Transform3D(-3.6199901e-06, -1, 0, 1, -3.6199901e-06, 0, 0, 0, 1, 0.72, -0.6, 1.2)
+material_override = SubResource("Material_wheel")
+mesh = SubResource("Mesh_wheel")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=104146103]
+environment = SubResource("Environment_car")
+
+[node name="Camera3D" type="Camera3D" parent="." unique_id=1504646161]
+transform = Transform3D(0.7771459, -0.15224639, 0.6106269, 0, 0.9702957, 0.2419219, -0.6293204, -0.18800862, 0.75406134, 7, 4.5, 8)
+current = true
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=714892101]
+transform = Transform3D(0.8480481, 0.3938068, -0.35458517, 0, 0.66913056, 0.74314487, 0.52991927, -0.63022256, 0.5674549, 0, 0, 0)
+light_energy = 1.2
+shadow_enabled = true
+
+[node name="Ground" type="StaticBody3D" parent="." unique_id=1705596420]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.5, 0)
+physics_material_override = SubResource("Material_car")
+
+[node name="Shape" type="CollisionShape3D" parent="Ground" unique_id=1739346480]
+shape = SubResource("Shape_ground")
+
+[node name="Mesh" type="MeshInstance3D" parent="Ground" unique_id=1879296312]
+mesh = SubResource("Mesh_ground")

@@ -21,6 +21,7 @@ add_requires("godotcpp4 4.1")
 -- BS::thread_pool: the job pool behind Solver's parallel update. Header-only, MIT, C++17.
 add_requires("thread-pool v5.1.0", {configs = {headeronly = true}})
 add_requires("eigen 5.0.1")
+add_requires("unordered_dense v4.8.1")
 local avbd_core = {
     "src/avbd/rigid.cpp",
     "src/avbd/bvh/node_storage.cpp",
@@ -91,7 +92,7 @@ target("avbd")
     set_strip("none")
     add_files(table.join(avbd_core, "src/nodes/*.cpp", "src/server/*.cpp"))
     add_includedirs("src")
-    add_packages("godotcpp4", "thread-pool","eigen")
+    add_packages("godotcpp4", "thread-pool", "eigen", "unordered_dense")
     add_defines("BS_THREAD_POOL_DISABLE_EXCEPTION_HANDLING")
     set_exceptions("none")
     -- Godot loads the library from the project's bin/ directory.
@@ -108,7 +109,7 @@ target("avbd_core_test")
     set_kind("binary")
     add_files(table.join(avbd_core, "test/core_test.cpp", "tools/core_scenes.cpp"))
     add_includedirs("src", "tools")
-    add_packages("thread-pool","eigen")
+    add_packages("thread-pool", "eigen", "unordered_dense")
 
 -- Parallelization deterministic test: verifies bit-identical results across thread counts.
 target("test_parallel")
@@ -116,7 +117,7 @@ target("test_parallel")
     set_kind("binary")
     add_files("tools/test_parallel.cpp")
     add_includedirs("src")
-    add_packages("thread-pool","eigen")
+    add_packages("thread-pool", "eigen", "unordered_dense")
     add_deps("avbd")
 
 -- Simple parallelization test: verifies parallel code compiles and runs without errors.
@@ -125,7 +126,7 @@ target("test_parallel_simple")
     set_kind("binary")
     add_files("tools/test_parallel_simple.cpp")
     add_includedirs("src")
-    add_packages("thread-pool","eigen")
+    add_packages("thread-pool", "eigen", "unordered_dense")
     add_deps("avbd")
 
 -- LeakSanitizer test: simple memory leak detection
@@ -134,7 +135,7 @@ target("test_leaksanitizer")
     set_kind("binary")
     add_files("tools/test_leaksanitizer.cpp")
     add_includedirs("src")
-    add_packages("thread-pool","eigen")
+    add_packages("thread-pool", "eigen", "unordered_dense")
     add_deps("avbd")
 
 -- Solver leak test: verify solver internals are leak-free
@@ -143,7 +144,7 @@ target("test_solver_leak_free")
     set_kind("binary")
     add_files("tools/test_solver_leak_free.cpp")
     add_includedirs("src")
-    add_packages("thread-pool","eigen")
+    add_packages("thread-pool", "eigen", "unordered_dense")
     add_deps("avbd")
 
 -- Simple leak test: quick sanity check
@@ -152,7 +153,7 @@ target("test_minimal_leak")
     set_kind("binary")
     add_files("tools/test_minimal_leak.cpp")
     add_includedirs("src")
-    add_packages("thread-pool","eigen")
+    add_packages("thread-pool", "eigen", "unordered_dense")
     add_deps("avbd")
 
 -- Comprehensive leak test: verify all fixes work
@@ -161,7 +162,7 @@ target("test_comprehensive_leak")
     set_kind("binary")
     add_files("tools/test_comprehensive_leak.cpp")
     add_includedirs("src")
-    add_packages("thread-pool","eigen")
+    add_packages("thread-pool", "eigen", "unordered_dense")
     add_deps("avbd")
 
 -- Constraint composition tests (Godot headless, inside the demo project).

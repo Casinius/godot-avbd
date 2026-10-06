@@ -19,3 +19,4 @@ demo/bin/
 *.scn
 .cache/
 .omp/
+TARS/

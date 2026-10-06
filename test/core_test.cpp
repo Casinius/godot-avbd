@@ -10,6 +10,7 @@
  *   xmake run avbd_core_test --list          # names of the ported scenes
  *   xmake run avbd_core_test --scene Stack --steps 300
  *   xmake run avbd_core_test --bench         # 512-box pyramid timing
+ *   xmake run avbd_core_test --island-bench-sweep # disconnected-island timing sweep
  */
 
 #include <algorithm>
@@ -21,6 +22,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "avbd/solver.h"
@@ -423,6 +425,20 @@ static uint64_t mixed_digest(int threads) {
     return state_digest(s);
 }
 
+static uint64_t independent_islands_digest(int threads, int pairCount = 12) {
+    Solver s;
+    s.threads = threads;
+    for (int i = 0; i < pairCount; ++i) {
+        const float x = static_cast<float>(i) * 4.0f;
+        new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {x, 0, 4});
+        new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {x, 0, 8});
+    }
+    step_n(s, 60);
+    report(s.islandCount() == pairCount * 2, "independent islands discovered", "islands=%d expected=%d",
+            s.islandCount(), pairCount * 2);
+    return state_digest(s);
+}
+
 static void test_parallel_equivalence() {
     const int threadCounts[] = {1, 2, 3, 4, 8, 12};
 
@@ -435,6 +451,11 @@ static void test_parallel_equivalence() {
         report(digest == reference, name, "0x%016llx vs serial 0x%016llx", (unsigned long long)digest,
                 (unsigned long long)reference);
     }
+
+    const uint64_t islandsSerial = independent_islands_digest(1);
+    const uint64_t islandsParallel = independent_islands_digest(4);
+    report(islandsSerial == islandsParallel, "island digest deterministic", "0x%016llx vs 0x%016llx",
+            (unsigned long long)islandsSerial, (unsigned long long)islandsParallel);
 
     const uint64_t softSerial = scene_digest(1, 120);
     for (int t : {4, 12}) {
@@ -1028,8 +1049,10 @@ static int run_scene(const std::string &name, int steps, int threads) {
     scene->build(&s);
     std::printf("scene '%s': %d bodies, %d forces\n", scene->name, count_bodies(s), count_forces(s));
     step_n(s, steps);
-    std::printf("after %d steps: threads=%d colours=%d widest=%d contacts=%d max|x|=%.4f finite=%s digest=0x%016llx\n",
-            steps, s.threadCount(), s.colourCount(), s.widestColour(), count_contact_points(s), max_abs_position(s),
+    std::printf("after %d steps: threads=%d islands=%d colours=%d widest=%d contacts=%d max|x|=%.4f "
+                "broad_filter=%.3fms colour_work=%.3fms colour_sync=%.3fms finite=%s digest=0x%016llx\n",
+            steps, s.threadCount(), s.islandCount(), s.colourCount(), s.widestColour(), count_contact_points(s), max_abs_position(s),
+            s.get_broadPhaseFilter_time(), s.get_colourWork_time(), s.get_colourSync_time(),
             all_finite(s) ? "yes" : "NO", (unsigned long long)state_digest(s));
     return all_finite(s) ? 0 : 1;
 }
@@ -1068,8 +1091,43 @@ static int run_bench(int threads) {
     return all_finite(s) ? 0 : 1;
 }
 
-// Sweep the thread count over the same scene so the speedup (and where it stops) is
-// visible rather than claimed.
+static void build_island_bench_scene(Solver &s, int islandCount, int bodiesPerIsland) {
+    for (int island = 0; island < islandCount; ++island) {
+        const float x = static_cast<float>(island) * 100.0f;
+        for (int body = 0; body < bodiesPerIsland; ++body)
+            new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f,
+                    {x, 0, 1.0f + static_cast<float>(body) * 0.9f});
+    }
+}
+
+// Sweep the thread count over tiny and substantial independent islands. The first workload
+// verifies that the policy avoids fine-grained island dispatch; the second exercises it.
+static int run_island_bench_sweep() {
+    const int warmup = 20;
+    const int timed = 80;
+    for (const auto &[name, islandCount, bodiesPerIsland] : {
+            std::tuple{"tiny", 128, 1}, std::tuple{"large", 8, 64},std::tuple{"larger",1,128}}) {
+        double serialMs = 0.0;
+        for (int threads : {1, 2, 4, 8, 12}) {
+            Solver s;
+            s.threads = threads;
+            build_island_bench_scene(s, islandCount, bodiesPerIsland);
+            step_n(s, warmup);
+            const auto t0 = std::chrono::steady_clock::now();
+            step_n(s, timed);
+            const auto t1 = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / timed;
+            if (threads == 1)
+                serialMs = ms;
+            std::printf("island-bench[%s]: threads=%2d  %7.3f ms/step  speedup %5.2fx  "
+                        "(islands=%d bodies/island=%d policy=%s)\n",
+                    name, threads, ms, serialMs / ms, s.islandCount(), bodiesPerIsland,
+                    s.usesIslandParallelism() ? "island" : "global");
+        }
+    }
+    return 0;
+}
+
 static int run_bench_sweep() {
     const int warmup = 30;
     const int timed = 120;
@@ -1086,8 +1144,8 @@ static int run_bench_sweep() {
         const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / (double)timed;
         if (threads == 1)
             serialMs = ms;
-        std::printf("bench: threads=%2d  %7.3f ms/step  speedup %5.2fx  (colours=%d widest=%d)\n", threads, ms,
-                serialMs / ms, s.colourCount(), s.widestColour());
+        std::printf("bench: threads=%2d  %7.3f ms/step  speedup %5.2fx  (islands=%d colours=%d widest=%d)\n", threads, ms,
+                serialMs / ms, s.islandCount(), s.colourCount(), s.widestColour());
     }
     return 0;
 }
@@ -1134,6 +1192,8 @@ int main(int argc, char **argv) {
             return run_bench(threads);
         } else if (arg == "--bench-sweep") {
             return run_bench_sweep();
+        } else if (arg == "--island-bench-sweep") {
+            return run_island_bench_sweep();
         } else if (arg == "--colour") {
             report_colouring();
             return 0;
@@ -1144,7 +1204,7 @@ int main(int argc, char **argv) {
         } else if (arg == "--threads" && i + 1 < argc) {
             threads = std::atoi(argv[++i]);
         } else {
-            std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --colour | --scene NAME [--steps N]]"
+            std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --island-bench-sweep | --colour | --scene NAME [--steps N]]"
                                  " [--threads N]\n", argv[0]);
             return 2;
         }

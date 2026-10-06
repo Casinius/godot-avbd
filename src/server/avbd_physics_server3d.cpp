@@ -87,7 +87,7 @@ AVBDPhysicsServer3D::ShapeData *AVBDPhysicsServer3D::find_shape(const RID &p_rid
 
 AVBDPhysicsServer3D::SpaceData *AVBDPhysicsServer3D::find_space(const RID &p_rid) {
     const auto found = spaces.find(id_of(p_rid));
-    return found == spaces.end() ? nullptr : &found->second;
+    return found == spaces.end() ? nullptr : found->second.get();
 }
 
 // -----------------------------------------------------------------------------
@@ -99,9 +99,9 @@ AVBDPhysicsServer3D::SpaceData *AVBDPhysicsServer3D::find_space(const RID &p_rid
 AVBDPhysicsServer3D::~AVBDPhysicsServer3D() {
     for (auto &[id, space] : spaces) {
         (void)id;
-        if (space.direct_state != nullptr) {
-            memdelete(space.direct_state);
-            space.direct_state = nullptr;
+        if (space->direct_state != nullptr) {
+            memdelete(space->direct_state);
+            space->direct_state = nullptr;
         }
     }
     if (body_state != nullptr) {
@@ -115,9 +115,9 @@ void AVBDPhysicsServer3D::_finish() {
     // objects are raw pointers inside the records, so they go first.
     for (auto &[id, space] : spaces) {
         (void)id;
-        if (space.direct_state != nullptr) {
-            memdelete(space.direct_state);
-            space.direct_state = nullptr;
+        if (space->direct_state != nullptr) {
+            memdelete(space->direct_state);
+            space->direct_state = nullptr;
         }
     }
     spaces.clear();
@@ -135,8 +135,8 @@ void AVBDPhysicsServer3D::_init() {
     // Spaces created after this moment read gravity themselves; this covers the ones the engine
     // creates before any of our code runs.
     for (auto &[id, space] : spaces) {
-        read_project_gravity(space);
-        read_project_params(space);
+        read_project_gravity(*space);
+        read_project_params(*space);
     }
 }
 
@@ -163,7 +163,7 @@ int32_t AVBDPhysicsServer3D::_get_process_info(PhysicsServer3D::ProcessInfo p_in
             for (const auto &[id, space] : spaces) {
                 (void)id;
                 count += static_cast<int32_t>(std::ranges::count_if(
-                        avbd::next_range(space.solver.forces),
+                        avbd::next_range(space->solver.forces),
                         [](const avbd::Force *force) { return force->contactPointCount() > 0; }));
             }
             return count;
@@ -194,8 +194,8 @@ void AVBDPhysicsServer3D::_free_rid(const RID &p_rid) {
 
     const auto space_found = spaces.find(id);
     if (space_found != spaces.end()) {
-        if (space_found->second.direct_state != nullptr) {
-            memdelete(space_found->second.direct_state);
+        if (space_found->second->direct_state != nullptr) {
+            memdelete(space_found->second->direct_state);
         }
         spaces.erase(space_found);
         return;
@@ -247,10 +247,9 @@ void AVBDPhysicsServer3D::_free_rid(const RID &p_rid) {
 
 RID AVBDPhysicsServer3D::_space_create() {
     const uint64_t id = next_id++;
-    // emplace, not assignment: Solver owns intrusive lists and is deliberately non-movable.
-    SpaceData &space = spaces.emplace(std::piecewise_construct, std::forward_as_tuple(id),
-            std::forward_as_tuple())
-                               .first->second;
+    auto [it, inserted] = spaces.emplace(id, std::make_unique<SpaceData>());
+    (void)inserted;
+    SpaceData &space = *it->second;
     read_project_gravity(space);
     read_project_params(space);
     return make_rid(id);
@@ -284,7 +283,7 @@ void AVBDPhysicsServer3D::_space_set_active(const RID &p_space, bool p_active) {
 
 bool AVBDPhysicsServer3D::_space_is_active(const RID &p_space) const {
     const auto found = spaces.find(id_of(p_space));
-    return found == spaces.end() ? false : found->second.active;
+    return found == spaces.end() ? false : found->second->active;
 }
 
 void AVBDPhysicsServer3D::_space_set_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param, double p_value) {
@@ -350,7 +349,7 @@ PackedVector3Array AVBDPhysicsServer3D::_space_get_contacts(const RID &p_space) 
     }
     // The engine's debug contacts are world-space points of recent contacts; serve the
     // first-shape contact points of every manifold seen this step.
-    for (const avbd::Force *force = found->second.solver.forces; force != nullptr; force = force->next) {
+    for (const avbd::Force *force = found->second->solver.forces; force != nullptr; force = force->next) {
         const int count = force->contactPointCount();
         if (count <= 0) {
             continue;
@@ -361,7 +360,7 @@ PackedVector3Array AVBDPhysicsServer3D::_space_get_contacts(const RID &p_space) 
         for (int i = 0; i < count; i++) {
             const avbd::float3 world = a->positionLin + a->positionAng * manifold->contacts[i].rA;
             out.push_back(to_godot(world));
-            if (out.size() >= static_cast<int64_t>(found->second.debug_contacts_max)) {
+            if (out.size() >= static_cast<int64_t>(found->second->debug_contacts_max)) {
                 return out;
             }
         }
@@ -375,7 +374,7 @@ int32_t AVBDPhysicsServer3D::_space_get_contact_count(const RID &p_space) const 
         return 0;
     }
     int32_t count = 0;
-    for (const avbd::Force *force = found->second.solver.forces; force != nullptr; force = force->next) {
+    for (const avbd::Force *force = found->second->solver.forces; force != nullptr; force = force->next) {
         count += force->contactPointCount();
     }
     return count;
@@ -973,7 +972,7 @@ void AVBDPhysicsServer3D::_step(double p_step) {
     }
 
     for (auto &[id, space] : spaces) {
-        if (!space.active) {
+        if (!space->active) {
             continue;
         }
 
@@ -985,28 +984,28 @@ void AVBDPhysicsServer3D::_step(double p_step) {
             rebuild_space(make_rid(id));
         }
 
-        if (space.solver.bodies == nullptr) {
+        if (space->solver.bodies == nullptr) {
             continue;
         }
 
         // Project settings may have changed since the last step (the tests flip
         // physics/avbd/substeps at runtime); re-read before stamping.
-        read_project_params(space);
+        read_project_params(*space);
 
         const float dt = static_cast<float>(p_step);
-        const int substeps = space.substeps > 0 ? space.substeps : 1;
-        space.solver.dt = dt / static_cast<float>(substeps);
-        space.solver.iterations = space.iterations > 0 ? space.iterations : space.solver.iterations;
-        space.solver.alpha = static_cast<float>(space.alpha);
-        space.solver.betaLin = static_cast<float>(space.beta_linear);
-        space.solver.betaAng = static_cast<float>(space.beta_angular);
-        space.solver.gamma = static_cast<float>(space.gamma);
-        space.solver.threads = space.threads;
+        const int substeps = space->substeps > 0 ? space->substeps : 1;
+        space->solver.dt = dt / static_cast<float>(substeps);
+        space->solver.iterations = space->iterations > 0 ? space->iterations : space->solver.iterations;
+        space->solver.alpha = static_cast<float>(space->alpha);
+        space->solver.betaLin = static_cast<float>(space->beta_linear);
+        space->solver.betaAng = static_cast<float>(space->beta_angular);
+        space->solver.gamma = static_cast<float>(space->gamma);
+        space->solver.threads = space->threads;
         // Newton/impulse phase split and tail-stiffness decay (real-time trade-off knobs).
-        space.solver.newtonRatio = static_cast<float>(std::clamp(space.newton_ratio, 0.0, 1.0));
-        space.solver.stiffnessDecay = static_cast<float>(std::clamp(space.stiffness_decay, 0.0, 1.0));
+        space->solver.newtonRatio = static_cast<float>(std::clamp(space->newton_ratio, 0.0, 1.0));
+        space->solver.stiffnessDecay = static_cast<float>(std::clamp(space->stiffness_decay, 0.0, 1.0));
         // Idle-sleep horizon: 30 steps at the usual 60 Hz tick = Godot's 0.5 s default.
-        space.solver.sleepFrames = 30;
+        space->solver.sleepFrames = 30;
 
         // Forces accumulated since the last step (persistent constant_* plus one-shot frame
         // ones) become velocity changes now, so the solver integrates them with everything else.
@@ -1037,7 +1036,7 @@ void AVBDPhysicsServer3D::_step(double p_step) {
         }
 
         for (int sub = 0; sub < substeps; sub++) {
-            space.solver.step();
+            space->solver.step();
         }
 
         // Area monitoring runs once per engine step, after the solver's output is in hand
@@ -1057,8 +1056,8 @@ void AVBDPhysicsServer3D::_step(double p_step) {
         }
         {
             // Rigid -> owning record, resolved once for the whole manifold walk.
-            std::unordered_map<const avbd::Rigid *, BodyData *> rigid_map;
-            std::unordered_map<const BodyData *, uint64_t> id_map;
+            ankerl::unordered_dense::map<const avbd::Rigid *, BodyData *> rigid_map;
+            ankerl::unordered_dense::map<const BodyData *, uint64_t> id_map;
             for (auto &[bid, b] : bodies) {
                 if (id_of(b.space) == id && b.rigid != nullptr) {
                     b.frame_contacts.clear();
@@ -1066,7 +1065,7 @@ void AVBDPhysicsServer3D::_step(double p_step) {
                     id_map.emplace(&b, bid);
                 }
             }
-            for (avbd::Force *force = space.solver.forces; force != nullptr; force = force->next) {
+            for (avbd::Force *force = space->solver.forces; force != nullptr; force = force->next) {
                 const int count = force->contactPointCount();
                 if (count <= 0) {
                     continue;
@@ -1789,7 +1788,7 @@ double AVBDPhysicsServer3D::body_state_step() const {
     // Every space steps with the engine's fixed timestep; report the common value.
     for (const auto &[id, space] : spaces) {
         (void)id;
-        return space.solver.dt;
+        return space->solver.dt;
     }
     return 0.0;
 }
@@ -1797,7 +1796,7 @@ double AVBDPhysicsServer3D::body_state_step() const {
 double AVBDPhysicsServer3D::get_solver_broad_phase_time() const {
     for (const auto &[id, space] : spaces) {
         (void)id;
-        return space.solver.get_broadPhase_time();
+        return space->solver.get_broadPhase_time();
     }
     return 0.0;
 }
@@ -1805,7 +1804,7 @@ double AVBDPhysicsServer3D::get_solver_broad_phase_time() const {
 double AVBDPhysicsServer3D::get_solver_colour_graph_time() const {
     for (const auto &[id, space] : spaces) {
         (void)id;
-        return space.solver.get_colourGraph_time();
+        return space->solver.get_colourGraph_time();
     }
     return 0.0;
 }
@@ -1813,7 +1812,7 @@ double AVBDPhysicsServer3D::get_solver_colour_graph_time() const {
 double AVBDPhysicsServer3D::get_solver_solve_time() const {
     for (const auto &[id, space] : spaces) {
         (void)id;
-        return space.solver.get_solve_time();
+        return space->solver.get_solve_time();
     }
     return 0.0;
 }
@@ -1821,7 +1820,7 @@ double AVBDPhysicsServer3D::get_solver_solve_time() const {
 double AVBDPhysicsServer3D::get_solver_finish_time() const {
     for (const auto &[id, space] : spaces) {
         (void)id;
-        return space.solver.get_finish_time();
+        return space->solver.get_finish_time();
     }
     return 0.0;
 }

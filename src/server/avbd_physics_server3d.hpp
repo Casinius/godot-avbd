@@ -36,7 +36,8 @@
 #define AVBD_PHYSICS_SERVER3D_HPP
 
 #include <cstdint>
-#include <unordered_map>
+#include <memory>
+#include <ankerl/unordered_dense.h>
 #include <vector>
 
 #include <godot_cpp/classes/physics_direct_body_state3d.hpp>
@@ -179,8 +180,8 @@ public:
 
         // Parameters of the specialised joints, stored by the server enum value. Their
         // solver mapping happens at rebuild time (see rebuild_space's joint switch).
-        std::unordered_map<int, double> joint_params;
-        std::unordered_map<int, bool> joint_flags;
+        ankerl::unordered_dense::map<int, double> joint_params;
+        ankerl::unordered_dense::map<int, bool> joint_flags;
     };
 
 protected:
@@ -235,7 +236,7 @@ protected:
         Callable monitor_callback;        // bodies entering/leaving this area
         Callable area_monitor_callback;   // other areas entering/leaving this area
         // Parameters recorded for the getter; they do not act on the solver this round.
-        std::unordered_map<int, Variant> params;
+        ankerl::unordered_dense::map<int, Variant> params;
         // Solver ids inside the area after the last step, for enter/exit diffing.
         std::vector<uint64_t> prev_inside_bodies;
         std::vector<uint64_t> prev_inside_areas;
@@ -243,11 +244,11 @@ protected:
 
     // Object kinds are kept in separate maps so an id that arrives for the wrong kind is a miss
     // rather than a reinterpretation.
-    std::unordered_map<uint64_t, SpaceData> spaces;
-    std::unordered_map<uint64_t, BodyData> bodies;
-    std::unordered_map<uint64_t, ShapeData> shapes;
-    std::unordered_map<uint64_t, JointData> joints;
-    std::unordered_map<uint64_t, AreaData> areas;
+    ankerl::unordered_dense::map<uint64_t, std::unique_ptr<SpaceData>> spaces;
+    ankerl::unordered_dense::map<uint64_t, BodyData> bodies;
+    ankerl::unordered_dense::map<uint64_t, ShapeData> shapes;
+    ankerl::unordered_dense::map<uint64_t, JointData> joints;
+    ankerl::unordered_dense::map<uint64_t, AreaData> areas;
 
     uint64_t next_id = 1;
 
@@ -280,7 +281,7 @@ protected:
 
     // Spaces whose body set changed since the last step; rebuilt at the top of _step so
     // a body joining mid-setup lands with its shapes attached.
-    std::unordered_map<uint64_t, bool> space_rebuild_pending;
+    ankerl::unordered_dense::map<uint64_t, bool> space_rebuild_pending;
 
     // Density the solver should see for a body: mass / volume of the first shape, or the house
     // density when no mass was set.

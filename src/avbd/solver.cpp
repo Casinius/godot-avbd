@@ -14,6 +14,7 @@
 #include <execution>
 #include <numeric>
 #include <span>
+#include <ankerl/unordered_dense.h>
 #include <chrono>
 
 #include "avbd/solver.h"
@@ -137,9 +138,11 @@ void Solver::clear()
 
     while (bodies)
     {
-        // Explicitly destroy and deallocate body - destructor only unlinks from lists
-        bodies->~Rigid();
-        ::operator delete(bodies);
+        // Save the current node because the destructor advances solver->bodies before
+        // storage is released.
+        Rigid *body = bodies;
+        body->~Rigid();
+        ::operator delete(body);
     }
 }
 
@@ -152,7 +155,10 @@ double Solver::get_time()
 void Solver::reset_timing()
 {
     _time_broadPhase = 0.0;
+    _time_broadPhaseFilter = 0.0;
     _time_colourGraph = 0.0;
+    _time_colourWork = 0.0;
+    _time_colourSync = 0.0;
     _time_solve = 0.0;
     _time_finish = 0.0;
 }
@@ -164,21 +170,22 @@ void Solver::step()
 
     double start = get_time();
     broadPhase();
-    _time_broadPhase = get_time() - start;
+    _time_broadPhase = (get_time() - start) / 1000.0;
 
     start = get_time();
     const int forceCount = warmstartForces();
     colourGraph();
-    _time_colourGraph = get_time() - start;
+    buildIslands();
+    _time_colourGraph = (get_time() - start) / 1000.0;
 
     start = get_time();
     warmstartBodies();
     solveIterations(forceCount);
-    _time_solve = get_time() - start;
+    _time_solve = (get_time() - start) / 1000.0;
 
     start = get_time();
     finishVelocities();
-    _time_finish = get_time() - start;
+    _time_finish = (get_time() - start) / 1000.0;
 }
 
 // A broad-phase candidate test: bounding spheres plus Godot's layer/mask pair rule,
@@ -296,13 +303,23 @@ void Solver::broadPhase()
     std::sort(sweepPairs.begin(), sweepPairs.end());
     sweepPairs.erase(std::unique(sweepPairs.begin(), sweepPairs.end()), sweepPairs.end());
 
+    const double filterStart = get_time();
+    broadPhaseAccepted.clear();
+    broadPhaseAccepted.resize(sweepPairs.size(), 0);
+    pool->forCount(static_cast<int>(sweepPairs.size()), [this](int index) {
+        const auto [i, j] = sweepPairs[index];
+        broadPhaseAccepted[index] = pairOverlaps(bodiesInOrder[i], bodiesInOrder[j]) ? 1 : 0;
+    }, kMinBroadPhasePairsPerDispatch);
+    _time_broadPhaseFilter = (get_time() - filterStart) / 1000.0;
 
-    for (const auto &[i, j] : sweepPairs)
+    // Commit in candidate order. Force and body intrusive lists remain single-writer, and
+    // manifold creation order stays identical to the serial broad phase.
+    for (size_t index = 0; index < sweepPairs.size(); ++index)
     {
-        Rigid *bodyA = bodiesInOrder[i];
-        Rigid *bodyB = bodiesInOrder[j];
-        if (pairOverlaps(bodyA, bodyB))
-            new Manifold(this, bodyA, bodyB);
+        if (!broadPhaseAccepted[index])
+            continue;
+        const auto [i, j] = sweepPairs[index];
+        new Manifold(this, bodiesInOrder[i], bodiesInOrder[j]);
     }
 }
 
@@ -410,6 +427,17 @@ void Solver::warmstartBodies()
 }
 
 // The solver's main loop: `iterations` rounds of a primal pass followed by a dual pass.
+bool Solver::usesIslandParallelism() const
+{
+    if (islands < 2 || threadCount() < 2 || islandWork.size() != static_cast<size_t>(islands))
+        return false;
+
+    const int largest = *std::ranges::max_element(islandWork);
+    const int total = std::accumulate(islandWork.begin(), islandWork.end(), 0);
+    const int usefulIslands = total / kMinBodiesPerIslandBatch;
+    return largest >= kMinBodiesPerIsland && usefulIslands >= 2;
+}
+
 void Solver::solveIterations(int forceCount)
 {
     int targetIterations = iterations;
@@ -438,7 +466,168 @@ void Solver::solveIterations(int forceCount)
     // dual-only relaxation (optionally with penalty decay via stiffnessDecay).
     const int newtonRounds = std::clamp(
             static_cast<int>(std::ceil(newtonRatio * static_cast<float>(targetIterations))), 0, targetIterations);
-    iterate(targetIterations, forceCount, newtonRounds);
+
+    // Independent islands have no shared mutable bodies or forces. Run each island as one
+    // serial color-ordered job so the outer pool supplies island parallelism without nested
+    // pool dispatches. A single island keeps the existing color-parallel path.
+    if (usesIslandParallelism())
+    {
+        pool->forCount(islands, [this, targetIterations, newtonRounds](int island) {
+            solveIsland(island, targetIterations, newtonRounds);
+        }, 2);
+    }
+    else
+    {
+        iterate(targetIterations, forceCount, newtonRounds);
+    }
+}
+
+void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
+{
+    iterateRange(std::span<Rigid *>(updateOrder), std::span<Force *>(forceOrder).first(forceCount),
+            std::span<const int>(colourStart), targetIterations, newtonRounds, true, true);
+}
+
+void Solver::buildIslands()
+{
+    const int bodyCount = static_cast<int>(updateOrder.size());
+    islands = 0;
+    islandBodyOrder.clear();
+    islandForceOrder.clear();
+    islandBodyStart.clear();
+    islandForceStart.clear();
+    islandColourStart.clear();
+    islandColourBase.clear();
+    islandColourCount.clear();
+    islandWork.clear();
+    bodyIsland.assign(bodyCount, -1);
+
+    if (bodyCount == 0)
+        return;
+
+    ankerl::unordered_dense::map<Rigid *, int> slots;
+    slots.reserve(static_cast<size_t>(bodyCount));
+    for (int i = 0; i < bodyCount; ++i)
+        slots.emplace(updateOrder[i], i);
+
+    std::vector<int> parent(bodyCount);
+    std::iota(parent.begin(), parent.end(), 0);
+    const auto find = [&parent](int value) {
+        while (parent[value] != value)
+            value = parent[value] = parent[parent[value]];
+        return value;
+    };
+    const auto unite = [&parent, &find](int a, int b) {
+        a = find(a);
+        b = find(b);
+        if (a != b)
+            parent[b] = a;
+    };
+
+    for (Force *force : forceOrder)
+    {
+        const auto slotOf = [&slots](const std::optional<Rigid *> &body) {
+            if (!body.has_value())
+                return -1;
+            const auto it = slots.find(*body);
+            return it == slots.end() ? -1 : it->second;
+        };
+        const int a = slotOf(force->bodyA);
+        const int b = slotOf(force->bodyB);
+        if (a >= 0 && b >= 0)
+            unite(a, b);
+    }
+
+    std::vector<int> rootIsland(bodyCount, -1);
+    for (int i = 0; i < bodyCount; ++i)
+    {
+        const int root = find(i);
+        if (rootIsland[root] < 0)
+            rootIsland[root] = islands++;
+        bodyIsland[i] = rootIsland[root];
+    }
+
+    std::vector<std::vector<Rigid *>> bodiesByIsland(static_cast<size_t>(islands));
+    std::vector<std::vector<int>> coloursByIsland(static_cast<size_t>(islands));
+    for (int colour = 0; colour < colours; ++colour)
+    {
+        const int first = colourStart[colour];
+        const int last = colourStart[colour + 1];
+        for (int i = first; i < last; ++i)
+        {
+            const int slot = slots.at(updateOrder[i]);
+            const int island = bodyIsland[slot];
+            bodiesByIsland[island].push_back(updateOrder[i]);
+            coloursByIsland[island].push_back(colour);
+        }
+    }
+
+    islandBodyStart.push_back(0);
+    for (int island = 0; island < islands; ++island)
+    {
+        islandColourBase.push_back(static_cast<int>(islandColourStart.size()));
+        islandColourStart.push_back(0);
+        int localBodyCount = 0;
+        int previousColour = -1;
+        for (size_t i = 0; i < bodiesByIsland[island].size(); ++i)
+        {
+            const int colour = coloursByIsland[island][i];
+            if (colour != previousColour)
+            {
+                if (previousColour >= 0)
+                    islandColourStart.push_back(localBodyCount);
+                previousColour = colour;
+            }
+            islandBodyOrder.push_back(bodiesByIsland[island][i]);
+            ++localBodyCount;
+        }
+        islandColourStart.push_back(localBodyCount);
+        islandColourCount.push_back(static_cast<int>(islandColourStart.size()) - islandColourBase[island] - 1);
+        islandWork.push_back(localBodyCount);
+        islandBodyStart.push_back(static_cast<int>(islandBodyOrder.size()));
+    }
+
+    std::vector<int> forceCounts(static_cast<size_t>(islands), 0);
+    std::vector<int> forceIsland(forceOrder.size(), -1);
+    for (size_t i = 0; i < forceOrder.size(); ++i)
+    {
+        Force *force = forceOrder[i];
+        const auto islandOf = [this, &slots](const std::optional<Rigid *> &body) {
+            if (!body.has_value())
+                return -1;
+            const auto it = slots.find(*body);
+            return it == slots.end() ? -1 : bodyIsland[it->second];
+        };
+        const int island = std::max(islandOf(force->bodyA), islandOf(force->bodyB));
+        if (island >= 0)
+        {
+            forceIsland[i] = island;
+            ++forceCounts[island];
+        }
+    }
+
+    islandForceStart.push_back(0);
+    for (int count : forceCounts)
+        islandForceStart.push_back(islandForceStart.back() + count);
+    islandForceOrder.resize(forceOrder.size() - static_cast<size_t>(std::count(forceIsland.begin(), forceIsland.end(), -1)));
+    std::vector<int> forceCursor = islandForceStart;
+    for (size_t i = 0; i < forceOrder.size(); ++i)
+        if (forceIsland[i] >= 0)
+            islandForceOrder[forceCursor[forceIsland[i]]++] = forceOrder[i];
+}
+
+void Solver::solveIsland(int island, int targetIterations, int newtonRounds)
+{
+    const int bodyFirst = islandBodyStart[island];
+    const int bodyLast = islandBodyStart[island + 1];
+    const int forceFirst = islandForceStart[island];
+    const int forceLast = islandForceStart[island + 1];
+    const int colourBase = islandColourBase[island];
+    const int colourCount = islandColourCount[island];
+    iterateRange(std::span<Rigid *>(islandBodyOrder).subspan(bodyFirst, bodyLast - bodyFirst),
+            std::span<Force *>(islandForceOrder).subspan(forceFirst, forceLast - forceFirst),
+            std::span<const int>(islandColourStart).subspan(colourBase, colourCount + 1),
+            targetIterations, newtonRounds, false, false);
 }
 
 // One worker-loop body for the whole iteration set: `iterations` rounds of a primal pass
@@ -452,8 +641,13 @@ void Solver::solveIterations(int forceCount)
 // Both sync types run the identical body: NullSync (small scenes, or another solver
 // holding the loop) executes it inline in list order, which is exactly the threads=1
 // reference the digest tests compare against.
-void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
+void Solver::iterateRange(std::span<Rigid *> bodyOrder, std::span<Force *> forceRange,
+        std::span<const int> rangeColourStart, int targetIterations, int newtonRounds, bool parallel,
+        bool recordTimings)
 {
+    const int bodyCount = static_cast<int>(bodyOrder.size());
+    const int forceCount = static_cast<int>(forceRange.size());
+    const int rangeColours = static_cast<int>(rangeColourStart.size()) - 1;
     // Convergence early exit: measure the residual at the end of a Newton round; when it
     // stops improving (delta below the threshold or rising), the remaining rounds would
     // burn cycles on float noise. Measured only at the Newton boundary - the impulse tail
@@ -462,7 +656,12 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
     float prevResidual = 0.0f;
     bool firstRound = true;
     std::atomic<bool> converged{false};
-    const auto loop = [this, targetIterations, forceCount, newtonRounds, &prevResidual, &firstRound, &converged](int workerIndex, auto &sync) {
+    double colourWorkTime = 0.0;
+    double colourSyncTime = 0.0;
+    const auto loop = [this, targetIterations, forceCount, newtonRounds, rangeColours, recordTimings,
+            &prevResidual, &firstRound, &converged, &bodyOrder, &forceRange, &rangeColourStart,
+            &colourWorkTime, &colourSyncTime]
+            (int workerIndex, auto &sync) {
         for (int it = 0; it < targetIterations; it++)
         {
             const bool newton = it < newtonRounds;
@@ -473,14 +672,31 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
                 // which is published via the barrier before this colour starts. Barrier at iteration
                 // boundary ensures Gauss-Seidel ordering across Newton rounds. Parallel per-colour
                 // is safe and fast: same pattern as colour-parallel Gauss-Seidel.
-                for (int colour = 0; colour < colours; colour++)
+                for (int colour = 0; colour < rangeColours; colour++)
                 {
-                    const int first = colourStart[colour];
-                    const int last = colourStart[colour + 1];
-                    sync.forItems(last - first, [this, first](int i) {
-                        updatePrimal(updateOrder[first + i]);
-                    });
+                    const int first = rangeColourStart[colour];
+                    const int last = rangeColourStart[colour + 1];
+                    const double workStart = get_time();
+                    if (last - first < kMinBodiesPerColourDispatch)
+                    {
+                        if (workerIndex == 0)
+                        {
+                            for (int i = first; i < last; ++i)
+                                updatePrimal(bodyOrder[i]);
+                        }
+                    }
+                    else
+                    {
+                        sync.forItems(last - first, [this, &bodyOrder, first](int i) {
+                            updatePrimal(bodyOrder[first + i]);
+                        });
+                    }
+                    if (recordTimings && workerIndex == 0)
+                        colourWorkTime += (get_time() - workStart) / 1000.0;
+                    const double syncStart = get_time();
                     sync.arriveAndWait();
+                    if (recordTimings && workerIndex == 0)
+                        colourSyncTime += (get_time() - syncStart) / 1000.0;
                 }
             }
 
@@ -494,8 +710,8 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
             {
                 const float decay = stiffnessDecay;
                 const float cap = PENALTY_MAX;
-                sync.forItems(forceCount, [this, decay, cap](int i) {
-                    Force *f = forceOrder[i];
+                sync.forItems(forceCount, [this, &forceRange, decay, cap](int i) {
+                    Force *f = forceRange[i];
                     // contactPointCount() > 0 iff the force is a Manifold; other forces
                     // keep their own penalty ramp untouched.
                     if (f->contactPointCount() > 0) {
@@ -510,9 +726,9 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
             // Forces are independent (no cross-force writes in updateDual), so the whole
             // pass is parallelizable. The barrier ensures all writes are visible before
             // the next phase (primal pass reads updated duals).
-            sync.forItems(forceCount, [this](int i) {
-                if (!constraintFrozen(forceOrder[i]))
-                    forceOrder[i]->updateDual(alpha);
+            sync.forItems(forceCount, [this, &forceRange](int i) {
+                if (!constraintFrozen(forceRange[i]))
+                    forceRange[i]->updateDual(alpha);
             });
                 sync.arriveAndWait();
 
@@ -527,7 +743,7 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
             {
                 float total = 0.0f;
                 int count = 0;
-                for (Force *f = forces; f != nullptr; f = f->next)
+                for (Force *f : forceRange)
                     f->accumulatePenetration(total, count);
                 const float residual = count > 0 ? total / count : 0.0f;
                 converged.store(prevResidual - residual < convergenceThreshold,
@@ -549,8 +765,8 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
 
     // Below both break-even sizes every phase would run inline anyway, so skip the
     // dispatch entirely. Above them the loop dispatches once for the whole set.
-    const bool tiny = static_cast<int>(updateOrder.size()) < kMinBodiesPerDispatch
-            && forceCount < kMinForcesPerDispatch;
+    const bool tiny = !parallel || (bodyCount < kMinBodiesPerDispatch
+            && forceCount < kMinForcesPerDispatch);
     if (tiny)
     {
         detail::NullSync sync;
@@ -559,6 +775,11 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
     else
     {
         pool->runLoop(loop);
+    }
+    if (recordTimings)
+    {
+        _time_colourWork = colourWorkTime;
+        _time_colourSync = colourSyncTime;
     }
 }
 

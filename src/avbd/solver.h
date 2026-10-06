@@ -452,6 +452,14 @@ int collideShapes(const Shape &a, const Shape &b,
 // across threads pays for the dispatch itself.
 constexpr int kMinBodiesPerDispatch = 48;
 constexpr int kMinForcesPerDispatch = 256;
+constexpr int kMinBroadPhasePairsPerDispatch = 256;
+// Small colours still participate in the phase fence, but the calling participant processes
+// them inline instead of paying an atomic work-distribution pass.
+constexpr int kMinBodiesPerColourDispatch = 32;
+// Island dispatch is useful only when every worker can receive a substantial island. Small
+// islands stay on the global colour path, which avoids one queue operation per tiny island.
+constexpr int kMinBodiesPerIsland = 32;
+constexpr int kMinBodiesPerIslandBatch = 32;
 
 // Core solver class which holds all the rigid bodies and forces, and has logic to step the simulation forward in time
 struct Solver
@@ -547,6 +555,10 @@ struct Solver
     // Number of bodies in the largest colour: the most work one parallel phase can spread
     // over the worker threads. Reporting only.
     [[nodiscard]] int widestColour() const { return widest; }
+    // Number of independent active islands in the current solve graph.
+    [[nodiscard]] int islandCount() const { return islands; }
+    // Whether the current island work is large enough to justify island-level dispatch.
+    [[nodiscard]] bool usesIslandParallelism() const;
     // Number of worker threads actually in use (1 when running inline).
     [[nodiscard]] int threadCount() const;
 
@@ -557,13 +569,19 @@ struct Solver
 
     // Performance timing counters (ms).
     double _time_broadPhase = 0.0;
+    double _time_broadPhaseFilter = 0.0;
     double _time_colourGraph = 0.0;
+    double _time_colourWork = 0.0;
+    double _time_colourSync = 0.0;
     double _time_solve = 0.0;
     double _time_finish = 0.0;
 
     // Performance timing getters (ms), reporting the most recent step.
     [[nodiscard]] double get_broadPhase_time() const { return _time_broadPhase; }
+    [[nodiscard]] double get_broadPhaseFilter_time() const { return _time_broadPhaseFilter; }
     [[nodiscard]] double get_colourGraph_time() const { return _time_colourGraph; }
+    [[nodiscard]] double get_colourWork_time() const { return _time_colourWork; }
+    [[nodiscard]] double get_colourSync_time() const { return _time_colourSync; }
     [[nodiscard]] double get_solve_time() const { return _time_solve; }
     [[nodiscard]] double get_finish_time() const { return _time_finish; }
     // Reset all timing counters to zero.
@@ -586,6 +604,7 @@ private:
     bvh::builder::LBVHScratch bvhScratch;
     bvh::nodes::NodeStorage bvhNodes;
     std::vector<std::pair<int, int>> sweepPairs;
+    std::vector<uint8_t> broadPhaseAccepted;
     std::vector<std::pair<int, int>> pendingPairs;
 
     // Bodies that take part in the primal update (movable ones), grouped by colour:
@@ -601,11 +620,20 @@ private:
     std::vector<Force *> forceOrder;
     std::vector<uint8_t> forceActive;
 
-    // Island scratch (rebuilt when sleep is active): body index base for the union-find,
-    // per-force body slots, and the island id of every movable body (-1 = no island).
+    // Island scratch: the sleep pass uses the first three buffers; the flattened ranges
+    // below partition the current update set for independent island solving.
     std::vector<Rigid *> islandBodies;
     std::vector<std::pair<int, int>> islandForceSlots;
     std::vector<int> bodyIsland;
+    std::vector<Rigid *> islandBodyOrder;
+    std::vector<Force *> islandForceOrder;
+    std::vector<int> islandBodyStart;
+    std::vector<int> islandForceStart;
+    std::vector<int> islandColourStart;
+    std::vector<int> islandColourBase;
+    std::vector<int> islandColourCount;
+    std::vector<int> islandWork;
+    int islands = 0;
 
     std::unique_ptr<detail::JobPool> pool;
 
@@ -634,6 +662,14 @@ private:
     int warmstartForces();
     void warmstartBodies();
     void solveIterations(int forceCount);
+    // Partition active bodies and forces into independent connected components. Static bodies
+    // are read-only during solve and therefore do not join otherwise independent islands.
+    void buildIslands();
+    void solveIsland(int island, int targetIterations, int newtonRounds);
+    // Shared iteration implementation for the global graph and one island range.
+    void iterateRange(std::span<Rigid *> bodyOrder, std::span<Force *> forceRange,
+            std::span<const int> rangeColourStart, int targetIterations, int newtonRounds,
+            bool parallel, bool recordTimings);
     // The whole iteration set as one persistent-worker loop: `targetIterations` rounds of
     // per-colour primal passes plus dual passes, fenced by LoopSync barriers instead of
     // one pool dispatch per phase. Declared here so `iterate` stays testable.
