@@ -174,13 +174,14 @@ double Solver::get_time()
 
 void Solver::reset_timing()
 {
-    _time_broadPhase = 0.0;
-    _time_broadPhaseFilter = 0.0;
-    _time_colourGraph = 0.0;
-    _time_colourWork = 0.0;
-    _time_colourSync = 0.0;
-    _time_solve = 0.0;
-    _time_finish = 0.0;
+    timings = SolverTimings{};
+    _time_broadPhase = timings.broadPhase;
+    _time_broadPhaseFilter = timings.broadPhaseFilter;
+    _time_colourGraph = timings.colourGraph;
+    _time_colourWork = timings.colourWork;
+    _time_colourSync = timings.colourSync;
+    _time_solve = timings.solve;
+    _time_finish = timings.finish;
 }
 
 void Solver::step()
@@ -190,22 +191,26 @@ void Solver::step()
 
     double start = get_time();
     broadPhase();
-    _time_broadPhase = (get_time() - start) / 1000.0;
+    timings.broadPhase = (get_time() - start) / 1000.0;
+    _time_broadPhase = timings.broadPhase;
 
     start = get_time();
     const int forceCount = warmstartForces();
     colourGraph();
     buildIslands();
-    _time_colourGraph = (get_time() - start) / 1000.0;
+    timings.colourGraph = (get_time() - start) / 1000.0;
+    _time_colourGraph = timings.colourGraph;
 
     start = get_time();
     warmstartBodies();
     solveIterations(forceCount);
-    _time_solve = (get_time() - start) / 1000.0;
+    timings.solve = (get_time() - start) / 1000.0;
+    _time_solve = timings.solve;
 
     start = get_time();
     finishVelocities();
-    _time_finish = (get_time() - start) / 1000.0;
+    timings.finish = (get_time() - start) / 1000.0;
+    _time_finish = timings.finish;
 }
 
 // A broad-phase candidate test: bounding spheres plus Godot's layer/mask pair rule,
@@ -448,7 +453,8 @@ void Solver::broadPhase()
         const auto [i, j] = sweepPairs[index];
         broadPhaseAccepted[index] = pairOverlaps(bodiesInOrder[i], bodiesInOrder[j]) ? 1 : 0;
     }, kMinBroadPhasePairsPerDispatch);
-    _time_broadPhaseFilter = (get_time() - filterStart) / 1000.0;
+    timings.broadPhaseFilter = (get_time() - filterStart) / 1000.0;
+    _time_broadPhaseFilter = timings.broadPhaseFilter;
 
     // Commit in candidate order. Force and body intrusive lists remain single-writer, and
     // manifold creation order stays identical to the serial broad phase.
@@ -916,8 +922,10 @@ void Solver::iterateRange(std::span<Rigid *> bodyOrder, std::span<Force *> force
     }
     if (recordTimings)
     {
-        _time_colourWork = colourWorkTime;
-        _time_colourSync = colourSyncTime;
+        timings.colourWork = colourWorkTime;
+        timings.colourSync = colourSyncTime;
+        _time_colourWork = timings.colourWork;
+        _time_colourSync = timings.colourSync;
     }
 }
 

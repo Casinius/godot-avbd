@@ -91,6 +91,8 @@ struct Shape
 struct Rigid
 {
     Solver *solver;
+    // Stable identity assigned by the owning Solver for the body's lifetime.
+    uint32_t bodyId = 0;
     Force *forces;
     Rigid *next;
     float3 positionLin;
@@ -470,6 +472,18 @@ constexpr int kMinBodiesPerColourDispatch = 32;
 constexpr int kMinBodiesPerIsland = 32;
 constexpr int kMinBodiesPerIslandBatch = 32;
 
+// Timing values for the most recent solver step, in milliseconds.
+struct SolverTimings
+{
+    double broadPhase = 0.0;
+    double broadPhaseFilter = 0.0;
+    double colourGraph = 0.0;
+    double colourWork = 0.0;
+    double colourSync = 0.0;
+    double solve = 0.0;
+    double finish = 0.0;
+};
+
 // Core solver class which holds all the rigid bodies and forces, and has logic to step the simulation forward in time
 struct Solver
 {
@@ -586,6 +600,12 @@ struct Solver
     double _time_solve = 0.0;
     double _time_finish = 0.0;
 
+    // Structured timing API. Legacy fields above remain at their original offsets for ABI compatibility.
+    SolverTimings timings;
+
+    // Allocate a stable identity for a newly-created body.
+    uint32_t allocateBodyId() { return nextBodyId++; }
+
     // Performance timing getters (ms), reporting the most recent step.
     [[nodiscard]] double get_broadPhase_time() const { return _time_broadPhase; }
     [[nodiscard]] double get_broadPhaseFilter_time() const { return _time_broadPhaseFilter; }
@@ -600,6 +620,7 @@ struct Solver
     static double get_time();
 
 private: //refit 脏重建所需
+    uint32_t nextBodyId = 1;
     std::size_t   bvhRebuildInterval = 30;      // 每 N 帧强制重建一次
     float bvhRebuildDisplacement = 1.0f; // 最大位移超过阈值就重建
     int bvhRoot = -1;

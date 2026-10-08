@@ -23,7 +23,7 @@ Rigid::Rigid(Solver *p_solver, float3 p_size, float p_density, float p_friction,
 
 Rigid::Rigid(Solver *p_solver, float3 p_size, ShapeType p_shape, float p_density, float p_friction,
         float3 p_position, float3 p_velocity)
-    : solver(p_solver), forces(0), next(0), positionLin(p_position), positionAng(quat::Identity()),
+    : solver(p_solver), bodyId(p_solver->allocateBodyId()), forces(0), next(0), positionLin(p_position), positionAng(quat::Identity()),
     velocityLin(p_velocity), velocityAng({ 0, 0, 0 }), prevVelocityLin(p_velocity), size(p_size),
     shape(p_shape), friction(p_friction), gravity(p_solver->gravity)
 {
