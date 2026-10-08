@@ -17,6 +17,7 @@
 #include <array>
 #include <span>
 #include <mutex>
+#include <ankerl/unordered_dense.h>
 
 #include "avbd/constants.hpp"
 #include "avbd/maths.h"
@@ -28,6 +29,30 @@
 namespace bvh::nodes { class NodeStorage; }
 
 namespace avbd {
+
+// Stable identity for a contact pair. Body pointers are deliberately not used: the
+// solver owns bodyId for the body's lifetime, so the key survives BVH/list reordering.
+struct PairKey
+{
+    uint32_t first;
+    uint32_t second;
+
+    static PairKey make(const Rigid *a, const Rigid *b);
+
+    friend bool operator==(const PairKey &a, const PairKey &b)
+    {
+        return a.first == b.first && a.second == b.second;
+    }
+};
+
+struct PairKeyHash
+{
+    using is_avalanching = void;
+    std::size_t operator()(const PairKey &key) const noexcept
+    {
+        return (static_cast<std::size_t>(key.first) << 32) ^ key.second;
+    }
+};
 
 // Defined in job_pool.hpp, which is only included by solver.cpp.
 namespace detail {
@@ -426,6 +451,9 @@ struct Manifold : Force
     bool jacobiansCached = false;
 
     Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB);
+    ~Manifold() override;
+
+    PairKey cacheKey() const { return PairKey::make(bodyA.get(), bodyB.get()); }
 
     // Class-specific pooled allocation: manifolds churn with contact formation and
     // separation (broad phase news them, warmstartForces deletes them), so recycled blocks
@@ -651,6 +679,12 @@ private:
     std::vector<std::pair<int, int>> sweepPairs;
     std::vector<uint8_t> broadPhaseAccepted;
     std::vector<std::pair<int, int>> pendingPairs;
+
+    // Contact-only reuse cache. Entries are removed by Manifold::~Manifold before
+    // the pooled block becomes available again, so it never retains a dangling pointer.
+    ankerl::unordered_dense::map<PairKey, Manifold *, PairKeyHash> manifoldCache;
+
+    friend struct Manifold;
 
     // Bodies that take part in the primal update (movable ones), grouped by colour:
     // colour c owns updateOrder[colourStart[c] .. colourStart[c + 1]).

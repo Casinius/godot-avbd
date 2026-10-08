@@ -29,6 +29,12 @@
 
 namespace avbd {
 
+PairKey PairKey::make(const Rigid *a, const Rigid *b)
+{
+    return a->bodyId < b->bodyId ? PairKey{a->bodyId, b->bodyId}
+                                 : PairKey{b->bodyId, a->bodyId};
+}
+
 Solver::Solver()
 {
     // Validate timestep: NaN/Inf causes numerical instability; dt <= 0 breaks assumptions
@@ -163,6 +169,7 @@ void Solver::clear()
     sweepPairs.clear();
     pendingPairs.clear();
     broadPhaseAccepted.clear();
+    manifoldCache.clear();
 
 }
 
@@ -463,7 +470,9 @@ void Solver::broadPhase()
         if (!broadPhaseAccepted[index])
             continue;
         const auto [i, j] = sweepPairs[index];
-        new Manifold(this, bodiesInOrder[i], bodiesInOrder[j]);
+        const PairKey key = PairKey::make(bodiesInOrder[i], bodiesInOrder[j]);
+        if (manifoldCache.find(key) == manifoldCache.end())
+            new Manifold(this, bodiesInOrder[i], bodiesInOrder[j]);
     }
 }
 
