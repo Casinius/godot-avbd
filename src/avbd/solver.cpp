@@ -20,6 +20,7 @@
 #include <chrono>
 
 #include "avbd/solver.h"
+#include "avbd/island_sleep.hpp"
 
 #include "avbd/job_pool.hpp"
 #include "avbd/list_range.hpp"
@@ -997,82 +998,9 @@ void Solver::finishVelocities()
 // Island-wide sleep bookkeeping. Movable, sleep-enabled bodies are grouped into islands
 // through force connectivity (union-find over the flattened body list; static bodies and
 // sleep_mode == NEVER bodies join nothing and never propagate). An island where every
-// member cleared idle detection this step (stillFrames >= sleepFrames or already
-// sleeping) is put to sleep as a unit: Godot semantics, and it removes the
-// partially-assembled-chain edge case where the bottom box qualifies a step before the
-// boxes above it. Deterministic: the union-find walks the force list in list order and
-// the minimum-body-index island representative is independent of visit order.
 void Solver::islandSleep()
 {
-    // Only bodies that can sleep join an island. With the default sleepFrames = 0 this
-    // whole pass is skipped by the caller, so the core suite (which never sets
-    // sleep_mode) is unaffected.
-    islandBodies.clear();
-    for (Rigid *body = bodies; body != 0; body = body->next)
-        if (body->mass > 0 && body->sleep_mode == 1)
-            islandBodies.push_back(body);
-
-    const int count = static_cast<int>(islandBodies.size());
-    if (count < 2)
-        return;
-
-    std::vector<int> parent(count);
-    for (int i = 0; i < count; ++i)
-        parent[i] = i;
-    auto find = [&parent](int x) {
-        while (parent[x] != x)
-            x = parent[x] = parent[parent[x]];
-        return x;
-    };
-
-    // Slot lookup: map body pointer -> island index once (sorted pointers + binary
-    // search), then each force is two O(log n) lookups. The map is rebuilt each call:
-    // bodies enter and leave the island set as sleep_mode and mass change.
-    islandForceSlots.clear();
-    std::vector<Rigid *> sorted = islandBodies;
-    std::sort(sorted.begin(), sorted.end());
-    for (Force *f = forces; f != 0; f = f->next)
-    {
-        const auto slotOf = [&sorted](Rigid *b) -> int {
-            const auto it = std::lower_bound(sorted.begin(), sorted.end(), b);
-            return (it != sorted.end() && *it == b) ? static_cast<int>(it - sorted.begin()) : -1;
-        };
-        const int ia = f->bodyA ? slotOf(f->bodyA.get()) : -1;
-        const int ib = f->bodyB ? slotOf(f->bodyB.get()) : -1;
-        if (ia >= 0 && ib >= 0)
-            islandForceSlots.emplace_back(ia, ib);
-    }
-
-    for (const auto &[ia, ib] : islandForceSlots)
-        parent[find(ia)] = find(ib);
-
-    // Compose islands: representative -> aggregate state.
-    // islandAwake[r] = true iff any member is awake; islandStill[r] = min stillFrames.
-    std::vector<char> islandAwake(count, 0);
-    std::vector<int> islandStill(count, INT_MAX);
-    for (int i = 0; i < count; ++i)
-    {
-        const int r = find(i);
-        if (!islandBodies[i]->sleeping)
-            islandAwake[r] = 1;
-        islandStill[r] = std::min(islandStill[r], islandBodies[i]->stillFrames);
-    }
-
-    // Sleep whole islands whose every member has cleared idle detection; leave mixed or
-    // awake islands exactly as they are (the per-body wake-up pass above already ran).
-    for (int i = 0; i < count; ++i)
-    {
-        const int r = find(i);
-        if (islandAwake[r] || islandStill[r] < sleepFrames)
-            continue;
-        Rigid *body = islandBodies[i];
-        if (!body->sleeping)
-        {
-            body->sleeping = true;
-            body->velocityLin = float3{0, 0, 0};
-            body->velocityAng = float3{0, 0, 0};
-        }
-    }
+    islandSleepManager.update(bodies, forces, sleepFrames);
 }
 
 // The primal half of one iteration for a single body (Eqs. 4-6): assemble the 6x6 system

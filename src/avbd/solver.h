@@ -21,6 +21,7 @@
 
 #include "avbd/constants.hpp"
 #include "avbd/maths.h"
+#include "avbd/island_sleep.hpp"
 #include "avbd/observe_ptr.hpp"
 #include "avbd/bvh/node_storage.hpp"
 #include "avbd/bvh/bvh.hpp"
@@ -77,6 +78,7 @@ inline constexpr float STICK_THRESH = 0.00001f;
 struct Rigid;
 struct Force;
 struct Manifold;
+class IslandSleepManager;
 struct Solver;
 
 // The collision and inertia shape of a body.
@@ -701,6 +703,7 @@ private:
 
     // Island scratch: the sleep pass uses the first three buffers; the flattened ranges
     // below partition the current update set for independent island solving.
+    IslandSleepManager islandSleepManager;
     std::vector<Rigid *> islandBodies;
     std::vector<std::pair<int, int>> islandForceSlots;
     std::vector<int> bodyIsland;

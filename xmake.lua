@@ -33,6 +33,7 @@ local avbd_core = {
     "src/avbd/manifold.cpp",
     "src/avbd/collide.cpp",
     "src/avbd/solver.cpp",
+    "src/avbd/island_sleep.cpp",
 }
 
 option("asan")
