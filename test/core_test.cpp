@@ -1181,7 +1181,7 @@ static void test_incremental_colouring() {
 int main(int argc, char **argv) {
     std::string scene;
     int steps = 300;
-    int threads = 0; // 0 = automatic
+    int threads = 8; // 默认使用 8 个参与线程
 
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
