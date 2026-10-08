@@ -928,7 +928,7 @@ void Solver::iterateRange(std::span<Rigid *> bodyOrder, std::span<Force *> force
     }
     else
     {
-        pool->runLoop(loop);
+        pool->runLoop(loop, std::max(bodyCount, forceCount), kMinBodiesPerColourDispatch);
     }
     if (recordTimings)
     {

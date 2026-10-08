@@ -226,8 +226,9 @@ public:
     // already inside a loop (the try-lock below; a second loop on a shared queue would
     // deadlock). The inline fallback is the serial reference, so results are unchanged.
     template <typename F>
-    void runLoop(F &&fn) {
-        const unsigned workers = threadCount();
+    void runLoop(F &&fn, int workItems = -1, int minItemsPerThread = 1) {
+        const unsigned workers = workItems >= 0
+                ? effectiveThreadCount(workItems, minItemsPerThread) : threadCount();
         if (workers <= 1) {
             NullSync sync;
             fn(0, sync);
