@@ -508,11 +508,12 @@ struct Solver
     // Realistic value 1e-4 (0.1 mm): in-iteration arm drift is millimetre-scale.
     float jacobianRebuildDistance = 0.0f;
 
-    // Worker threads for the per-body phases. 0 = one per hardware thread, 1 = run
-    // everything inline on the calling thread. The result does not depend on this value:
+    // Worker threads for the per-body phases. The default is 8, 1 runs everything inline,
+    // and values above the hardware count are clamped. The result does not depend on this value:
     // the update order is fixed by the colouring, and threads only spread one colour's
     // independent bodies over more cores.
-    int threads = 0;
+    // 默认使用 8 个参与线程；小工作量仍由 step_solve 的门槛强制串行执行。
+    int threads = 8;
 
     // Mutex to synchronize step/clear/destruction with job pool work to prevent data races
     mutable std::mutex stepMutex;
@@ -601,7 +602,8 @@ struct Solver
 private: //refit 脏重建所需
     std::size_t   bvhRebuildInterval = 30;      // 每 N 帧强制重建一次
     float bvhRebuildDisplacement = 1.0f; // 最大位移超过阈值就重建
-    bool  bvhValid = false;
+    int bvhRoot = -1;
+    bool bvhValid = false;
     bool  bvhNeedsRebuild=true;
     std::size_t framesSinceRebuild=0;
 
@@ -620,6 +622,9 @@ private:
     std::vector<Rigid *> bodiesInOrder;
     std::vector<const Rigid *> bodiesPtr;
     std::vector<int> broadPhaseIndices;
+    // 身份和位置快照对应 BVH 的叶子索引，用于安全 refit 及位移阈值判断。
+    std::vector<Rigid *> bvhBuildBodies;
+    std::vector<float3> bvhBuildPositions;
     bvh::builder::LBVHScratch bvhScratch;
     bvh::nodes::NodeStorage bvhNodes;
     std::vector<std::pair<int, int>> sweepPairs;

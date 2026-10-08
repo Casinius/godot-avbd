@@ -150,6 +150,7 @@ void Solver::clear()
 
 
 
+    bvhRoot = -1;
     bvhValid = false;
     bvhNeedsRebuild = true;
     framesSinceRebuild = 0;
@@ -157,6 +158,8 @@ void Solver::clear()
     bodiesInOrder.clear();
     bodiesPtr.clear();
     broadPhaseIndices.clear();
+    bvhBuildBodies.clear();
+    bvhBuildPositions.clear();
     sweepPairs.clear();
     pendingPairs.clear();
     broadPhaseAccepted.clear();
@@ -228,27 +231,34 @@ void Solver::refitBVH(){
         min = {body->positionLin.x() - r, body->positionLin.y() - r, body->positionLin.z() - r};
         max = {body->positionLin.x() + r, body->positionLin.y() + r, body->positionLin.z() + r};
     };
-    // 逆序：先叶子，再内部节点
-    for (int i = nodeCount - 1; i >= 0; --i)
-    {
-        if (bvhNodes.isLeaf(i))
-        {
-            const int bodyIndex = bvhNodes.bodyIndex(i);
-            const Rigid* body = bodiesInOrder[bodyIndex];
-            float3 aabb_min,aabb_max;
-            computeAABB(body, aabb_min,aabb_max);
-            bvhNodes.updateBounds(i, aabb_min, aabb_max);
+    // Refit strictly follows the topology: recurse into both children first, then
+    // rebuild the parent bound. This remains correct regardless of node allocation order.
+    const auto refitNode = [&](auto &&self, int node) -> void {
+        if (node < 0 || node >= nodeCount)
+            return;
+        if (bvhNodes.isLeaf(node)) {
+            const int bodyIndex = bvhNodes.bodyIndex(node);
+            if (bodyIndex < 0 || bodyIndex >= static_cast<int>(bvhBuildBodies.size()))
+                return;
+            const Rigid *body = bvhBuildBodies[bodyIndex];
+            if (body == nullptr)
+                return;
+            float3 aabbMin, aabbMax;
+            computeAABB(body, aabbMin, aabbMax);
+            bvhNodes.updateBounds(node, aabbMin, aabbMax);
+            return;
         }
-        else
-        {
-            
-            const int left  = bvhNodes.left()[i];
-            const int right = bvhNodes.right()[i];
-            const float3 min = comp3<float3,float3>(bvhNodes.boundsMin(left), bvhNodes.boundsMin(right),[](auto x, auto y){ return std::min(x, y); });
-            const float3 max = comp3<float3,float3>(bvhNodes.boundsMax(left), bvhNodes.boundsMax(right),[](auto x, auto y){ return std::max(x, y); });
-            bvhNodes.updateBounds(i, min, max);
-        }
-    }
+        const int left = bvhNodes.left()[node];
+        const int right = bvhNodes.right()[node];
+        self(self, left);
+        self(self, right);
+        const float3 min = comp3<float3, float3>(bvhNodes.boundsMin(left),
+                bvhNodes.boundsMin(right), [](auto x, auto y) { return std::min(x, y); });
+        const float3 max = comp3<float3, float3>(bvhNodes.boundsMax(left),
+                bvhNodes.boundsMax(right), [](auto x, auto y) { return std::max(x, y); });
+        bvhNodes.updateBounds(node, min, max);
+    };
+    refitNode(refitNode, bvhRoot);
 }
 
 // Contact detection: Morton LBVH (implicit heap layout), rebuilt every step.
@@ -291,13 +301,52 @@ void Solver::broadPhase()
         bvh::builder::Builder builder(bvhNodes, broadPhaseIndices, bodiesPtr, &bvhScratch);
 
         auto res = builder.buildLBVH();
-        root.swap(res);
+        bvhRoot = res.value_or(-1);
+        root = bvhRoot;
         bvhNeedsRebuild = false;
         bvhValid = true;
         framesSinceRebuild = 0;
+        // Keep the exact body-index mapping used by the builder. Refit must remain
+        // correct even when the intrusive body list changes order between frames.
+        bvhBuildBodies = bodiesInOrder;
+        bvhBuildPositions.resize(bvhBuildBodies.size());
+        for (std::size_t i = 0; i < bvhBuildBodies.size(); ++i)
+            bvhBuildPositions[i] = bvhBuildBodies[i]->positionLin;
     }else{
-        refitBVH();
-        ++framesSinceRebuild;
+        // A refit preserves topology only while the same bodies stay within the
+        // displacement budget. Any identity/count change or large motion rebuilds.
+        if (bvhBuildBodies.size() != bodiesInOrder.size())
+            bvhNeedsRebuild = true;
+        else {
+            const float limit2 = bvhRebuildDisplacement * bvhRebuildDisplacement;
+            for (std::size_t i = 0; i < bodiesInOrder.size(); ++i) {
+                if (bvhBuildBodies[i] != bodiesInOrder[i] ||
+                        (bodiesInOrder[i]->positionLin - bvhBuildPositions[i]).squaredNorm() > limit2) {
+                    bvhNeedsRebuild = true;
+                    break;
+                }
+            }
+        }
+        if (bvhNeedsRebuild) {
+            broadPhaseIndices.resize(count);
+            std::iota(broadPhaseIndices.begin(), broadPhaseIndices.end(), 0);
+            bodiesPtr.assign(bodiesInOrder.begin(), bodiesInOrder.end());
+            bvh::builder::Builder builder(bvhNodes, broadPhaseIndices, bodiesPtr, &bvhScratch);
+            auto res = builder.buildLBVH();
+            bvhRoot = res.value_or(-1);
+            bvhBuildBodies = bodiesInOrder;
+            bvhBuildPositions.resize(bvhBuildBodies.size());
+            for (std::size_t i = 0; i < bvhBuildBodies.size(); ++i)
+                bvhBuildPositions[i] = bvhBuildBodies[i]->positionLin;
+            bvhNeedsRebuild = false;
+            bvhValid = true;
+            framesSinceRebuild = 0;
+            root = bvhRoot;
+        } else {
+            refitBVH();
+            root = bvhRoot;
+            ++framesSinceRebuild;
+        }
         if(framesSinceRebuild>=bvhRebuildInterval){
             bvhNeedsRebuild = true;
         }
@@ -321,6 +370,8 @@ void Solver::broadPhase()
     
     
     
+    // On refit frames, the topology is unchanged and the previous root remains valid.
+    root = bvhRoot;
     if (!root || bvhNodes.size() < 2)
         return;
 
