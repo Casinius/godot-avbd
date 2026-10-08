@@ -23,6 +23,14 @@ Manifold::Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB)
     : Force(p_solver, p_bodyA, p_bodyB), contacts{}, basis(float3x3::Identity()), numContacts(0), friction(0.0f),
       jacobianCache{}, rotACaptured(float3x3::Identity()), rotBCaptured(float3x3::Identity()), jacobiansCached(false)
 {
+    solver->manifoldCache.emplace(cacheKey(), this);
+}
+
+Manifold::~Manifold()
+{
+    auto it = solver->manifoldCache.find(cacheKey());
+    if (it != solver->manifoldCache.end() && it->second == this)
+        solver->manifoldCache.erase(it);
 }
 
 namespace {
