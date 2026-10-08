@@ -147,6 +147,20 @@ void Solver::clear()
         body->~Rigid();
         ::operator delete(body);
     }
+
+
+
+    bvhValid = false;
+    bvhNeedsRebuild = true;
+    framesSinceRebuild = 0;
+    bvhNodes.clear();          // 如果 NodeStorage 有 clear()，用它
+    bodiesInOrder.clear();
+    bodiesPtr.clear();
+    broadPhaseIndices.clear();
+    sweepPairs.clear();
+    pendingPairs.clear();
+    broadPhaseAccepted.clear();
+
 }
 
 double Solver::get_time()
@@ -220,10 +234,10 @@ void Solver::refitBVH(){
         if (bvhNodes.isLeaf(i))
         {
             const int bodyIndex = bvhNodes.bodyIndex(i);
-            const Rigid* body = &(bodies[bodyIndex]);
+            const Rigid* body = bodiesInOrder[bodyIndex];
             float3 aabb_min,aabb_max;
             computeAABB(body, aabb_min,aabb_max);
-            bvhNodes.updateBounds(i, aabb_min, aabb_min);
+            bvhNodes.updateBounds(i, aabb_min, aabb_max);
         }
         else
         {
@@ -249,11 +263,15 @@ void Solver::refitBVH(){
 // Determinism: leaf order is the Morton-sorted body order, pair collection is leaf
 // order, and the final pair list is sorted ascending (min-index, other) - the same
 // manifold creation order contract as the sweep path.
+#include <cassert>
 void Solver::broadPhase()
 {
     
     bodiesInOrder.clear();
     bodiesInOrder.insert(bodiesInOrder.end(), next_range(bodies).begin(), next_range(bodies).end());
+
+    assert(bvh != nullptr && bvhBuilt);
+    assert(!bodiesInOrder.empty());
 
     const int count = static_cast<int>(bodiesInOrder.size());
     if (count < 2){
@@ -949,8 +967,8 @@ void Solver::islandSleep()
             const auto it = std::lower_bound(sorted.begin(), sorted.end(), b);
             return (it != sorted.end() && *it == b) ? static_cast<int>(it - sorted.begin()) : -1;
         };
-        const int ia = f->bodyA.has_value() ? slotOf(*f->bodyA) : -1;
-        const int ib = f->bodyB.has_value() ? slotOf(*f->bodyB) : -1;
+        const int ia = f->bodyA!=nullptr ? slotOf(f->bodyA) : -1;
+        const int ib = f->bodyB!=nullptr ? slotOf(f->bodyB) : -1;
         if (ia >= 0 && ib >= 0)
             islandForceSlots.emplace_back(ia, ib);
     }

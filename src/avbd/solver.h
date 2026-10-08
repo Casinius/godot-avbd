@@ -188,8 +188,8 @@ struct Block
 struct Force
 {
     Solver *solver;
-    std::optional<Rigid*> bodyA;
-    std::optional<Rigid*> bodyB;
+    Rigid* bodyA;
+    Rigid* bodyB;
     Force *nextA;
     Force *nextB;
     Force *next;
