@@ -166,8 +166,19 @@ public:
     JobPool(const JobPool &) = delete;
     JobPool &operator=(const JobPool &) = delete;
 
+    // Return the number of participants justified by the amount of work. This keeps
+    // the configured worker budget as an upper bound without paying full barrier cost
+    // for small colour/island loops.
+    unsigned effectiveThreadCount(int workItems, int minItemsPerThread) const {
+        const unsigned configured = threadCount();
+        if (configured <= 1 || workItems <= 0)
+            return 1;
+        const int grain = std::max(1, minItemsPerThread);
+        const unsigned useful = static_cast<unsigned>((workItems + grain - 1) / grain);
+        return std::max(1u, std::min(configured, useful));
+    }
     // Worker budget this solver may claim, clamped to what the machine has. Pure
-    // Arithmetic only: it never touches (or creates) the shared pool.
+    // arithmetic only: it never touches (or creates) the shared pool.
     unsigned threadCount() const {
         const unsigned hw = std::thread::hardware_concurrency();
         const unsigned available = hw == 0 ? 1 : hw;
