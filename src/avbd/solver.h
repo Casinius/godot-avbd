@@ -80,6 +80,7 @@ struct Force;
 struct Manifold;
 class IslandSleepManager;
 struct Solver;
+class BroadPhase;
 
 // The collision and inertia shape of a body.
 //
@@ -573,6 +574,9 @@ struct Solver
     // Heads of the two intrusive lists. Owned: `clear()` deletes through them.
     Rigid *bodies = nullptr;
     Force *forces = nullptr;
+
+    // Broad phase owns BVH topology, refit/rebuild policy, and pair traversal.
+    std::unique_ptr<BroadPhase> broadPhaseState;
 
     // BVH for broad-phase collision detection (SAH-based)
     bvh::nodes::NodeStorage* bvh = nullptr;

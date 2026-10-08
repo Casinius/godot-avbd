@@ -20,6 +20,7 @@
 #include <chrono>
 
 #include "avbd/solver.h"
+#include "avbd/broad_phase.hpp"
 #include "avbd/island_sleep.hpp"
 
 #include "avbd/job_pool.hpp"
@@ -37,6 +38,7 @@ PairKey PairKey::make(const Rigid *a, const Rigid *b)
 }
 
 Solver::Solver()
+    : broadPhaseState(std::make_unique<BroadPhase>())
 {
     // Validate timestep: NaN/Inf causes numerical instability; dt <= 0 breaks assumptions
     if (!std::isfinite(dt) || dt <= 0.0f) {
@@ -157,6 +159,8 @@ void Solver::clear()
 
 
 
+    if (broadPhaseState)
+        broadPhaseState->clear();
     bvhRoot = -1;
     bvhValid = false;
     bvhNeedsRebuild = true;
@@ -289,174 +293,13 @@ void Solver::refitBVH(){
 #include <cassert>
 void Solver::broadPhase()
 {
-    
     bodiesInOrder.clear();
     bodiesInOrder.insert(bodiesInOrder.end(), next_range(bodies).begin(), next_range(bodies).end());
 
-    // The active implementation stores the tree in bvhNodes. The legacy `bvh` pointer and
-    // `bvhBuilt` flag are no longer populated, so asserting them makes the first step fail
-    // even though the tree is built below on demand.
-    if (bodiesInOrder.size() < 2)
-    {
-        bvhValid = false;
-        return;
-    }
-
-    const int count = static_cast<int>(bodiesInOrder.size());
-
-
-    std::optional<int> root = std::nullopt;
-    if(!bvhValid||bvhNeedsRebuild){
-        broadPhaseIndices.resize(count);
-        std::iota(broadPhaseIndices.begin(), broadPhaseIndices.end(), 0);
-        bodiesPtr.assign(bodiesInOrder.begin(), bodiesInOrder.end());
-
-        bvh::builder::Builder builder(bvhNodes, broadPhaseIndices, bodiesPtr, &bvhScratch);
-
-        auto res = builder.buildLBVH();
-        bvhRoot = res.value_or(-1);
-        root = bvhRoot;
-        bvhNeedsRebuild = false;
-        bvhValid = true;
-        framesSinceRebuild = 0;
-        // Keep the exact body-index mapping used by the builder. Refit must remain
-        // correct even when the intrusive body list changes order between frames.
-        bvhBuildBodies = bodiesInOrder;
-        bvhBuildPositions.resize(bvhBuildBodies.size());
-        for (std::size_t i = 0; i < bvhBuildBodies.size(); ++i)
-            bvhBuildPositions[i] = bvhBuildBodies[i]->positionLin;
-    }else{
-        // A refit preserves topology only while the same bodies stay within the
-        // displacement budget. Any identity/count change or large motion rebuilds.
-        if (bvhBuildBodies.size() != bodiesInOrder.size())
-            bvhNeedsRebuild = true;
-        else {
-            const float limit2 = bvhRebuildDisplacement * bvhRebuildDisplacement;
-            for (std::size_t i = 0; i < bodiesInOrder.size(); ++i) {
-                if (bvhBuildBodies[i] != bodiesInOrder[i] ||
-                        (bodiesInOrder[i]->positionLin - bvhBuildPositions[i]).squaredNorm() > limit2) {
-                    bvhNeedsRebuild = true;
-                    break;
-                }
-            }
-        }
-        if (bvhNeedsRebuild) {
-            broadPhaseIndices.resize(count);
-            std::iota(broadPhaseIndices.begin(), broadPhaseIndices.end(), 0);
-            bodiesPtr.assign(bodiesInOrder.begin(), bodiesInOrder.end());
-            bvh::builder::Builder builder(bvhNodes, broadPhaseIndices, bodiesPtr, &bvhScratch);
-            auto res = builder.buildLBVH();
-            bvhRoot = res.value_or(-1);
-            bvhBuildBodies = bodiesInOrder;
-            bvhBuildPositions.resize(bvhBuildBodies.size());
-            for (std::size_t i = 0; i < bvhBuildBodies.size(); ++i)
-                bvhBuildPositions[i] = bvhBuildBodies[i]->positionLin;
-            bvhNeedsRebuild = false;
-            bvhValid = true;
-            framesSinceRebuild = 0;
-            root = bvhRoot;
-        } else {
-            refitBVH();
-            root = bvhRoot;
-            ++framesSinceRebuild;
-        }
-        if(framesSinceRebuild>=bvhRebuildInterval){
-            bvhNeedsRebuild = true;
-        }
-        
-    }
-    // broadPhaseIndices.clear();
-    // broadPhaseIndices.reserve(count);
-    // for (int i = 0; i < count; ++i)
-    //     broadPhaseIndices.push_back(i);
-
-    // bodiesPtr.clear();
-    // bodiesPtr.reserve(count);
-    // for (Rigid *b : bodiesInOrder)
-    //     bodiesPtr.push_back(b);
-
-    
-    // bvh::builder::Builder builder(bvhNodes, broadPhaseIndices, bodiesPtr, &bvhScratch);
-    // std::optional<int> root = 1; // NOT VALID TODO:ADD REFIT
-    // if(bvhNeedsRebuild)
-    //     const std::optional<int> root = builder.buildLBVH();
-    
-    
-    
-    // On refit frames, the topology is unchanged and the previous root remains valid.
-    root = bvhRoot;
-    if (!root || bvhNodes.size() < 2)
-        return;
-
-    const auto boundsOverlap = [this](int a, int b) {
-        const float3 aMin = bvhNodes.boundsMin(a);
-        const float3 aMax = bvhNodes.boundsMax(a);
-        const float3 bMin = bvhNodes.boundsMin(b);
-        const float3 bMax = bvhNodes.boundsMax(b);
-        return !(bMin.x() > aMax.x() || bMin.y() > aMax.y() || bMin.z() > aMax.z() ||
-                bMax.x() < aMin.x() || bMax.y() < aMin.y() || bMax.z() < aMin.z());
-    };
-
-    sweepPairs.clear();
-    pendingPairs.clear();
-    pendingPairs.emplace_back(root.value(), root.value());
-    while (!pendingPairs.empty())
-    {
-        const auto [a, b] = pendingPairs.back();
-        pendingPairs.pop_back();
-        if (a == b)
-        {
-            if (bvhNodes.isLeaf(a))
-                continue;
-            const int left = bvhNodes.left()[a];
-            const int right = bvhNodes.right()[a];
-            pendingPairs.emplace_back(left, left);
-            pendingPairs.emplace_back(left, right);
-            pendingPairs.emplace_back(right, right);
-            continue;
-        }
-        if (!boundsOverlap(a, b))
-            continue;
-        const bool aLeaf = bvhNodes.isLeaf(a);
-        const bool bLeaf = bvhNodes.isLeaf(b);
-        if (aLeaf && bLeaf)
-        {
-            sweepPairs.push_back(std::minmax(bvhNodes.bodyIndex(a), bvhNodes.bodyIndex(b)));
-            continue;
-        }
-        if (aLeaf)
-        {
-            const int left = bvhNodes.left()[b];
-            const int right = bvhNodes.right()[b];
-            pendingPairs.emplace_back(a, left);
-            pendingPairs.emplace_back(a, right);
-        }
-        else if (bLeaf)
-        {
-            const int left = bvhNodes.left()[a];
-            const int right = bvhNodes.right()[a];
-            pendingPairs.emplace_back(left, b);
-            pendingPairs.emplace_back(right, b);
-        }
-        else
-        {
-            const int leftA = bvhNodes.left()[a];
-            const int rightA = bvhNodes.right()[a];
-            const int leftB = bvhNodes.left()[b];
-            const int rightB = bvhNodes.right()[b];
-            pendingPairs.emplace_back(leftA, leftB);
-            pendingPairs.emplace_back(leftA, rightB);
-            pendingPairs.emplace_back(rightA, leftB);
-            pendingPairs.emplace_back(rightA, rightB);
-        }
-    }
-
-    std::sort(sweepPairs.begin(), sweepPairs.end());
-    sweepPairs.erase(std::unique(sweepPairs.begin(), sweepPairs.end()), sweepPairs.end());
-
     const double filterStart = get_time();
-    broadPhaseAccepted.clear();
-    broadPhaseAccepted.resize(sweepPairs.size(), 0);
+    const auto &candidates = broadPhaseState->collectPairs(bodiesInOrder);
+    sweepPairs.assign(candidates.begin(), candidates.end());
+    broadPhaseAccepted.assign(sweepPairs.size(), 0);
     pool->forCount(static_cast<int>(sweepPairs.size()), [this](int index) {
         const auto [i, j] = sweepPairs[index];
         broadPhaseAccepted[index] = pairOverlaps(bodiesInOrder[i], bodiesInOrder[j]) ? 1 : 0;
@@ -464,10 +307,7 @@ void Solver::broadPhase()
     timings.broadPhaseFilter = (get_time() - filterStart) / 1000.0;
     _time_broadPhaseFilter = timings.broadPhaseFilter;
 
-    // Commit in candidate order. Force and body intrusive lists remain single-writer, and
-    // manifold creation order stays identical to the serial broad phase.
-    for (size_t index = 0; index < sweepPairs.size(); ++index)
-    {
+    for (std::size_t index = 0; index < sweepPairs.size(); ++index) {
         if (!broadPhaseAccepted[index])
             continue;
         const auto [i, j] = sweepPairs[index];
