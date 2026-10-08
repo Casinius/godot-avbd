@@ -21,7 +21,8 @@ Force::Force(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB)
     next = p_solver->forces;
     p_solver->forces = this;
 
-    // Add to body linked lists
+    // Add to body linked lists. ObservePtr tracks lifetime separately; these links are
+    // the solver's force adjacency lists and must still be maintained explicitly.
     if (p_bodyA)
     {
         nextA = p_bodyA->forces;
@@ -43,20 +44,20 @@ Force::~Force()
         p = &(*p)->next;
     *p = next;
 
-    // Remove from body linked lists
-    if (bodyA)
+    // Remove from body linked lists via observer dereference
+    if (bodyA.get())
     {
-        p = &(*bodyA)->forces;
+        p = &bodyA->forces;
         while (*p != this)
-            p = (*p)->bodyA == bodyA ? &(*p)->nextA : &(*p)->nextB;
+            p = (*p)->bodyA.get() == bodyA.get() ? &(*p)->nextA : &(*p)->nextB;
         *p = nextA;
     }
 
-    if (bodyB)
+    if (bodyB.get())
     {
-        p = &(*bodyB)->forces;
+        p = &bodyB->forces;
         while (*p != this)
-            p = (*p)->bodyA == bodyB ? &(*p)->nextA : &(*p)->nextB;
+            p = (*p)->bodyA.get() == bodyB.get() ? &(*p)->nextA : &(*p)->nextB;
         *p = nextB;
     }
 }

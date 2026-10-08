@@ -355,7 +355,7 @@ PackedVector3Array AVBDPhysicsServer3D::_space_get_contacts(const RID &p_space) 
             continue;
         }
         // Walk the manifold's stored contacts: rA/rB are local offsets from each body.
-        const avbd::Rigid *a = force->bodyA.value_or(nullptr);
+        const avbd::Rigid *a = force->bodyA.get();
         const avbd::Manifold *manifold = static_cast<const avbd::Manifold *>(force);
         for (int i = 0; i < count; i++) {
             const avbd::float3 world = a->positionLin + a->positionAng * manifold->contacts[i].rA;
@@ -1071,8 +1071,8 @@ void AVBDPhysicsServer3D::_step(double p_step) {
                     continue;
                 }
                 const avbd::Manifold *manifold = static_cast<const avbd::Manifold *>(force);
-                const auto it_a = rigid_map.find(force->bodyA.value_or(nullptr));
-                const auto it_b = rigid_map.find(force->bodyB.value_or(nullptr));
+                const auto it_a = rigid_map.find(force->bodyA.get());
+                const auto it_b = rigid_map.find(force->bodyB.get());
                 BodyData *data[2] = {it_a != rigid_map.end() ? it_a->second : nullptr,
                         it_b != rigid_map.end() ? it_b->second : nullptr};
 
@@ -1082,7 +1082,7 @@ void AVBDPhysicsServer3D::_step(double p_step) {
                         continue;
                     }
                     const BodyData *other = data[side == 0 ? 1 : 0];
-                    const avbd::Rigid *self_rigid = side == 0 ? force->bodyA.value_or(nullptr) : force->bodyB.value_or(nullptr);
+                    const avbd::Rigid *self_rigid = side == 0 ? force->bodyA.get() : force->bodyB.get();
                     for (int c = 0; c < count && static_cast<int32_t>(fill->frame_contacts.size()) < fill->max_contacts_reported; c++) {
                         const avbd::float3 world = self_rigid->positionLin
                                 + self_rigid->positionAng

@@ -20,6 +20,7 @@
 
 #include "avbd/constants.hpp"
 #include "avbd/maths.h"
+#include "avbd/observe_ptr.hpp"
 #include "avbd/bvh/node_storage.hpp"
 #include "avbd/bvh/bvh.hpp"
 
@@ -153,6 +154,14 @@ struct Rigid
     int sleep_mode = 0; // 0=NEVER, 1=SLEEP, 2=START_IN_SLEEP
 
     bool constrainedTo(Rigid *other) const;
+
+    // Observer support - allows ObservePtr to track this body.
+    void addObserver(ObservePtr<Rigid> *observer);
+    void removeObserver(ObservePtr<Rigid> *observer);
+    void replaceObserver(ObservePtr<Rigid> *old_ptr, ObservePtr<Rigid> *new_ptr);
+
+private:
+    ObservePtr<Rigid> *observers = nullptr;
 };
 
 // The 6x6 Newton system a single body solves each iteration, split into its two 3x3
@@ -188,8 +197,8 @@ struct Block
 struct Force
 {
     Solver *solver;
-    Rigid* bodyA;
-    Rigid* bodyB;
+    ObservePtr<Rigid> bodyA;
+    ObservePtr<Rigid> bodyB;
     Force *nextA;
     Force *nextB;
     Force *next;

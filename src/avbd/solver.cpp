@@ -209,12 +209,12 @@ void Solver::step()
 // minus pairs already joined by a force (IgnoreCollision, joints).
 static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
 {
-    const float3 dp = (*bodyA).positionLin - (*bodyB).positionLin;
-    const float reach = (*bodyA).radius + (*bodyB).radius;
+    const float3 dp = bodyA->positionLin - bodyB->positionLin;
+    const float reach = bodyA->radius + bodyB->radius;
     // Godot semantics: the pair collides when either side's layer is in the other's
     // mask (defaults 1/1 keep every pair, as before these fields existed).
-    const bool layersAllow = (((*bodyA).collisionLayer & (*bodyB).collisionMask) != 0) ||
-            (((*bodyB).collisionLayer & (*bodyA).collisionMask) != 0);
+    const bool layersAllow = ((bodyA->collisionLayer & bodyB->collisionMask) != 0) ||
+            ((bodyB->collisionLayer & bodyA->collisionMask) != 0);
     return dp.squaredNorm() <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB);
 }
 
@@ -270,14 +270,16 @@ void Solver::broadPhase()
     bodiesInOrder.clear();
     bodiesInOrder.insert(bodiesInOrder.end(), next_range(bodies).begin(), next_range(bodies).end());
 
-    assert(bvh != nullptr && bvhBuilt);
-    assert(!bodiesInOrder.empty());
-
-    const int count = static_cast<int>(bodiesInOrder.size());
-    if (count < 2){
+    // The active implementation stores the tree in bvhNodes. The legacy `bvh` pointer and
+    // `bvhBuilt` flag are no longer populated, so asserting them makes the first step fail
+    // even though the tree is built below on demand.
+    if (bodiesInOrder.size() < 2)
+    {
         bvhValid = false;
         return;
     }
+
+    const int count = static_cast<int>(bodiesInOrder.size());
 
 
     std::optional<int> root = std::nullopt;
@@ -418,7 +420,7 @@ static bool constraintFrozen(const Force *f)
 {
     if (f->contactPointCount() <= 0)
         return false; // joints / springs / soft constraints keep their exact behaviour
-    const auto awake = [](const std::optional<Rigid*> b) { return b.has_value() && (*b)->mass > 0.0f && !(*b)->sleeping; };
+    const auto awake = [](const ObservePtr<Rigid> &body) { return body && body->mass > 0.0f && !body->sleeping; };
     return !awake(f->bodyA) && !awake(f->bodyB);
 }
 
@@ -611,10 +613,10 @@ void Solver::buildIslands()
 
     for (Force *force : forceOrder)
     {
-        const auto slotOf = [&slots](const std::optional<Rigid *> &body) {
-            if (!body.has_value())
+        const auto slotOf = [&slots](const ObservePtr<Rigid> &body) {
+            if (!body)
                 return -1;
-            const auto it = slots.find(*body);
+            const auto it = slots.find(body.get());
             return it == slots.end() ? -1 : it->second;
         };
         const int a = slotOf(force->bodyA);
@@ -677,10 +679,10 @@ void Solver::buildIslands()
     for (size_t i = 0; i < forceOrder.size(); ++i)
     {
         Force *force = forceOrder[i];
-        const auto islandOf = [this, &slots](const std::optional<Rigid *> &body) {
-            if (!body.has_value())
+        const auto islandOf = [this, &slots](const ObservePtr<Rigid> &body) {
+            if (!body)
                 return -1;
-            const auto it = slots.find(*body);
+            const auto it = slots.find(body.get());
             return it == slots.end() ? -1 : bodyIsland[it->second];
         };
         const int island = std::max(islandOf(force->bodyA), islandOf(force->bodyB));
@@ -967,8 +969,8 @@ void Solver::islandSleep()
             const auto it = std::lower_bound(sorted.begin(), sorted.end(), b);
             return (it != sorted.end() && *it == b) ? static_cast<int>(it - sorted.begin()) : -1;
         };
-        const int ia = f->bodyA!=nullptr ? slotOf(f->bodyA) : -1;
-        const int ib = f->bodyB!=nullptr ? slotOf(f->bodyB) : -1;
+        const int ia = f->bodyA ? slotOf(f->bodyA.get()) : -1;
+        const int ib = f->bodyB ? slotOf(f->bodyB.get()) : -1;
         if (ia >= 0 && ib >= 0)
             islandForceSlots.emplace_back(ia, ib);
     }
@@ -1027,7 +1029,7 @@ void Solver::updatePrimal(Rigid *body)
     Block block(body->mass, body->moment, dt, body->positionLin, body->inertialLin,
             body->positionAng, body->inertialAng);
 
-    for (Force *force = body->forces; force != 0; force = (force->bodyA == body) ? force->nextA : force->nextB)
+    for (Force *force = body->forces; force != 0; force = (force->bodyA.get() == body) ? force->nextA : force->nextB)
         force->updatePrimal(body, alpha, block);
 
     block.apply(*body);
@@ -1061,9 +1063,9 @@ void Solver::colourGraph()
         {
             if (!body->sleeping || body->sleep_mode != 1)
                 continue;
-            for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
+            for (Force *f = body->forces; f != 0; f = (f->bodyA.get() == body) ? f->nextA : f->nextB)
             {
-                Rigid *other = (f->bodyA == body) ? f->bodyB.value_or(nullptr) : f->bodyA.value_or(nullptr);
+                Rigid *other = (f->bodyA.get() == body) ? f->bodyB.get() : f->bodyA.get();
                 if (other != 0 && other->mass > 0 && !other->sleeping &&
                         (other->velocityLin.squaredNorm() > lin2 ||
                                 other->velocityAng.squaredNorm() > ang2))
@@ -1140,9 +1142,9 @@ void Solver::colourGraph()
     {
         // Collect the neighbours' current colours.
         taken.clear();
-        for (Force *force = body->forces; force != 0; force = (force->bodyA == body) ? force->nextA : force->nextB)
+        for (Force *force = body->forces; force != 0; force = (force->bodyA.get() == body) ? force->nextA : force->nextB)
         {
-            Rigid *other = (force->bodyA == body) ? force->bodyB.value_or(nullptr) : force->bodyA.value_or(nullptr);
+            Rigid *other = (force->bodyA.get() == body) ? force->bodyB.get() : force->bodyA.get();
             if (other != 0 && other->colour >= 0)
                 taken.push_back(other->colour);
         }
@@ -1214,6 +1216,39 @@ int Solver::threadCount() const
     if (pool == nullptr)
         return 1;
     return static_cast<int>(pool->threadCount());
+}
+
+void Rigid::addObserver(ObservePtr<Rigid> *observer)
+{
+    observer->m_prev = nullptr;
+    observer->m_next = observers;
+    if (observers)
+        observers->m_prev = observer;
+    observers = observer;
+}
+
+void Rigid::removeObserver(ObservePtr<Rigid> *observer)
+{
+    if (observer->m_prev)
+        observer->m_prev->m_next = observer->m_next;
+    else if (observers == observer)
+        observers = observer->m_next;
+    if (observer->m_next)
+        observer->m_next->m_prev = observer->m_prev;
+    observer->m_prev = nullptr;
+    observer->m_next = nullptr;
+}
+
+void Rigid::replaceObserver(ObservePtr<Rigid> *old_ptr, ObservePtr<Rigid> *new_ptr)
+{
+    new_ptr->m_prev = old_ptr->m_prev;
+    new_ptr->m_next = old_ptr->m_next;
+    if (new_ptr->m_prev)
+        new_ptr->m_prev->m_next = new_ptr;
+    else if (observers == old_ptr)
+        observers = new_ptr;
+    if (new_ptr->m_next)
+        new_ptr->m_next->m_prev = new_ptr;
 }
 
 } // namespace avbd

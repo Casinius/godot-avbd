@@ -85,6 +85,13 @@ Rigid::Rigid(Solver *p_solver, float3 p_size, ShapeType p_shape, float p_density
 
 Rigid::~Rigid()
 {
+    // Invalidate all observing pointers while the body is still alive.
+    while (observers) {
+        ObservePtr<Rigid> *observer = observers;
+        observers = observer->m_next;
+        observer->invalidate();
+    }
+
     // Remove from linked list
     Rigid** p = &solver->bodies;
     while (*p != this)
@@ -99,8 +106,9 @@ bool Rigid::constrainedTo(Rigid* other) const
     // O(every force in the scene) instead of O(this body's constraints) - which, with the
     // pair test running once per candidate pair per step, costs more than the whole rest of
     // the solver put together.
-    for (Force* f = forces; f != 0; f = (f->bodyA == this) ? f->nextA : f->nextB)
-        if ((f->bodyA == this && f->bodyB == other) || (f->bodyA == other && f->bodyB == this))
+    for (Force* f = forces; f != 0; f = (f->bodyA.get() == this) ? f->nextA : f->nextB)
+        if ((f->bodyA.get() == this && f->bodyB.get() == other) || 
+            (f->bodyA.get() == other && f->bodyB.get() == this))
             return true;
     return false;
 }
