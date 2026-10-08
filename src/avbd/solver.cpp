@@ -12,7 +12,9 @@
 #include <cmath>
 #include <algorithm>
 #include <execution>
+#include <functional>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <ankerl/unordered_dense.h>
 #include <chrono>
@@ -23,6 +25,7 @@
 #include "avbd/list_range.hpp"
 #include "avbd/bvh/bvh.hpp"
 #include "avbd/bvh/node_storage.hpp"
+#include "avbd/maths.h"
 
 namespace avbd {
 
@@ -201,6 +204,39 @@ static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
     return dp.squaredNorm() <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB);
 }
 
+
+
+
+void Solver::refitBVH(){
+    const int nodeCount = static_cast<int>(bvhNodes.size());
+    auto computeAABB = [](const avbd::Rigid* body, float3& min, float3& max) noexcept {
+        const float r = body->radius;
+        min = {body->positionLin.x() - r, body->positionLin.y() - r, body->positionLin.z() - r};
+        max = {body->positionLin.x() + r, body->positionLin.y() + r, body->positionLin.z() + r};
+    };
+    // 逆序：先叶子，再内部节点
+    for (int i = nodeCount - 1; i >= 0; --i)
+    {
+        if (bvhNodes.isLeaf(i))
+        {
+            const int bodyIndex = bvhNodes.bodyIndex(i);
+            const Rigid* body = &(bodies[bodyIndex]);
+            float3 aabb_min,aabb_max;
+            computeAABB(body, aabb_min,aabb_max);
+            bvhNodes.updateBounds(i, aabb_min, aabb_min);
+        }
+        else
+        {
+            
+            const int left  = bvhNodes.left()[i];
+            const int right = bvhNodes.right()[i];
+            const float3 min = comp3<float3,float3>(bvhNodes.boundsMin(left), bvhNodes.boundsMin(right),[](auto x, auto y){ return std::min(x, y); });
+            const float3 max = comp3<float3,float3>(bvhNodes.boundsMax(left), bvhNodes.boundsMax(right),[](auto x, auto y){ return std::max(x, y); });
+            bvhNodes.updateBounds(i, min, max);
+        }
+    }
+}
+
 // Contact detection: Morton LBVH (implicit heap layout), rebuilt every step.
 //
 // The old x-axis sweep emitted 28k candidate pairs on a 40-layer resting wall (x cannot
@@ -215,25 +251,56 @@ static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
 // manifold creation order contract as the sweep path.
 void Solver::broadPhase()
 {
+    
     bodiesInOrder.clear();
     bodiesInOrder.insert(bodiesInOrder.end(), next_range(bodies).begin(), next_range(bodies).end());
 
     const int count = static_cast<int>(bodiesInOrder.size());
-    if (count < 2)
+    if (count < 2){
+        bvhValid = false;
         return;
+    }
 
-    broadPhaseIndices.clear();
-    broadPhaseIndices.reserve(count);
-    for (int i = 0; i < count; ++i)
-        broadPhaseIndices.push_back(i);
 
-    bodiesPtr.clear();
-    bodiesPtr.reserve(count);
-    for (Rigid *b : bodiesInOrder)
-        bodiesPtr.push_back(b);
+    std::optional<int> root = std::nullopt;
+    if(!bvhValid||bvhNeedsRebuild){
+        broadPhaseIndices.resize(count);
+        std::iota(broadPhaseIndices.begin(), broadPhaseIndices.end(), 0);
+        bodiesPtr.assign(bodiesInOrder.begin(), bodiesInOrder.end());
 
-    bvh::builder::Builder builder(bvhNodes, broadPhaseIndices, bodiesPtr, &bvhScratch);
-    const std::optional<int> root = builder.buildLBVH();
+        bvh::builder::Builder builder(bvhNodes, broadPhaseIndices, bodiesPtr, &bvhScratch);
+
+        auto res = builder.buildLBVH();
+        root.swap(res);
+        bvhNeedsRebuild = false;
+        bvhValid = true;
+        framesSinceRebuild = 0;
+    }else{
+        refitBVH();
+        ++framesSinceRebuild;
+        if(framesSinceRebuild>=bvhRebuildInterval){
+            bvhNeedsRebuild = true;
+        }
+        
+    }
+    // broadPhaseIndices.clear();
+    // broadPhaseIndices.reserve(count);
+    // for (int i = 0; i < count; ++i)
+    //     broadPhaseIndices.push_back(i);
+
+    // bodiesPtr.clear();
+    // bodiesPtr.reserve(count);
+    // for (Rigid *b : bodiesInOrder)
+    //     bodiesPtr.push_back(b);
+
+    
+    // bvh::builder::Builder builder(bvhNodes, broadPhaseIndices, bodiesPtr, &bvhScratch);
+    // std::optional<int> root = 1; // NOT VALID TODO:ADD REFIT
+    // if(bvhNeedsRebuild)
+    //     const std::optional<int> root = builder.buildLBVH();
+    
+    
+    
     if (!root || bvhNodes.size() < 2)
         return;
 

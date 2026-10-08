@@ -14,7 +14,7 @@
 #include "avbd/solver.h"
 // cppcheck-suppress missingIncludeSystem
 #include <algorithm>
-
+#include <execution>
 namespace bvh::builder {
 
 // ============================================
@@ -140,12 +140,11 @@ inline uint64_t morton3D(float x, float y, float z, float lo, float scale) noexc
         const float3 c = bodies_[bodyIndex]->positionLin;
         coded.emplace_back(morton::morton3D(c.x(), c.y(), c.z(), lo.x(), scale), bodyIndex);
     }
-    std::sort(coded.begin(), coded.end(),
+    std::sort(std::execution::par,coded.begin(), coded.end(),
             [](const auto &a, const auto &b) {
-                if (a.first != b.first)
-                    return a.first < b.first;
-                return a.second < b.second;
-            });
+                //return a.first < b.first;   // stable sort可以只比 morton
+                return std::tie(a.first, a.second) < std::tie(b.first, b.second);
+            });  //use parallel sort
 
     nodes_.clear();
     nodes_.reserve(2 * n - 1);

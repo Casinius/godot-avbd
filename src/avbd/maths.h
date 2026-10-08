@@ -78,6 +78,19 @@ using quat = Eigen::Quaternion<float>;
   return quat::Identity();  // Return identity for zero/near-zero quaternion
 }
 
+
+
+
+template<class T,class T2,class F>
+inline T2 comp3(const T& a,const T& b,F func){
+    T2 m = {func(a.x(),b.x()),
+        func(a.y(),b.y()),
+        func(a.z(),b.z())
+    };
+    return m;
+}
+
+
 // Solve the symmetric 6x6 system [aLin  aCross^T; aCross  aAng] x = [bLin;
 // bAng].
 //

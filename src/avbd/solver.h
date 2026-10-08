@@ -589,6 +589,16 @@ struct Solver
     // Get current CPU time in microseconds.
     static double get_time();
 
+private: //refit 脏重建所需
+    std::size_t   bvhRebuildInterval = 30;      // 每 N 帧强制重建一次
+    float bvhRebuildDisplacement = 1.0f; // 最大位移超过阈值就重建
+    bool  bvhValid = false;
+    bool  bvhNeedsRebuild=true;
+    std::size_t framesSinceRebuild=0;
+
+    void refitBVH();
+
+
 private:
     // Every body in list order. The inertial/warmstart and BDF1 phases run over this,
     // because they also have to keep the cached state of static bodies current: contact

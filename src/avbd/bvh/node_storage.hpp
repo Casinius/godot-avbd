@@ -79,6 +79,7 @@ public:
     [[nodiscard]] std::optional<int> createLeaf(const float3& min, const float3& max, int bodyIdx) noexcept;
     [[nodiscard]] std::optional<int> createInternal(const float3& min, const float3& max, int leftIdx, int rightIdx, int parentIdx = -1) noexcept;
     [[nodiscard]] bool isLeaf(int nodeId) const noexcept { return bodyIndex_[nodeId] >= 0; }
+    
     void updateBounds(int nodeId, const float3& min, const float3& max) noexcept;
 };
 

@@ -12,6 +12,7 @@
 #pragma once
 
 // cppcheck-suppress missingIncludeSystem
+#include <cstddef>
 #include <vector>
 // cppcheck-suppress missingIncludeSystem
 #include <span>
@@ -102,6 +103,7 @@ public:
     // Builds a compact binary Morton tree with explicit child indices. Returns the root
     // node index, or std::nullopt when there are no bodies.
     [[nodiscard]] std::optional<int> buildLBVH();
+
 
 private:
     bvh::nodes::NodeStorage& nodes_;
