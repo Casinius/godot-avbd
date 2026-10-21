@@ -58,6 +58,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <atomic>
 #include <barrier>
 #include <cstddef>
 #include <mutex>
@@ -199,6 +200,35 @@ public:
         const std::size_t blocks = std::min<std::size_t>(workers, static_cast<std::size_t>(count));
         sharedPool().detach_blocks(0, count, [&fn](int first, int last) {
             for (int i = first; i < last; i++) {
+                fn(i);
+            }
+        }, blocks);
+        sharedPool().wait();
+    }
+
+    // Same contract as `forCount`, but items are pulled one at a time from a shared
+    // cursor instead of pre-split into blocks. That is what uneven work needs: an island
+    // is a single work item whose cost ranges from one body to hundreds, so a static
+    // split hands one worker every large island (measured 48% slower on four pyramids
+    // before this). Which worker takes which item cannot affect the result - the caller
+    // only hands over independent work.
+    template <typename F>
+    void forCountDynamic(int count, F &&fn) {
+        if (count <= 0) {
+            return;
+        }
+        const unsigned workers = threadCount();
+        if (workers <= 1 || count < 2) {
+            for (int i = 0; i < count; i++) {
+                fn(i);
+            }
+            return;
+        }
+        std::atomic<int> cursor{0};
+        const unsigned blocks = std::min<unsigned>(workers, static_cast<unsigned>(count));
+        sharedPool().detach_blocks(0, static_cast<int>(blocks), [&fn, &cursor, count](int, int) {
+            for (int i = cursor.fetch_add(1, std::memory_order_relaxed); i < count;
+                    i = cursor.fetch_add(1, std::memory_order_relaxed)) {
                 fn(i);
             }
         }, blocks);

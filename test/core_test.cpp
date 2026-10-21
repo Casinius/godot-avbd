@@ -1046,6 +1046,42 @@ static void build_bench_scene(Solver &s) {
     }
 }
 
+
+// N independent pyramids, spaced far enough apart that no two share a body or a force:
+// they are separate islands, which is the shape island parallelism is for.
+static void build_multi_island_scene(Solver &s, int islandCount, int size) {
+    new Rigid(&s, {2000, 2000, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
+    for (int i = 0; i < islandCount; i++) {
+        const float ox = (float)i * 40.0f;
+        for (int y = 0; y < size; y++) {
+            for (int x = 0; x < size - y; x++) {
+                new Rigid(&s, {1, 0.5f, 0.5f}, 1.0f, 0.5f,
+                        {ox + x * 1.01f + y * 0.5f, 0.0f, y * 0.85f + 0.5f});
+            }
+        }
+    }
+}
+
+static int run_bench_multi(int threads, int islandCount, int size) {
+    Solver s;
+    s.threads = threads;
+    build_multi_island_scene(s, islandCount, size);
+    std::printf("bench-multi: %d islands x %d-layer pyramid = %d bodies, %d iterations\n",
+            islandCount, size, count_bodies(s), s.iterations);
+
+    const int warmup = 30;
+    const int timed = 120;
+    step_n(s, warmup);
+    const auto t0 = std::chrono::steady_clock::now();
+    step_n(s, timed);
+    const auto t1 = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / (double)timed;
+    std::printf("bench-multi: threads=%d bodies=%d -> %.3f ms/step, contacts=%d, finite=%s\n",
+            s.threadCount(), count_bodies(s), ms, count_contact_points(s),
+            all_finite(s) ? "yes" : "NO");
+    return all_finite(s) ? 0 : 1;
+}
+
 static int run_bench(int threads) {
     Solver s;
     s.threads = threads;
@@ -1132,6 +1168,10 @@ int main(int argc, char **argv) {
             return 0;
         } else if (arg == "--bench") {
             return run_bench(threads);
+        } else if (arg == "--bench-multi") {
+            return run_bench_multi(threads, 4, 16);
+        } else if (arg.rfind("--bench-multi=", 0) == 0) {
+            return run_bench_multi(threads, std::atoi(arg.substr(14).c_str()), 16);
         } else if (arg == "--bench-sweep") {
             return run_bench_sweep();
         } else if (arg == "--colour") {
