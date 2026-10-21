@@ -24,6 +24,7 @@ config/features=PackedStringArray("4.7")
 common/physics_ticks_per_second=240
 common/max_physics_steps_per_frame=4
 3d/physics_engine="AVBD"
+avbd/substeps=1
 3d/time_before_sleep=0.09
 3d/solver/solver_iterations=4
 3d/solver/contact_recycle_radius=0.04
