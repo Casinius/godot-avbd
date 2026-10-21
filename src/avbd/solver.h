@@ -147,6 +147,9 @@ struct Rigid
     // kept across steps and reset to -1 whenever the body drops out of the update set
     // (static or sleeping), so -1 = "not in this step's update set".
     int colour = -1;
+    // Position in the solver's update set, i.e. the solve-island union-find index, or -1
+    // when the body is outside it (static, asleep, filtered by sleep mode).
+    int solveIndex = -1;
     int sleep_mode = 0; // 0=NEVER, 1=SLEEP, 2=START_IN_SLEEP
 
     bool constrainedTo(Rigid *other) const;
@@ -598,6 +601,22 @@ private:
     // colour c owns updateOrder[colourStart[c] .. colourStart[c + 1]).
     std::vector<Rigid *> updateOrder;
     std::vector<int> colourStart;
+
+    // Solve islands: bodies joined by forces, solved end-to-end by one worker. Two islands
+    // share no body and no force, so their updates commute and the island path needs no
+    // fence at all. `solveIslandBodies` holds each island's bodies in update order, and
+    // `solveIslandForces` its forces in `forceOrder` order. (The sleep pass above has its
+    // own island mapping; that one is about idle bodies, this one about parallelism.)
+    struct SolveIsland {
+        int firstBody = 0;
+        int bodyCount = 0;
+        int firstForce = 0;
+        int forceCount = 0;
+    };
+    std::vector<SolveIsland> solveIslands;
+    std::vector<Rigid *> solveIslandBodies;
+    std::vector<Force *> solveIslandForces;
+    std::vector<int> solveIslandParent;
     int colours = 0;
     int widest = 0;
 
@@ -644,6 +663,10 @@ private:
     int warmstartForces();
     void warmstartBodies();
     void solveIterations(int forceCount);
+    // Group the update set into solve islands (see `SolveIsland` below).
+    void buildSolveIslands();
+    // One solve island's whole iteration set, in the serial reference order.
+    void solveOneIsland(int index, int targetIterations, int newtonRounds);
     // The whole iteration set as one persistent-worker loop: `targetIterations` rounds of
     // per-colour primal passes plus dual passes, fenced by LoopSync barriers instead of
     // one pool dispatch per phase. Declared here so `iterate` stays testable.

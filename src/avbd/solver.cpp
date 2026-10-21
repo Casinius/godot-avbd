@@ -10,6 +10,8 @@
  */
 
 #include <cmath>
+#include <cstdlib>
+#include <string_view>
 #include <algorithm>
 #include <numeric>
 #include <span>
@@ -481,6 +483,7 @@ void Solver::solveIterations(int forceCount)
     // dual-only relaxation (optionally with penalty decay via stiffnessDecay).
     const int newtonRounds = std::clamp(
             static_cast<int>(std::ceil(newtonRatio * static_cast<float>(targetIterations))), 0, targetIterations);
+    buildSolveIslands();
     iterate(targetIterations, forceCount, newtonRounds);
 }
 
@@ -495,8 +498,100 @@ void Solver::solveIterations(int forceCount)
 // Both sync types run the identical body: NullSync (small scenes, or another solver
 // holding the loop) executes it inline in list order, which is exactly the threads=1
 // reference the digest tests compare against.
+// One island's whole iteration set. The body mirrors the parallel loop below phase for
+// phase - Newton primal rounds, the impulse tail's penalty decay, the dual pass, and the
+// convergence check - but with island-local state, because no other worker is involved.
+// `constraintFrozen` is honoured exactly as in the shared loop.
+void Solver::solveOneIsland(int index, int targetIterations, int newtonRounds)
+{
+    const SolveIsland &island = solveIslands[static_cast<std::size_t>(index)];
+    Rigid **bodies = solveIslandBodies.data() + island.firstBody;
+    Force **islandForceList = solveIslandForces.data() + island.firstForce;
+
+    float prevResidual = 0.0f;
+    for (int it = 0; it < targetIterations; it++)
+    {
+        const bool newton = it < newtonRounds;
+        if (newton)
+        {
+            for (int i = 0; i < island.bodyCount; i++)
+                updatePrimal(bodies[i]);
+        }
+
+        if (!newton && stiffnessDecay < 1.0f)
+        {
+            const float decay = stiffnessDecay;
+            const float cap = PENALTY_MAX;
+            for (int i = 0; i < island.forceCount; i++)
+            {
+                Force *f = islandForceList[i];
+                if (f->contactPointCount() <= 0)
+                    continue;
+                Manifold *m = static_cast<Manifold *>(f);
+                for (int ci = 0, n = m->numContacts; ci < n; ++ci)
+                    m->contacts[ci].penalty = (m->contacts[ci].penalty * decay).cwiseMin(float3{cap, cap, cap});
+            }
+        }
+
+        for (int i = 0; i < island.forceCount; i++)
+            if (!constraintFrozen(islandForceList[i]))
+                islandForceList[i]->updateDual(alpha);
+
+        if (convergenceThreshold > 0.0f && it + 1 < targetIterations)
+        {
+            float total = 0.0f;
+            int count = 0;
+            for (int i = 0; i < island.forceCount; i++)
+                islandForceList[i]->accumulatePenetration(total, count);
+            const float residual = count > 0 ? total / count : 0.0f;
+            if (prevResidual - residual < convergenceThreshold)
+                break;
+            prevResidual = residual;
+        }
+    }
+}
+
 void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
 {
+    // Two mutually exclusive strategies, chosen from the scene alone (island sizes, never
+    // the worker count - otherwise different machines would take different numerical
+    // paths). The island path has no fence; the colour path spreads one dominant island
+    // over every worker.
+    {
+        const int islandCount = static_cast<int>(solveIslands.size());
+        const int movable = static_cast<int>(solveIslandBodies.size());
+        int largestIsland = 0;
+        for (const SolveIsland &island : solveIslands)
+            largestIsland = std::max(largestIsland, island.bodyCount);
+
+        // Threshold from measurement on 529/544/1632-body piles: a largest island at 55%
+        // of the bodies favours colours by 2.5x, at 22% by 25%, and only at 7% does the
+        // island path win (8%). One eighth of the bodies separates those cases.
+        bool useIslands = islandCount >= 2 && largestIsland * 8 <= movable;
+        // Benchmark hook: force one path to A/B them on the same build.
+        if (const char *forced = std::getenv("AVBD_FORCE_PATH"))
+            useIslands = std::string_view(forced) == "islands";
+
+        if (useIslands)
+        {
+            const bool dispatchable = movable >= kMinBodiesPerDispatch && pool->threadCount() > 1;
+            if (!dispatchable)
+            {
+                for (int i = 0; i < islandCount; i++)
+                    solveOneIsland(i, targetIterations, newtonRounds);
+            }
+            else
+            {
+                // Dynamic dispatch: island cost ranges from one body to hundreds, so a
+                // static split would hand one worker every large island.
+                pool->forCountDynamic(islandCount, [this, targetIterations, newtonRounds](int i) {
+                    solveOneIsland(i, targetIterations, newtonRounds);
+                });
+            }
+            return;
+        }
+    }
+
     // Convergence early exit: measure the residual at the end of a Newton round; when it
     // stops improving (delta below the threshold or rising), the remaining rounds would
     // burn cycles on float noise. Measured only at the Newton boundary - the impulse tail
@@ -916,6 +1011,127 @@ void Solver::colourGraph()
     for (Rigid *body : updateOrder)
         grouped[cursor[body->colour]++] = body;
     updateOrder = std::move(grouped);
+}
+
+// Group the update set into solve islands: bodies connected, directly or through other
+// movable bodies, by a force. A static body never joins one - it would union the whole
+// scene through the ground - so a force with one static endpoint belongs to its movable
+// endpoint's island, and a force with two static endpoints gets an island of its own
+// (its dual update cannot affect anything else, so where it runs does not matter).
+//
+// Islands are the solver's parallelism unit on the island path: one worker solves an
+// island end-to-end, so the iteration loop needs no fence. The colour pass still runs, as
+// a pure ordering function, which keeps the per-island visitation order deterministic.
+void Solver::buildSolveIslands()
+{
+    // Clear last step's slots first: a body that left the update set (fell asleep,
+    // filtered by sleep mode, became static) must not answer with a stale index, or the
+    // force walk below would index outside the union-find.
+    for (Rigid *body = bodies; body != nullptr; body = body->next)
+        body->solveIndex = -1;
+
+    const int count = static_cast<int>(updateOrder.size());
+    solveIslandParent.resize(count);
+    for (int i = 0; i < count; i++)
+    {
+        updateOrder[i]->solveIndex = i;
+        solveIslandParent[i] = i;
+    }
+
+    const auto find = [this](int i)
+    {
+        while (solveIslandParent[i] != i)
+        {
+            solveIslandParent[i] = solveIslandParent[solveIslandParent[i]];
+            i = solveIslandParent[i];
+        }
+        return i;
+    };
+
+    for (Force *force : forceOrder)
+    {
+        Rigid *a = force->bodyA;
+        Rigid *b = force->bodyB;
+        if (a != nullptr && b != nullptr && a->solveIndex >= 0 && b->solveIndex >= 0)
+        {
+            const int ra = find(a->solveIndex);
+            const int rb = find(b->solveIndex);
+            if (ra != rb)
+                solveIslandParent[rb] = ra;
+        }
+    }
+
+    // Island numbering follows first appearance in the update order, so the decomposition
+    // is a pure function of the body list rather than of pointer values.
+    std::vector<int> rootToIsland(count, -1);
+    solveIslands.clear();
+    solveIslandBodies.clear();
+    solveIslandForces.clear();
+    for (int i = 0; i < count; i++)
+    {
+        const int root = find(i);
+        int island = rootToIsland[root];
+        if (island < 0)
+        {
+            island = static_cast<int>(solveIslands.size());
+            rootToIsland[root] = island;
+            solveIslands.push_back(SolveIsland{});
+        }
+        solveIslands[island].bodyCount++;
+    }
+
+    int offset = 0;
+    for (SolveIsland &island : solveIslands)
+    {
+        island.firstBody = offset;
+        offset += island.bodyCount;
+    }
+    solveIslandBodies.resize(static_cast<std::size_t>(offset));
+    {
+        std::vector<int> cursor(solveIslands.size());
+        for (std::size_t i = 0; i < solveIslands.size(); i++)
+            cursor[i] = solveIslands[i].firstBody;
+        for (int i = 0; i < count; i++)
+        {
+            const int island = rootToIsland[find(i)];
+            solveIslandBodies[static_cast<std::size_t>(cursor[island]++)] = updateOrder[i];
+        }
+    }
+
+    // Forces: same treatment, in forceOrder order. Two static endpoints share one island
+    // appended at the end.
+    int staticOnly = -1;
+    const auto islandOf = [&](Force *force) {
+        Rigid *a = force->bodyA;
+        Rigid *b = force->bodyB;
+        if (a != nullptr && a->solveIndex >= 0)
+            return rootToIsland[find(a->solveIndex)];
+        if (b != nullptr && b->solveIndex >= 0)
+            return rootToIsland[find(b->solveIndex)];
+        if (staticOnly < 0)
+        {
+            staticOnly = static_cast<int>(solveIslands.size());
+            solveIslands.push_back(SolveIsland{});
+        }
+        return staticOnly;
+    };
+    for (Force *force : forceOrder)
+        solveIslands[islandOf(force)].forceCount++;
+
+    offset = 0;
+    for (SolveIsland &island : solveIslands)
+    {
+        island.firstForce = offset;
+        offset += island.forceCount;
+    }
+    solveIslandForces.resize(static_cast<std::size_t>(offset));
+    {
+        std::vector<int> cursor(solveIslands.size());
+        for (std::size_t i = 0; i < solveIslands.size(); i++)
+            cursor[i] = solveIslands[i].firstForce;
+        for (Force *force : forceOrder)
+            solveIslandForces[static_cast<std::size_t>(cursor[islandOf(force)]++)] = force;
+    }
 }
 
 // Fill `forceOrder` with the solver's forces, so the phases can address them by index.
