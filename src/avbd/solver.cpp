@@ -10,6 +10,9 @@
  */
 
 #include <cmath>
+#include <cstdlib>
+#include <string_view>
+#include <cstdlib>
 #include <algorithm>
 #include <numeric>
 #include <span>
@@ -130,7 +133,7 @@ void Solver::step()
     const int forceCount = warmstartForces();
     colourGraph();
     warmstartBodies();
-    solveIterations(forceCount);
+    solveIterations();
     finishVelocities();
 }
 
@@ -283,7 +286,7 @@ void Solver::warmstartBodies()
 }
 
 // The solver's main loop: `iterations` rounds of a primal pass followed by a dual pass.
-void Solver::solveIterations(int forceCount)
+void Solver::solveIterations()
 {
     int targetIterations = iterations;
 
@@ -318,25 +321,83 @@ void Solver::solveIterations(int forceCount)
         targetIterations = std::min(targetIterations, 16); // Cap at 16 iterations
     }
 
-    // One dispatch covers every round: the barrier fences inside `iterate` carry the
-    // Gauss-Seidel ordering, so the loop body below runs the whole set, not one round.
-    iterate(targetIterations, forceCount);
+    buildIslands();
+    iterate(targetIterations);
 }
 
-// One worker-loop body for the whole iteration set: `iterations` rounds of a primal pass
-// per colour followed by a dual pass, with a barrier fence at every phase boundary.
+// Solve the iteration set. Two mutually exclusive strategies, picked from the shape of
+// the force graph - never combined, so each one stays simple:
 //
-// The shape matters more than the phases: the old code re-entered the pool once per
-// colour per iteration (~45 us a dispatch), which at 8 colours x 10 iterations burned
-// ~4 ms of a 16 ms frame on synchronisation alone. Here one dispatch arms the workers
-// once per step and each boundary costs a ~1-3 us barrier instead.
+//   islands: each island (a set of bodies joined by forces) is one work item solved
+//     end-to-end by one worker, no fence anywhere. Correct because islands share no body
+//     and no force, so their updates commute. Wins when the scene is many comparable
+//     clusters.
 //
-// Both sync types run the identical body: NullSync (small scenes, or another solver
-// holding the loop) executes it inline in list order, which is exactly the threads=1
-// reference the digest tests compare against.
-void Solver::iterate(int targetIterations, int forceCount)
+//   colours: the classic colour-parallel Gauss-Seidel, one barrier per (colour, dual)
+//     phase. Wins when one island dominates, because only this path can spread a single
+//     island over every worker.
+//
+// The choice is a pure function of the scene (island sizes and worker count), so results
+// stay a pure function of the input either way.
+void Solver::solveIsland(int index, int targetIterations)
 {
-    const auto loop = [this, targetIterations, forceCount](int, auto &sync) {
+    const Island &island = islands[static_cast<std::size_t>(index)];
+    Rigid **bodies = islandBodies.data() + island.firstBody;
+    Force **forces = islandForces.data() + island.firstForce;
+    for (int it = 0; it < targetIterations; it++)
+    {
+        for (int i = 0; i < island.bodyCount; i++)
+            updatePrimal(bodies[i]);
+        for (int i = 0; i < island.forceCount; i++)
+            forces[i]->updateDual(alpha);
+    }
+}
+
+void Solver::iterate(int targetIterations)
+{
+    const int islandCount = static_cast<int>(islands.size());
+    const int movable = static_cast<int>(islandBodies.size());
+    const int workers = pool->threadCount();
+
+    int largestIsland = 0;
+    for (const Island &island : islands)
+        largestIsland = std::max(largestIsland, island.bodyCount);
+
+    // The strategy has to be a pure function of the scene: if it depended on the worker
+    // count, the same scene would take a different numerical path on a different machine
+    // and the bit-exact-across-thread-counts property would be gone. So the only inputs
+    // here are island sizes and body counts.
+    //
+    // Threshold from measurement on 529/544/1632-body piles: a largest island at 55% of
+    // the bodies favours colours by 2.3x, at 22% by 27%, and only at 7% does the island
+    // path win (6%). One eighth of the bodies is the line that separates the last case
+    // from the others; a scene that fragments further than that gains, anything more
+    // concentrated keeps the colour path.
+    bool useIslands = islandCount >= 2 && largestIsland * 8 <= movable;
+    // Benchmark hook: force one path to A/B them on the same build (no effect otherwise).
+    if (const char *forced = std::getenv("AVBD_FORCE_PATH"))
+        useIslands = std::string_view(forced) == "islands";
+
+    const bool dispatchable = movable >= kMinBodiesPerDispatch && workers > 1;
+
+    if (useIslands)
+    {
+        if (!dispatchable)
+        {
+            for (int i = 0; i < islandCount; i++)
+                solveIsland(i, targetIterations);
+            return;
+        }
+        // Dynamic dispatch: island cost ranges from one body to hundreds, so a static
+        // block split hands one worker all the big islands.
+        pool->forCountDynamic(islandCount, [this, targetIterations](int i) {
+            solveIsland(i, targetIterations);
+        });
+        return;
+    }
+
+    // Colour path: the whole set as one persistent-worker loop, fenced per phase.
+    const auto loop = [this, targetIterations](int, auto &sync) {
         for (int it = 0; it < targetIterations; it++)
         {
             for (int colour = 0; colour < colours; colour++)
@@ -348,29 +409,19 @@ void Solver::iterate(int targetIterations, int forceCount)
                 });
                 sync.arriveAndWait();
             }
-
-            // Dual update: one item per force, and each force only reads the (frozen)
-            // body poses and writes its own dual state, so the whole pass is independent.
-            sync.forItems(forceCount, [this](int i) {
+            sync.forItems(static_cast<int>(forceOrder.size()), [this](int i) {
                 forceOrder[i]->updateDual(alpha);
             });
             sync.arriveAndWait();
         }
     };
-
-    // Below both break-even sizes every phase would run inline anyway, so skip the
-    // dispatch entirely. Above them the loop dispatches once for the whole set.
-    const bool tiny = static_cast<int>(updateOrder.size()) < kMinBodiesPerDispatch
-            && forceCount < kMinForcesPerDispatch;
-    if (tiny)
+    if (!dispatchable || colours <= 1)
     {
         detail::NullSync sync;
         loop(0, sync);
+        return;
     }
-    else
-    {
-        pool->runLoop(loop);
-    }
+    pool->runLoop(loop);
 }
 
 // BDF1 velocities after the final iteration. Per-body and independent; it covers static
@@ -555,6 +606,138 @@ void Solver::colourGraph()
     for (Rigid *body : updateOrder)
         grouped[cursor[body->colour]++] = body;
     updateOrder = std::move(grouped);
+}
+
+// Group the update set into islands: bodies connected, directly or through other movable
+// bodies, by a force. A static body never joins one - it would union the whole scene
+// through the ground - so a force with one static endpoint belongs to its movable
+// endpoint's island, and a force with two static endpoints gets an island of its own
+// (its dual update cannot affect anything else, so where it runs does not matter).
+//
+// This is the solver's only parallelism mechanism: an island is solved end-to-end by one
+// worker, and the loop needs no fence. The colour pass above still runs, but only to
+// order the bodies - a pure function of the body list, which keeps the per-island
+// visitation order (and therefore every digest) identical to the serial run.
+void Solver::buildIslands()
+{
+    const int count = static_cast<int>(updateOrder.size());
+    islandParent.resize(count);
+    for (int i = 0; i < count; i++)
+    {
+        updateOrder[i]->solveIndex = i;
+        islandParent[i] = i;
+    }
+
+    const auto find = [this](int i)
+    {
+        while (islandParent[i] != i)
+        {
+            islandParent[i] = islandParent[islandParent[i]];
+            i = islandParent[i];
+        }
+        return i;
+    };
+
+    for (Force *force : forceOrder)
+    {
+        Rigid *a = force->bodyA;
+        Rigid *b = force->bodyB;
+        if (a != nullptr && b != nullptr && a->solveIndex >= 0 && b->solveIndex >= 0)
+        {
+            const int ra = find(a->solveIndex);
+            const int rb = find(b->solveIndex);
+            if (ra != rb)
+                islandParent[rb] = ra;
+        }
+    }
+
+    // Island numbering follows first appearance in the update order, so the decomposition
+    // is a pure function of the body list rather than of pointer values.
+    std::vector<int> rootToIsland(count, -1);
+    islands.clear();
+    islandBodies.clear();
+    islandForces.clear();
+    for (int i = 0; i < count; i++)
+    {
+        const int root = find(i);
+        int island = rootToIsland[root];
+        if (island < 0)
+        {
+            island = static_cast<int>(islands.size());
+            rootToIsland[root] = island;
+            islands.push_back(Island{});
+        }
+        islands[island].bodyCount++;
+    }
+
+    // Offsets first, then a stable fill, so each island's bodies keep the update order.
+    {
+        int offset = 0;
+        for (Island &island : islands)
+        {
+            island.firstBody = offset;
+            offset += island.bodyCount;
+        }
+        islandBodies.resize(static_cast<std::size_t>(offset));
+        std::vector<int> cursor(islands.size());
+        for (std::size_t i = 0; i < islands.size(); i++)
+            cursor[i] = islands[i].firstBody;
+        for (int i = 0; i < count; i++)
+        {
+            const int island = rootToIsland[find(i)];
+            islandBodies[static_cast<std::size_t>(cursor[island]++)] = updateOrder[i];
+        }
+    }
+
+    // Forces: same treatment, in forceOrder order. Island index -1 means "two static
+    // endpoints"; those forces get one shared island appended at the end.
+    int staticOnlyIsland = -1;
+    for (Force *force : forceOrder)
+    {
+        Rigid *a = force->bodyA;
+        Rigid *b = force->bodyB;
+        int island = -1;
+        if (a != nullptr && a->solveIndex >= 0)
+            island = rootToIsland[find(a->solveIndex)];
+        else if (b != nullptr && b->solveIndex >= 0)
+            island = rootToIsland[find(b->solveIndex)];
+        if (island < 0)
+        {
+            if (staticOnlyIsland < 0)
+            {
+                staticOnlyIsland = static_cast<int>(islands.size());
+                islands.push_back(Island{});
+            }
+            island = staticOnlyIsland;
+        }
+        islands[island].forceCount++;
+    }
+
+    {
+        int offset = 0;
+        for (Island &island : islands)
+        {
+            island.firstForce = offset;
+            offset += island.forceCount;
+        }
+        islandForces.resize(static_cast<std::size_t>(offset));
+        std::vector<int> cursor(islands.size());
+        for (std::size_t i = 0; i < islands.size(); i++)
+            cursor[i] = islands[i].firstForce;
+        for (Force *force : forceOrder)
+        {
+            Rigid *a = force->bodyA;
+            Rigid *b = force->bodyB;
+            int island = -1;
+            if (a != nullptr && a->solveIndex >= 0)
+                island = rootToIsland[find(a->solveIndex)];
+            else if (b != nullptr && b->solveIndex >= 0)
+                island = rootToIsland[find(b->solveIndex)];
+            if (island < 0)
+                island = staticOnlyIsland;
+            islandForces[static_cast<std::size_t>(cursor[island]++)] = force;
+        }
+    }
 }
 
 // Fill `forceOrder` with the solver's forces, so the phases can address them by index.

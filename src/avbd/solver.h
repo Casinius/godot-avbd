@@ -142,6 +142,9 @@ struct Rigid
     // kept across steps and reset to -1 whenever the body drops out of the update set
     // (static or sleeping), so -1 = "not in this step's update set".
     int colour = -1;
+    // Position in the solver's update set (the island union-find index), or -1 for a
+    // body outside it (static, sleeping, filtered by sleep mode).
+    int solveIndex = -1;
     int sleep_mode = 0; // 0=NEVER, 1=SLEEP, 2=START_IN_SLEEP
 
     bool constrainedTo(Rigid *other) const;
@@ -466,6 +469,24 @@ struct Solver
     // store them grouped by colour in `updateOrder`. Incremental: updated bodies keep their
     // previous colour unless a neighbour took it; only conflicting bodies are re-coloured.
     void colourGraph();
+    // Split the update set into islands (see the definition on the class below).
+    void buildIslands();
+
+    // An island is a set of bodies joined by forces, solved end-to-end by one worker:
+    // the iteration loop never has to synchronise, because two islands share no body and
+    // no force, so their updates commute. `islandBodies` holds each island's bodies in
+    // the solver's update order (colour-major, i.e. exactly the serial order restricted
+    // to the island), and `islandForces` its forces in `forceOrder` order.
+    struct Island {
+        int firstBody = 0;
+        int bodyCount = 0;
+        int firstForce = 0;
+        int forceCount = 0;
+    };
+    std::vector<Island> islands;
+    std::vector<Rigid *> islandBodies;
+    std::vector<Force *> islandForces;
+    std::vector<int> islandParent;
 
     // Number of colours in the current ordering (1 means nothing can run in parallel).
     [[nodiscard]] int colourCount() const { return colours; }
@@ -548,11 +569,12 @@ private:
     void broadPhase();
     int warmstartForces();
     void warmstartBodies();
-    void solveIterations(int forceCount);
-    // The whole iteration set as one persistent-worker loop: `targetIterations` rounds of
-    // per-colour primal passes plus dual passes, fenced by LoopSync barriers instead of
-    // one pool dispatch per phase. Declared here so `iterate` stays testable.
-    void iterate(int targetIterations, int forceCount);
+    void solveIterations();
+    // The whole iteration set, one work item per island: each island runs `targetIterations`
+    // rounds of primal + dual with no synchronisation at all.
+    void iterate(int targetIterations);
+    // One island's whole iteration set, in the serial reference order.
+    void solveIsland(int index, int targetIterations);
     void finishVelocities();
     void updatePrimal(Rigid *body);
 };
