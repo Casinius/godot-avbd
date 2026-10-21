@@ -8,8 +8,9 @@ demo/.godot/
 demo/.import/
 *.uid
 
-# GDExtension binaries: produced by `xmake` into demo/bin/, not source.
+# GDExtension binaries: produced by `xmake`, not source.
 demo/bin/
+demo/gdavbd/bin/
 
 # Godot editor
 .editorconfig
