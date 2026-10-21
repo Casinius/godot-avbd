@@ -18,5 +18,8 @@ PhysicsServer3D* PhysicsServerFactory::create_server() {
 }
 
 void PhysicsServerFactory::_bind_methods() {
-    // ClassDB::bind_method(D_METHOD("create_server"), &PhysicsServerFactory::create_server);
+    // The engine invokes this through a Callable, so the method has to be bound to
+    // ClassDB - without this the callable is invalid, PhysicsServer3DManager silently
+    // falls back to the default engine and "AVBD" runs Godot Physics.
+    ClassDB::bind_method(D_METHOD("create_server"), &PhysicsServerFactory::create_server);
 }
