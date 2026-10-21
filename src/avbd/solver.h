@@ -578,6 +578,22 @@ private:
     bvh::nodes::NodeStorage bvhNodes;
     std::vector<std::pair<int, int>> sweepPairs;
 
+    // BVH refit state. `bvhTreeBodies` is the exact body list the current topology was
+    // built from: leaf nodes store indices into it, so the tree may only be refit while
+    // that list is unchanged (same pointers, same order). `bvhRoot` is the root index the
+    // builder returned - it is not 0, nodes are emitted post-order.
+    int bvhRoot = -1;
+    std::vector<Rigid *> bvhTreeBodies;
+    std::vector<uint8_t> bvhDirty;
+
+    // Steps of refit allowed before the LBVH is rebuilt from Morton codes again. A refit
+    // never re-sorts, so bodies that wander slowly degrade pruning until the next
+    // rebuild caps the drift. Purely a speed knob: refit keeps every internal box the
+    // exact union of its children, so the candidate set - and therefore the result -
+    // is bit-identical whatever this is set to.
+    int bvhAge = 0;
+    int bvhRefitBudget = 16;
+
     // Bodies that take part in the primal update (movable ones), grouped by colour:
     // colour c owns updateOrder[colourStart[c] .. colourStart[c + 1]).
     std::vector<Rigid *> updateOrder;
@@ -621,6 +637,10 @@ private:
 
     // The phases of a step, in the order `step()` runs them.
     void broadPhase();
+    // Refresh the broad-phase tree's bounds in place, keeping the topology of the last
+    // `buildLBVH` call. Precondition: every leaf index still addresses the same body,
+    // i.e. `bvhTreeBodies` equals `bodiesInOrder`.
+    void refitTree();
     int warmstartForces();
     void warmstartBodies();
     void solveIterations(int forceCount);

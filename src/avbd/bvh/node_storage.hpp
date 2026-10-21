@@ -78,6 +78,11 @@ public:
     int createInternal(const float3& min, const float3& max, int leftIdx, int rightIdx, int parentIdx = -1) noexcept;
     [[nodiscard]] bool isLeaf(int nodeId) const noexcept { return bodyIndex_[nodeId] >= 0; }
     void updateBounds(int nodeId, const float3& min, const float3& max) noexcept;
+
+    // Per-node child access used by the refit pass: building a span for every visited
+    // node adds an indirection to the innermost loop.
+    [[nodiscard]] int leftChild(int nodeId) const noexcept { return left_[nodeId]; }
+    [[nodiscard]] int rightChild(int nodeId) const noexcept { return right_[nodeId]; }
 };
 
 } // namespace nodes

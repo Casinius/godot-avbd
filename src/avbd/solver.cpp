@@ -152,18 +152,86 @@ static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
     return dp.squaredNorm() <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB);
 }
 
-// Contact detection: Morton LBVH (implicit heap layout), rebuilt every step.
+// Refresh the broad-phase tree's bounds in place, keeping its topology.
 //
-// The old x-axis sweep emitted 28k candidate pairs on a 40-layer resting wall (x cannot
-// discriminate a z-pile); the Morton tree partitions in 3D so the candidate list tracks
-// the real contact surface. Bodies are ordered by 64-bit Morton code - a pure function
-// of the scene bounds and positions - and the code-sorted order is mapped into the
-// implicit heap layout of a complete binary tree: node i has children 2i+1 / 2i+2, no
-// left/right/parent arrays, best-possible cache behaviour for a pointer-free BVH.
+// `Builder::buildLBVH` emits nodes post-order - a node is created after both of its
+// children - so a child always precedes its parent in the arrays and one ascending pass
+// refits every level. A node whose children did not move keeps its box: its parent sees
+// no dirty child and stops there, so the pass costs one mover's path to the root rather
+// than the whole body count. A settled pile pays a few leaf comparisons per step.
 //
-// Determinism: leaf order is the Morton-sorted body order, pair collection is leaf
-// order, and the final pair list is sorted ascending (min-index, other) - the same
-// manifold creation order contract as the sweep path.
+// Refit cannot change the candidate set: every internal box stays the exact union of its
+// children, so pruning stays correct - only its tightness drifts as bodies wander, which
+// is what `bvhRefitBudget` bounds.
+void Solver::refitTree()
+{
+    const int nodeCount = bvhNodes.size();
+    bvhDirty.assign(nodeCount, 0);
+
+    for (int i = 0; i < nodeCount; ++i)
+    {
+        const int body = bvhNodes.bodyIndex(i);
+        if (body >= 0)
+        {
+            const Rigid *b = bodiesInOrder[body];
+            const float r = b->radius;
+            const float3 mn = {b->positionLin.x() - r, b->positionLin.y() - r, b->positionLin.z() - r};
+            const float3 mx = {b->positionLin.x() + r, b->positionLin.y() + r, b->positionLin.z() + r};
+            const float3 &oldMin = bvhNodes.boundsMin(i);
+            const float3 &oldMax = bvhNodes.boundsMax(i);
+            if (mn.x() != oldMin.x() || mn.y() != oldMin.y() || mn.z() != oldMin.z() ||
+                    mx.x() != oldMax.x() || mx.y() != oldMax.y() || mx.z() != oldMax.z())
+            {
+                bvhNodes.updateBounds(i, mn, mx);
+                bvhDirty[i] = 1;
+            }
+            continue;
+        }
+
+        const int l = bvhNodes.leftChild(i);
+        const int r = bvhNodes.rightChild(i);
+        if (l >= 0 && bvhDirty[l] == 0 && (r < 0 || bvhDirty[r] == 0))
+            continue;
+
+        const float3 &lMin = bvhNodes.boundsMin(l);
+        const float3 &lMax = bvhNodes.boundsMax(l);
+        if (r < 0)
+        {
+            bvhNodes.updateBounds(i, lMin, lMax);
+            bvhDirty[i] = 1;
+            continue;
+        }
+        const float3 &rMin = bvhNodes.boundsMin(r);
+        const float3 &rMax = bvhNodes.boundsMax(r);
+        const float3 mn = {std::min(lMin.x(), rMin.x()), std::min(lMin.y(), rMin.y()), std::min(lMin.z(), rMin.z())};
+        const float3 mx = {std::max(lMax.x(), rMax.x()), std::max(lMax.y(), rMax.y()), std::max(lMax.z(), rMax.z())};
+        const float3 &oldMin = bvhNodes.boundsMin(i);
+        const float3 &oldMax = bvhNodes.boundsMax(i);
+        if (mn.x() != oldMin.x() || mn.y() != oldMin.y() || mn.z() != oldMin.z() ||
+                mx.x() != oldMax.x() || mx.y() != oldMax.y() || mx.z() != oldMax.z())
+        {
+            bvhNodes.updateBounds(i, mn, mx);
+            bvhDirty[i] = 1;
+        }
+    }
+}
+
+// Contact detection: Morton LBVH traversal over per-body bounding spheres.
+//
+// Bodies are ordered by 64-bit Morton code - a pure function of the scene bounds and
+// positions - and split into a tree whose internal boxes are the union of their children.
+// Two bodies can only be a contact pair if their boxes overlap, so a top-down traversal
+// that prunes non-overlapping node pairs touches O(real contact surface) candidates
+// instead of the O(n^2) pairs an all-pairs scan would test. The previous generation of
+// this phase scanned along x only, which cannot discriminate a z-pile: it emitted 28k
+// candidate pairs on a 40-layer resting wall.
+//
+// The topology is built once and then refit for `bvhRefitBudget` steps (see `refitTree`),
+// with a rebuild whenever the body set changes.
+//
+// Determinism: the topology is a pure function of the body set and the Morton order, pair
+// collection follows the traversal, and the final pair list is sorted ascending
+// (min-index, other) - the same manifold creation order contract as the sweep path.
 void Solver::broadPhase()
 {
     bodiesInOrder.clear();
@@ -173,17 +241,35 @@ void Solver::broadPhase()
     if (count < 2)
         return;
 
-    std::vector<int> indices(count);
-    for (int i = 0; i < count; ++i)
-        indices[i] = i;
+    // A refit is legal only while every leaf still addresses the same body, so the body
+    // list is compared to the one the topology was built from before anything else.
+    const bool sameBodySet = bvhRoot >= 0 && bvhNodes.size() > 0 &&
+            bvhTreeBodies.size() == bodiesInOrder.size() &&
+            std::equal(bodiesInOrder.begin(), bodiesInOrder.end(), bvhTreeBodies.begin());
 
-    std::vector<const Rigid *> bodiesPtr;
-    bodiesPtr.reserve(count);
-    for (Rigid *b : bodiesInOrder)
-        bodiesPtr.push_back(b);
+    if (!sameBodySet || bvhAge >= bvhRefitBudget || bvhNodes.size() < 2)
+    {
+        std::vector<int> indices(count);
+        for (int i = 0; i < count; ++i)
+            indices[i] = i;
 
-    bvh::builder::Builder builder(bvhNodes, indices, bodiesPtr);
-    const int root = builder.buildLBVH();
+        std::vector<const Rigid *> bodiesPtr;
+        bodiesPtr.reserve(count);
+        for (Rigid *b : bodiesInOrder)
+            bodiesPtr.push_back(b);
+
+        bvh::builder::Builder builder(bvhNodes, indices, bodiesPtr);
+        bvhRoot = builder.buildLBVH();
+        bvhTreeBodies = bodiesInOrder;
+        bvhAge = 0;
+    }
+    else
+    {
+        refitTree();
+        ++bvhAge;
+    }
+
+    const int root = bvhRoot;
     if (root < 0 || bvhNodes.size() < 2)
         return;
 
@@ -198,6 +284,9 @@ void Solver::broadPhase()
 
     sweepPairs.clear();
     std::vector<std::pair<int, int>> pending;
+    // The stack never holds more than a few dozen node pairs on a well-balanced tree,
+    // and every grow beyond the reserve is a fresh heap block per step.
+    pending.reserve(64);
     pending.emplace_back(root, root);
     while (!pending.empty())
     {
