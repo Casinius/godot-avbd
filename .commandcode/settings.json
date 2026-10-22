@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(xmake:*)",
+      "Shell(grep:*)"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}
