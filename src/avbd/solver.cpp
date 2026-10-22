@@ -265,63 +265,90 @@ void Solver::broadPhase() {
   if (root < 0 || bvhNodes.size() < 2)
     return;
 
-  const auto boundsOverlap = [this](int a, int b) {
+  // const auto boundsOverlap = [this](int a, int b) {
+  //   const float3 aMin = bvhNodes.boundsMin(a);
+  //   const float3 aMax = bvhNodes.boundsMax(a);
+  //   const float3 bMin = bvhNodes.boundsMin(b);
+  //   const float3 bMax = bvhNodes.boundsMax(b);
+  //   return !(bMin.x() > aMax.x() || bMin.y() > aMax.y() ||
+  //            bMin.z() > aMax.z() || bMax.x() < aMin.x() ||
+  //            bMax.y() < aMin.y() || bMax.z() < aMin.z());
+  // };
+  auto boundsOverlap = [this](int a, int b) {
     const float3 aMin = bvhNodes.boundsMin(a);
     const float3 aMax = bvhNodes.boundsMax(a);
     const float3 bMin = bvhNodes.boundsMin(b);
     const float3 bMax = bvhNodes.boundsMax(b);
-    return !(bMin.x() > aMax.x() || bMin.y() > aMax.y() ||
-             bMin.z() > aMax.z() || bMax.x() < aMin.x() ||
-             bMax.y() < aMin.y() || bMax.z() < aMin.z());
-  };
 
+    if (bMin.x() > aMax.x() || bMax.x() < aMin.x())
+      return false;
+    if (bMin.y() > aMax.y() || bMax.y() < aMin.y())
+      return false;
+    if (bMin.z() > aMax.z() || bMax.z() < aMin.z())
+      return false;
+    return true;
+  };
   sweepPairs.clear();
   std::vector<std::pair<int, int>> pending;
   // The stack never holds more than a few dozen node pairs on a well-balanced
   // tree, and every grow beyond the reserve is a fresh heap block per step.
-  pending.reserve(64);
+
+  auto pushPair = [&](int x, int y) {
+    if (x == y) {
+      // 叶节点自对没有意义
+      if (!bvhNodes.isLeaf(x))
+        pending.emplace_back(x, y);
+      return;
+    }
+    // 关键：不重叠的节点对根本不入栈
+    if (boundsOverlap(x, y))
+      pending.emplace_back(x, y);
+  };
+
+  pending.clear();
+  pending.reserve(128); // 可复用成员，不要每步新建
   pending.emplace_back(root, root);
+
   while (!pending.empty()) {
     const auto [a, b] = pending.back();
     pending.pop_back();
+
     if (a == b) {
-      if (bvhNodes.isLeaf(a))
-        continue;
       const int left = bvhNodes.left()[a];
       const int right = bvhNodes.right()[a];
-      pending.emplace_back(left, left);
-      pending.emplace_back(left, right);
-      pending.emplace_back(right, right);
+      pushPair(left, left);
+      pushPair(left, right);
+      pushPair(right, right);
       continue;
     }
-    if (!boundsOverlap(a, b))
-      continue;
+
+    // 到这里 a,b 已经保证 AABB 重叠，不需要再 boundsOverlap
     const bool aLeaf = bvhNodes.isLeaf(a);
     const bool bLeaf = bvhNodes.isLeaf(b);
+
     if (aLeaf && bLeaf) {
-      sweepPairs.push_back(
-          std::minmax(bvhNodes.bodyIndex(a), bvhNodes.bodyIndex(b)));
+      const int ia = bvhNodes.bodyIndex(a);
+      const int ib = bvhNodes.bodyIndex(b);
+      if (ia != ib)
+        sweepPairs.push_back(std::minmax(ia, ib));
       continue;
     }
+
     if (aLeaf) {
-      const int left = bvhNodes.left()[b];
-      const int right = bvhNodes.right()[b];
-      pending.emplace_back(a, left);
-      pending.emplace_back(a, right);
+      pushPair(a, bvhNodes.left()[b]);
+      pushPair(a, bvhNodes.right()[b]);
     } else if (bLeaf) {
-      const int left = bvhNodes.left()[a];
-      const int right = bvhNodes.right()[a];
-      pending.emplace_back(left, b);
-      pending.emplace_back(right, b);
+      pushPair(bvhNodes.left()[a], b);
+      pushPair(bvhNodes.right()[a], b);
     } else {
       const int leftA = bvhNodes.left()[a];
       const int rightA = bvhNodes.right()[a];
       const int leftB = bvhNodes.left()[b];
       const int rightB = bvhNodes.right()[b];
-      pending.emplace_back(leftA, leftB);
-      pending.emplace_back(leftA, rightB);
-      pending.emplace_back(rightA, leftB);
-      pending.emplace_back(rightA, rightB);
+      pushPair(leftA, leftB);
+      pushPair(leftA, rightB);
+      pushPair(rightA, leftB);
+      pushPair(rightA, rightB);
     }
   }
 
