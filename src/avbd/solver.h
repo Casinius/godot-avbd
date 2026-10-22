@@ -479,7 +479,7 @@ struct Solver
     // improves the average residual by less than this (or worsens it), the iteration set
     // ends early - remaining rounds would polish float noise at full price. 0 disables
     // the check (default: bit-identical iteration counts). Realistic value ~1e-5.
-    float convergenceThreshold = 0.0f;
+    float convergenceThreshold = 1e-5f;
 
     // Incremental jacobian rebuild distance (metres): after the first Newton round
     // assembles a contact's angular jacobian, later rounds reuse it while the contact's
