@@ -132,7 +132,7 @@ void Solver::step()
 
     broadPhase();
     const int forceCount = warmstartForces();
-    colourGraph();
+    selectUpdateBodies();
     warmstartBodies();
     solveIterations(forceCount);
     finishVelocities();
@@ -363,13 +363,15 @@ void Solver::solveIterations(int forceCount)
     iterate(targetIterations, forceCount, newtonRounds);
 }
 
-// One worker-loop body for the whole iteration set: `iterations` rounds of a primal pass
-// per colour followed by a dual pass, with a barrier fence at every phase boundary.
+// One worker-loop body for the whole iteration set: `iterations` rounds of the block
+// Jacobi primal (one full block solve per body against the iteration-start pose, then a
+// combine pass) followed by a dual pass, with a barrier fence at every phase boundary.
 //
-// The shape matters more than the phases: the old code re-entered the pool once per
-// colour per iteration (~45 us a dispatch), which at 8 colours x 10 iterations burned
-// ~4 ms of a 16 ms frame on synchronisation alone. Here one dispatch arms the workers
-// once per step and each boundary costs a ~1-3 us barrier instead.
+// The shape matters more than the phases: one dispatch arms the workers once per step and
+// each boundary costs a ~1-3 us barrier. The Jacobi primal needs two fences per round
+// regardless of how entangled the constraint graph is - the old colour-parallel
+// Gauss-Seidel needed one per colour, which is why dense stacking scenes starved it (and
+// why the incremental colouring's correctness was so fragile).
 //
 // Both sync types run the identical body: NullSync (small scenes, or another solver
 // holding the loop) executes it inline in list order, which is exactly the threads=1
@@ -390,15 +392,31 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
             const bool newton = it < newtonRounds;
             if (newton)
             {
-                for (int colour = 0; colour < colours; colour++)
-                {
-                    const int first = colourStart[colour];
-                    const int last = colourStart[colour + 1];
-                    sync.forItems(last - first, [this, first](int i) {
-                        updatePrimal(updateOrder[first + i]);
-                    });
-                    sync.arriveAndWait();
-                }
+                // Block projected Jacobi: every update-set body assembles its full block
+                // system (own inertia plus every incident constraint, all stamped against
+                // the iteration-start pose) and solves for its delta. Nobody writes a
+                // pose until the combine pass, so every body reads the same frozen
+                // snapshot - race-free by construction, no colours, and no thread-count
+                // dependence.
+                sync.forItems(static_cast<int>(updateOrder.size()), [this](int i) {
+                    Rigid *body = updateOrder[i];
+                    Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
+                            body->positionAng, body->inertialAng);
+                    for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
+                        f->updatePrimal(body, alpha, block);
+                    block.solveDelta(bodyDeltaLin[i], bodyDeltaAng[i]);
+                });
+                sync.arriveAndWait();
+
+                // Combine: each body applies its own delta (relaxed; see
+                // Solver::jacobiRelaxation). A body with no constraints solves to exactly
+                // its inertial pose - free flight falls out of the same code path.
+                sync.forItems(static_cast<int>(updateOrder.size()), [this](int i) {
+                    Rigid *body = updateOrder[i];
+                    body->positionLin = body->positionLin + bodyDeltaLin[i] * jacobiRelaxation;
+                    body->positionAng = body->positionAng + bodyDeltaAng[i] * jacobiRelaxation;
+                });
+                sync.arriveAndWait();
             }
 
             // Dual update: one item per force, and each force only reads the (frozen)
@@ -606,38 +624,26 @@ void Solver::islandSleep()
 // The primal half of one iteration for a single body (Eqs. 4-6): assemble the 6x6 system
 // from every force acting on the body, then solve it and move the body.
 //
-// Only ever called for movable bodies: `updateOrder` holds exactly those, which is also
-// why a static body needs no guard here.
 // Solve the assembled system and move the body by the result (Eq. 4).
 void Block::apply(Rigid &body) const noexcept
 {
     float3 dxLin, dxAng;
-    solve(lhsLin, lhsAng, lhsCross, -rhsLin, -rhsAng, dxLin, dxAng);
+    solveDelta(dxLin, dxAng);
     body.positionLin = body.positionLin + dxLin;
     body.positionAng = body.positionAng + dxAng;
 }
 
-void Solver::updatePrimal(Rigid *body)
-{
-    Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
-            body->positionAng, body->inertialAng);
-
-    for (Force *force = body->forces; force != 0; force = (force->bodyA == body) ? force->nextA : force->nextB)
-        force->updatePrimal(body, alpha, block);
-
-    block.apply(*body);
-}
-
-// Greedy graph colouring of the constraint graph. A body's colour must differ from every
-// body it shares a force with, which is precisely the condition for two bodies to be
-// updatable at the same time.
+// Block Jacobi needs no colours and no mass splitting: the primal is parallel over
+// bodies, each solving its full block system (own inertia plus every incident
+// constraint, stamped against the iteration-start pose snapshot) and holding the delta
+// for the combine pass. Rigid-body constraint graphs have no shared-vertex structure to
+// split around - each manifold couples exactly two bodies - so the body-level split is
+// the natural one: race-free by construction, one 6x6 solve per body per round.
 //
-// Incremental: a body in this step's update set keeps its previous colour unless a
-// neighbour now holds it, in which case it re-runs the first-fit search. Contacts move
-// slowly between steps, so the search is rarely paid. Bodies outside the update set
-// (static or sleeping) carry `colour == -1`, keeping the invariant that `colour >= 0`
-// marks exactly the bodies in `updateOrder` - a stale colour is never trusted.
-void Solver::colourGraph()
+// The wake-up and island-sleep logic is unchanged from the colouring era: a sleeping body
+// sharing a force with a moving movable body re-enters the update set, and settled
+// islands sleep together.
+void Solver::selectUpdateBodies()
 {
     warmstartOrder.clear();
     updateOrder.clear();
@@ -673,11 +679,13 @@ void Solver::colourGraph()
     }
 
     // Every body is warmed up; only movable ones are updated. Static bodies are excluded
-    // from the colouring: they are never moved, so they take no part in the update order
-    // and cannot conflict with anything.
+    // from the update set: they are never moved, so nothing solves for them.
     for (Rigid *body = bodies; body != 0; body = body->next)
     {
         warmstartOrder.push_back(body);
+
+        // Fresh per-step state; admitted bodies flip inUpdateSet below.
+        body->inUpdateSet = false;
 
         // Sleep mode support (Godot 4.7 API)
         // SLEEP_MODE_NEVER: always update
@@ -713,76 +721,18 @@ void Solver::colourGraph()
             if (should_update)
             {
                 updateOrder.push_back(body);
-            }
-            else
-            {
-                // Not in this step's update set: drop any stale colour so the invariant
-                // `colour >= 0` <=> "in updateOrder" holds.
-                body->colour = -1;
+                body->inUpdateSet = true;
             }
         }
         else
         {
-            // Static body: excluded from the update set, so it must not contribute a
-            // stale colour.
-            body->colour = -1;
+            // Static body: excluded from the update set, so nothing solves for it.
         }
     }
 
-    std::vector<int> taken;
-    int maxColour = -1;
-    for (Rigid *body : updateOrder)
-    {
-        // Collect the neighbours' current colours.
-        taken.clear();
-        for (Force *force = body->forces; force != 0; force = (force->bodyA == body) ? force->nextA : force->nextB)
-        {
-            Rigid *other = (force->bodyA == body) ? force->bodyB : force->bodyA;
-            if (other != 0 && other->colour >= 0)
-                taken.push_back(other->colour);
-        }
-
-        // Incremental recolouring: keep the previous colour when no neighbour took it.
-        // A kept colour is conflict-free: neighbours processed earlier in this loop hold
-        // their final colours, and a later neighbour that would collide with a kept colour
-        // sees it in `taken` and refits. Only bodies whose neighbourhood actually changed
-        // pay for the first-fit search.
-        int colour = body->colour;
-        if (colour < 0 || std::ranges::find(taken, colour) != taken.end())
-        {
-            colour = 0;
-            while (std::ranges::find(taken, colour) != taken.end())
-                colour++;
-        }
-
-        body->colour = colour;
-        if (colour > maxColour)
-            maxColour = colour;
-    }
-
-    colours = maxColour + 1;
-
-    // Group the bodies by colour, so each iteration walks contiguous, independent runs.
-    std::vector<int> perColour;
-    perColour.reserve(colours);
-    perColour.assign(colours, 0);
-    for (const Rigid *body : updateOrder)
-        perColour[body->colour]++;
-
-    colourStart.assign(colours + 1, 0);
-    std::exclusive_scan(perColour.begin(), perColour.end(), colourStart.begin(), 0);
-    colourStart[colours] = static_cast<int>(updateOrder.size());
-
-    widest = perColour.empty() ? 0 : *std::ranges::max_element(perColour);
-
-    std::vector<int> cursor;
-    cursor.reserve(colours + 1);
-    cursor = colourStart; // cursor[c] is the next free slot for colour c
-    std::vector<Rigid *> grouped;
-    grouped.reserve(updateOrder.size());
-    for (Rigid *body : updateOrder)
-        grouped.push_back(body);
-    updateOrder = std::move(grouped);
+    // Per-body delta buffers for the Jacobi primal's split-solve / combine pair.
+    bodyDeltaLin.resize(updateOrder.size());
+    bodyDeltaAng.resize(updateOrder.size());
 }
 
 // Fill `forceOrder` with the solver's forces, so the phases can address them by index.

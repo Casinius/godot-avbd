@@ -325,12 +325,24 @@ void sceneBreakable(Solver *solver)
         new Rigid(solver, {2, 1, 1}, 1.0f, 0.5f, {0, 0, i * 2.0f + 8.0f});
 }
 
+void scenePyramidXL(Solver *solver)
+{
+    const int SIZE = 57; // 1653 boxes + ground: large-stack scale for the parallel bench
+    solver->clear();
+    new Rigid(solver, {100, 100, 1}, 0.0f, 0.5f, {0.0f, 0.0f, -0.5f});
+
+    for (int y = 0; y < SIZE; y++)
+        for (int x = 0; x < SIZE - y; x++)
+            new Rigid(solver, {1, 0.5f, 0.5f}, 1.0f, 0.5f, {x * 1.01f + y * 0.5f - SIZE / 2.0f, 0.0f, y * 0.85f + 0.5f});
+}
+
 const CoreScene coreScenes[] = {
     {"Empty", sceneEmpty},
     {"Ground", sceneGround},
     {"Dynamic Friction", sceneDynamicFriction},
     {"Static Friction", sceneStaticFriction},
     {"Pyramid", scenePyramid},
+    {"Pyramid XL", scenePyramidXL},
     {"Rope", sceneRope},
     {"Heavy Rope", sceneHeavyRope},
     {"Spring", sceneSpring},
@@ -342,6 +354,6 @@ const CoreScene coreScenes[] = {
     {"Breakable", sceneBreakable},
 };
 
-const int coreSceneCount = 14;
+const int coreSceneCount = 15;
 
 } // namespace avbd
