@@ -18,5 +18,7 @@ Object *PhysicsServerFactory::create_server() {
 }
 
 void PhysicsServerFactory::_bind_methods() {
-    // ClassDB::bind_method(D_METHOD("create_server"), &PhysicsServerFactory::create_server);
+    // The manager calls the registered callable to instantiate the server; without this
+    // binding the call fails and Godot silently falls back to the built-in engine.
+    ClassDB::bind_method(D_METHOD("create_server"), &PhysicsServerFactory::create_server);
 }
