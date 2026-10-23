@@ -187,6 +187,10 @@ protected:
     struct SpaceData {
         avbd::Solver solver;
         bool active = true;
+        // Re-read the project-setting solver parameters on the next step. Set at creation
+        // and by the settings-changed signal, so the common tick does not hash nine
+        // setting names for nothing.
+        bool params_dirty = true;
 
         // Solver parameters, read from project settings at space creation and stamped
         // into the solver every step (so a changed setting shows up without a restart).
@@ -205,6 +209,10 @@ protected:
         // Newton phase ends: stiff-penalty tails converge slowly, softening them lets the
         // cheaper iterations finish the job. 1.0 = no decay (original behaviour).
         double stiffness_decay = 1.0;
+        // Rotation drift (unit-column distance, ~2 sin(angle/2)) above which a manifold's
+        // cached angular jacobians are rebuilt. 0 disables the cache and reassembles them
+        // for every contact on every iteration (original behaviour).
+        double jacobian_rebuild_distance = 0.0;
 
         // Debug contacts collected during the last step (world space, Godot frame).
 
@@ -255,6 +263,9 @@ protected:
     // follow the game, so _step refuses to run while the engine says the server is inactive.
     bool server_active = true;
     bool flushing_queries = false;
+    // Set once any space has stepped. _flush_queries delivers state to the scene only
+    // after that, so the engine never reads a body pose the solver has not produced.
+    bool has_stepped = false;
 
     // Cached state objects handed to the engine's callbacks; re-aimed per body before use.
     AVBDDirectBodyState3D *body_state = nullptr;
@@ -272,6 +283,9 @@ protected:
     static void read_project_gravity(SpaceData &p_space);
     // Solver parameters live in project settings the same way ("physics/avbd/*").
     void read_project_params(SpaceData &p_space);
+    // ProjectSettings::settings_changed lands here (deferred); marks every space's
+    // parameters for a re-read on the next step.
+    void _on_project_settings_changed();
 
     // Rebuild the solver for one space from the bodies and joints assigned to it. Needed
     // whenever a body, its shapes, its mode or a joint changes, because those decide what the
@@ -345,6 +359,9 @@ protected:
         ClassDB::bind_method(D_METHOD("get_solver_colour_graph_time"), &AVBDPhysicsServer3D::get_solver_colour_graph_time);
         ClassDB::bind_method(D_METHOD("get_solver_solve_time"), &AVBDPhysicsServer3D::get_solver_solve_time);
         ClassDB::bind_method(D_METHOD("get_solver_finish_time"), &AVBDPhysicsServer3D::get_solver_finish_time);
+        // Target of the ProjectSettings::settings_changed connection made in _init. Bound
+        // so the StringName callable can reach it; not meant for scripts.
+        ClassDB::bind_method(D_METHOD("_on_project_settings_changed"), &AVBDPhysicsServer3D::_on_project_settings_changed);
         // ClassDB::bind_method(D_METHOD("get_singleton"), &AVBDPhysicsServer3D::get_singleton); // static method, not bound
     }
 

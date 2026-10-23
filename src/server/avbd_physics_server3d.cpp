@@ -10,7 +10,10 @@
 
 #include "avbd/list_range.hpp"
 
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <ranges>
@@ -29,6 +32,47 @@ using namespace godot;
 // Singleton pointer declaration.
 AVBDPhysicsServer3D *AVBDPhysicsServer3D::SpaceData::singleton = nullptr;
 using namespace avbd_godot;
+
+// --- step profiling (AVBD_PROFILE=1) -----------------------------------------
+//
+// Env-gated aggregate timers for headless runs that need to attribute per-tick
+// cost to a phase: rebuild, project-settings reads, force integration, the
+// solver itself, contact collection, sync dispatch. Off by default; the on
+// path is a handful of steady_clock reads per step.
+
+namespace {
+using ProfClock = std::chrono::steady_clock;
+
+double seconds_since(const ProfClock::time_point &p_since) {
+    return std::chrono::duration<double, std::nano>(ProfClock::now() - p_since).count();
+}
+
+struct StepProfile {
+    bool enabled = false;
+    bool decided = false;
+    uint64_t ticks = 0;
+    double total_ns = 0.0;
+    double solver_ns = 0.0;
+    double sync_ns = 0.0;
+    double contacts_ns = 0.0;
+    double rebuild_ns = 0.0;
+    double params_ns = 0.0;
+    double forces_ns = 0.0;
+    int threads_used = 1;
+    int substeps = 0;
+    int iterations = 0;
+};
+
+StepProfile &step_profile() {
+    static StepProfile profile;
+    if (!profile.decided) {
+        profile.decided = true;
+        const char *env = std::getenv("AVBD_PROFILE");
+        profile.enabled = env != nullptr && env[0] != '\0' && env[0] != '0';
+    }
+    return profile;
+}
+} // namespace
 
 // Godot 4.3 added per-axis springs to the generic 6-DOF joint and grew the server enums; the
 // godot-cpp headers this extension builds against predate that, so the new slots are named
@@ -133,11 +177,69 @@ void AVBDPhysicsServer3D::_init() {
         read_project_gravity(space);
         read_project_params(space);
     }
+    if (ProjectSettings *settings = ProjectSettings::get_singleton()) {
+        // Solver parameters are re-read only when a setting actually changes (the signal
+        // is deferred), instead of hashing the setting names on every tick.
+        settings->connect("settings_changed", Callable(this, "_on_project_settings_changed"));
+    }
+}
+
+void AVBDPhysicsServer3D::_on_project_settings_changed() {
+    for (auto &[id, space] : spaces) {
+        (void)id;
+        space.params_dirty = true;
+    }
 }
 
 void AVBDPhysicsServer3D::_flush_queries() {
     flushing_queries = true;
-    // Nothing accumulates queries yet; the direct space state answers immediately.
+    // The engine flushes before stepping, so this is where the last step's poses reach
+    // the scene: the per-body state-sync callable, then scripted integration. Both read
+    // and write the solver's live state, so forces a script applies in _integrate_forces
+    // land in the step about to run (the GodotPhysics contract, and godot-jolt's shape).
+    // The first flush of a scene has no step behind it yet: nothing to deliver.
+    if (has_stepped) {
+        StepProfile &prof = step_profile();
+        const ProfClock::time_point prof_t_sync = ProfClock::now();
+
+        static thread_local Array one_arg = []() {
+            Array array;
+            array.resize(1);
+            return array;
+        }();
+        static thread_local Array two_args = []() {
+            Array array;
+            array.resize(2);
+            return array;
+        }();
+
+        for (auto &[body_id, body] : bodies) {
+            if (body.rigid == nullptr) {
+                continue;
+            }
+            if (!body.sync.is_valid() && !body.force_integration_callback.is_valid()) {
+                continue;
+            }
+            body_state->bind(this, body.rigid, make_rid(body_id));
+            if (body.sync.is_valid()) {
+                one_arg[0] = body_state;
+                body.sync.callv(one_arg);
+            }
+            if (body.force_integration_callback.is_valid()) {
+                if (body.force_integration_userdata.get_type() != Variant::NIL) {
+                    two_args[0] = body_state;
+                    two_args[1] = body.force_integration_userdata;
+                    body.force_integration_callback.callv(two_args);
+                } else {
+                    one_arg[0] = body_state;
+                    body.force_integration_callback.callv(one_arg);
+                }
+            }
+        }
+        if (prof.enabled) {
+            prof.sync_ns += seconds_since(prof_t_sync);
+        }
+    }
     flushing_queries = false;
 }
 
@@ -240,6 +342,7 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     p_space.substeps = static_cast<int>(settings->get_setting("physics/avbd/substeps", 2));
     p_space.newton_ratio = settings->get_setting("physics/avbd/newton_ratio", 1.0);
     p_space.stiffness_decay = settings->get_setting("physics/avbd/stiffness_decay", 0.8);
+    p_space.jacobian_rebuild_distance = settings->get_setting("physics/avbd/jacobian_rebuild_distance", 0.0);
 }
 
 void AVBDPhysicsServer3D::_space_set_active(const RID &p_space, bool p_active) {
@@ -938,6 +1041,19 @@ void AVBDPhysicsServer3D::_step(double p_step) {
         body_state = memnew(AVBDDirectBodyState3D);
     }
 
+    StepProfile &prof = step_profile();
+    const bool profiling = prof.enabled;
+    const ProfClock::time_point prof_t0 = ProfClock::now();
+    double prof_rebuild = 0.0;
+    double prof_params = 0.0;
+    double prof_forces = 0.0;
+    double prof_solver = 0.0;
+    double prof_contacts = 0.0;
+    int prof_threads = 1;
+    int prof_substeps = 0;
+    int prof_iterations = 0;
+    bool stepped_any = false;
+
     for (auto &[id, space] : spaces) {
         if (!space.active) {
             continue;
@@ -948,16 +1064,23 @@ void AVBDPhysicsServer3D::_step(double p_step) {
         // the empty check: a space may be pending precisely because its first body is
         // only now arriving.
         if (space_rebuild_pending.erase(id) > 0) {
+            const ProfClock::time_point prof_t_rebuild = ProfClock::now();
             rebuild_space(make_rid(id));
+            prof_rebuild += seconds_since(prof_t_rebuild);
         }
 
         if (space.solver.bodies == nullptr) {
             continue;
         }
 
-        // Project settings may have changed since the last step (the tests flip
-        // physics/avbd/substeps at runtime); re-read before stamping.
-        read_project_params(space);
+        // Project settings are re-read only after a change (the tests flip
+        // physics/avbd/substeps at runtime and expect it to apply without a restart).
+        const ProfClock::time_point prof_t_params = ProfClock::now();
+        if (space.params_dirty) {
+            read_project_params(space);
+            space.params_dirty = false;
+        }
+        prof_params += seconds_since(prof_t_params);
 
         const float dt = static_cast<float>(p_step);
         const int substeps = space.substeps > 0 ? space.substeps : 1;
@@ -971,11 +1094,13 @@ void AVBDPhysicsServer3D::_step(double p_step) {
         // Newton/impulse phase split and tail-stiffness decay (real-time trade-off knobs).
         space.solver.newtonRatio = static_cast<float>(std::clamp(space.newton_ratio, 0.0, 1.0));
         space.solver.stiffnessDecay = static_cast<float>(std::clamp(space.stiffness_decay, 0.0, 1.0));
+        space.solver.jacobianRebuildDistance = static_cast<float>(std::max(space.jacobian_rebuild_distance, 0.0));
         // Idle-sleep horizon: 30 steps at the usual 60 Hz tick = Godot's 0.5 s default.
         space.solver.sleepFrames = 30;
 
         // Forces accumulated since the last step (persistent constant_* plus one-shot frame
         // ones) become velocity changes now, so the solver integrates them with everything else.
+        const ProfClock::time_point prof_t_forces = ProfClock::now();
         for (auto &[body_id, body] : bodies) {
             if (id_of(body.space) != id || body.rigid == nullptr || body.rigid->mass <= 0.0f) {
                 continue;
@@ -1001,27 +1126,38 @@ void AVBDPhysicsServer3D::_step(double p_step) {
                 body.rigid->velocityAng += body.rigid->positionAng * delta;
             }
         }
+        prof_forces += seconds_since(prof_t_forces);
 
+        const ProfClock::time_point prof_t_solver = ProfClock::now();
         for (int sub = 0; sub < substeps; sub++) {
             space.solver.step();
         }
+        prof_solver += seconds_since(prof_t_solver);
+        stepped_any = true;
 
         // Area monitoring runs once per engine step, after the solver's output is in hand
         // and before the scene reads anything back.
         _monitor_areas();
+        const ProfClock::time_point prof_t_contacts = ProfClock::now();
 
         // Collect each body's contacts for the step (used by the DirectBodyState contact
         // getters, i.e. RigidBody3D contact monitoring). Manifolds are the forces with
         // contact points; a contact's world position comes from the anchor of the body
         // being filled. Capped by max_contacts_reported, as Godot does: without the cap
-        // request no contacts are recorded.
+        // request no contacts are recorded. The manifold walk (and its two hash maps)
+        // only runs when some body in this space actually reports contacts.
+        bool any_reports = false;
         for (auto &[collect_id, collect_body] : bodies) {
             (void)collect_id;
             if (id_of(collect_body.space) != id) {
+                continue;
+            }
+            if (collect_body.max_contacts_reported > 0) {
                 collect_body.frame_contacts.clear();
+                any_reports = true;
             }
         }
-        {
+        if (any_reports) {
             // Rigid -> owning record, resolved once for the whole manifold walk.
             std::unordered_map<const avbd::Rigid *, BodyData *> rigid_map;
             std::unordered_map<const BodyData *, uint64_t> id_map;
@@ -1066,14 +1202,16 @@ void AVBDPhysicsServer3D::_step(double p_step) {
                 }
             }
         }
+        prof_contacts += seconds_since(prof_t_contacts);
 
         for (auto &[body_id, body] : bodies) {
             if (id_of(body.space) != id || body.rigid == nullptr) {
                 continue;
             }
 
-            // Wall clock the result back, through the callback the engine registered for this
-            // body. The server does not touch the scene itself: the engine applies it.
+            // Snapshot the solver's output into the host record; _flush_queries delivers
+            // it to the scene before the next step, through the callback the engine
+            // registered for this body. The server does not touch the scene itself.
             const avbd::Rigid *rigid = body.rigid;
 
             Transform3D transform;
@@ -1087,29 +1225,47 @@ void AVBDPhysicsServer3D::_step(double p_step) {
             // writes body.sleeping back into body.rigid->sleeping, so a solver-side sleep
             // decision would otherwise be overwritten on the next step.
             body.sleeping = rigid->sleeping;
+        }
 
-            // Godot 4.x sync contract (verified against 4.7 sources): the callable receives
-            // exactly one argument - the PhysicsDirectBodyState3D. The engine reads transform,
-            // velocities, sleeping and contacts off it.
-            if (body.sync.is_valid()) {
-                body_state->bind(this, body.rigid, make_rid(body_id));
-                Array args;
-                args.push_back(body_state);
-                body.sync.callv(args);
-            }
+        prof_threads = std::max(prof_threads, space.solver.threadCount());
+        prof_substeps = std::max(prof_substeps, substeps);
+        prof_iterations = std::max(prof_iterations, space.solver.iterations);
+    }
 
-            // Scripted integration: the callback gets the state plus the stored userdata
-            // (Godot drops the userdata argument when it is nil).
-            if (body.force_integration_callback.is_valid()) {
-                body_state->bind(this, body.rigid, make_rid(body_id));
-                Array args;
-                args.push_back(body_state);
-                const bool has_userdata = body.force_integration_userdata.get_type() != Variant::NIL;
-                if (has_userdata) {
-                    args.push_back(body.force_integration_userdata);
-                }
-                body.force_integration_callback.callv(args);
-            }
+    if (stepped_any) {
+        has_stepped = true;
+    }
+
+    if (profiling) {
+        prof.total_ns += seconds_since(prof_t0);
+        prof.solver_ns += prof_solver;
+        prof.contacts_ns += prof_contacts;
+        prof.rebuild_ns += prof_rebuild;
+        prof.params_ns += prof_params;
+        prof.forces_ns += prof_forces;
+        prof.threads_used = std::max(prof.threads_used, prof_threads);
+        prof.substeps = prof_substeps;
+        prof.iterations = prof_iterations;
+        prof.ticks++;
+        if (prof.ticks % 240 == 0) {
+            constexpr double to_us = 0.001;
+            std::fprintf(stdout,
+                    "[avbd-profile] ticks=%llu total=%.1fus solver=%.1fus sync=%.1fus contacts=%.1fus "
+                    "rebuild=%.1fus params=%.1fus forces=%.1fus threads=%d substeps=%d iterations=%d\n",
+                    static_cast<unsigned long long>(prof.ticks), prof.total_ns * to_us,
+                    prof.solver_ns * to_us, prof.sync_ns * to_us, prof.contacts_ns * to_us,
+                    prof.rebuild_ns * to_us, prof.params_ns * to_us, prof.forces_ns * to_us,
+                    prof.threads_used, prof.substeps, prof.iterations);
+            std::fflush(stdout);
+            prof.ticks = 0;
+            prof.total_ns = 0.0;
+            prof.solver_ns = 0.0;
+            prof.sync_ns = 0.0;
+            prof.contacts_ns = 0.0;
+            prof.rebuild_ns = 0.0;
+            prof.params_ns = 0.0;
+            prof.forces_ns = 0.0;
+            prof.threads_used = 1;
         }
     }
 }
