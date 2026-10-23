@@ -46,6 +46,15 @@ static void report(bool ok, const char *name, const char *fmt, ...) {
 }
 
 static void step_n(Solver &s, int n) {
+    // Tuning affordance: AVBD_JACOBI_RELAX overrides the combine-pass relaxation for
+    // sweep runs without touching the solver default. Same value for every solver in a
+    // process, so determinism/parallel-equivalence checks stay meaningful.
+    static const float relax = []() {
+        const char *env = std::getenv("AVBD_JACOBI_RELAX");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0f;
+    }();
+    if (relax > 0.0f)
+        s.jacobiRelaxation = relax;
     for (int i = 0; i < n; i++) {
         s.step();
     }
@@ -390,9 +399,10 @@ static const CoreScene *find_scene(const std::string &name) {
 }
 
 // ---------------------------------------------------------------------------
-// The parallel update must not depend on how many threads run it: work inside a colour
-// is independent, so the split cannot change the result. If this ever fails, the
-// colouring has put two coupled bodies in the same group (a race and a wrong answer).
+// The parallel update must not depend on how many threads run it: every force solves its
+// own mass-split problem against the same pose snapshot, and each body sums its shares in
+// list order, so the split cannot change the result. If this ever fails, a phase boundary
+// is missing and coupled work is racing.
 // ---------------------------------------------------------------------------
 static uint64_t scene_digest(int threads, int steps) {
     Solver s;
@@ -407,8 +417,8 @@ static uint64_t scene_digest(int threads, int steps) {
 static uint64_t mixed_digest(int threads) {
     Solver s;
     s.threads = threads;
-    // Bodies coupled by contacts and joints, plus a free-falling stack, so the colours are
-    // varied: contacts (coupled), joints (coupled), and singletons.
+    // Bodies coupled by contacts and joints, plus a free-falling stack, so the update set
+    // is varied: contacts (coupled), joints (coupled), and singletons.
     new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
     Rigid *prev = 0;
     for (int i = 0; i < 30; i++) {
@@ -446,8 +456,8 @@ static void test_parallel_equivalence() {
     }
 }
 
-// Report the shape of the constraint graph: how much of the work can run at once.
-static void report_colouring() {
+// Report the parallel shape of each scene: how many bodies the Jacobi primal moves.
+static void report_parallel_shape() {
     const char *names[] = {"Stack", "Pyramid", "Soft Body", "Bridge"};
     for (const char *name : names) {
         const CoreScene *scene = find_scene(name);
@@ -461,8 +471,8 @@ static void report_colouring() {
         for (Rigid *b = s.bodies; b != 0; b = b->next)
             if (b->mass > 0)
                 movable++;
-        std::printf("     colours %-10s colours=%2d widest=%4d movable=%4d threads=%d\n", name, s.colourCount(),
-                s.widestColour(), movable, s.threadCount());
+        std::printf("     shape    %-10s bodies=%4d movable=%4d threads=%d\n", name, count_bodies(s),
+                movable, s.threadCount());
     }
 }
 
@@ -1028,8 +1038,8 @@ static int run_scene(const std::string &name, int steps, int threads) {
     scene->build(&s);
     std::printf("scene '%s': %d bodies, %d forces\n", scene->name, count_bodies(s), count_forces(s));
     step_n(s, steps);
-    std::printf("after %d steps: threads=%d colours=%d widest=%d contacts=%d max|x|=%.4f finite=%s digest=0x%016llx\n",
-            steps, s.threadCount(), s.colourCount(), s.widestColour(), count_contact_points(s), max_abs_position(s),
+    std::printf("after %d steps: threads=%d bodies=%d contacts=%d max|x|=%.4f finite=%s digest=0x%016llx\n",
+            steps, s.threadCount(), count_bodies(s), count_contact_points(s), max_abs_position(s),
             all_finite(s) ? "yes" : "NO", (unsigned long long)state_digest(s));
     return all_finite(s) ? 0 : 1;
 }
@@ -1050,8 +1060,7 @@ static int run_bench(int threads) {
     Solver s;
     s.threads = threads;
     build_bench_scene(s);
-    std::printf("bench: %d boxes, %d iterations, %d bodies movable\n", count_bodies(s), s.iterations,
-            s.widestColour());
+    std::printf("bench: %d boxes, %d iterations\n", count_bodies(s), s.iterations);
 
     const int warmup = 30;
     const int timed = 120;
@@ -1063,9 +1072,8 @@ static int run_bench(int threads) {
     const auto t1 = std::chrono::steady_clock::now();
 
     const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / (double)timed;
-    std::printf("bench: threads=%d colours=%d widest=%d -> %.3f ms/step, contacts=%d, finite=%s\n", s.threadCount(),
-            s.colourCount(), s.widestColour(), ms, count_contact_points(s), all_finite(s) ? "yes" : "NO");
-    return all_finite(s) ? 0 : 1;
+    std::printf("bench: threads=%d -> %.3f ms/step, contacts=%d, finite=%s\n", s.threadCount(),
+            ms, count_contact_points(s), all_finite(s) ? "yes" : "NO");    return all_finite(s) ? 0 : 1;
 }
 
 // Sweep the thread count over the same scene so the speedup (and where it stops) is
@@ -1086,21 +1094,20 @@ static int run_bench_sweep() {
         const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / (double)timed;
         if (threads == 1)
             serialMs = ms;
-        std::printf("bench: threads=%2d  %7.3f ms/step  speedup %5.2fx  (colours=%d widest=%d)\n", threads, ms,
-                serialMs / ms, s.colourCount(), s.widestColour());
+        std::printf("bench: threads=%2d  %7.3f ms/step  speedup %5.2fx  (bodies=%d)\n", threads, ms,
+                serialMs / ms, count_bodies(s));
     }
     return 0;
 }
 
 // ---------------------------------------------------------------------------
-// Incremental graph colouring: two boxes at different heights collide mid-run,
-// so a contact force appears between two bodies whose colours were assigned on
-// earlier, force-free steps. The recolouring pass must see the clash and split
-// the colours - a stale colour reuse (or a lost conflict check) shows up as two
-// force-connected bodies sharing one colour, which would corrupt the parallel
-// phases.
+// Block-Jacobi update-set coverage: two boxes at different heights collide mid-run,
+// so a contact force appears between bodies whose update-set membership was decided
+// on earlier, force-free steps. Every awake, movable body taking part in a stamping
+// force must be in the update set - otherwise the constraint is silently dropped
+// for that side and the pair drifts.
 // ---------------------------------------------------------------------------
-static void test_incremental_colouring() {
+static void test_jacobi_shares() {
     Solver s;
     new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
     Rigid *a = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 2});
@@ -1108,14 +1115,16 @@ static void test_incremental_colouring() {
 
     step_n(s, 300);
 
-    bool conflictFree = true;
+    bool covered = true;
     for (const Force *f = s.forces; f != nullptr; f = f->next) {
-        if (f->bodyA->colour >= 0 && f->bodyB->colour >= 0 && f->bodyA->colour == f->bodyB->colour)
-            conflictFree = false;
+        const Rigid *sides[2] = {f->bodyA, f->bodyB};
+        for (const Rigid *side : sides) {
+            if (side != nullptr && side->mass > 0 && !side->sleeping && !side->inUpdateSet)
+                covered = false;
+        }
     }
-    report(conflictFree, "colouring conflict-free", "forces=%d colours=%d", count_forces(s), s.colourCount());
-    report(s.colourCount() >= 1, "colour count valid", "colours=%d widest=%d", s.colourCount(), s.widestColour());
-    report(all_finite(s), "colouring finite", "bodies=%d", count_bodies(s));
+    report(covered, "update set covers every awake constraint", "forces=%d", count_forces(s));
+    report(all_finite(s), "update set finite", "bodies=%d", count_bodies(s));
     (void)a;
     (void)b;
 }
@@ -1134,8 +1143,8 @@ int main(int argc, char **argv) {
             return run_bench(threads);
         } else if (arg == "--bench-sweep") {
             return run_bench_sweep();
-        } else if (arg == "--colour") {
-            report_colouring();
+        } else if (arg == "--shape") {
+            report_parallel_shape();
             return 0;
         } else if (arg == "--scene" && i + 1 < argc) {
             scene = argv[++i];
@@ -1144,7 +1153,7 @@ int main(int argc, char **argv) {
         } else if (arg == "--threads" && i + 1 < argc) {
             threads = std::atoi(argv[++i]);
         } else {
-            std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --colour | --scene NAME [--steps N]]"
+            std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --shape | --scene NAME [--steps N]]"
                                  " [--threads N]\n", argv[0]);
             return 2;
         }
@@ -1161,9 +1170,9 @@ int main(int argc, char **argv) {
     test_soft_lattice();
     test_all_scenes();
     test_determinism();
-    test_incremental_colouring();
+    test_jacobi_shares();
     test_parallel_equivalence();
-    report_colouring();
+    report_parallel_shape();
     test_generic_hinge();
     test_generic_axis_limit();
     test_generic_prismatic_spring();

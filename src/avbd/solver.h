@@ -142,11 +142,10 @@ struct Rigid
     Rigid(Rigid &&) = delete;
     Rigid &operator=(Rigid &&) = delete;
 
-    // Graph-colouring label used by the parallel solver: bodies in one colour never share
-    // a force, so they can be updated concurrently. Written only by Solver::colourGraph();
-    // kept across steps and reset to -1 whenever the body drops out of the update set
-    // (static or sleeping), so -1 = "not in this step's update set".
-    int colour = -1;
+    // Block-Jacobi update-set bookkeeping, rewritten by Solver::selectUpdateBodies() each
+    // step: `inUpdateSet` marks the movable, awake bodies whose pose the primal phases may
+    // change. Bodies outside the set (static, sleeping) are never solved or moved.
+    bool inUpdateSet = false;
     int sleep_mode = 0; // 0=NEVER, 1=SLEEP, 2=START_IN_SLEEP
 
     bool constrainedTo(Rigid *other) const;
@@ -176,6 +175,12 @@ struct Block
             lhsCross(float3x3::Zero()),
             rhsLin(diagonal(mass, mass, mass) / dtSq * (positionLin - inertialLin)),
             rhsAng(diagonal(moment.x(), moment.y(), moment.z()) / dtSq * (positionAng - inertialAng)) {}
+
+    // Solve for the update without applying it (block-Jacobi path: each force stores its
+    // partial delta and a later combine pass applies the sum over a body's constraints).
+    void solveDelta(float3 &r_dxLin, float3 &r_dxAng) const noexcept {
+        solve(lhsLin, lhsAng, lhsCross, -rhsLin, -rhsAng, r_dxLin, r_dxAng);
+    }
 
     // Solve for and apply the update (Eq. 4).
     void apply(Rigid &body) const noexcept;
@@ -481,6 +486,15 @@ struct Solver
     // the check (default: bit-identical iteration counts). Realistic value ~1e-5.
     float convergenceThreshold = 0.0f;
 
+    // Combine-pass relaxation for the block-Jacobi primal. Every body solves its full
+    // block system against the iteration-start pose snapshot (Jacobi, not Gauss-Seidel),
+    // which for stiff densely-coupled scenes can overshoot where the sequential update
+    // would not; scaling the applied delta by omega < 1 trades per-iteration progress
+    // for stability. 1.0 = unrelaxed. The Chebyshev variant replaces this constant with
+    // a per-iteration schedule. Suite sweep: 0.5-0.7 hold every rigid scene; 1.0 drifts
+    // the 32-layer pyramid.
+    float jacobiRelaxation = 0.7f;
+
     // Incremental jacobian rebuild distance (metres): after the first Newton round
     // assembles a contact's angular jacobian, later rounds reuse it while the contact's
     // world-space moment arms have drifted less than this from the captured values.
@@ -490,8 +504,8 @@ struct Solver
 
     // Worker threads for the per-body phases. 0 = one per hardware thread, 1 = run
     // everything inline on the calling thread. The result does not depend on this value:
-    // the update order is fixed by the colouring, and threads only spread one colour's
-    // independent bodies over more cores.
+    // every body solves its own block system against the same pose snapshot, and applies
+    // its own delta.
     int threads = 0;
 
     // Idle detection: a movable body whose BDF1 velocities stay under both thresholds for
@@ -531,16 +545,10 @@ struct Solver
     void clear();
     void step();
 
-    // Split the bodies into colours such that no two bodies in a colour share a force, and
-    // store them grouped by colour in `updateOrder`. Incremental: updated bodies keep their
-    // previous colour unless a neighbour took it; only conflicting bodies are re-coloured.
-    void colourGraph();
+    // Decide which bodies the primal phases may move this step (wake-up, island sleep and
+    // the sleep-mode gate), and size the per-body delta buffers.
+    void selectUpdateBodies();
 
-    // Number of colours in the current ordering (1 means nothing can run in parallel).
-    [[nodiscard]] int colourCount() const { return colours; }
-    // Number of bodies in the largest colour: the most work one parallel phase can spread
-    // over the worker threads. Reporting only.
-    [[nodiscard]] int widestColour() const { return widest; }
     // Number of worker threads actually in use (1 when running inline).
     [[nodiscard]] int threadCount() const;
 
@@ -578,12 +586,12 @@ private:
     bvh::nodes::NodeStorage bvhNodes;
     std::vector<std::pair<int, int>> sweepPairs;
 
-    // Bodies that take part in the primal update (movable ones), grouped by colour:
-    // colour c owns updateOrder[colourStart[c] .. colourStart[c + 1]).
+    // Bodies that take part in the primal update (movable, awake ones), in list order.
+    // The Jacobi primal solves one block system per body against the iteration-start
+    // pose, holding the delta in the parallel buffers below until the combine pass.
     std::vector<Rigid *> updateOrder;
-    std::vector<int> colourStart;
-    int colours = 0;
-    int widest = 0;
+    std::vector<float3> bodyDeltaLin;
+    std::vector<float3> bodyDeltaAng;
 
     // The force list rebuilt each step so the phases can address forces by index, plus the
     // per-force result of initialize() so that deletion can be done in one thread after the
@@ -625,11 +633,11 @@ private:
     void warmstartBodies();
     void solveIterations(int forceCount);
     // The whole iteration set as one persistent-worker loop: `targetIterations` rounds of
-    // per-colour primal passes plus dual passes, fenced by LoopSync barriers instead of
-    // one pool dispatch per phase. Declared here so `iterate` stays testable.
+    // the block-Jacobi primal (one full block solve per body against the iteration-start
+    // pose, then a combine pass) plus dual passes, fenced by LoopSync barriers. Declared
+    // here so `iterate` stays testable.
     void iterate(int targetIterations, int forceCount, int newtonRounds);
     void finishVelocities();
-    void updatePrimal(Rigid *body);
 
     // Island-wide sleep bookkeeping (runs when sleeping is enabled): movable bodies are
     // grouped into islands through force connectivity, and an island whose every body
