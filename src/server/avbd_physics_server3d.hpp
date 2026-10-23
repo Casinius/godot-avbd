@@ -213,6 +213,9 @@ protected:
         // cached angular jacobians are rebuilt. 0 disables the cache and reassembles them
         // for every contact on every iteration (original behaviour).
         double jacobian_rebuild_distance = 0.0;
+        // Chebyshev semi-iteration spectral-radius bound over the Jacobi primal.
+        // 0 = off (constant relaxation); 0.9-0.99 is the useful range.
+        double chebyshev_rho = 0.0;
 
         // Debug contacts collected during the last step (world space, Godot frame).
 

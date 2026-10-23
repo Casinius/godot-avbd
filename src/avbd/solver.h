@@ -146,6 +146,10 @@ struct Rigid
     // step: `inUpdateSet` marks the movable, awake bodies whose pose the primal phases may
     // change. Bodies outside the set (static, sleeping) are never solved or moved.
     bool inUpdateSet = false;
+    // True when every force on the body is a contact manifold. Only such bodies take the
+    // Chebyshev extrapolation: the contact map is clamped and tolerates gamma > 1, hard
+    // joints do not.
+    bool contactOnly = true;
     int sleep_mode = 0; // 0=NEVER, 1=SLEEP, 2=START_IN_SLEEP
 
     bool constrainedTo(Rigid *other) const;
@@ -495,6 +499,19 @@ struct Solver
     // the 32-layer pyramid.
     float jacobiRelaxation = 0.7f;
 
+    // Chebyshev semi-iteration over the block-Jacobi primal (0 = off, the default). The
+    // plain Jacobi estimate x + delta is convex-combined with the previous iterate
+    // through the Chebyshev weights for a symmetric iteration matrix with spectral
+    // radius <= rho: gamma_0 = 1, gamma_1 = 1/(1 - rho^2/2), then
+    // gamma_{k+1} = 1/(1 - rho^2 * gamma_k / 4). Only pure-contact bodies take it
+    // (Rigid::contactOnly): extrapolation diverges joint chains. Suite sweeps: rho=0.9
+    // recovers deep-stack penetration (0.058 -> 0.027 m on the 10-box stack) but
+    // diverges the 32-layer stack's interfaces; rho=0.7 is safe but the prev-mixing
+    // smoothing gives back what the extrapolation gains. The textbook schedule assumes
+    // a linear map; this one is clamped with ramping penalties, so it ships default-off
+    // as a per-scene experiment rather than a win.
+    float chebyshevRho = 0.0f;
+
     // Incremental jacobian rebuild distance (metres): after the first Newton round
     // assembles a contact's angular jacobian, later rounds reuse it while the contact's
     // world-space moment arms have drifted less than this from the captured values.
@@ -592,6 +609,10 @@ private:
     std::vector<Rigid *> updateOrder;
     std::vector<float3> bodyDeltaLin;
     std::vector<float3> bodyDeltaAng;
+    // Previous linear iterate per update-set body (the Chebyshev combination's x_{k-1};
+    // only read when chebyshevRho > 0). Angular iterates are not mixed: quats are not a
+    // vector space, so the angular delta only takes the schedule's gamma.
+    std::vector<float3> bodyPrevLin;
 
     // The force list rebuilt each step so the phases can address forces by index, plus the
     // per-force result of initialize() so that deletion can be done in one thread after the
