@@ -387,6 +387,10 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
     int roundsRun = 0;
     std::atomic<bool> converged{false};
     const auto loop = [this, targetIterations, forceCount, newtonRounds, &prevResidual, &roundsRun, &converged](int workerIndex, auto &sync) {
+        // Per-worker Chebyshev schedule state: the recurrence is deterministic, so every
+        // worker derives the same weights without sharing anything.
+        int chebRound = 0;
+        float chebGammaPrev = 1.0f;
         for (int it = 0; it < targetIterations; it++)
         {
             const bool newton = it < newtonRounds;
@@ -408,13 +412,42 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
                 });
                 sync.arriveAndWait();
 
-                // Combine: each body applies its own delta (relaxed; see
-                // Solver::jacobiRelaxation). A body with no constraints solves to exactly
-                // its inertial pose - free flight falls out of the same code path.
-                sync.forItems(static_cast<int>(updateOrder.size()), [this](int i) {
+                // Combine: each body applies its own delta. With chebyshevRho > 0 the
+                // plain Jacobi estimate x + delta is convex-combined with the previous
+                // iterate through the Chebyshev weights (semi-iteration); otherwise the
+                // constant jacobiRelaxation scales it. The angular delta gets the same
+                // gamma but no prev-mixing: positions are a vector space, rotations are
+                // not, and the first-order quat integration stays exact as written. A
+                // body with no constraints solves to exactly its inertial pose - free
+                // flight falls out of the same path.
+                float gamma = jacobiRelaxation;
+                if (chebyshevRho > 0.0f)
+                {
+                    const float rho2 = chebyshevRho * chebyshevRho;
+                    if (chebRound == 0)
+                        gamma = 1.0f;
+                    else if (chebRound == 1)
+                        gamma = 1.0f / (1.0f - 0.5f * rho2);
+                    else
+                        gamma = 1.0f / (1.0f - 0.25f * rho2 * chebGammaPrev);
+                    chebGammaPrev = gamma;
+                }
+                chebRound++;
+                sync.forItems(static_cast<int>(updateOrder.size()), [this, gamma](int i) {
                     Rigid *body = updateOrder[i];
-                    body->positionLin = body->positionLin + bodyDeltaLin[i] * jacobiRelaxation;
-                    body->positionAng = body->positionAng + bodyDeltaAng[i] * jacobiRelaxation;
+                    if (chebyshevRho <= 0.0f || !body->contactOnly)
+                    {
+                        // Plain relaxed Jacobi - the constant, or the safe fallback for
+                        // bodies coupled by joints (extrapolation diverges those).
+                        body->positionLin = body->positionLin + bodyDeltaLin[i] * jacobiRelaxation;
+                        body->positionAng = body->positionAng + bodyDeltaAng[i] * jacobiRelaxation;
+                        return;
+                    }
+                    // x_{k+1} = gamma * (x_k + delta_k) + (1 - gamma) * x_{k-1}
+                    const float3 xLin = body->positionLin;
+                    body->positionLin = gamma * (xLin + bodyDeltaLin[i]) + (1.0f - gamma) * bodyPrevLin[i];
+                    bodyPrevLin[i] = xLin;
+                    body->positionAng = body->positionAng + bodyDeltaAng[i] * gamma;
                 });
                 sync.arriveAndWait();
             }
@@ -686,6 +719,7 @@ void Solver::selectUpdateBodies()
 
         // Fresh per-step state; admitted bodies flip inUpdateSet below.
         body->inUpdateSet = false;
+        body->contactOnly = true;
 
         // Sleep mode support (Godot 4.7 API)
         // SLEEP_MODE_NEVER: always update
@@ -730,9 +764,24 @@ void Solver::selectUpdateBodies()
         }
     }
 
-    // Per-body delta buffers for the Jacobi primal's split-solve / combine pair.
+    // Per-body delta buffers for the Jacobi primal's split-solve / combine pair, plus
+    // the previous-iterate buffer the Chebyshev combination reads.
     bodyDeltaLin.resize(updateOrder.size());
     bodyDeltaAng.resize(updateOrder.size());
+    bodyPrevLin.resize(updateOrder.size());
+
+    // Chebyshev eligibility: a body carrying any non-manifold force (joint, spring, world
+    // anchor) extrapolates unsafely - its gamma falls back to the constant relaxation in
+    // the combine pass. Walk the force lists once, after warmstartForces() has pruned.
+    for (Force *f = forces; f != 0; f = f->next)
+    {
+        if (f->contactPointCount() > 0)
+            continue;
+        if (f->bodyA != 0)
+            f->bodyA->contactOnly = false;
+        if (f->bodyB != 0)
+            f->bodyB->contactOnly = false;
+    }
 }
 
 // Fill `forceOrder` with the solver's forces, so the phases can address them by index.

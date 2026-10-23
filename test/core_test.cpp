@@ -46,15 +46,21 @@ static void report(bool ok, const char *name, const char *fmt, ...) {
 }
 
 static void step_n(Solver &s, int n) {
-    // Tuning affordance: AVBD_JACOBI_RELAX overrides the combine-pass relaxation for
-    // sweep runs without touching the solver default. Same value for every solver in a
-    // process, so determinism/parallel-equivalence checks stay meaningful.
+    // Tuning affordance: AVBD_JACOBI_RELAX / AVBD_CHEBYSHEV_RHO override the combine
+    // controls for sweep runs without touching the solver defaults. Same value for every
+    // solver in a process, so determinism/parallel-equivalence checks stay meaningful.
     static const float relax = []() {
         const char *env = std::getenv("AVBD_JACOBI_RELAX");
         return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0f;
     }();
+    static const float rho = []() {
+        const char *env = std::getenv("AVBD_CHEBYSHEV_RHO");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0f;
+    }();
     if (relax > 0.0f)
         s.jacobiRelaxation = relax;
+    if (rho > 0.0f)
+        s.chebyshevRho = rho;
     for (int i = 0; i < n; i++) {
         s.step();
     }

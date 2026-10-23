@@ -343,6 +343,7 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     p_space.newton_ratio = settings->get_setting("physics/avbd/newton_ratio", 1.0);
     p_space.stiffness_decay = settings->get_setting("physics/avbd/stiffness_decay", 0.8);
     p_space.jacobian_rebuild_distance = settings->get_setting("physics/avbd/jacobian_rebuild_distance", 0.0);
+    p_space.chebyshev_rho = settings->get_setting("physics/avbd/chebyshev_rho", 0.0);
 }
 
 void AVBDPhysicsServer3D::_space_set_active(const RID &p_space, bool p_active) {
@@ -1095,6 +1096,7 @@ void AVBDPhysicsServer3D::_step(double p_step) {
         space.solver.newtonRatio = static_cast<float>(std::clamp(space.newton_ratio, 0.0, 1.0));
         space.solver.stiffnessDecay = static_cast<float>(std::clamp(space.stiffness_decay, 0.0, 1.0));
         space.solver.jacobianRebuildDistance = static_cast<float>(std::max(space.jacobian_rebuild_distance, 0.0));
+        space.solver.chebyshevRho = static_cast<float>(std::max(space.chebyshev_rho, 0.0));
         // Idle-sleep horizon: 30 steps at the usual 60 Hz tick = Godot's 0.5 s default.
         space.solver.sleepFrames = 30;
 
