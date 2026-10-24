@@ -24,10 +24,33 @@ static inline float3 computeAABBCenter(const avbd::Rigid* body) noexcept {
 static inline float computeAABBRadius(const avbd::Rigid* body) noexcept {
     return body->radius;
 }
+// Tight world-space AABB of the oriented shape (AABB-of-OBB), not of its bounding
+// sphere. The sphere-based box fattened every body by up to ~2.7x per axis (a
+// 1 x 0.5 x 0.5 box carried a 1.4^3 bound), which in dense stacking scenes turned the
+// candidate list into near-all-pairs; the oriented extent is what actually bounds the
+// shape, so broad-phase pruning has something to prune.
 static inline void computeAABB(const avbd::Rigid* body, float3& min, float3& max) noexcept {
-    const float r = body->radius;
-    min = {body->positionLin.x() - r, body->positionLin.y() - r, body->positionLin.z() - r};
-    max = {body->positionLin.x() + r, body->positionLin.y() + r, body->positionLin.z() + r};
+    float3 half;
+    switch (body->shape) {
+        case avbd::ShapeType::Sphere:
+            half = float3{body->radius, body->radius, body->radius};
+            break;
+        case avbd::ShapeType::Cylinder:
+            // Local half extents: radius in x/z, half height along the local Z axis.
+            half = float3{body->size.x(), body->size.z() * 0.5f, body->size.x()};
+            break;
+        case avbd::ShapeType::Box:
+        default:
+            half = body->size * 0.5f;
+            break;
+    }
+    const float3x3 rot(body->positionAng);
+    const float3 wx{
+        std::abs(rot(0, 0)) * half.x() + std::abs(rot(0, 1)) * half.y() + std::abs(rot(0, 2)) * half.z(),
+        std::abs(rot(1, 0)) * half.x() + std::abs(rot(1, 1)) * half.y() + std::abs(rot(1, 2)) * half.z(),
+        std::abs(rot(2, 0)) * half.x() + std::abs(rot(2, 1)) * half.y() + std::abs(rot(2, 2)) * half.z()};
+    min = body->positionLin - wx;
+    max = body->positionLin + wx;
 }
 
 // ============================================
