@@ -20,6 +20,7 @@
 #include "Eigen/Geometry"
 #include <Eigen/Dense>
 #include <Eigen/LU>
+#include <array>
 #include <cmath>
 #include <cstddef>
 
@@ -93,7 +94,7 @@ inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross, float3 bLin,
     // float ops keep the result bit-identical for every thread count. A degenerate
     // pivot (non-positive D, which a near-singular block can produce) bails to the
     // pivoted dynamic retry below.
-    float a[6][6];
+    std::array<std::array<float, 6>, 6> a{};
     for (int r = 0; r < 3; r++) {
       for (int c = 0; c < 3; c++) {
         a[r][c] = aLin(r, c);
@@ -103,8 +104,8 @@ inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross, float3 bLin,
       }
     }
 
-    float l[6][6] = {};
-    float d[6];
+    std::array<std::array<float, 6>, 6> l{};
+    std::array<float, 6> d{};
     bool factored = true;
     for (int j = 0; j < 6; j++) {
       float dj = a[j][j];
@@ -125,7 +126,7 @@ inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross, float3 bLin,
     }
 
     if (factored) {
-      float z[6];
+      std::array<float, 6> z{};
       // Forward solve L z = b (unit lower triangle).
       for (int i = 0; i < 6; i++) {
         float v = i < 3 ? bLin[i] : bAng[i - 3];
@@ -134,7 +135,7 @@ inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross, float3 bLin,
         z[i] = v;
       }
       // Diagonal scaling y = D^-1 z, then back solve L^T x = y, all in one array.
-      float x[6];
+      std::array<float, 6> x{};
       for (int i = 0; i < 6; i++)
         x[i] = z[i] / d[i];
       for (int i = 5; i >= 0; i--) {

@@ -18,6 +18,7 @@
 
 #include "avbd/job_pool.hpp"
 #include "avbd/list_range.hpp"
+#include "avbd/fixed_stack.hpp"
 #include "avbd/bvh/bvh.hpp"
 #include "avbd/bvh/node_storage.hpp"
 
@@ -153,12 +154,13 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
             return true;
         };
 
-        int stack[66];
-        int top = 0;
-        stack[top++] = 0;
-        while (top > 0)
+        // Complete-tree depth bounds the descent (one pending node per level); 64
+        // covers n up to 2^31 with room to spare.
+        FixedStack<int, 64> stack;
+        stack.push(0);
+        while (!stack.empty())
         {
-            const int slot = stack[--top];
+            const int slot = stack.pop();
             if (!bvhNodes.valid(slot))
                 continue;
             float tEnter = 0.0f;
@@ -167,8 +169,8 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
             if (2 * slot + 1 < bvhNodes.size())
             {
                 // Internal node (its children exist in the implicit layout).
-                stack[top++] = 2 * slot + 1;
-                stack[top++] = 2 * slot + 2;
+                stack.push(2 * slot + 1);
+                stack.push(2 * slot + 2);
                 continue;
             }
             const int bodyIndex = bvhNodes.bodyIndex()[slot];
@@ -232,18 +234,17 @@ void Solver::collectAABB(float3 min, float3 max, uint32_t p_mask, std::vector<Ri
                 min.x() > bmax.x() || min.y() > bmax.y() || min.z() > bmax.z());
     };
 
-    int stack[66];
-    int top = 0;
-    stack[top++] = 0;
-    while (top > 0)
+    FixedStack<int, 64> stack;
+    stack.push(0);
+    while (!stack.empty())
     {
-        const int slot = stack[--top];
+        const int slot = stack.pop();
         if (!bvhNodes.valid(slot) || !overlaps(slot))
             continue;
         if (2 * slot + 1 < bvhNodes.size())
         {
-            stack[top++] = 2 * slot + 1;
-            stack[top++] = 2 * slot + 2;
+            stack.push(2 * slot + 1);
+            stack.push(2 * slot + 2);
             continue;
         }
         const int bodyIndex = bvhNodes.bodyIndex()[slot];
