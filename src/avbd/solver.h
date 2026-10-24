@@ -34,6 +34,8 @@ class JobPool;
 inline constexpr float PENALTY_MIN = 1.0f;
 // Maximum penalty parameter
 inline constexpr float PENALTY_MAX = 10000000000.0f;
+// Cap of the adaptive per-contact betaScale multiplier (see Solver::adaptiveBeta).
+inline constexpr float ADAPTIVE_BETA_MAX = 64.0f;
 // Base margin for collision detection to avoid flickering contacts
 inline constexpr float COLLISION_MARGIN_BASE = 0.005f;
 // Margin damping factor per iteration
@@ -396,6 +398,10 @@ struct Manifold : Force
         float3 penalty;
         float3 lambda;
         bool stick;
+        // Personal multiplier on the betaLin penalty ramp, carried across steps with
+        // the warmstart. Adaptive beta (Solver::adaptiveBeta) raises it for contacts
+        // whose error stopped shrinking and lets it fall back for converging ones.
+        float betaScale = 1.0f;
     };
 
     std::array<Contact, 8> contacts;
@@ -483,6 +489,12 @@ struct Solver
     // dual-only tail: a stiff penalty converges slowly under relaxation, softening it
     // lets the cheap rounds actually converge instead of spinning. 1.0 = no decay.
     float stiffnessDecay = 1.0f;
+
+    // Adaptive beta: per-contact penalty-ramp multipliers carried across steps,
+    // raised (x2, capped) for contacts whose error did not shrink against last step
+    // and decayed (x0.5, floored at 1) for converging ones - the classic augmented
+    // Lagrangian kappa update, per constraint instead of a global betaLin.
+    bool adaptiveBeta = false;
 
     // Upper bound of the adaptive iteration boost. The boost multiplies the round count
     // by the penetration ratio, so at impact moments a scene pays this many dense rounds

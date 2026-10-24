@@ -360,6 +360,7 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     p_space.jacobian_rebuild_distance = settings->get_setting("physics/avbd/jacobian_rebuild_distance", 0.0);
     p_space.chebyshev_rho = settings->get_setting("physics/avbd/chebyshev_rho", 0.0);
     p_space.adaptive_max_iterations = settings->get_setting("physics/avbd/adaptive_max_iterations", 16.0);
+    p_space.adaptive_beta = settings->get_setting("physics/avbd/adaptive_beta", false);
 }
 
 void AVBDPhysicsServer3D::_space_set_active(const RID &p_space, bool p_active) {
@@ -1126,6 +1127,7 @@ void AVBDPhysicsServer3D::_step(double p_step) {
         space.solver.jacobianRebuildDistance = static_cast<float>(std::max(space.jacobian_rebuild_distance, 0.0));
         space.solver.chebyshevRho = static_cast<float>(std::max(space.chebyshev_rho, 0.0));
         space.solver.adaptiveMaxIterations = std::max(static_cast<int>(space.adaptive_max_iterations), 2);
+        space.solver.adaptiveBeta = space.adaptive_beta;
         // Idle-sleep horizon: 30 steps at the usual 60 Hz tick = Godot's 0.5 s default.
         space.solver.sleepFrames = 30;
 

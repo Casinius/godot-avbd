@@ -76,7 +76,11 @@ bool Manifold::initialize()
     std::array<Contact, 8> newContacts = {};
     int newNumContacts = collide(bodyA, bodyB, std::span<Contact>(newContacts), basis);
 
-    // Merge old contact data with new contacts
+    // Merge old contact data with new contacts. prevErr[i] carries the matched
+    // contact's error from the previous step so the adaptive-beta update below can
+    // compare it against the fresh error.
+    std::array<float, 8> prevErr{};
+    prevErr.fill(-1.0f);
     for (int i = 0; i < newNumContacts; i++)
     {
         for (int j = 0; j < numContacts; j++)
@@ -86,6 +90,8 @@ bool Manifold::initialize()
                 float3 newRA = newContacts[i].rA;
                 float3 newRB = newContacts[i].rB;
                 newContacts[i] = contacts[j];
+                prevErr[i] = contacts[j].C0.norm();
+                newContacts[i].betaScale = contacts[j].betaScale;
 
                 // If no static friction in last frame, use the new contact point locations
                 if (!contacts[j].stick)
@@ -118,6 +124,25 @@ bool Manifold::initialize()
         if (penetration > 0.02f) // Cap at 2cm penetration
         {
             contacts[i].C0 = contacts[i].C0.normalized() * 0.02f;
+        }
+
+        // Adaptive beta (the augmented-Lagrangian kappa update, per contact): a
+        // sticking contact whose error did not shrink against last step doubles its
+        // personal ramp multiplier; a well-converging one halves it back toward 1.
+        // Unmatched (fresh) contacts start from the neutral multiplier.
+        if (solver->adaptiveBeta && prevErr[i] > 0.0f)
+        {
+            const float err = contacts[i].C0.norm();
+            float scale = contacts[i].betaScale;
+            if (err > 0.5f * prevErr[i])
+                scale = std::min(scale * 2.0f, ADAPTIVE_BETA_MAX);
+            else if (err < 0.1f * prevErr[i])
+                scale = std::max(scale * 0.5f, 1.0f);
+            contacts[i].betaScale = scale;
+        }
+        else
+        {
+            contacts[i].betaScale = 1.0f;
         }
 
         // Initial penalty (Eq. 19): the original computed base * 10^(2*log10(pen)) —
@@ -291,12 +316,13 @@ void Manifold::updateDual(float alpha)
         contacts[i].lambda = F;
 
         // Update the penalty parameter and clamp to material stiffness if we are within the force bounds (Eq. 16)
+        const float beta = solver->betaLin * contacts[i].betaScale;
         if (F[0] < 0)
-            contacts[i].penalty[0] = std::min(contacts[i].penalty[0] + solver->betaLin * std::fabs(C[0]), PENALTY_MAX);
+            contacts[i].penalty[0] = std::min(contacts[i].penalty[0] + beta * std::fabs(C[0]), PENALTY_MAX);
         if (frictionScale <= bounds)
         {
-            contacts[i].penalty[1] = std::min(contacts[i].penalty[1] + solver->betaLin * std::fabs(C[1]), PENALTY_MAX);
-            contacts[i].penalty[2] = std::min(contacts[i].penalty[2] + solver->betaLin * std::fabs(C[2]), PENALTY_MAX);
+            contacts[i].penalty[1] = std::min(contacts[i].penalty[1] + beta * std::fabs(C[1]), PENALTY_MAX);
+            contacts[i].penalty[2] = std::min(contacts[i].penalty[2] + beta * std::fabs(C[2]), PENALTY_MAX);
             contacts[i].stick = float2{C[1], C[2]}.norm() < STICK_THRESH;
         }
     }

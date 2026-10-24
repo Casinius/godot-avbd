@@ -219,6 +219,8 @@ protected:
         // Upper bound of the adaptive iteration boost. 16 keeps the reference quality;
         // 8 trades deep-impact penetration for flat frame cost (see the load sweep).
         double adaptive_max_iterations = 16;
+        // Per-contact adaptive penalty ramp (augmented-Lagrangian kappa update).
+        bool adaptive_beta = false;
 
         // Debug contacts collected during the last step (world space, Godot frame).
 
