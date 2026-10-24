@@ -241,12 +241,12 @@ inline bool addContact(const Shape& shapeA, const Shape& shapeB, std::span<Manif
 // The generic per-axis form (normalise, absDot both boxes' three axes) did ~30
 // multiplies plus a sqrt per axis, 15 axes per pair.
 
-inline bool testFaceAxisA(const OBB& boxA, const OBB& boxB, const float3& dA, const float m[3][3], int i, SatAxis& best)
+inline bool testFaceAxisA(const OBB& boxA, const OBB& boxB, const float3& dA, const float3x3& m, int i, SatAxis& best)
 {
     const float separation = std::abs(dA[i]) -
             (boxA.half[i] +
-                    boxB.half.x() * std::abs(m[i][0]) + boxB.half.y() * std::abs(m[i][1]) +
-                    boxB.half.z() * std::abs(m[i][2]));
+                    boxB.half.x() * std::abs(m(i, 0)) + boxB.half.y() * std::abs(m(i, 1)) +
+                    boxB.half.z() * std::abs(m(i, 2)));
     if (separation > 0.0f)
         return false;
 
@@ -262,12 +262,12 @@ inline bool testFaceAxisA(const OBB& boxA, const OBB& boxB, const float3& dA, co
     return true;
 }
 
-inline bool testFaceAxisB(const OBB& boxA, const OBB& boxB, const float3& dB, const float m[3][3], int j, SatAxis& best)
+inline bool testFaceAxisB(const OBB& boxA, const OBB& boxB, const float3& dB, const float3x3& m, int j, SatAxis& best)
 {
     const float separation = std::abs(dB[j]) -
             (boxB.half[j] +
-                    boxA.half.x() * std::abs(m[0][j]) + boxA.half.y() * std::abs(m[1][j]) +
-                    boxA.half.z() * std::abs(m[2][j]));
+                    boxA.half.x() * std::abs(m(0, j)) + boxA.half.y() * std::abs(m(1, j)) +
+                    boxA.half.z() * std::abs(m(2, j)));
     if (separation > 0.0f)
         return false;
 
@@ -283,7 +283,7 @@ inline bool testFaceAxisB(const OBB& boxA, const OBB& boxB, const float3& dB, co
     return true;
 }
 
-inline bool testEdgeAxis(const OBB& boxA, const OBB& boxB, const float3& delta, const float3& axis, const float m[3][3],
+inline bool testEdgeAxis(const OBB& boxA, const OBB& boxB, const float3& delta, const float3& axis, const float3x3& m,
         int i, int j, SatAxis& best)
 {
     const float lenSq = axis.squaredNorm();
@@ -296,8 +296,8 @@ inline bool testEdgeAxis(const OBB& boxA, const OBB& boxB, const float3& delta, 
     //   |A_k . (A_i x B_j)| = |m[(i+2)%3][j]| for k=(i+1)%3, |m[(i+1)%3][j]| for k=(i+2)%3
     const int i1 = (i + 1) % 3, i2 = (i + 2) % 3;
     const int j1 = (j + 1) % 3, j2 = (j + 2) % 3;
-    const float rA = (boxA.half[i1] * std::abs(m[i2][j]) + boxA.half[i2] * std::abs(m[i1][j])) * invLen;
-    const float rB = (boxB.half[j1] * std::abs(m[i][j2]) + boxB.half[j2] * std::abs(m[i][j1])) * invLen;
+    const float rA = (boxA.half[i1] * std::abs(m(i2, j)) + boxA.half[i2] * std::abs(m(i1, j))) * invLen;
+    const float rB = (boxB.half[j1] * std::abs(m(i, j2)) + boxB.half[j2] * std::abs(m(i, j1))) * invLen;
 
     const float signedDist = delta.dot(axis) * invLen;
     const float separation = std::abs(signedDist) - (rA + rB);
@@ -941,10 +941,10 @@ int collideShapes(const Shape& a, const Shape& b,
 
     // Frame table for the specialised SAT axes: m[i][j] = axisA_i·axisB_j, plus delta
     // in each box's frame. 15 dots once, instead of ~30 absDots + a sqrt per axis.
-    float m[3][3];
+    float3x3 m;
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j)
-            m[i][j] = boxA.axis[i].dot(boxB.axis[j]);
+            m(i, j) = boxA.axis[i].dot(boxB.axis[j]);
     const float3 dA{delta.dot(boxA.axis[0]), delta.dot(boxA.axis[1]), delta.dot(boxA.axis[2])};
     const float3 dB{delta.dot(boxB.axis[0]), delta.dot(boxB.axis[1]), delta.dot(boxB.axis[2])};
 
