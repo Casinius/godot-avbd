@@ -35,12 +35,15 @@ var velocity_stats := { "max_lin": 0.0, "max_ang": 0.0, "avg_lin": 0.0, "steps":
 var max_velocity_accumulated := 0.0  # Track worst velocity spike during collapse
 var collapse_started := false
 var collapse_start_y := 0.0
+var digest_enabled := false
 
 
 func _ready() -> void:
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--steps="):
 			quit_after_steps = int(arg.split("=")[1])
+		elif arg == "--digest":
+			digest_enabled = true
 	soft_world = get_node_or_null("World") as AVBDSoftWorld3D
 	_collect_bodies(self)
 	# Separate pyramid boxes (those named "Box*") from ground
@@ -82,6 +85,23 @@ func _physics_process(_delta: float) -> void:
 		return
 	steps += 1
 	if steps < quit_after_steps:
+		return
+
+	# Regression harness hook (--digest --steps=N): emit a stable pose digest over the
+	# scene's rigid bodies and quit, for tools/bridge_regression.py to diff against a
+	# recorded baseline. The simulation is bit-deterministic, so equal digests mean
+	# identical physics.
+	if digest_enabled:
+		digest_enabled = false
+		var hash := 5381
+		for body in bodies:
+			var t := body.global_transform
+			t.origin = (t.origin * 1000.0).round() / 1000.0
+			for byte in var_to_bytes(t):
+				hash = (hash * 33 + byte) & 0xFFFFFFFF
+		var scene_name := String(get_tree().current_scene.scene_file_path.get_file()).trim_suffix(".tscn")
+		print("AVBD_SCENE_DIGEST %s=0x%x" % [scene_name, hash])
+		get_tree().quit()
 		return
 
 	# Calculate pyramid collapse metrics

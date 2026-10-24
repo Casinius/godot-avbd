@@ -13,14 +13,16 @@
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/godot.hpp>
 
+#include <godot_cpp/classes/project_settings.hpp>
+#include <godot_cpp/classes/physics_server3d_manager.hpp>
+#include <godot_cpp/variant/variant.hpp>
+
 #include "nodes/avbd_soft_body3d.hpp"
 #include "nodes/avbd_soft_world3d.hpp"
 #include "server/avbd_direct_body_state3d.hpp"
 #include "server/avbd_direct_space_state3d.hpp"
 #include "server/avbd_physics_server3d.hpp"
 #include "server/physics_server_factory.hpp"
-
-#include <godot_cpp/classes/physics_server3d_manager.hpp>
 
 using namespace godot;
 
@@ -41,6 +43,45 @@ static void register_physics_server() {
     manager->register_server("AVBD", Callable(factory, "create_server"));
 }
 
+// Register every physics/avbd/* solver setting with ProjectSettings, so the editor's
+// Project Settings dialog shows an "AVBD" group instead of the settings existing only
+// after a script writes them. Defaults must match read_project_params in the server.
+static void register_avbd_settings() {
+    ProjectSettings *settings = ProjectSettings::get_singleton();
+    if (settings == nullptr) {
+        return;
+    }
+
+    const std::pair<const char *, Variant> entries[] = {
+            {"physics/avbd/threads", Variant(0)},
+            {"physics/avbd/iterations", Variant(4)},
+            {"physics/avbd/alpha", Variant(0.99)},
+            {"physics/avbd/beta_linear", Variant(10000.0)},
+            {"physics/avbd/beta_angular", Variant(100.0)},
+            {"physics/avbd/gamma", Variant(0.999)},
+            {"physics/avbd/substeps", Variant(2)},
+            {"physics/avbd/newton_ratio", Variant(1.0)},
+            {"physics/avbd/stiffness_decay", Variant(0.8)},
+            {"physics/avbd/jacobian_rebuild_distance", Variant(0.0)},
+            {"physics/avbd/chebyshev_rho", Variant(0.0)},
+            {"physics/avbd/adaptive_max_iterations", Variant(16)},
+            {"physics/avbd/adaptive_beta", Variant(false)},
+    };
+    for (const auto &entry : entries) {
+        if (settings->has_setting(entry.first)) {
+            continue;
+        }
+        settings->set_setting(entry.first, entry.second);
+        settings->set_initial_value(entry.first, entry.second);
+        // The knobs people reach for first are basic; the rest live under "Advanced".
+        const StringName name(entry.first);
+        settings->set_as_basic(name,
+                name == StringName("physics/avbd/adaptive_beta") ||
+                        name == StringName("physics/avbd/substeps") ||
+                        name == StringName("physics/avbd/iterations"));
+    }
+}
+
 static void uninitialize_avbd_module(ModuleInitializationLevel p_level) {
     if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
         return;
@@ -58,6 +99,7 @@ static void initialize_avbd_module(ModuleInitializationLevel p_level) {
     // The engine instantiates these two itself (body state sync, direct space state).
     GDREGISTER_CLASS(AVBDDirectBodyState3D);
     GDREGISTER_CLASS(AVBDDirectSpaceState3D);
+    register_avbd_settings();
     register_physics_server();
 }
 
