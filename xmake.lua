@@ -17,7 +17,7 @@
 add_rules("mode.debug", "mode.release")
 add_rules("plugin.compile_commands.autoupdate", { outputdir = "." })
 
-add_requires("godotcpp4 4.1")
+add_requires("godotcpp4 4.5")
 -- BS::thread_pool: the job pool behind Solver's parallel update. Header-only, MIT, C++17.
 add_requires("thread-pool v5.1.0")
 add_requires("eigen 5.0.1")

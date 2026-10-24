@@ -374,7 +374,7 @@ bool AVBDPhysicsServer3D::_space_is_active(const RID &p_space) const {
     return found == spaces.end() ? false : found->second.active;
 }
 
-void AVBDPhysicsServer3D::_space_set_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param, double p_value) {
+void AVBDPhysicsServer3D::_space_set_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param, float p_value) {
     // The space parameters are contact tolerances and sleep thresholds, none of which map onto
     // AVBD's model. They are accepted and ignored rather than rejected, so a project's settings do
     // not error out on load. Gravity does not come through here at all: Godot keeps it in the
@@ -401,7 +401,7 @@ void AVBDPhysicsServer3D::read_project_gravity(SpaceData &p_space) {
     p_space.solver.gravity = -magnitude * sign;
 }
 
-double AVBDPhysicsServer3D::_space_get_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param) const {
+float AVBDPhysicsServer3D::_space_get_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param) const {
     (void)p_space;
     (void)p_param;
     return 0.0;
@@ -496,6 +496,141 @@ RID AVBDPhysicsServer3D::_cylinder_shape_create() {
     return make_rid(id);
 }
 
+RID AVBDPhysicsServer3D::_capsule_shape_create() {
+    const uint64_t id = next_id++;
+    ShapeData &shape = shapes[id];
+    shape.type = PhysicsServer3D::SHAPE_CAPSULE;
+    return make_rid(id);
+}
+
+RID AVBDPhysicsServer3D::_convex_polygon_shape_create() {
+    const uint64_t id = next_id++;
+    ShapeData &shape = shapes[id];
+    shape.type = PhysicsServer3D::SHAPE_CONVEX_POLYGON;
+    return make_rid(id);
+}
+
+RID AVBDPhysicsServer3D::_concave_polygon_shape_create() {
+    const uint64_t id = next_id++;
+    ShapeData &shape = shapes[id];
+    shape.type = PhysicsServer3D::SHAPE_CONCAVE_POLYGON;
+    return make_rid(id);
+}
+
+RID AVBDPhysicsServer3D::_heightmap_shape_create() {
+    const uint64_t id = next_id++;
+    ShapeData &shape = shapes[id];
+    shape.type = PhysicsServer3D::SHAPE_HEIGHTMAP;
+    return make_rid(id);
+}
+
+RID AVBDPhysicsServer3D::_world_boundary_shape_create() {
+    const uint64_t id = next_id++;
+    ShapeData &shape = shapes[id];
+    shape.type = PhysicsServer3D::SHAPE_WORLD_BOUNDARY;
+    return make_rid(id);
+}
+
+RID AVBDPhysicsServer3D::_separation_ray_shape_create() {
+    const uint64_t id = next_id++;
+    ShapeData &shape = shapes[id];
+    shape.type = PhysicsServer3D::SHAPE_SEPARATION_RAY;
+    return make_rid(id);
+}
+
+RID AVBDPhysicsServer3D::_custom_shape_create() {
+    const uint64_t id = next_id++;
+    ShapeData &shape = shapes[id];
+    shape.type = PhysicsServer3D::SHAPE_CUSTOM;
+    return make_rid(id);
+}
+
+void AVBDPhysicsServer3D::_shape_set_custom_solver_bias(const RID &p_shape, float p_bias) {
+    if (ShapeData *shape = find_shape(p_shape)) {
+        shape->custom_bias = p_bias;
+    }
+}
+
+float AVBDPhysicsServer3D::_shape_get_custom_solver_bias(const RID &p_shape) const {
+    const auto found = shapes.find(id_of(p_shape));
+    return found == shapes.end() ? 0.0f : found->second.custom_bias;
+}
+
+void AVBDPhysicsServer3D::_shape_set_margin(const RID &p_shape, float p_margin) {
+    if (ShapeData *shape = find_shape(p_shape)) {
+        shape->margin = p_margin;
+    }
+}
+
+float AVBDPhysicsServer3D::_shape_get_margin(const RID &p_shape) const {
+    const auto found = shapes.find(id_of(p_shape));
+    return found == shapes.end() ? 0.0f : found->second.margin;
+}
+
+// -----------------------------------------------------------------------------
+// Soft-body server API: documented unsupported. Godot only drives these through
+// SoftBody3D nodes; every method answers neutrally and nothing is simulated.
+// -----------------------------------------------------------------------------
+
+RID AVBDPhysicsServer3D::_soft_body_create() {
+    return make_rid(next_id++);
+}
+void AVBDPhysicsServer3D::_soft_body_set_space(const RID &p_body, const RID &p_space) { (void)p_body; (void)p_space; }
+RID AVBDPhysicsServer3D::_soft_body_get_space(const RID &p_body) const { (void)p_body; return RID(); }
+void AVBDPhysicsServer3D::_soft_body_set_mesh(const RID &p_body, const RID &p_mesh) { (void)p_body; (void)p_mesh; }
+void AVBDPhysicsServer3D::_soft_body_set_transform(const RID &p_body, const Transform3D &p_transform) { (void)p_body; (void)p_transform; }
+void AVBDPhysicsServer3D::_soft_body_set_collision_layer(const RID &p_body, uint32_t p_layer) { (void)p_body; (void)p_layer; }
+uint32_t AVBDPhysicsServer3D::_soft_body_get_collision_layer(const RID &p_body) const { (void)p_body; return 1; }
+void AVBDPhysicsServer3D::_soft_body_set_collision_mask(const RID &p_body, uint32_t p_mask) { (void)p_body; (void)p_mask; }
+uint32_t AVBDPhysicsServer3D::_soft_body_get_collision_mask(const RID &p_body) const { (void)p_body; return 1; }
+void AVBDPhysicsServer3D::_soft_body_add_collision_exception(const RID &p_body, const RID &p_body_b) { (void)p_body; (void)p_body_b; }
+void AVBDPhysicsServer3D::_soft_body_remove_collision_exception(const RID &p_body, const RID &p_body_b) { (void)p_body; (void)p_body_b; }
+TypedArray<RID> AVBDPhysicsServer3D::_soft_body_get_collision_exceptions(const RID &p_body) const { (void)p_body; return {}; }
+void AVBDPhysicsServer3D::_soft_body_set_total_mass(const RID &p_body, float p_total_mass) { (void)p_body; (void)p_total_mass; }
+float AVBDPhysicsServer3D::_soft_body_get_total_mass(const RID &p_body) const { (void)p_body; return 0.0f; }
+void AVBDPhysicsServer3D::_soft_body_set_linear_stiffness(const RID &p_body, float p_linear_stiffness) { (void)p_body; (void)p_linear_stiffness; }
+float AVBDPhysicsServer3D::_soft_body_get_linear_stiffness(const RID &p_body) const { (void)p_body; return 0.0f; }
+void AVBDPhysicsServer3D::_soft_body_set_pressure_coefficient(const RID &p_body, float p_pressure_coefficient) { (void)p_body; (void)p_pressure_coefficient; }
+float AVBDPhysicsServer3D::_soft_body_get_pressure_coefficient(const RID &p_body) const { (void)p_body; return 0.0f; }
+void AVBDPhysicsServer3D::_soft_body_set_damping_coefficient(const RID &p_body, float p_damping_coefficient) { (void)p_body; (void)p_damping_coefficient; }
+float AVBDPhysicsServer3D::_soft_body_get_damping_coefficient(const RID &p_body) const { (void)p_body; return 0.0f; }
+void AVBDPhysicsServer3D::_soft_body_set_drag_coefficient(const RID &p_body, float p_drag_coefficient) { (void)p_body; (void)p_drag_coefficient; }
+float AVBDPhysicsServer3D::_soft_body_get_drag_coefficient(const RID &p_body) const { (void)p_body; return 0.0f; }
+void AVBDPhysicsServer3D::_soft_body_set_simulation_precision(const RID &p_body, int32_t p_simulation_precision) { (void)p_body; (void)p_simulation_precision; }
+int32_t AVBDPhysicsServer3D::_soft_body_get_simulation_precision(const RID &p_body) const { (void)p_body; return 0; }
+void AVBDPhysicsServer3D::_soft_body_set_shrinking_factor(const RID &p_body, float p_shrinking_factor) { (void)p_body; (void)p_shrinking_factor; }
+float AVBDPhysicsServer3D::_soft_body_get_shrinking_factor(const RID &p_body) const { (void)p_body; return 0.0f; }
+void AVBDPhysicsServer3D::_soft_body_set_state(const RID &p_body, PhysicsServer3D::BodyState p_state, const Variant &p_variant) { (void)p_body; (void)p_state; (void)p_variant; }
+Variant AVBDPhysicsServer3D::_soft_body_get_state(const RID &p_body, PhysicsServer3D::BodyState p_state) const { (void)p_body; (void)p_state; return {}; }
+void AVBDPhysicsServer3D::_soft_body_apply_central_force(const RID &p_body, const Vector3 &p_force) { (void)p_body; (void)p_force; }
+void AVBDPhysicsServer3D::_soft_body_apply_central_impulse(const RID &p_body, const Vector3 &p_impulse) { (void)p_body; (void)p_impulse; }
+void AVBDPhysicsServer3D::_soft_body_apply_point_force(const RID &p_body, int32_t p_point_index, const Vector3 &p_force) { (void)p_body; (void)p_point_index; (void)p_force; }
+void AVBDPhysicsServer3D::_soft_body_apply_point_impulse(const RID &p_body, int32_t p_point_index, const Vector3 &p_impulse) { (void)p_body; (void)p_point_index; (void)p_impulse; }
+void AVBDPhysicsServer3D::_soft_body_move_point(const RID &p_body, int32_t p_point_index, const Vector3 &p_global_position) { (void)p_body; (void)p_point_index; (void)p_global_position; }
+void AVBDPhysicsServer3D::_soft_body_pin_point(const RID &p_body, int32_t p_point_index, bool p_pin) { (void)p_body; (void)p_point_index; (void)p_pin; }
+bool AVBDPhysicsServer3D::_soft_body_is_point_pinned(const RID &p_body, int32_t p_point_index) const { (void)p_body; (void)p_point_index; return false; }
+Vector3 AVBDPhysicsServer3D::_soft_body_get_point_global_position(const RID &p_body, int32_t p_point_index) const { (void)p_body; (void)p_point_index; return Vector3(); }
+void AVBDPhysicsServer3D::_soft_body_remove_all_pinned_points(const RID &p_body) { (void)p_body; }
+void AVBDPhysicsServer3D::_soft_body_set_ray_pickable(const RID &p_body, bool p_enable) { (void)p_body; (void)p_enable; }
+AABB AVBDPhysicsServer3D::_soft_body_get_bounds(const RID &p_body) const { (void)p_body; return AABB(); }
+void AVBDPhysicsServer3D::_soft_body_update_rendering_server(const RID &p_body,
+        PhysicsServer3DRenderingServerHandler *p_rendering_server_handler) { (void)p_body; (void)p_rendering_server_handler; }
+
+bool AVBDPhysicsServer3D::_body_test_motion(const RID &p_body, const Transform3D &p_from, const Vector3 &p_motion,
+        float p_margin, int32_t p_max_collisions, bool p_collide_separation_ray, bool p_recovery_as_collision,
+        PhysicsServer3DExtensionMotionResult *p_result) const {
+    // Motion queries are documented unsupported: the neutral answer is "no hit".
+    (void)p_body;
+    (void)p_from;
+    (void)p_motion;
+    (void)p_margin;
+    (void)p_max_collisions;
+    (void)p_collide_separation_ray;
+    (void)p_recovery_as_collision;
+    (void)p_result;
+    return false;
+}
+
 void AVBDPhysicsServer3D::_shape_set_data(const RID &p_shape, const Variant &p_data) {
     ShapeData *shape = find_shape(p_shape);
     if (shape == nullptr) {
@@ -526,6 +661,33 @@ void AVBDPhysicsServer3D::_shape_set_data(const RID &p_shape, const Variant &p_d
             }
             break;
         }
+        case PhysicsServer3D::SHAPE_CAPSULE: {
+            if (p_data.get_type() == Variant::DICTIONARY) {
+                const Dictionary data = p_data;
+                if (data.has("radius")) {
+                    shape->radius = data["radius"];
+                }
+                if (data.has("height")) {
+                    shape->height = data["height"];
+                }
+            }
+            break;
+        }
+        case PhysicsServer3D::SHAPE_CONVEX_POLYGON: {
+            // Proxy contract: the convex hull is simulated as the local AABB of its
+            // points, stored as full extents (the solver rotates it as an OBB).
+            if (p_data.get_type() == Variant::PACKED_VECTOR3_ARRAY) {
+                const PackedVector3Array points = p_data;
+                Vector3 lo = points.is_empty() ? Vector3() : points[0];
+                Vector3 hi = lo;
+                for (const Vector3 &pt : points) {
+                    lo = lo.min(pt);
+                    hi = hi.max(pt);
+                }
+                shape->extents = hi - lo;
+            }
+            break;
+        }
         default: {
             if (p_data.get_type() == Variant::VECTOR3) {
                 // Half extents in, full extents stored (the resource's `size / 2`).
@@ -537,6 +699,8 @@ void AVBDPhysicsServer3D::_shape_set_data(const RID &p_shape, const Variant &p_d
             break;
         }
     }
+    // Round-trip for _shape_get_data (the engine reads back what it sent).
+    shape->data = p_data;
 }
 
 PhysicsServer3D::ShapeType AVBDPhysicsServer3D::_shape_get_type(const RID &p_shape) const {
@@ -562,8 +726,15 @@ Variant AVBDPhysicsServer3D::_shape_get_data(const RID &p_shape) const {
             data["height"] = shape.height;
             return data;
         }
+        case PhysicsServer3D::SHAPE_CAPSULE: {
+            Dictionary data;
+            data["radius"] = shape.radius;
+            data["height"] = shape.height;
+            return data;
+        }
         default:
-            return Variant(shape.extents / 2.0);
+            // Proxied and excluded shapes round-trip the engine's own payload.
+            return shape.data;
     }
 }
 
@@ -684,6 +855,7 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
 
         avbd::float3 extents{1, 1, 1};
         avbd::ShapeType type = avbd::ShapeType::Box;
+        bool simulated = true;
         switch (shape.type) {
             case PhysicsServer3D::SHAPE_SPHERE:
                 type = avbd::ShapeType::Sphere;
@@ -697,11 +869,42 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
                 extents = {static_cast<float>(shape.radius), static_cast<float>(shape.radius),
                         static_cast<float>(shape.height)};
                 break;
+            case PhysicsServer3D::SHAPE_CAPSULE:
+                // Capsule proxy: the solver's cylinder over the capsule's radius and full
+                // height. The hemispherical caps are flat, dimensions and segment match.
+                type = avbd::ShapeType::Cylinder;
+                extents = {static_cast<float>(shape.radius), static_cast<float>(shape.radius),
+                        static_cast<float>(shape.height)};
+                break;
+            case PhysicsServer3D::SHAPE_CONVEX_POLYGON:
+                // Convex proxy: the points' local AABB as a box (stored at set_data time);
+                // the solver rotates it as an OBB. A bounding-box hull, not the hull.
+                extents = to_sim_extents(shape.extents);
+                break;
+            case PhysicsServer3D::SHAPE_CONCAVE_POLYGON:
+            case PhysicsServer3D::SHAPE_HEIGHTMAP:
+            case PhysicsServer3D::SHAPE_WORLD_BOUNDARY:
+            case PhysicsServer3D::SHAPE_SEPARATION_RAY:
+            case PhysicsServer3D::SHAPE_CUSTOM:
+                simulated = false;
+                break;
             default:
                 // Godot's BoxShape3D size is full extents, and so is the solver's box size;
                 // permute into sim axes rather than scaling.
                 extents = to_sim_extents(shape.extents);
                 break;
+        }
+        if (!simulated) {
+            // No neutral proxy exists (a trimesh ground's AABB would be a giant solid
+            // box): the body stays out of the solver entirely, per the unsupported-list
+            // contract in the header. Swap the scene to a box shape instead.
+            if (!body.unsupported_warned) {
+                body.unsupported_warned = true;
+                WARN_PRINT("AVBD physics server: a body uses a shape AVBD cannot simulate "
+                        "(concave/heightmap/world boundary/separation ray/custom); the body "
+                        "is excluded from simulation. Use box/sphere/cylinder shapes.");
+            }
+            continue;
         }
 
         body.rigid = new avbd::Rigid(&space->solver, extents, type, density_for(body), body.friction,
@@ -1059,7 +1262,7 @@ void AVBDPhysicsServer3D::rebuild_cone_twist_joint(SpaceData *space, const Joint
 // Stepping follows the game: while the engine has the server inactive (SceneTree paused)
 // nothing steps. Solver parameters are stamped from project settings every step, and each
 // space runs `substeps` solver steps per engine step with dt split across them.
-void AVBDPhysicsServer3D::_step(double p_step) {
+void AVBDPhysicsServer3D::_step(float p_step) {
     if (!server_active) {
         return;
     }
@@ -1439,7 +1642,7 @@ void AVBDPhysicsServer3D::_joint_make_pin(const RID &p_joint, const RID &p_body_
 }
 
 void AVBDPhysicsServer3D::_pin_joint_set_param(const RID &p_joint, PhysicsServer3D::PinJointParam p_param,
-        double p_value) {
+        float p_value) {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end()) {
         return;
@@ -1448,7 +1651,7 @@ void AVBDPhysicsServer3D::_pin_joint_set_param(const RID &p_joint, PhysicsServer
     // BIAS/DAMPING/IMPULSE_CLAMP are recorded only; the solver's stabilisation is its own.
 }
 
-double AVBDPhysicsServer3D::_pin_joint_get_param(const RID &p_joint, PhysicsServer3D::PinJointParam p_param) const {
+float AVBDPhysicsServer3D::_pin_joint_get_param(const RID &p_joint, PhysicsServer3D::PinJointParam p_param) const {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end()) {
         return 0.0;
@@ -1527,7 +1730,7 @@ void AVBDPhysicsServer3D::_joint_make_hinge_simple(const RID &p_joint, const RID
 }
 
 void AVBDPhysicsServer3D::_hinge_joint_set_param(const RID &p_joint, PhysicsServer3D::HingeJointParam p_param,
-        double p_value) {
+        float p_value) {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end()) {
         return;
@@ -1538,7 +1741,7 @@ void AVBDPhysicsServer3D::_hinge_joint_set_param(const RID &p_joint, PhysicsServ
     }
 }
 
-double AVBDPhysicsServer3D::_hinge_joint_get_param(const RID &p_joint, PhysicsServer3D::HingeJointParam p_param) const {
+float AVBDPhysicsServer3D::_hinge_joint_get_param(const RID &p_joint, PhysicsServer3D::HingeJointParam p_param) const {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end()) {
         return 0.0;
@@ -1584,7 +1787,7 @@ void AVBDPhysicsServer3D::_joint_make_slider(const RID &p_joint, const RID &p_bo
 }
 
 void AVBDPhysicsServer3D::_slider_joint_set_param(const RID &p_joint, PhysicsServer3D::SliderJointParam p_param,
-        double p_value) {
+        float p_value) {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end()) {
         return;
@@ -1598,7 +1801,7 @@ void AVBDPhysicsServer3D::_slider_joint_set_param(const RID &p_joint, PhysicsSer
     }
 }
 
-double AVBDPhysicsServer3D::_slider_joint_get_param(const RID &p_joint, PhysicsServer3D::SliderJointParam p_param) const {
+float AVBDPhysicsServer3D::_slider_joint_get_param(const RID &p_joint, PhysicsServer3D::SliderJointParam p_param) const {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end()) {
         return 0.0;
@@ -1623,7 +1826,7 @@ void AVBDPhysicsServer3D::_joint_make_cone_twist(const RID &p_joint, const RID &
 }
 
 void AVBDPhysicsServer3D::_cone_twist_joint_set_param(const RID &p_joint, PhysicsServer3D::ConeTwistJointParam p_param,
-        double p_value) {
+        float p_value) {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end()) {
         return;
@@ -1635,7 +1838,7 @@ void AVBDPhysicsServer3D::_cone_twist_joint_set_param(const RID &p_joint, Physic
     }
 }
 
-double AVBDPhysicsServer3D::_cone_twist_joint_get_param(const RID &p_joint,
+float AVBDPhysicsServer3D::_cone_twist_joint_get_param(const RID &p_joint,
         PhysicsServer3D::ConeTwistJointParam p_param) const {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end()) {
@@ -1646,7 +1849,7 @@ double AVBDPhysicsServer3D::_cone_twist_joint_get_param(const RID &p_joint,
 }
 
 void AVBDPhysicsServer3D::_generic_6dof_joint_set_param(const RID &p_joint, Vector3::Axis p_axis,
-        PhysicsServer3D::G6DOFJointAxisParam p_param, double p_value) {
+        PhysicsServer3D::G6DOFJointAxisParam p_param, float p_value) {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end() || p_axis < 0 || p_axis > Vector3::AXIS_Z ||
             static_cast<int>(p_param) >= JointData::kMaxParams) {
@@ -1667,7 +1870,7 @@ void AVBDPhysicsServer3D::_generic_6dof_joint_set_param(const RID &p_joint, Vect
     }
 }
 
-double AVBDPhysicsServer3D::_generic_6dof_joint_get_param(const RID &p_joint, Vector3::Axis p_axis,
+float AVBDPhysicsServer3D::_generic_6dof_joint_get_param(const RID &p_joint, Vector3::Axis p_axis,
         PhysicsServer3D::G6DOFJointAxisParam p_param) const {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end() || p_axis < 0 || p_axis > Vector3::AXIS_Z ||
@@ -2365,13 +2568,13 @@ int32_t AVBDPhysicsServer3D::_body_get_max_contacts_reported(const RID &p_body) 
     return found == bodies.end() ? 0 : found->second.max_contacts_reported;
 }
 
-void AVBDPhysicsServer3D::_body_set_contacts_reported_depth_threshold(const RID &p_body, double p_threshold) {
+void AVBDPhysicsServer3D::_body_set_contacts_reported_depth_threshold(const RID &p_body, float p_threshold)  {
     if (BodyData *body = find_body(p_body)) {
         body->contacts_depth_threshold = p_threshold; // recorded; not applied (contact depths come from the solver)
     }
 }
 
-double AVBDPhysicsServer3D::_body_get_contacts_reported_depth_threshold(const RID &p_body) const {
+float AVBDPhysicsServer3D::_body_get_contacts_reported_depth_threshold(const RID &p_body) const {
     const auto found = bodies.find(id_of(p_body));
     return found == bodies.end() ? 0.0 : found->second.contacts_depth_threshold;
 }
@@ -2478,13 +2681,13 @@ uint32_t AVBDPhysicsServer3D::_body_get_collision_mask(const RID &p_body) const 
     return found == bodies.end() ? 1 : found->second.collision_mask;
 }
 
-void AVBDPhysicsServer3D::_body_set_collision_priority(const RID &p_body, double p_priority) {
+void AVBDPhysicsServer3D::_body_set_collision_priority(const RID &p_body, float p_priority) {
     if (BodyData *body = find_body(p_body)) {
         body->collision_priority = p_priority; // recorded; solver has no priority weighting
     }
 }
 
-double AVBDPhysicsServer3D::_body_get_collision_priority(const RID &p_body) const {
+float AVBDPhysicsServer3D::_body_get_collision_priority(const RID &p_body) const {
     const auto found = bodies.find(id_of(p_body));
     return found == bodies.end() ? 1.0 : found->second.collision_priority;
 }
