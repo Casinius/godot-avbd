@@ -351,11 +351,11 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     p_space.threads = static_cast<int>(settings->get_setting("physics/avbd/threads", 0));
     p_space.iterations = static_cast<int>(settings->get_setting("physics/avbd/iterations", 4));
     p_space.alpha = settings->get_setting("physics/avbd/alpha", 0.99);
-    p_space.beta_linear = settings->get_setting("physics/avbd/beta_linear", 10000.0);
-    p_space.beta_angular = settings->get_setting("physics/avbd/beta_angular", 100.0);
+    p_space.beta_linear = settings->get_setting("physics/avbd/beta_linear", 1e5);
+    p_space.beta_angular = settings->get_setting("physics/avbd/beta_angular", 1e2);
     p_space.gamma = settings->get_setting("physics/avbd/gamma", 0.999);
     p_space.substeps = static_cast<int>(settings->get_setting("physics/avbd/substeps", 2));
-    p_space.newton_ratio = settings->get_setting("physics/avbd/newton_ratio", 1.0);
+    p_space.newton_ratio = settings->get_setting("physics/avbd/newton_ratio", 0.5);
     p_space.stiffness_decay = settings->get_setting("physics/avbd/stiffness_decay", 0.8);
     p_space.jacobian_rebuild_distance = settings->get_setting("physics/avbd/jacobian_rebuild_distance", 0.0);
     p_space.chebyshev_rho = settings->get_setting("physics/avbd/chebyshev_rho", 0.0);
