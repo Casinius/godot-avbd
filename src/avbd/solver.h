@@ -425,6 +425,9 @@ struct Manifold : Force
     float3x3 rotACaptured = float3x3::Identity(); // body rotations at capture
     float3x3 rotBCaptured = float3x3::Identity();
     bool jacobiansCached = false;
+    // Clamped contact forces from the primal's shared precompute pass; the two body
+    // stamps read these instead of each recomputing the same C/F from the snapshot.
+    std::array<float3, 8> contactForceCache;
 
     Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB);
 
@@ -440,6 +443,12 @@ struct Manifold : Force
 
     bool initialize() override;
     void updatePrimal(Rigid *body, float alpha, Block &block) override;
+    // Two-phase primal: preCompute (parallel over forces) evaluates the shared per-
+    // contact arms/jacobians/clamped forces once; stampCached (parallel over bodies)
+    // stamps one body's side from that cache. updatePrimal is the self-contained
+    // fallback that runs both.
+    void preCompute(float alpha);
+    void stampCached(Rigid *body, Block &block);
     void updateDual(float alpha) override;
     int contactPointCount() const override { return numContacts; }
     void accumulatePenetration(float &r_total, int &r_count) const override;

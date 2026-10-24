@@ -558,18 +558,37 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
             const bool newton = it < newtonRounds;
             if (newton)
             {
-                // Block projected Jacobi: every update-set body assembles its full block
-                // system (own inertia plus every incident constraint, all stamped against
-                // the iteration-start pose) and solves for its delta. Nobody writes a
-                // pose until the combine pass, so every body reads the same frozen
-                // snapshot - race-free by construction, no colours, and no thread-count
-                // dependence.
+                // Block projected Jacobi in three phases. Phase A precomputes each
+                // manifold's shared per-contact assembly (world arms, angular jacobians,
+                // clamped forces) once from the round's pose snapshot - work the two
+                // body stamps used to duplicate. Nobody writes a pose until the combine
+                // pass, so every phase reads the same frozen snapshot: race-free by
+                // construction, no colours, and no thread-count dependence.
+                sync.forItems(forceCount, [this](int i) {
+                    Force *f = forceOrder[i];
+                    if (f->contactPointCount() <= 0)
+                        return;
+                    Manifold *manifold = static_cast<Manifold *>(f);
+                    if (!manifold->bodyA->inUpdateSet && !manifold->bodyB->inUpdateSet)
+                        return; // frozen: neither side moves this round
+                    manifold->preCompute(alpha);
+                });
+                sync.arriveAndWait();
+
+                // Phase B: each body assembles its full block system (own inertia plus
+                // every incident constraint - manifolds stamped from the phase-A cache,
+                // other forces stamping directly) and solves for its delta.
                 sync.forItems(static_cast<int>(updateOrder.size()), [this](int i) {
                     Rigid *body = updateOrder[i];
                     Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
                             body->positionAng, body->inertialAng);
                     for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
-                        f->updatePrimal(body, alpha, block);
+                    {
+                        if (f->contactPointCount() > 0)
+                            static_cast<Manifold *>(f)->stampCached(body, block);
+                        else
+                            f->updatePrimal(body, alpha, block);
+                    }
                     block.solveDelta(bodyDeltaLin[i], bodyDeltaAng[i]);
                 });
                 sync.arriveAndWait();

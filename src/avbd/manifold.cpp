@@ -160,7 +160,15 @@ bool Manifold::initialize()
     return numContacts > 0;
 }
 
-void Manifold::updatePrimal(Rigid *body, float alpha, Block &block)
+// The primal runs in two phases so the two bodies of a manifold share one assembly:
+// preCompute (parallel over forces, once per round) evaluates everything both stamps
+// need - world arms, angular jacobians, and the clamped contact forces - from the
+// round's pose snapshot; stampCached (parallel over bodies) stamps each body's side
+// from that cache. Before the split, each of the two per-round updatePrimal calls
+// recomputed the whole shared half and used only its own side of the stamps. Same
+// inputs in the same order, so the cached values are bit-identical to what the stamps
+// used to recompute.
+void Manifold::preCompute(float alpha)
 {
     float3 dqALin = bodyA->positionLin - bodyA->initialLin;
     float3 dqAAng = bodyA->positionAng - bodyA->initialAng;
@@ -212,17 +220,17 @@ void Manifold::updatePrimal(Rigid *body, float alpha, Block &block)
                 jBAng.row(r) = rBWorld.cross(jBLin.row(r));
             }
 
-            if (cacheable)
-            {
-                cache.rAWorld = rAWorld;
-                cache.rBWorld = rBWorld;
-                cache.jAAng = jAAng;
-                cache.jBAng = jBAng;
-                if (i == numContacts - 1) {
-                    rotACaptured = rotA;
-                    rotBCaptured = rotB;
-                    jacobiansCached = true;
-                }
+            // Always landed in the cache: stampCached reads these for this round even
+            // when the cross-round drift feature is off (the capture bookkeeping below
+            // is what jacobianRebuildDistance gates).
+            cache.rAWorld = rAWorld;
+            cache.rBWorld = rBWorld;
+            cache.jAAng = jAAng;
+            cache.jBAng = jBAng;
+            if (cacheable && i == numContacts - 1) {
+                rotACaptured = rotA;
+                rotBCaptured = rotB;
+                jacobiansCached = true;
             }
         }
 
@@ -246,9 +254,19 @@ void Manifold::updatePrimal(Rigid *body, float alpha, Block &block)
             F[2] *= bounds / frictionScale;
         }
 
-        // Choose jacobian depending on input body
-        float3x3 jLin = body == bodyA ? jALin : jBLin;
-        float3x3 jAng = body == bodyA ? jAAng : jBAng;
+        contactForceCache[i] = F;
+    }
+}
+
+void Manifold::stampCached(Rigid *body, Block &block)
+{
+    const bool fromIsA = body == bodyA;
+    for (int i = 0; i < numContacts; i++)
+    {
+        const float3 &F = contactForceCache[i];
+        const float3x3 K = diagonal(contacts[i].penalty.x(), contacts[i].penalty.y(), contacts[i].penalty.z());
+        const float3x3 jLin = fromIsA ? basis : -basis;
+        const float3x3 &jAng = fromIsA ? jacobianCache[i].jAAng : jacobianCache[i].jBAng;
 
         // Stamp into LHS
         float3x3 jLinT = jLin.transpose();
@@ -263,6 +281,13 @@ void Manifold::updatePrimal(Rigid *body, float alpha, Block &block)
         block.rhsLin += jLinT * F;
         block.rhsAng += jAngT * F;
     }
+}
+
+void Manifold::updatePrimal(Rigid *body, float alpha, Block &block)
+{
+    // Self-contained fallback; the parallel primal drives the two phases directly.
+    preCompute(alpha);
+    stampCached(body, block);
 }
 
 void Manifold::updateDual(float alpha)
