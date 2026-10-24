@@ -562,8 +562,13 @@ struct Solver
     [[nodiscard]] Rigid *pick(float3 origin, float3 dir, float3 &local);
     // Masked variant with Godot's pair semantics: a body is a candidate when
     // (body.layer & p_mask) != 0. The two-argument form above forwards with an
-    // accept-everything mask.
+    // accept-everything mask. Both walk the last built broad-phase tree (ray/AABB
+    // pruned); before any step has built one, they fall back to a body-list walk.
     [[nodiscard]] Rigid *pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask);
+    // Bodies whose last-built broad-phase bounds overlap the query AABB, filtered by
+    // (layer & p_mask) != 0. Backs the direct space state's shape and point queries;
+    // the same no-tree fallback applies.
+    void collectAABB(float3 min, float3 max, uint32_t p_mask, std::vector<Rigid *> &out) const;
     // Delete every body and force.
     void clear();
     void step();

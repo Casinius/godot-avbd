@@ -231,43 +231,88 @@ inline bool addContact(const Shape& shapeA, const Shape& shapeB, std::span<Manif
     return true;
 }
 
-inline bool testAxis(const OBB& boxA, const OBB& boxB, const float3& delta, const float3& axis, AxisType type, int indexA, int indexB, SatAxis& best)
+// SAT with the frame table. The caller precomputes m[i][j] = axisA_i·axisB_j and
+// dA/dB = delta in each box's frame once per pair; every axis projection then reduces
+// to table reads:
+//   face axis A_i: |delta·A_i| = |dA[i]| and the projection radius of A is exactly
+//     halfA[i] (its own face normal) - no sqrt, no per-axis absDot storm;
+//   edge axis A_i×B_j: the cross product is perpendicular to both parents, so each
+//     box's radius reads the two off-axis entries of m (perpendicularity identity).
+// The generic per-axis form (normalise, absDot both boxes' three axes) did ~30
+// multiplies plus a sqrt per axis, 15 axes per pair.
+
+inline bool testFaceAxisA(const OBB& boxA, const OBB& boxB, const float3& dA, const float m[3][3], int i, SatAxis& best)
 {
-    float lenSq = axis.squaredNorm();
-    if (lenSq < SAT_AXIS_EPSILON)
-        return true;
-
-    float invLen = 1.0f / std::sqrt(lenSq);
-    float3 n = axis * invLen;
-    if (n.dot(delta) < 0.0f)
-        n = -n;
-
-    float distance = std::abs(delta.dot(n));
-
-    float rA =
-        boxA.half.x() * absDot(n, boxA.axis[0]) +
-        boxA.half.y() * absDot(n, boxA.axis[1]) +
-        boxA.half.z() * absDot(n, boxA.axis[2]);
-
-    float rB =
-        boxB.half.x() * absDot(n, boxB.axis[0]) +
-        boxB.half.y() * absDot(n, boxB.axis[1]) +
-        boxB.half.z() * absDot(n, boxB.axis[2]);
-
-    float separation = distance - (rA + rB);
+    const float separation = std::abs(dA[i]) -
+            (boxA.half[i] +
+                    boxB.half.x() * std::abs(m[i][0]) + boxB.half.y() * std::abs(m[i][1]) +
+                    boxB.half.z() * std::abs(m[i][2]));
     if (separation > 0.0f)
         return false;
 
     if (!best.valid || separation > best.separation)
     {
         best.valid = true;
-        best.type = type;
-        best.indexA = indexA;
-        best.indexB = indexB;
+        best.type = AXIS_FACE_A;
+        best.indexA = i;
+        best.indexB = -1;
         best.separation = separation;
-        best.normalAB = n;
+        best.normalAB = boxA.axis[i] * (dA[i] < 0.0f ? -1.0f : 1.0f);
     }
+    return true;
+}
 
+inline bool testFaceAxisB(const OBB& boxA, const OBB& boxB, const float3& dB, const float m[3][3], int j, SatAxis& best)
+{
+    const float separation = std::abs(dB[j]) -
+            (boxB.half[j] +
+                    boxA.half.x() * std::abs(m[0][j]) + boxA.half.y() * std::abs(m[1][j]) +
+                    boxA.half.z() * std::abs(m[2][j]));
+    if (separation > 0.0f)
+        return false;
+
+    if (!best.valid || separation > best.separation)
+    {
+        best.valid = true;
+        best.type = AXIS_FACE_B;
+        best.indexA = -1;
+        best.indexB = j;
+        best.separation = separation;
+        best.normalAB = boxB.axis[j] * (dB[j] < 0.0f ? -1.0f : 1.0f);
+    }
+    return true;
+}
+
+inline bool testEdgeAxis(const OBB& boxA, const OBB& boxB, const float3& delta, const float3& axis, const float m[3][3],
+        int i, int j, SatAxis& best)
+{
+    const float lenSq = axis.squaredNorm();
+    if (lenSq < SAT_AXIS_EPSILON)
+        return true;
+
+    const float invLen = 1.0f / std::sqrt(lenSq);
+    // (A_i x B_j) is perpendicular to A_i and B_j, so each box's support along it is
+    // the support along the two adjacent axes, read off the frame table:
+    //   |A_k . (A_i x B_j)| = |m[(i+2)%3][j]| for k=(i+1)%3, |m[(i+1)%3][j]| for k=(i+2)%3
+    const int i1 = (i + 1) % 3, i2 = (i + 2) % 3;
+    const int j1 = (j + 1) % 3, j2 = (j + 2) % 3;
+    const float rA = (boxA.half[i1] * std::abs(m[i2][j]) + boxA.half[i2] * std::abs(m[i1][j])) * invLen;
+    const float rB = (boxB.half[j1] * std::abs(m[i][j2]) + boxB.half[j2] * std::abs(m[i][j1])) * invLen;
+
+    const float signedDist = delta.dot(axis) * invLen;
+    const float separation = std::abs(signedDist) - (rA + rB);
+    if (separation > 0.0f)
+        return false;
+
+    if (!best.valid || separation > best.separation)
+    {
+        best.valid = true;
+        best.type = AXIS_EDGE;
+        best.indexA = i;
+        best.indexB = j;
+        best.separation = separation;
+        best.normalAB = axis * (signedDist < 0.0f ? -invLen : invLen);
+    }
     return true;
 }
 
@@ -894,6 +939,15 @@ int collideShapes(const Shape& a, const Shape& b,
     OBB boxB = makeOBB(b);
     float3 delta = boxB.center - boxA.center;
 
+    // Frame table for the specialised SAT axes: m[i][j] = axisA_i·axisB_j, plus delta
+    // in each box's frame. 15 dots once, instead of ~30 absDots + a sqrt per axis.
+    float m[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            m[i][j] = boxA.axis[i].dot(boxB.axis[j]);
+    const float3 dA{delta.dot(boxA.axis[0]), delta.dot(boxA.axis[1]), delta.dot(boxA.axis[2])};
+    const float3 dB{delta.dot(boxB.axis[0]), delta.dot(boxB.axis[1]), delta.dot(boxB.axis[2])};
+
     SatAxis bestFace{};
     bestFace.separation = -FLT_MAX;
     bestFace.valid = false;
@@ -902,24 +956,24 @@ int collideShapes(const Shape& a, const Shape& b,
     bestEdge.separation = -FLT_MAX;
     bestEdge.valid = false;
 
-    for (size_t i = 0; i < 3; ++i)
+    for (int i = 0; i < 3; ++i)
     {
-        if (!testAxis(boxA, boxB, delta, boxA.axis[i], AXIS_FACE_A, i, -1, bestFace))
+        if (!testFaceAxisA(boxA, boxB, dA, m, i, bestFace))
             return 0;
     }
 
-    for (size_t i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
     {
-        if (!testAxis(boxA, boxB, delta, boxB.axis[i], AXIS_FACE_B, -1, i, bestFace))
+        if (!testFaceAxisB(boxA, boxB, dB, m, j, bestFace))
             return 0;
     }
 
-    for (size_t i = 0; i < 3; ++i)
+    for (int i = 0; i < 3; ++i)
     {
         for (int j = 0; j < 3; ++j)
         {
             float3 axis = boxA.axis[i].cross(boxB.axis[j]);
-            if (!testAxis(boxA, boxB, delta, axis, AXIS_EDGE, i, j, bestEdge))
+            if (!testEdgeAxis(boxA, boxB, delta, axis, m, i, j, bestEdge))
                 return 0;
         }
     }

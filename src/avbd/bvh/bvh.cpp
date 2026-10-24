@@ -54,66 +54,6 @@ static inline void computeAABB(const avbd::Rigid* body, float3& min, float3& max
 }
 
 // ============================================
-// Build Recursive Implementation
-// ============================================
-// Returns the node index of the subtree root for this range of body indices.
-int Builder::buildRange(std::vector<int> local, int depth) noexcept {
-    const int count = static_cast<int>(local.size());
-
-    if (count == 1) {
-        const int bodyIndex = local[0];
-        const avbd::Rigid* body = bodies_[bodyIndex];
-        float3 min, max;
-        computeAABB(body, min, max);
-        return nodes_.createLeaf(min, max, bodyIndex);
-    }
-
-    // Split on the axis with largest span of bounding-sphere centres.
-    float3 min = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
-    float3 max = {std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
-
-    for (int i = 0; i < count; ++i) {
-        const float3 c = computeAABBCenter(bodies_[local[i]]);
-        min = {std::min(min.x(), c.x()), std::min(min.y(), c.y()), std::min(min.z(), c.z())};
-        max = {std::max(max.x(), c.x()), std::max(max.y(), c.y()), std::max(max.z(), c.z())};
-    }
-
-    const float3 span = {max.x() - min.x(), max.y() - min.y(), max.z() - min.z()};
-    const int splitAxis = span.x() >= span.y() ? (span.x() >= span.z() ? 0 : 2) : (span.y() >= span.z() ? 1 : 2);
-    const float splitPos = min[splitAxis] + span[splitAxis] * 0.5f;
-
-    int splitPosIdx = 0;
-    for (int i = 0; i < count; ++i) {
-        if (computeAABBCenter(bodies_[local[i]])[splitAxis] < splitPos) {
-            std::swap(local[i], local[splitPosIdx]);
-            ++splitPosIdx;
-        }
-    }
-    // Degenerate partition (all centres on one side): median split keeps the tree
-    // balanced and the recursion terminating.
-    if (splitPosIdx == 0 || splitPosIdx == count)
-        splitPosIdx = count / 2;
-
-    // Sub-ranges recurse on their own copies; the (const) span is never written.
-    std::vector<int> leftLocal(local.begin(), local.begin() + splitPosIdx);
-    std::vector<int> rightLocal(local.begin() + splitPosIdx, local.end());
-
-    const int leftNode = buildRange(std::move(leftLocal), depth + 1);
-    const int rightNode = buildRange(std::move(rightLocal), depth + 1);
-
-    const float3 mn = rmin(nodes_.boundsMin()[leftNode], nodes_.boundsMin()[rightNode]);
-    const float3 mx = rmax(nodes_.boundsMax()[leftNode], nodes_.boundsMax()[rightNode]);
-    return nodes_.createInternal(mn, mx, leftNode, rightNode);
-}
-
-// Morton LBVH: implicit heap layout over a complete binary tree with `padded` =
-// next_pow2(n) leaf slots. Bodies are ordered by Morton code (a pure function of the
-// scene bounds and positions - deterministic), leaves are filled in Morton order into
-// slots [padded-1, padded-1+n), and internal slots [0, padded-1) aggregate their
-// children. Slot arithmetic (children = 2i+1 / 2i+2) IS the tree.
-//
-// Returns the leaf count; the first leaf slot is padded - 1.
-// ============================================
 // Morton LBVH Builder: implicit heap layout, balanced by construction
 // ============================================
 //
@@ -162,12 +102,15 @@ int Builder::buildLBVH()
     const float3 extent = {hi.x() - lo.x(), hi.y() - lo.y(), hi.z() - lo.z()};
     const float scale = 2097151.0f / std::max({extent.x(), extent.y(), extent.z(), 1e-6f});
 
-    // Morton codes per body index, then sort body indices by code.
+    // Morton codes per body index, then sort body indices by code. The builder's index
+    // contract is "bodyIndices_[k] selects bodies_[k]"; the leaf records that value so a
+    // caller passing a filtered or reordered subset maps back to the right bodies.
     std::vector<std::pair<uint64_t, int>> coded;
     coded.reserve(n);
     for (int i = 0; i < n; ++i) {
-        const float3 c = bodies_[i]->positionLin;
-        coded.emplace_back(morton::morton3D(c.x(), c.y(), c.z(), lo.x(), scale), i);
+        const int bodyIndex = bodyIndices_[i];
+        const float3 c = bodies_[bodyIndex]->positionLin;
+        coded.emplace_back(morton::morton3D(c.x(), c.y(), c.z(), lo.x(), scale), bodyIndex);
     }
     std::sort(coded.begin(), coded.end(),
             [](const auto &a, const auto &b) { return a.first < b.first; });
@@ -202,17 +145,22 @@ int Builder::buildLBVH()
         // Empty child slots (beyond n) carry max/lowest bounds; skip them in the union
         // so a mostly-empty tree does not poison its ancestors with inverted boxes.
         float3 mn, mx;
-        const bool lValid = l >= padded - 1 ? (l - (padded - 1)) < n : true;
-        const bool rValid = r >= padded - 1 ? (r - (padded - 1)) < n : true;
+        const bool lValid = l >= padded - 1 ? (l - (padded - 1)) < n : nodes_.valid(l);
+        const bool rValid = r >= padded - 1 ? (r - (padded - 1)) < n : nodes_.valid(r);
         if (lValid && rValid) {
             mn = rmin(lmn, rmn);
             mx = rmax(lmx, rmx);
         } else if (lValid) {
             mn = lmn; mx = lmx;
-        } else {
+        } else if (rValid) {
             mn = rmn; mx = rmx;
+        } else {
+            // Fully empty subtree: keep the node out of every traversal (its bounds are
+            // uninitialized) instead of letting a query test garbage floats.
+            nodes_.setImplicitInternalBounds(slot, allMin, allMax, false);
+            continue;
         }
-        nodes_.setImplicitInternalBounds(slot, mn, mx);
+        nodes_.setImplicitInternalBounds(slot, mn, mx, true);
     }
     return n;
 }

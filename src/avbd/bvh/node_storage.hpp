@@ -68,6 +68,11 @@ public:
     [[nodiscard]] const float3& boundsMin(int index) const noexcept { return boundsMin_[index]; }
     [[nodiscard]] const float3& boundsMax(int index) const noexcept { return boundsMax_[index]; }
     [[nodiscard]] const int& bodyIndex(int index) const noexcept { return bodyIndex_[index]; }
+    // Whether the node's subtree contains at least one real leaf. Empty subtrees exist
+    // in the implicit layout whenever the leaf count is not a power of two (the right
+    // tail), and their bounds are left uninitialized by design - traversals must skip
+    // them instead of testing garbage floats.
+    [[nodiscard]] bool valid(int index) const noexcept { return valid_[index] != 0; }
     [[nodiscard]] int countLeaves() const noexcept;
     [[nodiscard]] int root() const noexcept { return 0; }
 
@@ -77,16 +82,24 @@ public:
         boundsMin_.resize(nodeCount);
         boundsMax_.resize(nodeCount);
         bodyIndex_.resize(nodeCount, -1);
+        valid_.assign(nodeCount, 0);
     }
     void setImplicitLeaf(int slot, const float3& min, const float3& max, int bodyIndex) noexcept {
         boundsMin_[slot] = min;
         boundsMax_[slot] = max;
         bodyIndex_[slot] = bodyIndex;
+        valid_[slot] = 1;
     }
-    void setImplicitInternalBounds(int slot, const float3& min, const float3& max) noexcept {
+    void setImplicitInternalBounds(int slot, const float3& min, const float3& max, bool subtreeValid) noexcept {
         boundsMin_[slot] = min;
         boundsMax_[slot] = max;
+        valid_[slot] = subtreeValid ? 1 : 0;
     }
+
+private:
+    std::vector<uint8_t> valid_;
+
+public:
 
     // Node creation (SafeC++: returns int, no nullptr)
     int createLeaf(const float3& min, const float3& max, int bodyIndex) noexcept;
