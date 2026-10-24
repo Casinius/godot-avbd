@@ -229,6 +229,11 @@ protected:
 
         // Cached direct space state handed to the engine; owned, freed with the space.
         AVBDDirectSpaceState3D *direct_state = nullptr;
+
+        // Solver-body -> server id, rebuilt with the space. The direct space state's
+        // queries get their candidates back as Rigid* from the BVH; this is the O(1)
+        // bridge back to RIDs (body_id_of used to scan every body per result).
+        std::unordered_map<const avbd::Rigid *, uint64_t> rigid_ids;
     };
 
     // One area, as the engine described it. Monitored each step against the bodies of
@@ -325,6 +330,11 @@ public:
     };
     // Every simulated body of the space whose layer survives the query mask.
     std::vector<QueryCandidate> query_candidates(const RID &p_space, uint32_t p_mask) const;
+    // The same contract, narrowed by the last built broad-phase tree: only bodies whose
+    // bound overlaps the query AABB (sim space). Before any step has built a tree this
+    // answers from the body list with per-body bounds.
+    std::vector<QueryCandidate> query_candidates_aabb(const RID &p_space, avbd::float3 p_min,
+            avbd::float3 p_max, uint32_t p_mask) const;
 
     // Solver::pick with a mask, on one space's solver.
     avbd::Rigid *solver_pick(const RID &p_space, avbd::float3 p_origin, avbd::float3 p_dir, uint32_t p_mask,

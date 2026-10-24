@@ -48,13 +48,11 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
     Rigid *bestBody = 0;
     float3 bestLocal = {0, 0, 0};
 
-    // Ray-cast against each OBB by transforming the ray into body local space.
-    // Unlike the upstream demo (which uses this to pick bodies for dragging) this
-    // also tests static bodies, so rays hit the ground and ramps.
-    for (Rigid *body = bodies; body != 0; body = body->next)
-    {
+    // Exact per-body test: ray against the body's local box, as before. Used at BVH
+    // leaves and by the no-tree fallback below, so both paths agree bit for bit.
+    const auto testBody = [&](Rigid *body) {
         if ((body->collisionLayer & p_mask) == 0)
-            continue;
+            return;
         quat invRot = body->positionAng.conjugate();
         float3 o = invRot * (origin - body->positionLin);
         float3 d = invRot * dir;
@@ -96,17 +94,87 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
         }
 
         if (!hit)
-            continue;
+            return;
 
         float tHit = tEnter >= 0.0f ? tEnter : tExit;
         if (tHit < 0.0f)
-            continue;
+            return;
 
         if (tHit < bestT)
         {
             bestT = tHit;
             bestBody = body;
             bestLocal = o + d * tHit;
+        }
+    };
+
+    if (bvhNodes.size() == 0)
+    {
+        // No broad phase yet (no step has run): walk the list, as this always did.
+        // Unlike the upstream demo (which picks bodies for dragging) this also tests
+        // static bodies, so rays hit the ground and ramps.
+        for (Rigid *body = bodies; body != 0; body = body->next)
+            testBody(body);
+    }
+    else
+    {
+        // Descend the last built broad-phase tree. Node bounds are the tight
+        // AABB-of-OBB leaves aggregated upward, so a ray/AABB interval test prunes
+        // whole subtrees; pruning by the current best hit keeps the query output-
+        // sensitive. The exact per-body test above decides at the leaves.
+        const auto rayOverNode = [&](int slot, float &r_tEnter) {
+            const float3 &bmin = bvhNodes.boundsMin()[slot];
+            const float3 &bmax = bvhNodes.boundsMax()[slot];
+            float tEnter = 0.0f;
+            float tExit = bestT; // prune against the closest hit so far
+            for (int i = 0; i < 3; ++i)
+            {
+                if (std::fabs(dir[i]) < epsilon)
+                {
+                    if (origin[i] < bmin[i] || origin[i] > bmax[i])
+                        return false;
+                    continue;
+                }
+                const float invD = 1.0f / dir[i];
+                float t0 = (bmin[i] - origin[i]) * invD;
+                float t1 = (bmax[i] - origin[i]) * invD;
+                if (t0 > t1)
+                {
+                    const float tmp = t0;
+                    t0 = t1;
+                    t1 = tmp;
+                }
+                tEnter = std::max(tEnter, t0);
+                tExit = std::min(tExit, t1);
+                if (tEnter > tExit)
+                    return false;
+            }
+            r_tEnter = tEnter;
+            return true;
+        };
+
+        int stack[66];
+        int top = 0;
+        stack[top++] = 0;
+        while (top > 0)
+        {
+            const int slot = stack[--top];
+            if (!bvhNodes.valid(slot))
+                continue;
+            float tEnter = 0.0f;
+            if (!rayOverNode(slot, tEnter))
+                continue;
+            if (2 * slot + 1 < bvhNodes.size())
+            {
+                // Internal node (its children exist in the implicit layout).
+                stack[top++] = 2 * slot + 1;
+                stack[top++] = 2 * slot + 2;
+                continue;
+            }
+            const int bodyIndex = bvhNodes.bodyIndex()[slot];
+            if (bodyIndex < 0)
+                continue;
+            testBody(bodiesInOrder[bodyIndex]);
         }
     }
 
@@ -115,6 +183,76 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
 
     local = bestLocal;
     return bestBody;
+}
+
+void Solver::collectAABB(float3 min, float3 max, uint32_t p_mask, std::vector<Rigid *> &out) const
+{
+    if (bvhNodes.size() == 0)
+    {
+        // No tree yet: the list walk answers with the same overlap rule.
+        for (Rigid *body = bodies; body != 0; body = body->next)
+        {
+            if ((body->collisionLayer & p_mask) == 0)
+                continue;
+            // The body's own bound: centre plus its tight world half-extent (the same
+            // formula the broad phase builds leaves with, evaluated inline).
+            float3 bmin, bmax;
+            float3 half;
+            switch (body->shape)
+            {
+                case ShapeType::Sphere:
+                    half = float3{body->radius, body->radius, body->radius};
+                    break;
+                case ShapeType::Cylinder:
+                    half = float3{body->size.x(), body->size.z() * 0.5f, body->size.x()};
+                    break;
+                case ShapeType::Box:
+                default:
+                    half = body->size * 0.5f;
+                    break;
+            }
+            const float3x3 rot(body->positionAng);
+            const float3 wx{
+                    std::abs(rot(0, 0)) * half.x() + std::abs(rot(0, 1)) * half.y() + std::abs(rot(0, 2)) * half.z(),
+                    std::abs(rot(1, 0)) * half.x() + std::abs(rot(1, 1)) * half.y() + std::abs(rot(1, 2)) * half.z(),
+                    std::abs(rot(2, 0)) * half.x() + std::abs(rot(2, 1)) * half.y() + std::abs(rot(2, 2)) * half.z()};
+            bmin = body->positionLin - wx;
+            bmax = body->positionLin + wx;
+            if (!(bmin.x() > max.x() || bmin.y() > max.y() || bmin.z() > max.z() ||
+                        min.x() > bmax.x() || min.y() > bmax.y() || min.z() > bmax.z()))
+                out.push_back(body);
+        }
+        return;
+    }
+
+    const auto overlaps = [&](int slot) {
+        const float3 &bmin = bvhNodes.boundsMin()[slot];
+        const float3 &bmax = bvhNodes.boundsMax()[slot];
+        return !(bmin.x() > max.x() || bmin.y() > max.y() || bmin.z() > max.z() ||
+                min.x() > bmax.x() || min.y() > bmax.y() || min.z() > bmax.z());
+    };
+
+    int stack[66];
+    int top = 0;
+    stack[top++] = 0;
+    while (top > 0)
+    {
+        const int slot = stack[--top];
+        if (!bvhNodes.valid(slot) || !overlaps(slot))
+            continue;
+        if (2 * slot + 1 < bvhNodes.size())
+        {
+            stack[top++] = 2 * slot + 1;
+            stack[top++] = 2 * slot + 2;
+            continue;
+        }
+        const int bodyIndex = bvhNodes.bodyIndex()[slot];
+        if (bodyIndex < 0)
+            continue;
+        Rigid *body = bodiesInOrder[bodyIndex];
+        if ((body->collisionLayer & p_mask) != 0)
+            out.push_back(body);
+    }
 }
 
 void Solver::clear()
@@ -192,52 +330,56 @@ void Solver::broadPhase()
     const int firstLeaf = p - 1;
     (void)padded;
 
-    // Leaf slots [firstLeaf, firstLeaf + leafCount) in Morton-sorted order; pair them
-    // through a real BVH self-query: for each leaf, descend the tree and test only
-    // nodes whose aggregated bounds overlap the leaf's AABB. Internal slots [0,
-    // firstLeaf) aggregate their descendants' bounds, so a skipped subtree costs O(1)
-    // and loses no candidates; the implicit layout makes children 2i+1 / 2i+2 and empty
-    // trailing leaf slots carry bodyIndex -1. Each unordered pair is found from both
-    // sides, so a slot-order comparison records it once; the body-index minmax keeps
-    // the pair set identical to the old all-pairs sweep. The final sort keeps the
-    // ascending (min-index, other) manifold order.
+    // Leaf slots [firstLeaf, firstLeaf + leafCount) in Morton-sorted order. The pair
+    // search is one top-down self-query: collideSubtrees walks every leaf pair between
+    // two subtrees whose aggregated bounds overlap (descending the internal side), and
+    // selfTraverse splits each internal node into its two children and recurses - each
+    // internal-node overlap test runs once per ancestor path, where the per-leaf
+    // from-root descent re-tested the top of the tree once per leaf. Empty subtrees
+    // (the right tail when n is not a power of two) are marked invalid by the builder
+    // and pruned before their uninitialized bounds are read. The body-index minmax and
+    // the final sort keep the (min-index, other) manifold order.
     sweepPairs.clear();
-    const auto boundsOverlap = [&](int na, int nb) {
-        const float3 &aMin = bvhNodes.boundsMin()[na];
-        const float3 &aMax = bvhNodes.boundsMax()[na];
-        const float3 &bMin = bvhNodes.boundsMin()[nb];
-        const float3 &bMax = bvhNodes.boundsMax()[nb];
+    const auto boundsOverlap = [&](int sa, int sb) {
+        const float3 &aMin = bvhNodes.boundsMin()[sa];
+        const float3 &aMax = bvhNodes.boundsMax()[sa];
+        const float3 &bMin = bvhNodes.boundsMin()[sb];
+        const float3 &bMax = bvhNodes.boundsMax()[sb];
         // Same touching-counts-as-overlapping semantics as the old pairwise sweep.
         return !(bMin.x() > aMax.x() || bMin.y() > aMax.y() || bMin.z() > aMax.z() ||
                 aMin.x() > bMax.x() || aMin.y() > bMax.y() || aMin.z() > bMax.z());
     };
-    // Complete-tree depth is ceil(log2(padded)) + 1; the descent holds at most one
-    // node per level plus one split, and padded <= next_pow2(n) for n < 2^31.
-    int stack[64];
-    for (int a = 0; a < leafCount; ++a)
-    {
-        const int na = firstLeaf + a;
-        int top = 0;
-        stack[top++] = 0; // root
-        while (top > 0)
+    const auto collideSubtrees = [&](auto &&self, int sa, int sb) -> void {
+        if (!bvhNodes.valid(sa) || !bvhNodes.valid(sb) || !boundsOverlap(sa, sb))
+            return;
+        const bool aLeaf = sa >= firstLeaf;
+        const bool bLeaf = sb >= firstLeaf;
+        if (aLeaf && bLeaf)
         {
-            const int slot = stack[--top];
-            if (!boundsOverlap(na, slot))
-                continue;
-            if (slot < firstLeaf)
-            {
-                stack[top++] = 2 * slot + 1;
-                stack[top++] = 2 * slot + 2;
-                continue;
-            }
-            if (slot <= na)
-                continue; // self, or the pair's lower slot (recorded from that side)
-            const int other = bvhNodes.bodyIndex()[slot];
-            if (other < 0)
-                continue; // padding leaf beyond the body count
-            sweepPairs.emplace_back(std::minmax(bvhNodes.bodyIndex()[na], other));
+            sweepPairs.emplace_back(std::minmax(bvhNodes.bodyIndex()[sa], bvhNodes.bodyIndex()[sb]));
+            return;
         }
-    }
+        if (!aLeaf)
+        {
+            self(self, 2 * sa + 1, sb);
+            self(self, 2 * sa + 2, sb);
+        }
+        else
+        {
+            self(self, sa, 2 * sb + 1);
+            self(self, sa, 2 * sb + 2);
+        }
+    };
+    const auto selfTraverse = [&](auto &&self, int slot) -> void {
+        if (slot >= firstLeaf)
+            return;
+        const int l = 2 * slot + 1;
+        const int r = 2 * slot + 2;
+        collideSubtrees(collideSubtrees, l, r);
+        self(self, l);
+        self(self, r);
+    };
+    selfTraverse(selfTraverse, 0);
 
     std::sort(sweepPairs.begin(), sweepPairs.end());
     sweepPairs.erase(std::unique(sweepPairs.begin(), sweepPairs.end()), sweepPairs.end());

@@ -68,6 +68,33 @@ avbd::Shape query_shape_of(const AVBDPhysicsServer3D::ShapeData &data, const Tra
     return s;
 }
 
+// Tight world-space (sim frame) AABB of a query shape - the same AABB-of-OBB the
+// broad phase builds its leaves with, so the BVH can prune the query instead of the
+// query scanning every body.
+void shape_aabb(const avbd::Shape &s, avbd::float3 &r_min, avbd::float3 &r_max) {
+    avbd::float3 half;
+    switch (s.type) {
+        case avbd::ShapeType::Sphere:
+            half = avbd::float3{s.radius, s.radius, s.radius};
+            break;
+        case avbd::ShapeType::Cylinder:
+            // Shape's cylinder axis is its local Z (see the axis field above).
+            half = avbd::float3{s.radius, s.radius, s.halfHeight};
+            break;
+        case avbd::ShapeType::Box:
+        default:
+            half = s.half;
+            break;
+    }
+    const avbd::float3x3 rot(s.rotation);
+    const avbd::float3 wx{
+            std::abs(rot(0, 0)) * half.x() + std::abs(rot(0, 1)) * half.y() + std::abs(rot(0, 2)) * half.z(),
+            std::abs(rot(1, 0)) * half.x() + std::abs(rot(1, 1)) * half.y() + std::abs(rot(1, 2)) * half.z(),
+            std::abs(rot(2, 0)) * half.x() + std::abs(rot(2, 1)) * half.y() + std::abs(rot(2, 2)) * half.z()};
+    r_min = s.center - wx;
+    r_max = s.center + wx;
+}
+
 // Deepest contact of a pair, or false when separated. Returns the deepest contact by
 // penetration depth - the one rest info and collide shape want.
 bool deepest_contact(const avbd::Shape &a, const avbd::Shape &b, avbd::Manifold::Contact &r_contact,
@@ -146,7 +173,10 @@ bool AVBDDirectSpaceState3D::_intersect_ray(const Vector3 &p_from, const Vector3
         probe.center = origin;
         probe.rotation = avbd::quat::Identity();
         probe.axis = avbd::float3{0, 0, 1};
-        for (const AVBDPhysicsServer3D::QueryCandidate &candidate : server->query_candidates(space, p_collision_mask)) {
+        const avbd::float3 probe_min = origin - avbd::float3{probe.radius, probe.radius, probe.radius};
+        const avbd::float3 probe_max = origin + avbd::float3{probe.radius, probe.radius, probe.radius};
+        for (const AVBDPhysicsServer3D::QueryCandidate &candidate :
+                server->query_candidates_aabb(space, probe_min, probe_max, p_collision_mask)) {
             if (!deepest_contact(probe, shape_of(*candidate.rigid), contact, basis)) {
                 continue;
             }
@@ -201,8 +231,11 @@ int32_t AVBDDirectSpaceState3D::_intersect_point(const Vector3 &p_position, uint
     probe.rotation = avbd::quat::Identity();
     probe.axis = avbd::float3{0, 0, 1};
 
+    const avbd::float3 probe_min = probe.center - avbd::float3{probe.radius, probe.radius, probe.radius};
+    const avbd::float3 probe_max = probe.center + avbd::float3{probe.radius, probe.radius, probe.radius};
     int32_t count = 0;
-    for (const AVBDPhysicsServer3D::QueryCandidate &candidate : server->query_candidates(space, p_collision_mask)) {
+    for (const AVBDPhysicsServer3D::QueryCandidate &candidate :
+            server->query_candidates_aabb(space, probe_min, probe_max, p_collision_mask)) {
         avbd::Manifold::Contact contact{};
         avbd::float3x3 basis{};
         if (!deepest_contact(probe, shape_of(*candidate.rigid), contact, basis)) {
@@ -236,8 +269,11 @@ int32_t AVBDDirectSpaceState3D::_intersect_shape(const RID &p_shape_rid, const T
     query.center = query.center + to_sim(p_motion); // the query pose is transform moved by motion
     (void)p_margin; // the solver's COLLISION_MARGIN already keeps contacts stable
 
+    avbd::float3 qmin, qmax;
+    shape_aabb(query, qmin, qmax);
     int32_t count = 0;
-    for (const AVBDPhysicsServer3D::QueryCandidate &candidate : server->query_candidates(space, p_collision_mask)) {
+    for (const AVBDPhysicsServer3D::QueryCandidate &candidate :
+            server->query_candidates_aabb(space, qmin, qmax, p_collision_mask)) {
         avbd::Manifold::Contact contact{};
         avbd::float3x3 basis{};
         if (!deepest_contact(query, shape_of(*candidate.rigid), contact, basis)) {
@@ -285,12 +321,23 @@ bool AVBDDirectSpaceState3D::_cast_motion(const RID &p_shape_rid, const Transfor
     const avbd::float3 motion = to_sim(p_motion);
     const avbd::Shape base = query_shape_of(*data, p_transform);
 
+    // The sweep's candidate box: the query shape's bound swept over the motion (a
+    // translation, so the union is per-axis min/max of the two endpoint bounds).
+    avbd::float3 swept_min, swept_max;
+    shape_aabb(base, swept_min, swept_max);
+    for (int i = 0; i < 3; i++) {
+        const float m = motion[i];
+        swept_min[i] = std::min(swept_min[i], swept_min[i] + m);
+        swept_max[i] = std::max(swept_max[i], swept_max[i] + m);
+    }
+
     // Binary search the motion fraction for the first colliding pose (8 iterations is
     // 1/256 precision - finer than any gameplay use).
     const auto collides = [&](float t) {
         avbd::Shape posed = base;
         posed.center = posed.center + motion * t;
-        for (const AVBDPhysicsServer3D::QueryCandidate &candidate : server->query_candidates(space, p_collision_mask)) {
+        for (const AVBDPhysicsServer3D::QueryCandidate &candidate :
+                server->query_candidates_aabb(space, swept_min, swept_max, p_collision_mask)) {
             avbd::Manifold::Contact contact{};
             avbd::float3x3 basis{};
             if (deepest_contact(posed, shape_of(*candidate.rigid), contact, basis)) {
@@ -356,9 +403,12 @@ bool AVBDDirectSpaceState3D::_collide_shape(const RID &p_shape_rid, const Transf
     Vector3 *points = static_cast<Vector3 *>(r_results);
     const int32_t max_pairs = p_max_results / 2;
 
+    avbd::float3 qmin, qmax;
+    shape_aabb(query, qmin, qmax);
     int32_t pairs = 0;
     bool any = false;
-    for (const AVBDPhysicsServer3D::QueryCandidate &candidate : server->query_candidates(space, p_collision_mask)) {
+    for (const AVBDPhysicsServer3D::QueryCandidate &candidate :
+            server->query_candidates_aabb(space, qmin, qmax, p_collision_mask)) {
         avbd::Manifold::Contact contact{};
         avbd::float3x3 basis{};
         if (!deepest_contact(query, shape_of(*candidate.rigid), contact, basis)) {
@@ -398,7 +448,10 @@ bool AVBDDirectSpaceState3D::_rest_info(const RID &p_shape_rid, const Transform3
     // The deepest contact over all bodies wins.
     bool found = false;
     float best_depth = -1.0f;
-    for (const AVBDPhysicsServer3D::QueryCandidate &candidate : server->query_candidates(space, p_collision_mask)) {
+    avbd::float3 qmin, qmax;
+    shape_aabb(query, qmin, qmax);
+    for (const AVBDPhysicsServer3D::QueryCandidate &candidate :
+            server->query_candidates_aabb(space, qmin, qmax, p_collision_mask)) {
         avbd::Manifold::Contact contact{};
         avbd::float3x3 basis{};
         if (!deepest_contact(query, shape_of(*candidate.rigid), contact, basis)) {

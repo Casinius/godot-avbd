@@ -737,6 +737,16 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
         }
     }
 
+    // Solver-body -> server id index for the query paths: the BVH hands candidates back
+    // as Rigid*, and this is the O(1) bridge to RIDs. Rebuilt here because every Rigid
+    // was just re-created.
+    space->rigid_ids.clear();
+    for (auto &[id, body] : bodies) {
+        if (id_of(body.space) == space_id && body.rigid != nullptr) {
+            space->rigid_ids.emplace(body.rigid, id);
+        }
+    }
+
     // Joints second, once every body exists. One solver GenericJoint per engine joint
     // whose both bodies live in this space (or whose A side is the world). Every Godot
     // joint type maps onto the solver's GenericJoint; the specialised types fix which
@@ -2037,6 +2047,29 @@ std::vector<AVBDPhysicsServer3D::QueryCandidate> AVBDPhysicsServer3D::query_cand
     );
 }
 
+std::vector<AVBDPhysicsServer3D::QueryCandidate> AVBDPhysicsServer3D::query_candidates_aabb(
+        const RID &p_space, avbd::float3 p_min, avbd::float3 p_max, uint32_t p_mask) const {
+    const auto found = spaces.find(id_of(p_space));
+    if (found == spaces.end()) {
+        return {};
+    }
+    const SpaceData &space = found->second;
+
+    std::vector<avbd::Rigid *> rigids;
+    space.solver.collectAABB(p_min, p_max, p_mask, rigids);
+
+    std::vector<QueryCandidate> out;
+    out.reserve(rigids.size());
+    for (const avbd::Rigid *rigid : rigids) {
+        const auto id = space.rigid_ids.find(rigid);
+        if (id == space.rigid_ids.end()) {
+            continue;
+        }
+        out.push_back(QueryCandidate{const_cast<avbd::Rigid *>(rigid), id->second});
+    }
+    return out;
+}
+
 avbd::Rigid *AVBDPhysicsServer3D::solver_pick(const RID &p_space, avbd::float3 p_origin, avbd::float3 p_dir,
         uint32_t p_mask, avbd::float3 &r_local) {
     SpaceData *space = find_space(p_space);
@@ -2047,13 +2080,14 @@ avbd::Rigid *AVBDPhysicsServer3D::solver_pick(const RID &p_space, avbd::float3 p
 }
 
 uint64_t AVBDPhysicsServer3D::body_id_of(const RID &p_space, const avbd::Rigid *p_rigid) const {
-    const uint64_t space_id = id_of(p_space);
-    for (const auto &[id, body] : bodies) {
-        if (body.rigid == p_rigid && id_of(body.space) == space_id) {
-            return id;
-        }
+    // O(1) through the space's solver-body index (rebuilt with the space); the BVH
+    // query paths resolve every result through here.
+    const auto found = spaces.find(id_of(p_space));
+    if (found == spaces.end()) {
+        return 0;
     }
-    return 0;
+    const auto id = found->second.rigid_ids.find(p_rigid);
+    return id != found->second.rigid_ids.end() ? id->second : 0;
 }
 
 RID AVBDPhysicsServer3D::solver_pick_rid(const RID &p_space, const avbd::Rigid *p_rigid) {
