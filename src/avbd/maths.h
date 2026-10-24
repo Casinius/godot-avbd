@@ -85,17 +85,73 @@ using quat = Eigen::Quaternion<float>;
 inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross, float3 bLin,
                   float3 bAng, float3 &xLin, float3 &xAng) noexcept {
   {
-    Eigen::Matrix<float, 6, 6> A;
-    A << aLin, aCross.transpose(), aCross, aAng; // fills row-major by 3x3 blocks: [aLin aCross^T; aCross aAng]
-    Eigen::Matrix<float, 6, 1> b;
-    b << bLin, bAng;
-    const Eigen::LDLT<Eigen::Matrix<float, 6, 6>> solver(A);
-    const Eigen::Matrix<float, 6, 1> x = solver.solve(b);
-    if (x.allFinite() && x.cwiseAbs().maxCoeff() < 1.0e1f)
-    {
-      xLin = x.head<3>();
-      xAng = x.tail<3>();
-      return;
+    // Hand-rolled 6x6 LDL^T without pivoting. The system is dominated by the M/dt^2
+    // diagonal (a 1 kg body at 240 Hz carries a 57,600 kg/s^2 diagonal against ~1e4
+    // penalty terms), so the pivot growth Eigen's symmetric pivoting exists for does
+    // not occur here, and dropping it - plus Eigen's expression and Transpositions
+    // plumbing - lands the kernel an order of magnitude cheaper. Plain sequential
+    // float ops keep the result bit-identical for every thread count. A degenerate
+    // pivot (non-positive D, which a near-singular block can produce) bails to the
+    // pivoted dynamic retry below.
+    float a[6][6];
+    for (int r = 0; r < 3; r++) {
+      for (int c = 0; c < 3; c++) {
+        a[r][c] = aLin(r, c);
+        a[r + 3][c + 3] = aAng(r, c);
+        a[r + 3][c] = aCross(r, c);     // [aLin aCross^T; aCross aAng]
+        a[r][c + 3] = aCross(c, r);
+      }
+    }
+
+    float l[6][6] = {};
+    float d[6];
+    bool factored = true;
+    for (int j = 0; j < 6; j++) {
+      float dj = a[j][j];
+      for (int s = 0; s < j; s++)
+        dj -= l[j][s] * l[j][s] * d[s];
+      if (!(dj > 1.0e-12f)) {
+        factored = false;
+        break;
+      }
+      d[j] = dj;
+      l[j][j] = 1.0f;
+      for (int i = j + 1; i < 6; i++) {
+        float lij = a[i][j];
+        for (int s = 0; s < j; s++)
+          lij -= l[i][s] * l[j][s] * d[s];
+        l[i][j] = lij / d[j];
+      }
+    }
+
+    if (factored) {
+      float z[6];
+      // Forward solve L z = b (unit lower triangle).
+      for (int i = 0; i < 6; i++) {
+        float v = i < 3 ? bLin[i] : bAng[i - 3];
+        for (int s = 0; s < i; s++)
+          v -= l[i][s] * z[s];
+        z[i] = v;
+      }
+      // Diagonal scaling y = D^-1 z, then back solve L^T x = y, all in one array.
+      float x[6];
+      for (int i = 0; i < 6; i++)
+        x[i] = z[i] / d[i];
+      for (int i = 5; i >= 0; i--) {
+        float v = x[i];
+        for (int s = i + 1; s < 6; s++)
+          v -= l[s][i] * x[s];
+        x[i] = v;
+      }
+
+      const float3 candLin{x[0], x[1], x[2]};
+      const float3 candAng{x[3], x[4], x[5]};
+      const float worst = std::max(candLin.cwiseAbs().maxCoeff(), candAng.cwiseAbs().maxCoeff());
+      if (std::isfinite(worst) && worst < 1.0e1f) {
+        xLin = candLin;
+        xAng = candAng;
+        return;
+      }
     }
   }
 

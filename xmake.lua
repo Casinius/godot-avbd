@@ -57,6 +57,8 @@ local avbd_warnings = { "all", "extra" }
 -- that target's scope.
 local function avbd_common()
     set_languages("c++23")
+    set_symbols("debug")
+    set_strip("none")
     set_warnings(avbd_warnings)
     add_cxflags("-Wshadow", "-Wnon-virtual-dtor")
     add_syslinks("pthread")

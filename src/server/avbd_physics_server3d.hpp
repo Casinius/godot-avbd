@@ -216,6 +216,9 @@ protected:
         // Chebyshev semi-iteration spectral-radius bound over the Jacobi primal.
         // 0 = off (constant relaxation); 0.9-0.99 is the useful range.
         double chebyshev_rho = 0.0;
+        // Upper bound of the adaptive iteration boost. 16 keeps the reference quality;
+        // 8 trades deep-impact penetration for flat frame cost (see the load sweep).
+        double adaptive_max_iterations = 16;
 
         // Debug contacts collected during the last step (world space, Godot frame).
 

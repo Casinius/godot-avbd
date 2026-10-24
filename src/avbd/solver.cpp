@@ -351,7 +351,7 @@ void Solver::solveIterations(int forceCount)
             targetIterations = static_cast<int>(std::round(iterations * avgPenetration / maxPenetrationError));
         }
         targetIterations = std::max(2, targetIterations);  // Minimum 2 iterations
-        targetIterations = std::min(targetIterations, 16); // Cap at 16 iterations (Jolt/Godot use 8, but their impulse solver is 10x cheaper per round; AVBD's dense blocks need the room - the convergence early-exit is the intended way to skip cheap rounds)
+        targetIterations = std::min(targetIterations, adaptiveMaxIterations); // Impact-moment cost bound; see the member comment.
     }
 
     // One dispatch covers every round: the barrier fences inside `iterate` carry the
