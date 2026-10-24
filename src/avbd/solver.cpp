@@ -636,28 +636,21 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
             // Dual update: one item per force, and each force only reads the (frozen)
             // body poses and writes its own dual state, so the whole pass is independent.
             // Frozen constraints have nothing to update: every input they read is parked.
-            // In the impulse tail, decay the contact penalties first (stiffnessDecay < 1):
+            // In the impulse tail the contact penalties decay first (stiffnessDecay < 1):
             // relaxation converges poorly against a stiff ramp, softening lets the cheap
-            // rounds finish the job the Newton rounds started.
-            if (!newton && stiffnessDecay < 1.0f)
-            {
-                const float decay = stiffnessDecay;
-                const float cap = PENALTY_MAX;
-                sync.forItems(forceCount, [this, decay, cap](int i) {
-                    Force *f = forceOrder[i];
-                    // contactPointCount() > 0 iff the force is a Manifold; other forces
-                    // keep their own penalty ramp untouched.
-                    if (f->contactPointCount() > 0) {
-                        Manifold *m = static_cast<Manifold *>(f);
-                        for (int ci = 0, n = m->numContacts; ci < n; ++ci)
-                            m->contacts[ci].penalty = (m->contacts[ci].penalty * decay).cwiseMin(float3{cap, cap, cap});
-                    }
-                });
-                sync.arriveAndWait();
-            }
-            sync.forItems(forceCount, [this](int i) {
-                if (!constraintFrozen(forceOrder[i]))
-                    forceOrder[i]->updateDual(alpha);
+            // rounds finish the job the Newton rounds started - fused into the same pass,
+            // same force, same order, so the decay lands before the dual reads the
+            // penalty without paying an extra pass and barrier per tail round.
+            const float decay = stiffnessDecay;
+            sync.forItems(forceCount, [this, newton, decay](int i) {
+                Force *f = forceOrder[i];
+                if (!newton && decay < 1.0f && f->contactPointCount() > 0) {
+                    Manifold *m = static_cast<Manifold *>(f);
+                    for (int ci = 0, n = m->numContacts; ci < n; ++ci)
+                        m->contacts[ci].penalty = (m->contacts[ci].penalty * decay).cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX});
+                }
+                if (!constraintFrozen(f))
+                    f->updateDual(alpha);
             });
             sync.arriveAndWait();
             ++roundsRun;
