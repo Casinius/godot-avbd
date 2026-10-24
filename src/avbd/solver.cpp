@@ -192,31 +192,50 @@ void Solver::broadPhase()
     const int firstLeaf = p - 1;
     (void)padded;
 
-    // Leaf slots [firstLeaf, firstLeaf + leafCount) in Morton-sorted order; collect them
-    // and pair each against all later slots (AABB overlap prune). The final sort keeps
-    // the ascending (min-index, other) manifold order.
+    // Leaf slots [firstLeaf, firstLeaf + leafCount) in Morton-sorted order; pair them
+    // through a real BVH self-query: for each leaf, descend the tree and test only
+    // nodes whose aggregated bounds overlap the leaf's AABB. Internal slots [0,
+    // firstLeaf) aggregate their descendants' bounds, so a skipped subtree costs O(1)
+    // and loses no candidates; the implicit layout makes children 2i+1 / 2i+2 and empty
+    // trailing leaf slots carry bodyIndex -1. Each unordered pair is found from both
+    // sides, so a slot-order comparison records it once; the body-index minmax keeps
+    // the pair set identical to the old all-pairs sweep. The final sort keeps the
+    // ascending (min-index, other) manifold order.
     sweepPairs.clear();
-    // Parallel AABB overlap pruning - O(N²) pairwise check, parallelized over pairs
-    // Note: For small leafCount (< 200), this may be slower than serial due to overhead
-    // TODO: Consider chunking strategy for better scalability on large scenes
-    const int totalPairs = leafCount * (leafCount - 1) / 2;
+    const auto boundsOverlap = [&](int na, int nb) {
+        const float3 &aMin = bvhNodes.boundsMin()[na];
+        const float3 &aMax = bvhNodes.boundsMax()[na];
+        const float3 &bMin = bvhNodes.boundsMin()[nb];
+        const float3 &bMax = bvhNodes.boundsMax()[nb];
+        // Same touching-counts-as-overlapping semantics as the old pairwise sweep.
+        return !(bMin.x() > aMax.x() || bMin.y() > aMax.y() || bMin.z() > aMax.z() ||
+                aMin.x() > bMax.x() || aMin.y() > bMax.y() || aMin.z() > bMax.z());
+    };
+    // Complete-tree depth is ceil(log2(padded)) + 1; the descent holds at most one
+    // node per level plus one split, and padded <= next_pow2(n) for n < 2^31.
+    int stack[64];
     for (int a = 0; a < leafCount; ++a)
     {
         const int na = firstLeaf + a;
-        const float3 aMin = bvhNodes.boundsMin()[na];
-        const float3 aMax = bvhNodes.boundsMax()[na];
-        for (int b = a + 1; b < leafCount; ++b)
+        int top = 0;
+        stack[top++] = 0; // root
+        while (top > 0)
         {
-            const int nb = firstLeaf + b;
-            const float3 bMin = bvhNodes.boundsMin()[nb];
-            if (bMin.x() > aMax.x() || bMin.y() > aMax.y() || bMin.z() > aMax.z())
+            const int slot = stack[--top];
+            if (!boundsOverlap(na, slot))
                 continue;
-            const float3 bMax = bvhNodes.boundsMax()[nb];
-            if (bMax.x() < aMin.x() || bMax.y() < aMin.y() || bMax.z() < aMin.z())
+            if (slot < firstLeaf)
+            {
+                stack[top++] = 2 * slot + 1;
+                stack[top++] = 2 * slot + 2;
                 continue;
-            const int i = bvhNodes.bodyIndex()[na];
-            const int j = bvhNodes.bodyIndex()[nb];
-            sweepPairs.emplace_back(std::minmax(i, j));
+            }
+            if (slot <= na)
+                continue; // self, or the pair's lower slot (recorded from that side)
+            const int other = bvhNodes.bodyIndex()[slot];
+            if (other < 0)
+                continue; // padding leaf beyond the body count
+            sweepPairs.emplace_back(std::minmax(bvhNodes.bodyIndex()[na], other));
         }
     }
 
