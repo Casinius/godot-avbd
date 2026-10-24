@@ -28,6 +28,38 @@ void AVBDDirectBodyState3D::bind(AVBDPhysicsServer3D *p_server, avbd::Rigid *p_r
     body_rid = p_body_rid;
 }
 
+uint32_t AVBDDirectBodyState3D::_get_collision_layer() const {
+    const AVBDPhysicsServer3D::BodyData *body = server != nullptr ? server->find_body(body_rid) : nullptr;
+    return body != nullptr ? static_cast<uint32_t>(body->collision_layer) : 1;
+}
+
+void AVBDDirectBodyState3D::_set_collision_layer(uint32_t p_layer) {
+    AVBDPhysicsServer3D::BodyData *body = server != nullptr ? server->find_body(body_rid) : nullptr;
+    if (body == nullptr) {
+        return;
+    }
+    body->collision_layer = p_layer;
+    if (body->rigid != nullptr) {
+        body->rigid->collisionLayer = p_layer;
+    }
+}
+
+uint32_t AVBDDirectBodyState3D::_get_collision_mask() const {
+    const AVBDPhysicsServer3D::BodyData *body = server != nullptr ? server->find_body(body_rid) : nullptr;
+    return body != nullptr ? static_cast<uint32_t>(body->collision_mask) : 1;
+}
+
+void AVBDDirectBodyState3D::_set_collision_mask(uint32_t p_mask) {
+    AVBDPhysicsServer3D::BodyData *body = server != nullptr ? server->find_body(body_rid) : nullptr;
+    if (body == nullptr) {
+        return;
+    }
+    body->collision_mask = p_mask;
+    if (body->rigid != nullptr) {
+        body->rigid->collisionMask = p_mask;
+    }
+}
+
 Vector3 AVBDDirectBodyState3D::_get_total_gravity() const {
     // The solver applies gravity along its -Z with magnitude |gravity|; express that
     // back in Godot's frame (straight down).
@@ -37,11 +69,11 @@ Vector3 AVBDDirectBodyState3D::_get_total_gravity() const {
     return Vector3(0, -std::fabs(rigid->gravity), 0);
 }
 
-double AVBDDirectBodyState3D::_get_total_linear_damp() const {
+float AVBDDirectBodyState3D::_get_total_linear_damp() const {
     return 0.0; // damping is not simulated (documented in the README)
 }
 
-double AVBDDirectBodyState3D::_get_total_angular_damp() const {
+float AVBDDirectBodyState3D::_get_total_angular_damp() const {
     return 0.0;
 }
 
@@ -59,7 +91,7 @@ Basis AVBDDirectBodyState3D::_get_principal_inertia_axes() const {
     return rigid != nullptr ? to_godot_basis(rigid->positionAng) : Basis();
 }
 
-double AVBDDirectBodyState3D::_get_inverse_mass() const {
+float AVBDDirectBodyState3D::_get_inverse_mass() const {
     return rigid != nullptr && rigid->mass > 0.0f ? 1.0 / rigid->mass : 0.0;
 }
 
@@ -278,7 +310,7 @@ Vector3 AVBDDirectBodyState3D::_get_contact_collider_velocity_at_position(int32_
     return server != nullptr ? server->body_state_contact_collider_velocity(body_rid, p_contact_idx) : Vector3();
 }
 
-double AVBDDirectBodyState3D::_get_step() const {
+float AVBDDirectBodyState3D::_get_step() const {
     return server != nullptr ? server->body_state_step() : 0.0;
 }
 

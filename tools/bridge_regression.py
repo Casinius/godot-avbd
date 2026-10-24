@@ -91,8 +91,11 @@ def main():
         os.remove(override)
 
     if args.update:
+        # Merge: a plain run must not wipe the @adaptive-beta keys and vice versa.
+        merged = dict(baseline)
+        merged.update(digests)
         with open(args.baseline, "w") as f:
-            json.dump(digests, f, indent=1, sort_keys=True)
+            json.dump(merged, f, indent=1, sort_keys=True)
             f.write("\n")
         print(f"baseline written: {args.baseline}")
         return 0

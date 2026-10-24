@@ -42,6 +42,7 @@
 #include <godot_cpp/classes/physics_direct_body_state3d.hpp>
 #include <godot_cpp/classes/physics_direct_space_state3d.hpp>
 #include <godot_cpp/classes/physics_server3d_extension.hpp>
+#include <godot_cpp/classes/physics_server3d_rendering_server_handler.hpp>
 #include <godot_cpp/variant/callable.hpp>
 #include <godot_cpp/variant/rid.hpp>
 #include <godot_cpp/variant/transform3d.hpp>
@@ -72,6 +73,9 @@ public:
         Vector3 extents = Vector3(1, 1, 1); // box: full extents; sphere: x is the radius
         double radius = 0.5;
         double height = 1.0;
+        float custom_bias = 0.0f;
+        float margin = 0.0f;
+        Variant data; // the engine's payload, round-tripped for _shape_get_data
     };
 
 protected:
@@ -147,6 +151,9 @@ protected:
         bool ccd = false;
         double collision_priority = 1.0;
         uint32_t user_flags = 0;
+        // One-time warning sent for bodies whose only shape is one the solver cannot
+        // simulate (concave/heightmap/world boundary/separation ray/custom).
+        bool unsupported_warned = false;
 
         avbd::Rigid *rigid = nullptr;        // null until the body joins a space that is stepped
     };
@@ -390,7 +397,7 @@ public:
     // --- lifecycle ---------------------------------------------------------------
     void _init() override;
     void _finish() override;
-    void _step(double p_step) override;
+    void _step(float p_step) override;
     void _sync() override;
     void _end_sync() override;
     void _flush_queries() override;
@@ -403,15 +410,29 @@ public:
     RID _space_create() override;
     void _space_set_active(const RID &p_space, bool p_active) override;
     bool _space_is_active(const RID &p_space) const override;
-    void _space_set_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param, double p_value) override;
-    double _space_get_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param) const override;
+    void _space_set_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param, float p_value) override;
+    float _space_get_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param) const override;
     PhysicsDirectSpaceState3D *_space_get_direct_state(const RID &p_space) override;
     void _space_set_debug_contacts(const RID &p_space, int32_t p_max_contacts) override;
     PackedVector3Array _space_get_contacts(const RID &p_space) const override;
     int32_t _space_get_contact_count(const RID &p_space) const override;
 
     // --- shapes ------------------------------------------------------------------
-    RID _box_shape_create() override;
+        void _shape_set_custom_solver_bias(const RID &p_shape, float p_bias) override;
+    float _shape_get_custom_solver_bias(const RID &p_shape) const override;
+    void _shape_set_margin(const RID &p_shape, float p_margin) override;
+    float _shape_get_margin(const RID &p_shape) const override;
+    RID _capsule_shape_create() override;
+    RID _convex_polygon_shape_create() override;
+    RID _concave_polygon_shape_create() override;
+    RID _heightmap_shape_create() override;
+    RID _world_boundary_shape_create() override;
+    RID _separation_ray_shape_create() override;
+    RID _custom_shape_create() override;
+    bool _body_test_motion(const RID &p_body, const Transform3D &p_from, const Vector3 &p_motion, float p_margin,
+            int32_t p_max_collisions, bool p_collide_separation_ray, bool p_recovery_as_collision,
+            PhysicsServer3DExtensionMotionResult *p_result) const override;
+RID _box_shape_create() override;
     RID _sphere_shape_create() override;
     RID _cylinder_shape_create() override;
     void _shape_set_data(const RID &p_shape, const Variant &p_data) override;
@@ -429,6 +450,52 @@ public:
     void _body_set_state_sync_callback(const RID &p_body, const Callable &p_callable) override;
     void _body_attach_object_instance_id(const RID &p_body, uint64_t p_id) override;
     uint64_t _body_get_object_instance_id(const RID &p_body) const override;
+
+    // --- soft-body server API: documented unsupported this round -----------------
+    // The engine calls these only for SoftBody3D nodes, which the demo scenes do not
+    // use (the AVBDSoftBody3D node class runs its own solver). Neutral answers keep a
+    // stray SoftBody3D from erroring; nothing is simulated.
+    RID _soft_body_create() override;
+    void _soft_body_set_space(const RID &p_body, const RID &p_space) override;
+    RID _soft_body_get_space(const RID &p_body) const override;
+    void _soft_body_set_mesh(const RID &p_body, const RID &p_mesh) override;
+    void _soft_body_set_transform(const RID &p_body, const Transform3D &p_transform) override;
+    void _soft_body_set_collision_layer(const RID &p_body, uint32_t p_layer) override;
+    uint32_t _soft_body_get_collision_layer(const RID &p_body) const override;
+    void _soft_body_set_collision_mask(const RID &p_body, uint32_t p_mask) override;
+    uint32_t _soft_body_get_collision_mask(const RID &p_body) const override;
+    void _soft_body_add_collision_exception(const RID &p_body, const RID &p_body_b) override;
+    void _soft_body_remove_collision_exception(const RID &p_body, const RID &p_body_b) override;
+    TypedArray<RID> _soft_body_get_collision_exceptions(const RID &p_body) const override;
+    void _soft_body_set_total_mass(const RID &p_body, float p_total_mass) override;
+    float _soft_body_get_total_mass(const RID &p_body) const override;
+    void _soft_body_set_linear_stiffness(const RID &p_body, float p_linear_stiffness) override;
+    float _soft_body_get_linear_stiffness(const RID &p_body) const override;
+    void _soft_body_set_pressure_coefficient(const RID &p_body, float p_pressure_coefficient) override;
+    float _soft_body_get_pressure_coefficient(const RID &p_body) const override;
+    void _soft_body_set_damping_coefficient(const RID &p_body, float p_damping_coefficient) override;
+    float _soft_body_get_damping_coefficient(const RID &p_body) const override;
+    void _soft_body_set_drag_coefficient(const RID &p_body, float p_drag_coefficient) override;
+    float _soft_body_get_drag_coefficient(const RID &p_body) const override;
+    void _soft_body_set_simulation_precision(const RID &p_body, int32_t p_simulation_precision) override;
+    int32_t _soft_body_get_simulation_precision(const RID &p_body) const override;
+    void _soft_body_set_shrinking_factor(const RID &p_body, float p_shrinking_factor) override;
+    float _soft_body_get_shrinking_factor(const RID &p_body) const override;
+    void _soft_body_set_state(const RID &p_body, PhysicsServer3D::BodyState p_state, const Variant &p_variant) override;
+    Variant _soft_body_get_state(const RID &p_body, PhysicsServer3D::BodyState p_state) const override;
+    void _soft_body_apply_central_force(const RID &p_body, const Vector3 &p_force) override;
+    void _soft_body_apply_central_impulse(const RID &p_body, const Vector3 &p_impulse) override;
+    void _soft_body_apply_point_force(const RID &p_body, int32_t p_point_index, const Vector3 &p_force) override;
+    void _soft_body_apply_point_impulse(const RID &p_body, int32_t p_point_index, const Vector3 &p_impulse) override;
+    void _soft_body_move_point(const RID &p_body, int32_t p_point_index, const Vector3 &p_global_position) override;
+    void _soft_body_pin_point(const RID &p_body, int32_t p_point_index, bool p_pin) override;
+    bool _soft_body_is_point_pinned(const RID &p_body, int32_t p_point_index) const override;
+    Vector3 _soft_body_get_point_global_position(const RID &p_body, int32_t p_point_index) const override;
+    void _soft_body_remove_all_pinned_points(const RID &p_body) override;
+    void _soft_body_set_ray_pickable(const RID &p_body, bool p_enable) override;
+    AABB _soft_body_get_bounds(const RID &p_body) const override;
+    void _soft_body_update_rendering_server(const RID &p_body,
+            PhysicsServer3DRenderingServerHandler *p_rendering_server_handler) override;
     void _body_set_ray_pickable(const RID &p_body, bool p_enable) override;
     bool _body_is_continuous_collision_detection_enabled(const RID &p_body) const override;
     void _body_set_enable_continuous_collision_detection(const RID &p_body, bool p_enable) override;
@@ -436,8 +503,8 @@ public:
     uint32_t _body_get_collision_layer(const RID &p_body) const override;
     void _body_set_collision_mask(const RID &p_body, uint32_t p_mask) override;
     uint32_t _body_get_collision_mask(const RID &p_body) const override;
-    void _body_set_collision_priority(const RID &p_body, double p_priority) override;
-    double _body_get_collision_priority(const RID &p_body) const override;
+    void _body_set_collision_priority(const RID &p_body, float p_priority) override;
+    float _body_get_collision_priority(const RID &p_body) const override;
     void _body_set_user_flags(const RID &p_body, uint32_t p_flags) override;
     uint32_t _body_get_user_flags(const RID &p_body) const override;
     void _body_reset_mass_properties(const RID &p_body) override;
@@ -446,8 +513,8 @@ public:
     TypedArray<RID> _body_get_collision_exceptions(const RID &p_body) const override;
     void _body_set_max_contacts_reported(const RID &p_body, int32_t p_amount) override;
     int32_t _body_get_max_contacts_reported(const RID &p_body) const override;
-    void _body_set_contacts_reported_depth_threshold(const RID &p_body, double p_threshold) override;
-    double _body_get_contacts_reported_depth_threshold(const RID &p_body) const override;
+    void _body_set_contacts_reported_depth_threshold(const RID &p_body, float p_threshold) override;
+    float _body_get_contacts_reported_depth_threshold(const RID &p_body) const override;
     void _body_set_omit_force_integration(const RID &p_body, bool p_enable) override;
     bool _body_is_omitting_force_integration(const RID &p_body) const override;
     void _body_set_force_integration_callback(const RID &p_body, const Callable &p_callable, const Variant &p_userdata) override;
@@ -499,8 +566,8 @@ public:
     void _joint_make_generic_6dof(const RID &p_joint, const RID &p_body_a, const Transform3D &p_local_ref_a,
             const RID &p_body_b, const Transform3D &p_local_ref_b) override;
     void _generic_6dof_joint_set_param(const RID &p_joint, Vector3::Axis p_axis,
-            PhysicsServer3D::G6DOFJointAxisParam p_param, double p_value) override;
-    double _generic_6dof_joint_get_param(const RID &p_joint, Vector3::Axis p_axis,
+            PhysicsServer3D::G6DOFJointAxisParam p_param, float p_value) override;
+    float _generic_6dof_joint_get_param(const RID &p_joint, Vector3::Axis p_axis,
             PhysicsServer3D::G6DOFJointAxisParam p_param) const override;
     void _generic_6dof_joint_set_flag(const RID &p_joint, Vector3::Axis p_axis,
             PhysicsServer3D::G6DOFJointAxisFlag p_flag, bool p_enable) override;
@@ -510,8 +577,8 @@ public:
     // --- joints: the other four types, mapped onto avbd::GenericJoint -------------
     void _joint_make_pin(const RID &p_joint, const RID &p_body_a, const Vector3 &p_local_a,
             const RID &p_body_b, const Vector3 &p_local_b) override;
-    void _pin_joint_set_param(const RID &p_joint, PhysicsServer3D::PinJointParam p_param, double p_value) override;
-    double _pin_joint_get_param(const RID &p_joint, PhysicsServer3D::PinJointParam p_param) const override;
+    void _pin_joint_set_param(const RID &p_joint, PhysicsServer3D::PinJointParam p_param, float p_value) override;
+    float _pin_joint_get_param(const RID &p_joint, PhysicsServer3D::PinJointParam p_param) const override;
     void _pin_joint_set_local_a(const RID &p_joint, const Vector3 &p_local_a) override;
     Vector3 _pin_joint_get_local_a(const RID &p_joint) const override;
     void _pin_joint_set_local_b(const RID &p_joint, const Vector3 &p_local_b) override;
@@ -522,21 +589,21 @@ public:
     void _joint_make_hinge_simple(const RID &p_joint, const RID &p_body_a, const Vector3 &p_pivot_a,
             const Vector3 &p_axis_a, const RID &p_body_b, const Vector3 &p_pivot_b,
             const Vector3 &p_axis_b) override;
-    void _hinge_joint_set_param(const RID &p_joint, PhysicsServer3D::HingeJointParam p_param, double p_value) override;
-    double _hinge_joint_get_param(const RID &p_joint, PhysicsServer3D::HingeJointParam p_param) const override;
+    void _hinge_joint_set_param(const RID &p_joint, PhysicsServer3D::HingeJointParam p_param, float p_value) override;
+    float _hinge_joint_get_param(const RID &p_joint, PhysicsServer3D::HingeJointParam p_param) const override;
     void _hinge_joint_set_flag(const RID &p_joint, PhysicsServer3D::HingeJointFlag p_flag, bool p_enabled) override;
     bool _hinge_joint_get_flag(const RID &p_joint, PhysicsServer3D::HingeJointFlag p_flag) const override;
 
     void _joint_make_slider(const RID &p_joint, const RID &p_body_a, const Transform3D &p_local_ref_a,
             const RID &p_body_b, const Transform3D &p_local_ref_b) override;
-    void _slider_joint_set_param(const RID &p_joint, PhysicsServer3D::SliderJointParam p_param, double p_value) override;
-    double _slider_joint_get_param(const RID &p_joint, PhysicsServer3D::SliderJointParam p_param) const override;
+    void _slider_joint_set_param(const RID &p_joint, PhysicsServer3D::SliderJointParam p_param, float p_value) override;
+    float _slider_joint_get_param(const RID &p_joint, PhysicsServer3D::SliderJointParam p_param) const override;
 
     void _joint_make_cone_twist(const RID &p_joint, const RID &p_body_a, const Transform3D &p_local_ref_a,
             const RID &p_body_b, const Transform3D &p_local_ref_b) override;
     void _cone_twist_joint_set_param(const RID &p_joint, PhysicsServer3D::ConeTwistJointParam p_param,
-            double p_value) override;
-    double _cone_twist_joint_get_param(const RID &p_joint, PhysicsServer3D::ConeTwistJointParam p_param) const override;
+            float p_value) override;
+    float _cone_twist_joint_get_param(const RID &p_joint, PhysicsServer3D::ConeTwistJointParam p_param) const override;
 
     // --- areas --------------------------------------------------------------------
     // Created and tracked; every storage virtual is implemented and monitoring runs each

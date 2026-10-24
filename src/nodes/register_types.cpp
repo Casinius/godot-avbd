@@ -32,6 +32,10 @@ using namespace godot;
 //
 //   [physics]
 //   3d/physics_engine="AVBD"
+// The physics server factory the manager's creation Callable points at; freed at
+// deinitialization because nothing else owns it.
+static PhysicsServerFactory *avbd_factory = nullptr;
+
 static void register_physics_server() {
     PhysicsServer3DManager *manager = PhysicsServer3DManager::get_singleton();
     if (manager == nullptr) {
@@ -39,7 +43,10 @@ static void register_physics_server() {
     }
 
     // The manager wants a callable that produces the server, so a small factory object holds one.
+    // The manager only keeps the Callable, which does not own the object - the factory is
+    // freed at deinitialization (see uninitialize_avbd_module).
     PhysicsServerFactory *factory = memnew(PhysicsServerFactory);
+    avbd_factory = factory;
     manager->register_server("AVBD", Callable(factory, "create_server"));
 }
 
@@ -82,25 +89,40 @@ static void register_avbd_settings() {
     }
 }
 
+// Everything registers at the SERVERS level (as godot-jolt does): the physics server
+// object must keep its ClassDB entry until PhysicsServer3D::finish() has called
+// _finish on it at exit. Registered at SCENE level the classes deregister with the
+// main loop first, and teardown fails with "Required virtual method ::_finish must be
+// overridden" plus a leaked instance.
 static void uninitialize_avbd_module(ModuleInitializationLevel p_level) {
-    if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
+    if (p_level != MODULE_INITIALIZATION_LEVEL_SERVERS) {
         return;
+    }
+    if (avbd_factory != nullptr) {
+        memdelete(avbd_factory);
+        avbd_factory = nullptr;
     }
 }
 
 static void initialize_avbd_module(ModuleInitializationLevel p_level) {
-    if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
-        return;
+    // SERVERS: the engine-facing classes (the physics server must exist before the
+    // engine picks its physics engine, and its ClassDB entry must outlive
+    // PhysicsServer3D::finish()).
+    if (p_level == MODULE_INITIALIZATION_LEVEL_SERVERS) {
+        GDREGISTER_CLASS(AVBDPhysicsServer3D);
+        GDREGISTER_CLASS(PhysicsServerFactory);
+        // The engine instantiates these two itself (body state sync, direct space state).
+        GDREGISTER_CLASS(AVBDDirectBodyState3D);
+        GDREGISTER_CLASS(AVBDDirectSpaceState3D);
+        register_avbd_settings();
+        register_physics_server();
     }
-    GDREGISTER_CLASS(AVBDSoftBody3D);
-    GDREGISTER_CLASS(AVBDSoftWorld3D);
-    GDREGISTER_CLASS(AVBDPhysicsServer3D);
-    GDREGISTER_CLASS(PhysicsServerFactory);
-    // The engine instantiates these two itself (body state sync, direct space state).
-    GDREGISTER_CLASS(AVBDDirectBodyState3D);
-    GDREGISTER_CLASS(AVBDDirectSpaceState3D);
-    register_avbd_settings();
-    register_physics_server();
+    // SCENE: the soft-body pair derive from Node3D/MultiMeshInstance3D, which do not
+    // exist yet at the SERVERS level.
+    if (p_level == MODULE_INITIALIZATION_LEVEL_SCENE) {
+        GDREGISTER_CLASS(AVBDSoftBody3D);
+        GDREGISTER_CLASS(AVBDSoftWorld3D);
+    }
 }
 
 extern "C" {
@@ -111,7 +133,7 @@ GDExtensionBool GDE_EXPORT avbd_library_init(
     GDExtensionBinding::InitObject init_obj(p_get_proc_address, p_library, r_initialization);
     init_obj.register_initializer(initialize_avbd_module);
     init_obj.register_terminator(uninitialize_avbd_module);
-    init_obj.set_minimum_library_initialization_level(MODULE_INITIALIZATION_LEVEL_SCENE);
+    init_obj.set_minimum_library_initialization_level(MODULE_INITIALIZATION_LEVEL_SERVERS);
     return init_obj.init();
 }
 }

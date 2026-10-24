@@ -52,12 +52,12 @@ public:
 
     // --- reads/writes onto the bound body ------------------------------------
     Vector3 _get_total_gravity() const override;
-    double _get_total_linear_damp() const override;
-    double _get_total_angular_damp() const override;
+    float _get_total_linear_damp() const override;
+    float _get_total_angular_damp() const override;
     Vector3 _get_center_of_mass() const override;
     Vector3 _get_center_of_mass_local() const override;
     Basis _get_principal_inertia_axes() const override;
-    double _get_inverse_mass() const override;
+    float _get_inverse_mass() const override;
     Vector3 _get_inverse_inertia() const override;
     Basis _get_inverse_inertia_tensor() const override;
     void _set_linear_velocity(const Vector3 &p_velocity) override;
@@ -82,6 +82,11 @@ public:
     Vector3 _get_constant_torque() const override;
     void _set_sleep_state(bool p_enabled) override;
     bool _is_sleeping() const override;
+    // Godot 4.4+ extension surface: the engine reads these during state sync.
+    uint32_t _get_collision_layer() const override;
+    void _set_collision_layer(uint32_t p_layer) override;
+    uint32_t _get_collision_mask() const override;
+    void _set_collision_mask(uint32_t p_mask) override;
     int32_t _get_contact_count() const override;
     Vector3 _get_contact_local_position(int32_t p_contact_idx) const override;
     Vector3 _get_contact_local_normal(int32_t p_contact_idx) const override;
@@ -94,7 +99,7 @@ public:
     Object *_get_contact_collider_object(int32_t p_contact_idx) const override;
     int32_t _get_contact_collider_shape(int32_t p_contact_idx) const override;
     Vector3 _get_contact_collider_velocity_at_position(int32_t p_contact_idx) const override;
-    double _get_step() const override;
+    float _get_step() const override;
     void _integrate_forces() override;
     PhysicsDirectSpaceState3D *_get_space_state() override;
 };
