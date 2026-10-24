@@ -401,7 +401,7 @@ void Solver::broadPhase()
 // sleep win: a settled scene stops paying SAT refresh + dual updates for all its contacts.
 static bool constraintFrozen(const Force *f)
 {
-    if (f->contactPointCount() <= 0)
+    if (!f->isManifold)
         return false; // joints / springs / soft constraints keep their exact behaviour
     const auto awake = [](const Rigid *b) { return b != nullptr && b->mass > 0.0f && !b->sleeping; };
     return !awake(f->bodyA) && !awake(f->bodyB);
@@ -566,7 +566,7 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
                 // construction, no colours, and no thread-count dependence.
                 sync.forItems(forceCount, [this](int i) {
                     Force *f = forceOrder[i];
-                    if (f->contactPointCount() <= 0)
+                    if (!f->isManifold)
                         return;
                     Manifold *manifold = static_cast<Manifold *>(f);
                     if (!manifold->bodyA->inUpdateSet && !manifold->bodyB->inUpdateSet)
@@ -584,7 +584,7 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
                             body->positionAng, body->inertialAng);
                     for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
                     {
-                        if (f->contactPointCount() > 0)
+                        if (f->isManifold)
                             static_cast<Manifold *>(f)->stampCached(body, block);
                         else
                             f->updatePrimal(body, alpha, block);
@@ -644,7 +644,7 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
             const float decay = stiffnessDecay;
             sync.forItems(forceCount, [this, newton, decay](int i) {
                 Force *f = forceOrder[i];
-                if (!newton && decay < 1.0f && f->contactPointCount() > 0) {
+                if (!newton && decay < 1.0f && f->isManifold) {
                     Manifold *m = static_cast<Manifold *>(f);
                     for (int ci = 0, n = m->numContacts; ci < n; ++ci)
                         m->contacts[ci].penalty = (m->contacts[ci].penalty * decay).cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX});
@@ -949,7 +949,7 @@ void Solver::selectUpdateBodies()
     // the combine pass. Walk the force lists once, after warmstartForces() has pruned.
     for (Force *f = forces; f != 0; f = f->next)
     {
-        if (f->contactPointCount() > 0)
+        if (f->isManifold)
             continue;
         if (f->bodyA != 0)
             f->bodyA->contactOnly = false;

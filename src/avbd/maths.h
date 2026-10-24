@@ -83,17 +83,62 @@ using quat = Eigen::Quaternion<float>;
 // compound into e15-scale positions; the policy caps every solve at the physical bound.
 // The fixed kernel's rounding differs from the old dynamic-only implementation, which
 // re-anchors every state digest - accepted on the real-time branch.
+// Fixed-size 6x6 LDL^T without pivoting, over an already-assembled system. The
+// system is dominated by the M/dt^2 diagonal (a 1 kg body at 240 Hz carries a
+// 57,600 kg/s^2 diagonal against ~1e4 penalty terms), so the pivot growth Eigen's
+// symmetric pivoting exists for does not occur here, and dropping it - plus Eigen's
+// expression and Transpositions plumbing - lands the kernel an order of magnitude
+// cheaper. Plain sequential float ops keep the result bit-identical for every thread
+// count. Returns false on a degenerate pivot (non-positive D, which a near-singular
+// block can produce) or an unsane solution - callers retry with the pivoted dynamic
+// path in solve() below.
+inline bool ldlt6_solve(const std::array<std::array<float, 6>, 6> &a, const std::array<float, 6> &b,
+                        std::array<float, 6> &x) noexcept {
+  std::array<std::array<float, 6>, 6> l{};
+  std::array<float, 6> d{};
+  for (int j = 0; j < 6; j++) {
+    float dj = a[j][j];
+    for (int s = 0; s < j; s++)
+      dj -= l[j][s] * l[j][s] * d[s];
+    if (!(dj > 1.0e-12f))
+      return false;
+    d[j] = dj;
+    l[j][j] = 1.0f;
+    for (int i = j + 1; i < 6; i++) {
+      float lij = a[i][j];
+      for (int s = 0; s < j; s++)
+        lij -= l[i][s] * l[j][s] * d[s];
+      l[i][j] = lij / d[j];
+    }
+  }
+
+  std::array<float, 6> z{};
+  // Forward solve L z = b (unit lower triangle).
+  for (int i = 0; i < 6; i++) {
+    float v = b[i];
+    for (int s = 0; s < i; s++)
+      v -= l[i][s] * z[s];
+    z[i] = v;
+  }
+  // Diagonal scaling y = D^-1 z, then back solve L^T x = y, all in one array.
+  for (int i = 0; i < 6; i++)
+    x[i] = z[i] / d[i];
+  for (int i = 5; i >= 0; i--) {
+    float v = x[i];
+    for (int s = i + 1; s < 6; s++)
+      v -= l[s][i] * x[s];
+    x[i] = v;
+  }
+
+  float worst = 0.0f;
+  for (int i = 0; i < 6; i++)
+    worst = std::max(worst, std::abs(x[i]));
+  return std::isfinite(worst) && worst < 1.0e1f;
+}
+
 inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross, float3 bLin,
                   float3 bAng, float3 &xLin, float3 &xAng) noexcept {
   {
-    // Hand-rolled 6x6 LDL^T without pivoting. The system is dominated by the M/dt^2
-    // diagonal (a 1 kg body at 240 Hz carries a 57,600 kg/s^2 diagonal against ~1e4
-    // penalty terms), so the pivot growth Eigen's symmetric pivoting exists for does
-    // not occur here, and dropping it - plus Eigen's expression and Transpositions
-    // plumbing - lands the kernel an order of magnitude cheaper. Plain sequential
-    // float ops keep the result bit-identical for every thread count. A degenerate
-    // pivot (non-positive D, which a near-singular block can produce) bails to the
-    // pivoted dynamic retry below.
     std::array<std::array<float, 6>, 6> a{};
     for (int r = 0; r < 3; r++) {
       for (int c = 0; c < 3; c++) {
@@ -104,55 +149,12 @@ inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross, float3 bLin,
       }
     }
 
-    std::array<std::array<float, 6>, 6> l{};
-    std::array<float, 6> d{};
-    bool factored = true;
-    for (int j = 0; j < 6; j++) {
-      float dj = a[j][j];
-      for (int s = 0; s < j; s++)
-        dj -= l[j][s] * l[j][s] * d[s];
-      if (!(dj > 1.0e-12f)) {
-        factored = false;
-        break;
-      }
-      d[j] = dj;
-      l[j][j] = 1.0f;
-      for (int i = j + 1; i < 6; i++) {
-        float lij = a[i][j];
-        for (int s = 0; s < j; s++)
-          lij -= l[i][s] * l[j][s] * d[s];
-        l[i][j] = lij / d[j];
-      }
-    }
-
-    if (factored) {
-      std::array<float, 6> z{};
-      // Forward solve L z = b (unit lower triangle).
-      for (int i = 0; i < 6; i++) {
-        float v = i < 3 ? bLin[i] : bAng[i - 3];
-        for (int s = 0; s < i; s++)
-          v -= l[i][s] * z[s];
-        z[i] = v;
-      }
-      // Diagonal scaling y = D^-1 z, then back solve L^T x = y, all in one array.
-      std::array<float, 6> x{};
-      for (int i = 0; i < 6; i++)
-        x[i] = z[i] / d[i];
-      for (int i = 5; i >= 0; i--) {
-        float v = x[i];
-        for (int s = i + 1; s < 6; s++)
-          v -= l[s][i] * x[s];
-        x[i] = v;
-      }
-
-      const float3 candLin{x[0], x[1], x[2]};
-      const float3 candAng{x[3], x[4], x[5]};
-      const float worst = std::max(candLin.cwiseAbs().maxCoeff(), candAng.cwiseAbs().maxCoeff());
-      if (std::isfinite(worst) && worst < 1.0e1f) {
-        xLin = candLin;
-        xAng = candAng;
-        return;
-      }
+    const std::array<float, 6> b{bLin[0], bLin[1], bLin[2], bAng[0], bAng[1], bAng[2]};
+    std::array<float, 6> x{};
+    if (ldlt6_solve(a, b, x)) {
+      xLin = float3{x[0], x[1], x[2]};
+      xAng = float3{x[3], x[4], x[5]};
+      return;
     }
   }
 

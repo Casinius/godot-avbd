@@ -23,6 +23,7 @@ namespace avbd {
 Manifold::Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB)
     : Force(p_solver, p_bodyA, p_bodyB), numContacts(0)
 {
+    isManifold = true;
 }
 
 namespace {
@@ -208,11 +209,10 @@ void Manifold::preCompute(float alpha)
         cache.jAAng = jAAng;
         cache.jBAng = jBAng;
 
-        const float3x3 K = diagonal(contacts[i].penalty.x(), contacts[i].penalty.y(), contacts[i].penalty.z());
         float3 C = contacts[i].C0 * (1 - alpha) + jALin * dqALin + jBLin * dqBLin + jAAng * dqAAng + jBAng * dqBAng;
 
-        // Compute force
-        float3 F = K * C + contacts[i].lambda;
+        // Compute force - the penalty is a diagonal, so K*C is componentwise.
+        float3 F = contacts[i].penalty.cwiseProduct(C) + contacts[i].lambda;
 
         // Clamp normal force
         F[0] = std::min(F[0], 0.0f);
@@ -236,22 +236,24 @@ void Manifold::stampCached(Rigid *body, Block &block)
     for (int i = 0; i < numContacts; i++)
     {
         const float3 &F = contactForceCache[i];
-        const float3x3 K = diagonal(contacts[i].penalty.x(), contacts[i].penalty.y(), contacts[i].penalty.z());
+        // The penalty is a diagonal: every K product below is a row/column scaling,
+        // not a generic 3x3 product (the diagonal zeros turned a third of the old
+        // multiplies into bookkeeping).
+        const auto kDiag = contacts[i].penalty.asDiagonal();
         const float3x3 jLin = fromIsA ? basis : -basis;
         const float3x3 &jAng = fromIsA ? jacobianCache[i].jAAng : jacobianCache[i].jBAng;
 
         // Stamp into LHS
-        float3x3 jLinT = jLin.transpose();
-        float3x3 jAngT = jAng.transpose();
-        float3x3 jAngTk = jAngT * K;
+        const float3x3 jLinT = jLin.transpose();
+        const float3x3 jAngTk = jAng.transpose() * kDiag;
 
-        block.lhsLin += jLinT * K * jLin;
+        block.lhsLin += (jLinT * kDiag) * jLin;
         block.lhsAng += jAngTk * jAng;
         block.lhsCross += jAngTk * jLin;
 
         // Stamp into RHS
         block.rhsLin += jLinT * F;
-        block.rhsAng += jAngT * F;
+        block.rhsAng += jAng.transpose() * F;
     }
 }
 
@@ -318,11 +320,10 @@ void Manifold::updateDual(float alpha)
             }
         }
 
-        float3x3 K = diagonal(contacts[i].penalty.x(), contacts[i].penalty.y(), contacts[i].penalty.z());
         float3 C = contacts[i].C0 * (1 - alpha) + jALin * dqALin + jBLin * dqBLin + jAAng * dqAAng + jBAng * dqBAng;
 
-        // Compute force
-        float3 F = K * C + contacts[i].lambda;
+        // Compute force - the penalty is a diagonal, so K*C is componentwise.
+        float3 F = contacts[i].penalty.cwiseProduct(C) + contacts[i].lambda;
 
         // Clamp normal force
         F[0] = std::min(F[0], 0.0f);
@@ -358,8 +359,7 @@ void Manifold::updateDual(float alpha)
         // after the first.
         jacobianCache[i].jAAng = jAAng;
         jacobianCache[i].jBAng = jBAng;
-        const float3x3 kNext = diagonal(contacts[i].penalty.x(), contacts[i].penalty.y(), contacts[i].penalty.z());
-        float3 fNext = kNext * C + contacts[i].lambda;
+        float3 fNext = contacts[i].penalty.cwiseProduct(C) + contacts[i].lambda;
         fNext[0] = std::min(fNext[0], 0.0f);
         const float boundsNext = std::fabs(fNext[0]) * friction;
         const float frictionScaleNext = float2{fNext[1], fNext[2]}.norm();

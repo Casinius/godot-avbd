@@ -175,16 +175,40 @@ struct Block
     // side. `dtSq` is dt*dt: the division is kept as a division on purpose, since
     // multiplying by a reciprocal would not be bit-identical.
     Block(float mass, float3 moment, float dtSq, float3 positionLin, float3 inertialLin,
-          quat positionAng, quat inertialAng) noexcept :
-            lhsLin(diagonal(mass, mass, mass) / dtSq),
-            lhsAng(diagonal(moment.x(), moment.y(), moment.z()) / dtSq),
-            lhsCross(float3x3::Zero()),
-            rhsLin(diagonal(mass, mass, mass) / dtSq * (positionLin - inertialLin)),
-            rhsAng(diagonal(moment.x(), moment.y(), moment.z()) / dtSq * (positionAng - inertialAng)) {}
+          quat positionAng, quat inertialAng) noexcept {
+        // The M/dt^2 diagonal is one value per matrix: three divisions per side instead
+        // of Eigen's nine-entry expression chain, then componentwise products.
+        const float3 massOverDtSq = float3{mass, mass, mass} / dtSq;
+        const float3 momentOverDtSq = moment / dtSq;
+        lhsLin = diagonal(massOverDtSq.x(), massOverDtSq.y(), massOverDtSq.z());
+        lhsAng = diagonal(momentOverDtSq.x(), momentOverDtSq.y(), momentOverDtSq.z());
+        lhsCross = float3x3::Zero();
+        rhsLin = massOverDtSq.cwiseProduct(positionLin - inertialLin);
+        rhsAng = momentOverDtSq.cwiseProduct(positionAng - inertialAng);
+    }
 
-    // Solve for the update without applying it (block-Jacobi path: each force stores its
-    // partial delta and a later combine pass applies the sum over a body's constraints).
+    // Solve for the update without applying it (block-Jacobi path: each body stores its
+    // delta and a later combine pass applies it). Assembles the 6x6 directly from the
+    // block's members - no by-value matrix copies on the hot path.
     void solveDelta(float3 &r_dxLin, float3 &r_dxAng) const noexcept {
+        std::array<std::array<float, 6>, 6> a{};
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 3; c++) {
+                a[r][c] = lhsLin(r, c);
+                a[r + 3][c + 3] = lhsAng(r, c);
+                a[r + 3][c] = lhsCross(r, c);
+                a[r][c + 3] = lhsCross(c, r);
+            }
+        }
+        const std::array<float, 6> b{-rhsLin[0], -rhsLin[1], -rhsLin[2], -rhsAng[0], -rhsAng[1], -rhsAng[2]};
+        std::array<float, 6> x{};
+        if (ldlt6_solve(a, b, x)) {
+            r_dxLin = float3{x[0], x[1], x[2]};
+            r_dxAng = float3{x[3], x[4], x[5]};
+            return;
+        }
+        // Degenerate block: the pivoted dynamic retry (its own fixed attempt fails the
+        // same way, so this lands straight in the dynamic path).
         solve(lhsLin, lhsAng, lhsCross, -rhsLin, -rhsAng, r_dxLin, r_dxAng);
     }
 
@@ -227,6 +251,12 @@ struct Force
     // Whether this constraint has broken and stopped acting on its bodies. Only
     // breakable joints ever report true; every other force is permanent.
     virtual bool isBroken() const { return false; }
+
+    // True for collision manifolds. The primal's per-body dispatch used a virtual
+    // contactPointCount() call per incident force per round to learn this; a plain
+    // flag keeps the hot walk free of indirect calls (5% of serial time at 1653
+    // bodies was the vtable tax).
+    bool isManifold = false;
 
     // Host-side ownership tag. The solver never reads or writes it; it exists so a
     // host can map a force back to its own object, including one the solver removed.
