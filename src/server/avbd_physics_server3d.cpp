@@ -58,6 +58,19 @@ struct StepProfile {
     double rebuild_ns = 0.0;
     double params_ns = 0.0;
     double forces_ns = 0.0;
+    // Spike attribution: per-phase maxima within the reporting window. The average
+    // hides exactly what a player feels - the one tick in a hundred that stalls the
+    // frame (an impact running max adaptive rounds, a broad-phase pair storm, a
+    // rebuild).
+    double max_total_ns = 0.0;
+    double max_solver_ns = 0.0;
+    double max_sync_ns = 0.0;
+    double max_contacts_ns = 0.0;
+    double max_rebuild_ns = 0.0;
+    double max_params_ns = 0.0;
+    double max_forces_ns = 0.0;
+    uint32_t over_2ms_ticks = 0; // ticks above a 2 ms budget in the window
+    uint32_t rebuilds = 0;
     int threads_used = 1;
     int substeps = 0;
     int iterations = 0;
@@ -237,7 +250,9 @@ void AVBDPhysicsServer3D::_flush_queries() {
             }
         }
         if (prof.enabled) {
-            prof.sync_ns += seconds_since(prof_t_sync);
+            const double sync_elapsed = seconds_since(prof_t_sync);
+            prof.sync_ns += sync_elapsed;
+            prof.max_sync_ns = std::max(prof.max_sync_ns, sync_elapsed);
         }
     }
     flushing_queries = false;
@@ -344,6 +359,7 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     p_space.stiffness_decay = settings->get_setting("physics/avbd/stiffness_decay", 0.8);
     p_space.jacobian_rebuild_distance = settings->get_setting("physics/avbd/jacobian_rebuild_distance", 0.0);
     p_space.chebyshev_rho = settings->get_setting("physics/avbd/chebyshev_rho", 0.0);
+    p_space.adaptive_max_iterations = settings->get_setting("physics/avbd/adaptive_max_iterations", 16.0);
 }
 
 void AVBDPhysicsServer3D::_space_set_active(const RID &p_space, bool p_active) {
@@ -1053,6 +1069,7 @@ void AVBDPhysicsServer3D::_step(double p_step) {
     int prof_threads = 1;
     int prof_substeps = 0;
     int prof_iterations = 0;
+    int prof_rebuild_count = 0;
     bool stepped_any = false;
 
     for (auto &[id, space] : spaces) {
@@ -1068,6 +1085,7 @@ void AVBDPhysicsServer3D::_step(double p_step) {
             const ProfClock::time_point prof_t_rebuild = ProfClock::now();
             rebuild_space(make_rid(id));
             prof_rebuild += seconds_since(prof_t_rebuild);
+            prof_rebuild_count++;
         }
 
         if (space.solver.bodies == nullptr) {
@@ -1097,6 +1115,7 @@ void AVBDPhysicsServer3D::_step(double p_step) {
         space.solver.stiffnessDecay = static_cast<float>(std::clamp(space.stiffness_decay, 0.0, 1.0));
         space.solver.jacobianRebuildDistance = static_cast<float>(std::max(space.jacobian_rebuild_distance, 0.0));
         space.solver.chebyshevRho = static_cast<float>(std::max(space.chebyshev_rho, 0.0));
+        space.solver.adaptiveMaxIterations = std::max(static_cast<int>(space.adaptive_max_iterations), 2);
         // Idle-sleep horizon: 30 steps at the usual 60 Hz tick = Godot's 0.5 s default.
         space.solver.sleepFrames = 30;
 
@@ -1239,12 +1258,22 @@ void AVBDPhysicsServer3D::_step(double p_step) {
     }
 
     if (profiling) {
-        prof.total_ns += seconds_since(prof_t0);
+        const double prof_total = seconds_since(prof_t0);
+        prof.total_ns += prof_total;
         prof.solver_ns += prof_solver;
         prof.contacts_ns += prof_contacts;
         prof.rebuild_ns += prof_rebuild;
         prof.params_ns += prof_params;
         prof.forces_ns += prof_forces;
+        prof.max_total_ns = std::max(prof.max_total_ns, prof_total);
+        prof.max_solver_ns = std::max(prof.max_solver_ns, prof_solver);
+        prof.max_contacts_ns = std::max(prof.max_contacts_ns, prof_contacts);
+        prof.max_rebuild_ns = std::max(prof.max_rebuild_ns, prof_rebuild);
+        prof.max_params_ns = std::max(prof.max_params_ns, prof_params);
+        prof.max_forces_ns = std::max(prof.max_forces_ns, prof_forces);
+        prof.rebuilds += prof_rebuild_count;
+        if (prof_total > 2.0e6)
+            prof.over_2ms_ticks++;
         prof.threads_used = std::max(prof.threads_used, prof_threads);
         prof.substeps = prof_substeps;
         prof.iterations = prof_iterations;
@@ -1252,11 +1281,16 @@ void AVBDPhysicsServer3D::_step(double p_step) {
         if (prof.ticks % 240 == 0) {
             constexpr double to_us = 0.001;
             std::fprintf(stdout,
-                    "[avbd-profile] ticks=%llu total=%.1fus solver=%.1fus sync=%.1fus contacts=%.1fus "
-                    "rebuild=%.1fus params=%.1fus forces=%.1fus threads=%d substeps=%d iterations=%d\n",
+                    "[avbd-profile] ticks=%llu total=%.1fus max=%.1fus solver=%.1fus(max %.1fus) sync=%.1fus(max %.1fus) "
+                    "contacts=%.1fus rebuild=%.1fus(max %.1fus x%u) params=%.1fus forces=%.1fus over2ms=%u "
+                    "threads=%d substeps=%d iterations=%d\n",
                     static_cast<unsigned long long>(prof.ticks), prof.total_ns * to_us,
-                    prof.solver_ns * to_us, prof.sync_ns * to_us, prof.contacts_ns * to_us,
-                    prof.rebuild_ns * to_us, prof.params_ns * to_us, prof.forces_ns * to_us,
+                    prof.max_total_ns * to_us,
+                    prof.solver_ns * to_us, prof.max_solver_ns * to_us,
+                    prof.sync_ns * to_us, prof.max_sync_ns * to_us,
+                    prof.contacts_ns * to_us,
+                    prof.rebuild_ns * to_us, prof.max_rebuild_ns * to_us, prof.rebuilds,
+                    prof.params_ns * to_us, prof.forces_ns * to_us, prof.over_2ms_ticks,
                     prof.threads_used, prof.substeps, prof.iterations);
             std::fflush(stdout);
             prof.ticks = 0;
@@ -1267,6 +1301,15 @@ void AVBDPhysicsServer3D::_step(double p_step) {
             prof.rebuild_ns = 0.0;
             prof.params_ns = 0.0;
             prof.forces_ns = 0.0;
+            prof.max_total_ns = 0.0;
+            prof.max_solver_ns = 0.0;
+            prof.max_sync_ns = 0.0;
+            prof.max_contacts_ns = 0.0;
+            prof.max_rebuild_ns = 0.0;
+            prof.max_params_ns = 0.0;
+            prof.max_forces_ns = 0.0;
+            prof.over_2ms_ticks = 0;
+            prof.rebuilds = 0;
             prof.threads_used = 1;
         }
     }

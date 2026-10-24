@@ -484,6 +484,12 @@ struct Solver
     // lets the cheap rounds actually converge instead of spinning. 1.0 = no decay.
     float stiffnessDecay = 1.0f;
 
+    // Upper bound of the adaptive iteration boost. The boost multiplies the round count
+    // by the penetration ratio, so at impact moments a scene pays this many dense rounds
+    // per substep - the frame spike the profiler blames. Lower it for smoother frames;
+    // the healing those rounds did is recovered by substeps at high tick rates instead.
+    int adaptiveMaxIterations = 16;
+
     // Early-exit threshold on the mean penetration residual: when a Newton round
     // improves the average residual by less than this (or worsens it), the iteration set
     // ends early - remaining rounds would polish float noise at full price. 0 disables
