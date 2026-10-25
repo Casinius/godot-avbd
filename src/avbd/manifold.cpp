@@ -70,8 +70,9 @@ bool Manifold::initialize()
     // Compute friction
     friction = std::sqrt(bodyA->friction * bodyB->friction);
 
-    // New contact set: cached jacobians describe the old geometry, drop them.
-    jacobiansCached = false;
+    // New contact set: cached moment arms describe the old geometry, drop them.
+    armsCached = false;
+    primalCacheReady = false;
 
     // Compute new contacts
     std::array<Contact, 8> newContacts = {};
@@ -178,45 +179,29 @@ bool Manifold::initialize()
 // used to recompute.
 void Manifold::preCompute(float alpha)
 {
-    float3 dqALin = bodyA->positionLin - bodyA->initialLin;
-    float3 dqAAng = bodyA->positionAng - bodyA->initialAng;
-    float3 dqBLin = bodyB->positionLin - bodyB->initialLin;
-    float3 dqBAng = bodyB->positionAng - bodyB->initialAng;
+    const float3 dqALin = bodyA->positionLin - bodyA->initialLin;
+    const float3 dqAAng = bodyA->positionAng - bodyA->initialAng;
+    const float3 dqBLin = bodyB->positionLin - bodyB->initialLin;
+    const float3 dqBAng = bodyB->positionAng - bodyB->initialAng;
 
     // Same rotation-matrix hoist as updateDual: body quats are loop-invariant here.
     const float3x3 rotA = qmat(bodyA->positionAng);
     const float3x3 rotB = qmat(bodyB->positionAng);
 
-    // Round-0 shared assembly. The angular jacobian is a function of the world-space
-    // moment arms only (rows are rWorld x basis.row(i)); computed fresh because the
-    // step's warmstart moved every pose, which always exceeds the drift threshold.
-    // Rounds >= 1 get their jacobians from updateDual's drift-gated pass instead.
-    const float3x3 jALin = basis;
-    const float3x3 jBLin = -basis;
+    // Constraint value in the basis frame. The linear jacobian rows are the basis rows
+    // (±), and each angular row is rWorld x that basis row, so the four matrix-vector
+    // products the old assembly built collapse into one bracket the basis then rotates:
+    //   C = C0(1-alpha) + B * [ (dqA_lin - dqB_lin) + (dqA_ang x rA) - (dqB_ang x rB) ]
+    // No angular jacobian matrices are needed: the basis is the only frame C lives in.
     for (int i = 0; i < numContacts; i++)
     {
-        JacobianCache &cache = jacobianCache[i];
-
         const float3 rAWorld = mul(rotA, contacts[i].rA);
         const float3 rBWorld = mul(rotB, contacts[i].rB);
+        jacobianCache[i].rAWorld = rAWorld;
+        jacobianCache[i].rBWorld = rBWorld;
 
-        // Compute the Taylor series approximation of the constraint function C(x) (Sec 4)
-        // Row i of the angular jacobian is the moment arm crossed with row i of the linear one
-        // (the manifold basis is authored in terms of rows; row()/setRow() keep that vocabulary).
-        float3x3 jAAng, jBAng;
-        for (int r = 0; r < 3; r++)
-        {
-            setRow(jAAng, r, cross(rAWorld, row(jALin, r)));
-            setRow(jBAng, r, cross(rBWorld, row(jBLin, r)));
-        }
-
-        // Landed in the cache: stampCached reads these for this round.
-        cache.rAWorld = rAWorld;
-        cache.rBWorld = rBWorld;
-        cache.jAAng = jAAng;
-        cache.jBAng = jBAng;
-
-        float3 C = contacts[i].C0 * (1 - alpha) + mul(jALin, dqALin) + mul(jBLin, dqBLin) + mul(jAAng, dqAAng) + mul(jBAng, dqBAng);
+        const float3 bracket = (dqALin - dqBLin) + cross(dqAAng, rAWorld) - cross(dqBAng, rBWorld);
+        const float3 C = contacts[i].C0 * (1 - alpha) + mul(basis, bracket);
 
         // Compute force - the penalty is a diagonal, so K*C is componentwise.
         float3 F = cmul(contacts[i].penalty, C) + contacts[i].lambda;
@@ -235,48 +220,91 @@ void Manifold::preCompute(float alpha)
 
         contactForceCache[i] = F;
     }
+    primalCacheReady = true;
 }
 
 void Manifold::stampCached(Rigid *body, Block &block)
 {
     const bool fromIsA = body == bodyA;
+    const float side = fromIsA ? 1.0f : -1.0f;
+
+    // Both bodies share the linear jacobian up to sign, Jlin = ±basis, so the linear
+    // Hessian Jlin^T K Jlin = B^T K B is the same for A and B. K is diagonal, so that
+    // "basis sandwich" S is just a weighted sum of the three basis-row outer products.
+    // With R = skew(rWorld) the angular jacobian is Jang = ±B R^T, which gives the whole
+    // stamp in closed form:
+    //   lhsLin   = S
+    //   lhsAng   = Jang^T K Jang = R S R^T
+    //   lhsCross = Jang^T K Jlin = R S
+    //   rhsLin   = ±B^T F
+    //   rhsAng   = ±R (B^T F)
+    // This replaces the three generic 3x3 products (and their transposes) the old stamp
+    // built per contact, per body. The symmetric results are written mirrored so the
+    // pivot fallback in Block::solveDelta still sees a full matrix.
+    const float3 b0 = row(basis, 0);
+    const float3 b1 = row(basis, 1);
+    const float3 b2 = row(basis, 2);
+
     for (int i = 0; i < numContacts; i++)
     {
         const float3 &F = contactForceCache[i];
-        // The penalty is a diagonal: every K product below is a row/column scaling,
-        // not a generic 3x3 product (the diagonal zeros turned a third of the old
-        // multiplies into bookkeeping).
-        const float3x3 kDiag = diagonal(contacts[i].penalty.x, contacts[i].penalty.y, contacts[i].penalty.z);
-        const float3x3 jLin = fromIsA ? basis : -basis;
-        const float3x3 &jAng = fromIsA ? jacobianCache[i].jAAng : jacobianCache[i].jBAng;
+        const float3 k = contacts[i].penalty;
+        const float3 r = fromIsA ? jacobianCache[i].rAWorld : jacobianCache[i].rBWorld;
 
-        // Stamp into LHS
-        const float3x3 jLinT = transpose(jLin);
-        const float3x3 jAngTk = mul(transpose(jAng), kDiag);
+        // S = B^T K B, symmetric. Six values (s01 = S[0][1], and so on).
+        const float s00 = k.x * b0.x * b0.x + k.y * b1.x * b1.x + k.z * b2.x * b2.x;
+        const float s11 = k.x * b0.y * b0.y + k.y * b1.y * b1.y + k.z * b2.y * b2.y;
+        const float s22 = k.x * b0.z * b0.z + k.y * b1.z * b1.z + k.z * b2.z * b2.z;
+        const float s01 = k.x * b0.x * b0.y + k.y * b1.x * b1.y + k.z * b2.x * b2.y;
+        const float s02 = k.x * b0.x * b0.z + k.y * b1.x * b1.z + k.z * b2.x * b2.z;
+        const float s12 = k.x * b0.y * b0.z + k.y * b1.y * b1.z + k.z * b2.y * b2.z;
 
-        block.lhsLin += mul(jLinT, kDiag, jLin);
-        block.lhsAng += mul(jAngTk, jAng);
-        block.lhsCross += mul(jAngTk, jLin);
+        // Column-major: column j of S is (S[0][j], S[1][j], S[2][j]).
+        const float3x3 S{float3{s00, s01, s02}, float3{s01, s11, s12}, float3{s02, s12, s22}};
 
-        // Stamp into RHS
-        block.rhsLin += mul(jLinT, F);
-        block.rhsAng += mul(transpose(jAng), F);
+        // R S, one cross product per column of S.
+        const float3x3 RS{cross(r, S.x), cross(r, S.y), cross(r, S.z)};
+
+        // R S R^T, symmetric. Closed form in r and S (verified against the matrix
+        // product); h01 = H[0][1], h02 = H[0][2], h12 = H[1][2].
+        const float h00 = s11 * r.z * r.z - 2.0f * s12 * r.y * r.z + s22 * r.y * r.y;
+        const float h11 = s22 * r.x * r.x - 2.0f * s02 * r.x * r.z + s00 * r.z * r.z;
+        const float h22 = s00 * r.y * r.y - 2.0f * s01 * r.x * r.y + s11 * r.x * r.x;
+        const float h01 = s12 * r.x * r.z + s02 * r.y * r.z - s22 * r.x * r.y - s01 * r.z * r.z;
+        const float h02 = s12 * r.x * r.y + s01 * r.y * r.z - s11 * r.x * r.z - s02 * r.y * r.y;
+        const float h12 = s02 * r.x * r.y + s01 * r.x * r.z - s00 * r.y * r.z - s12 * r.x * r.x;
+
+        // B^T F and its moment about the contact arm: the only per-body part of the RHS.
+        const float3 fw = b0 * F.x + b1 * F.y + b2 * F.z;
+        const float3 fwAng = cross(r, fw);
+
+        block.lhsLin += S;
+        block.lhsAng += float3x3{float3{h00, h01, h02}, float3{h01, h11, h12}, float3{h02, h12, h22}};
+        block.lhsCross += RS;
+        block.rhsLin += fw * side;
+        block.rhsAng += fwAng * side;
     }
 }
 
 void Manifold::updatePrimal(Rigid *body, float alpha, Block &block)
 {
-    // Self-contained fallback; the parallel primal drives the two phases directly.
-    preCompute(alpha);
+    // The first body to touch this manifold in a round consumes the force/jacobian cache
+    // the previous round's dual left behind: no pose in this computation has moved since
+    // then (the other body has not been solved yet either), so recomputing would produce
+    // the same floats. The second body's colour runs after poses have moved, so it
+    // recomputes - that is the round's one fresh evaluation.
+    if (!primalCacheReady)
+        preCompute(alpha);
     stampCached(body, block);
+    primalCacheReady = false;
 }
 
 void Manifold::updateDual(float alpha)
 {
-    float3 dqALin = bodyA->positionLin - bodyA->initialLin;
-    float3 dqAAng = bodyA->positionAng - bodyA->initialAng;
-    float3 dqBLin = bodyB->positionLin - bodyB->initialLin;
-    float3 dqBAng = bodyB->positionAng - bodyB->initialAng;
+    const float3 dqALin = bodyA->positionLin - bodyA->initialLin;
+    const float3 dqAAng = bodyA->positionAng - bodyA->initialAng;
+    const float3 dqBLin = bodyB->positionLin - bodyB->initialLin;
+    const float3 dqBAng = bodyB->positionAng - bodyB->initialAng;
 
     // Both contact rotations share the two body quats, which never change inside this
     // loop: one rotation-matrix conversion (~20 ns) replaces two quat multiplies per
@@ -284,52 +312,35 @@ void Manifold::updateDual(float alpha)
     const float3x3 rotA = qmat(bodyA->positionAng);
     const float3x3 rotB = qmat(bodyB->positionAng);
 
-    // Drift-gated jacobian reuse (the jacobianRebuildDistance semantics, now living in
-    // the dual): when neither body's rotation moved further than the threshold since the
-    // last capture, the cached jacobians are reused for C and the next round's stamp -
-    // the arms and crosses are simply not computed this round.
+    // Drift-gated arm reuse (the jacobianRebuildDistance semantics, now living in the
+    // dual): when neither body's rotation moved further than the threshold since the last
+    // capture, the cached world moment arms are reused for C and for the next round's
+    // stamp. Only the arms are cached now - the angular jacobian matrices are gone.
     const bool cacheable = solver->jacobianRebuildDistance > 0.0f;
     const float rebuild2 = solver->jacobianRebuildDistance * solver->jacobianRebuildDistance;
     const float3 dA = rotA[0] - rotACaptured[0];
     const float3 dB = rotB[0] - rotBCaptured[0];
-    const bool driftUsable = cacheable && jacobiansCached &&
+    const bool driftUsable = cacheable && armsCached &&
             length2(dA) <= rebuild2 && length2(dB) <= rebuild2;
 
-    const float3x3 jALin = basis;
-    const float3x3 jBLin = -basis;
     for (int i = 0; i < numContacts; i++)
     {
-        float3x3 jAAng, jBAng;
+        float3 rAWorld, rBWorld;
         if (driftUsable)
         {
-            jAAng = jacobianCache[i].jAAng;
-            jBAng = jacobianCache[i].jBAng;
+            rAWorld = jacobianCache[i].rAWorld;
+            rBWorld = jacobianCache[i].rBWorld;
         }
         else
         {
-            const float3 rAWorld = mul(rotA, contacts[i].rA);
-            const float3 rBWorld = mul(rotB, contacts[i].rB);
+            rAWorld = mul(rotA, contacts[i].rA);
+            rBWorld = mul(rotB, contacts[i].rB);
             jacobianCache[i].rAWorld = rAWorld;
             jacobianCache[i].rBWorld = rBWorld;
-
-            // Compute the Taylor series approximation of the constraint function C(x) (Sec 4)
-            // Row i of the angular jacobian is the moment arm crossed with row i of the linear one.
-            for (int j = 0; j < 3; j++)
-            {
-                setRow(jAAng, j, cross(rAWorld, row(jALin, j)));
-                setRow(jBAng, j, cross(rBWorld, row(jBLin, j)));
-            }
-            jacobianCache[i].jAAng = jAAng;
-            jacobianCache[i].jBAng = jBAng;
-            if (cacheable && i == numContacts - 1)
-            {
-                rotACaptured = rotA;
-                rotBCaptured = rotB;
-                jacobiansCached = true;
-            }
         }
 
-        float3 C = contacts[i].C0 * (1 - alpha) + mul(jALin, dqALin) + mul(jBLin, dqBLin) + mul(jAAng, dqAAng) + mul(jBAng, dqBAng);
+        const float3 bracket = (dqALin - dqBLin) + cross(dqAAng, rAWorld) - cross(dqBAng, rBWorld);
+        float3 C = contacts[i].C0 * (1 - alpha) + mul(basis, bracket);
 
         // Compute force - the penalty is a diagonal, so K*C is componentwise.
         float3 F = cmul(contacts[i].penalty, C) + contacts[i].lambda;
@@ -362,12 +373,9 @@ void Manifold::updateDual(float alpha)
 
         // Leave the primal's cache ready for the next Newton round. The pose is frozen
         // between here and the next stampCached (the solve runs after the next
-        // preCompute would), so the next preCompute would recompute exactly this
-        // jacobian - and, with the ramped penalty and the just-stored lambda, exactly
-        // this force. Doing it here removes the standalone preCompute from every round
-        // after the first.
-        jacobianCache[i].jAAng = jAAng;
-        jacobianCache[i].jBAng = jBAng;
+        // preCompute would), so the next preCompute would recompute exactly this bracket
+        // - and, with the ramped penalty and the just-stored lambda, exactly this force.
+        // Doing it here removes the standalone preCompute from every round after the first.
         float3 fNext = cmul(contacts[i].penalty, C) + contacts[i].lambda;
         fNext[0] = std::min(fNext[0], 0.0f);
         const float boundsNext = std::fabs(fNext[0]) * friction;
@@ -379,6 +387,16 @@ void Manifold::updateDual(float alpha)
         }
         contactForceCache[i] = fNext;
     }
+
+    if (!driftUsable && cacheable)
+    {
+        rotACaptured = rotA;
+        rotBCaptured = rotB;
+        armsCached = true;
+    }
+
+    // Ready for the next round's first primal touch: nothing moves between here and it.
+    primalCacheReady = true;
 }
 
 // Accumulate this manifold's penetration error for the adaptive iteration estimate.

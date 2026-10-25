@@ -17,6 +17,7 @@
 #include "avbd/solver.h"
 
 #include "avbd/job_pool.hpp"
+#include "avbd/taskflow.hpp"
 #include "avbd/list_range.hpp"
 #include "avbd/fixed_stack.hpp"
 #include "avbd/spatial_hash.hpp"
@@ -148,16 +149,53 @@ void Solver::clear()
         delete bodies;
 }
 
+// One step, expressed as a classified task flow:
+//   serial      - broad phase (internally independent prep/filter stages)
+//   serial      - warm-start forces (independent initialisation + serial deletion)
+//   serial      - update-set selection and colouring
+//   independent - per-body inertial/warm-start update
+//   serial      - adaptive round count for this step
+//   region      - the colour-parallel Gauss-Seidel iteration set
+//   independent - BDF1 velocities and idle detection
+//
+// The flow is built before it runs, so values a later stage needs from an earlier one are
+// captured by reference and read when that stage executes. The region falls back to an
+// inline NullSync run when the step is too small to pay for waking workers.
 void Solver::step()
 {
     ensurePool();
+    flow->clear();
 
-    broadPhase();
-    const int forceCount = warmstartForces();
-    selectUpdateBodies();
-    warmstartBodies();
-    solveIterations(forceCount);
-    finishVelocities();
+    int forceCount = 0;
+    int targetIterations = iterations;
+    int newtonRounds = iterations;
+    float prevResidual = 0.0f;
+    std::atomic<bool> converged{false};
+
+    flow->serial([this] { broadPhase(); });
+    flow->serial([this, &forceCount] { forceCount = warmstartForces(); });
+    flow->serial([this] { selectUpdateBodies(); });
+
+    flow->independent([this] { return static_cast<int>(warmstartOrder.size()); },
+            kMinBodiesPerDispatch, [this](int i) { warmstartBody(i); });
+
+    flow->serial([this, &targetIterations, &newtonRounds] {
+        computeIterations(targetIterations, newtonRounds);
+    });
+
+    flow->region(
+            [this, &forceCount, &targetIterations, &newtonRounds, &prevResidual, &converged](int workerIndex, auto &sync) {
+                iterateBody(workerIndex, sync, targetIterations, forceCount, newtonRounds, prevResidual, converged);
+            },
+            [this, &forceCount] {
+                return static_cast<int>(updateOrder.size()) < kMinBodiesPerDispatch
+                        && forceCount < kMinForcesPerDispatch;
+            });
+
+    flow->independent([this] { return static_cast<int>(warmstartOrder.size()); },
+            kMinBodiesPerDispatch, [this](int i) { finishBody(i); });
+
+    flow->run();
 }
 
 // A broad-phase candidate test: tight world AABBs plus Godot's layer/mask pair
@@ -185,10 +223,10 @@ static bool pairOverlaps(Rigid *bodyA, const float3 &aHalf, Rigid *bodyB, const 
 // The old x-axis sweep emitted 28k candidate pairs on a 40-layer resting wall,
 // and the Morton LBVH that replaced it partitioned in 3D at the cost of a tree
 // build and a recursive self-query. The hash bucketing also partitions in 3D,
-// but with none of either: bodies go into dyadic levels by bounding-sphere
-// size, each level is a sorted key table, and candidate pairs come from a
-// 27-cell walk. The candidate set is a superset of the overlapping-sphere set,
-// exactly as the tree's AABB overlap set was.
+// but with none of either: bodies go into dyadic levels by tight-AABB size,
+// each level is a sorted key table, and candidate pairs come from a
+// 27-cell walk. The candidate set is a superset of the tight-AABB overlap set,
+// exactly as the tree's was.
 //
 // Determinism: pair collection is integer-sorted and de-duplicated, and the
 // final (min-index, other) sort fixes the manifold creation order - the same
@@ -202,30 +240,25 @@ void Solver::broadPhase()
     if (count < 2)
         return;
 
-    // Cache each body's tight AABB half extents: the exact candidate filter runs on
-    // every pair, so recomputing the rotation matrix there would dominate the phase.
+    // The hash computes each body's tight AABB half extents in its own per-body pass (the
+    // exact candidate filter below reuses them), rather than paying a second dispatch for
+    // the same rotation matrices. Note the solver's own pool: the broad phase used to
+    // build a fixed 8-worker JobPool on the stack, ignoring `threads` entirely.
     bodyAabbHalf.resize(static_cast<size_t>(count));
-    for (int i = 0; i < count; ++i)
-        bodyAabbHalf[i] = aabbHalfExtent(*bodiesInOrder[i]);
+    broadHash.buildAndCollectPairs(bodiesInOrder, 0.0f, sweepPairs, bodyAabbHalf, *pool);
 
-    auto pool = detail::JobPool(8);
-    broadHash.buildAndCollectPairs(bodiesInOrder, 0.0f, sweepPairs,bodyAabbHalf,pool);
-
+    // Pairs are packed (min<<32 | max), so integer order is lexicographic order over the
+    // old std::pair and the sort takes the radix path instead of std::sort's comparator.
     radix_std::sort(sweepPairs.begin(), sweepPairs.end());
     sweepPairs.erase(std::unique(sweepPairs.begin(), sweepPairs.end()), sweepPairs.end());
-    // for (const auto &[i, j] : sweepPairs)
-    // {
-    //     Rigid *bodyA = bodiesInOrder[i];
-    //     Rigid *bodyB = bodiesInOrder[j];
-    //     if (pairOverlaps(bodyA, bodyAabbHalf[i], bodyB, bodyAabbHalf[j]))
-    //         new Manifold(this, bodyA, bodyB);
-    // }
+
     auto kMinPairsPerDispatch = kMinForcesPerDispatch;
     const size_t pairCount = sweepPairs.size();
     std::vector<uint8_t> pairValid;
     pairValid.resize(pairCount);
-    pool.forCount(pairCount, [this,&pairValid](int k) {
-        const auto [i, j] = sweepPairs[k];
+    pool->forCount(pairCount, [this, &pairValid](int k) {
+        const int i = pairFirst(sweepPairs[k]);
+        const int j = pairSecond(sweepPairs[k]);
         pairValid[k] = pairOverlaps(bodiesInOrder[i], bodyAabbHalf[i],
                                     bodiesInOrder[j], bodyAabbHalf[j]);
     }, kMinPairsPerDispatch);
@@ -233,7 +266,8 @@ void Solver::broadPhase()
     // 串行创建：manifold 链表顺序 + pool mutex 都要求单线程
     for (size_t k = 0; k < pairCount; k++) {
         if (!pairValid[k]) continue;
-        const auto [i, j] = sweepPairs[k];
+        const int i = pairFirst(sweepPairs[k]);
+        const int j = pairSecond(sweepPairs[k]);
         new Manifold(this, bodiesInOrder[i], bodiesInOrder[j]);
     }
 
@@ -281,66 +315,65 @@ int Solver::warmstartForces()
     return forceCount;
 }
 
-// Compute every body's inertial position and warm-start it (Eq. 2 and the adaptive
+// Compute one body's inertial position and warm-start it (Eq. 2 and the adaptive
 // warm-start of the original VBD paper).
 //
-// Per-body and independent, so it runs in parallel. It covers static bodies as well: their
-// poses do not move, but the constraint code reads their cached `initialLin`/`initialAng`.
-void Solver::warmstartBodies()
+// Per-body and independent, so the step's flow runs it as an Independent stage. It covers
+// static bodies as well: their poses do not move, but the constraint code reads their
+// cached `initialLin`/`initialAng`.
+void Solver::warmstartBody(int i)
 {
-    const int count = static_cast<int>(warmstartOrder.size());
-    pool->forCount(count, [this](int i) {
-        Rigid *body = warmstartOrder[i];
+    Rigid *body = warmstartOrder[i];
 
-        // Axis locks (Godot BodyAxis): a locked axis cannot carry velocity into the step,
-        // and gravity does not act along a locked linear axis. Constraint coupling can
-        // still displace a locked axis within a step; documented approximation.
-        if (body->axisLockLinear)
+    // Axis locks (Godot BodyAxis): a locked axis cannot carry velocity into the step,
+    // and gravity does not act along a locked linear axis. Constraint coupling can
+    // still displace a locked axis within a step; documented approximation.
+    if (body->axisLockLinear)
+    {
+        for (int k = 0; k < 3; ++k)
         {
-            for (int k = 0; k < 3; ++k)
-            {
-                if (body->axisLockLinear & (1 << k))
-                    body->velocityLin[k] = 0.0f;
-            }
+            if (body->axisLockLinear & (1 << k))
+                body->velocityLin[k] = 0.0f;
         }
-        if (body->axisLockAngular)
+    }
+    if (body->axisLockAngular)
+    {
+        for (int k = 0; k < 3; ++k)
         {
-            for (int k = 0; k < 3; ++k)
-            {
-                if (body->axisLockAngular & (1 << k))
-                    body->velocityAng[k] = 0.0f;
-            }
+            if (body->axisLockAngular & (1 << k))
+                body->velocityAng[k] = 0.0f;
         }
+    }
 
-        // Gravity runs along -Z only, so the lock on bit 2 (z) gates it entirely.
-        const float g = (body->axisLockLinear & 0x4) ? 0.0f : body->gravity;
+    // Gravity runs along -Z only, so the lock on bit 2 (z) gates it entirely.
+    const float g = (body->axisLockLinear & 0x4) ? 0.0f : body->gravity;
 
-        body->inertialLin = body->positionLin + body->velocityLin * dt;
-        if (body->mass > 0)
-            body->inertialLin += float3{0, 0, g} * (dt * dt);
-        body->inertialAng = body->positionAng + body->velocityAng * dt;
+    body->inertialLin = body->positionLin + body->velocityLin * dt;
+    if (body->mass > 0)
+        body->inertialLin += float3{0, 0, g} * (dt * dt);
+    body->inertialAng = body->positionAng + body->velocityAng * dt;
 
-        // Adaptive warmstart (See original VBD paper)
-        const float3 accel = (body->velocityLin - body->prevVelocityLin) / dt;
-        const float accelExt = accel.z * std::copysign(1.0f, g);
-        float accelWeight = std::clamp(accelExt / std::fabs(g), 0.0f, 1.0f);
-        if (!std::isfinite(accelWeight))
-            accelWeight = 0.0f;
+    // Adaptive warmstart (See original VBD paper)
+    const float3 accel = (body->velocityLin - body->prevVelocityLin) / dt;
+    const float accelExt = accel.z * std::copysign(1.0f, g);
+    float accelWeight = std::clamp(accelExt / std::fabs(g), 0.0f, 1.0f);
+    if (!std::isfinite(accelWeight))
+        accelWeight = 0.0f;
 
-        // Save the position at the start of the step (x-) and warm-start to the tentative
-        // new position (See original VBD paper)
-        body->initialLin = body->positionLin;
-        body->initialAng = body->positionAng;
-        if (body->mass > 0)
-        {
-            body->positionLin = body->positionLin + body->velocityLin * dt + float3{0, 0, g} * (accelWeight * dt * dt);
-            body->positionAng = body->positionAng + body->velocityAng * dt;
-        }
-    }, kMinBodiesPerDispatch);
+    // Save the position at the start of the step (x-) and warm-start to the tentative
+    // new position (See original VBD paper)
+    body->initialLin = body->positionLin;
+    body->initialAng = body->positionAng;
+    if (body->mass > 0)
+    {
+        body->positionLin = body->positionLin + body->velocityLin * dt + float3{0, 0, g} * (accelWeight * dt * dt);
+        body->positionAng = body->positionAng + body->velocityAng * dt;
+    }
 }
 
-// The solver's main loop: `iterations` rounds of a primal pass followed by a dual pass.
-void Solver::solveIterations(int forceCount)
+// Decide this step's round count once, on the caller, after warm-starting and before the
+// region starts; every participant then reads the same values.
+void Solver::computeIterations(int &r_targetIterations, int &r_newtonRounds)
 {
     int targetIterations = iterations;
 
@@ -362,16 +395,14 @@ void Solver::solveIterations(int forceCount)
         targetIterations = std::min(targetIterations, adaptiveMaxIterations); // Impact-moment cost bound; see the member comment.
     }
 
-    // One dispatch covers every round: the barrier fences inside `iterate` carry the
-    // Gauss-Seidel ordering, so the loop body below runs the whole set, not one round.
+    r_targetIterations = targetIterations;
     // newtonRatio splits the set: the leading rounds run primal + dual, the tail runs
     // dual-only relaxation (optionally with penalty decay via stiffnessDecay).
-    const int newtonRounds = std::clamp(
+    r_newtonRounds = std::clamp(
             static_cast<int>(std::ceil(newtonRatio * static_cast<float>(targetIterations))), 0, targetIterations);
-    iterate(targetIterations, forceCount, newtonRounds);
 }
 
-// One worker-loop body for the whole iteration set: `iterations` rounds of the
+// One region body for the whole iteration set: `iterations` rounds of the
 // colour-parallel Gauss-Seidel primal followed by a dual pass, with a barrier
 // fence at every phase boundary.
 //
@@ -380,272 +411,252 @@ void Solver::solveIterations(int forceCount)
 // and applies the update immediately - Gauss-Seidel across colours, parallel
 // and race-free within one (a colour is an independent set of the constraint
 // graph by construction). Manifolds take the self-contained updatePrimal path,
-// which recomputes the shared assembly against the live pose; each manifold is
-// seen by at most one body per colour, so nothing races.
+// which consumes the previous round's cache for the first touch and recomputes
+// once for the second; each manifold is seen by at most one body per colour, so
+// nothing races.
 //
 // The colouring is capped at kMaxColours so the barrier count per round is
 // bounded; bodies the greedy colouring could not fit run one block-Jacobi round
 // after the colours (precompute, solve against the post-colour snapshot,
 // combine), using jacobiRelaxation/Chebyshev as the combine controls.
 //
-// Both sync types run the identical body: NullSync (small scenes, or another solver
-// holding the loop) executes it inline in list order, which is exactly the threads=1
-// reference the digest tests compare against.
-void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
+// NullSync (small scenes) runs the identical body inline in list order, which is
+// exactly the threads=1 reference the digest tests compare against.
+template <typename Sync>
+void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int forceCount,
+        int newtonRounds, float &r_prevResidual, std::atomic<bool> &r_converged)
 {
     // Convergence early exit: measure the residual at the end of a Newton round; when it
     // stops improving (delta below the threshold or rising), the remaining rounds would
     // burn cycles on float noise. Measured only at the Newton boundary - the impulse tail
     // converges slowly by design, so its delta is checked against its own, much looser
     // scale. 0 disables the check.
-    float prevResidual = 0.0f;
-    int roundsRun = 0;
-    std::atomic<bool> converged{false};
-    const auto loop = [this, targetIterations, forceCount, newtonRounds, &prevResidual, &roundsRun, &converged](int workerIndex, auto &sync) {
-        // Per-worker Chebyshev schedule state for the overflow bucket's combine:
-        // the recurrence is deterministic, so every worker derives the same
-        // weights without sharing anything.
-        int chebRound = 0;
-        float chebGammaPrev = 1.0f;
-        
-        for (int it = 0; it < targetIterations; it++)
+    // Per-worker Chebyshev schedule state for the overflow bucket's combine:
+    // the recurrence is deterministic, so every worker derives the same
+    // weights without sharing anything.
+    int chebRound = 0;
+    float chebGammaPrev = 1.0f;
+    
+    for (int it = 0; it < targetIterations; it++)
+    {
+        const bool newton = it < newtonRounds;
+        if (newton)
         {
-            const bool newton = it < newtonRounds;
-            if (newton)
+            // Colour-parallel Gauss-Seidel. One pass per colour: assemble
+            // (manifolds stamp self-contained against the live poses, other
+            // forces stamp directly), solve, apply. Bodies of one colour
+            // share no force, so the pass is race-free without a snapshot.
+            
+            for (int c = 0; c < colourCount; c++)
             {
-                // Colour-parallel Gauss-Seidel. One pass per colour: assemble
-                // (manifolds stamp self-contained against the live poses, other
-                // forces stamp directly), solve, apply. Bodies of one colour
-                // share no force, so the pass is race-free without a snapshot.
-                
-                for (int c = 0; c < colourCount; c++)
-                {
-                    const int first = colourBegins[c];
-                    const int last = colourBegins[c + 1];
-                    if (last == first)
-                        continue; // empty colour: every worker skips the barrier alike
-                    sync.forItems(last - first, [this, first, it](int k) {
-                        Rigid *body = updateOrder[colourOrder[first + k]];
-                        Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
-                                body->positionAng, body->inertialAng);
-                        for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
-                            f->updatePrimal(body, alpha, block);
-                        block.apply(*body);
-                    });
-                    sync.arriveAndWait();
-                }
+                const int first = colourBegins[c];
+                const int last = colourBegins[c + 1];
+                if (last == first)
+                    continue; // empty colour: every worker skips the barrier alike
+                sync.forItems(last - first, [this, first, it](int k) {
+                    Rigid *body = updateOrder[colourOrder[first + k]];
+                    Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
+                            body->positionAng, body->inertialAng);
+                    for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
+                        f->updatePrimal(body, alpha, block);
+                    block.apply(*body);
+                });
+                sync.arriveAndWait();
+            }
 
-                // Overflow bucket (> kMaxColours cliques): block Jacobi against
-                // the post-colour snapshot, in three phases. Phase A precomputes
-                // each manifold's shared per-contact assembly (world arms,
-                // angular jacobians, clamped forces) once - work the two body
-                // stamps used to duplicate. Nobody writes a pose until the
-                // combine pass, so every phase reads the same frozen snapshot.
-                const int overflowCount = static_cast<int>(overflowOrder.size());
-                if (overflowCount > 0)
-                {
-                    sync.forItems(forceCount, [this](int i) {
-                        Force *f = forceOrder[i];
-                        if (!f->isManifold)
-                            return;
-                        Manifold *manifold = static_cast<Manifold *>(f);
-                        const bool aIn = manifold->bodyA->inUpdateSet &&
-                                bodyColour[manifold->bodyA->updateIndex] == kOverflowColour;
-                        const bool bIn = manifold->bodyB->inUpdateSet &&
-                                bodyColour[manifold->bodyB->updateIndex] == kOverflowColour;
-                        if (!aIn && !bIn)
-                            return; // both sides solved in a colour, or frozen
-                        manifold->preCompute(alpha);
-                    });
-                    sync.arriveAndWait();
+            // Overflow bucket (> kMaxColours cliques): block Jacobi against
+            // the post-colour snapshot, in three phases. Phase A precomputes
+            // each manifold's shared per-contact assembly (world arms,
+            // angular jacobians, clamped forces) once - work the two body
+            // stamps used to duplicate. Nobody writes a pose until the
+            // combine pass, so every phase reads the same frozen snapshot.
+            const int overflowCount = static_cast<int>(overflowOrder.size());
+            if (overflowCount > 0)
+            {
+                sync.forItems(forceCount, [this](int i) {
+                    Force *f = forceOrder[i];
+                    if (!f->isManifold)
+                        return;
+                    Manifold *manifold = static_cast<Manifold *>(f);
+                    const bool aIn = manifold->bodyA->inUpdateSet &&
+                            bodyColour[manifold->bodyA->updateIndex] == kOverflowColour;
+                    const bool bIn = manifold->bodyB->inUpdateSet &&
+                            bodyColour[manifold->bodyB->updateIndex] == kOverflowColour;
+                    if (!aIn && !bIn)
+                        return; // both sides solved in a colour, or frozen
+                    manifold->preCompute(alpha);
+                });
+                sync.arriveAndWait();
 
-                    // Phase B: each bucket body assembles its full block system
-                    // (own inertia plus every incident constraint - manifolds
-                    // stamped from the phase-A cache, other forces stamping
-                    // directly) and solves for its delta.
-                    sync.forItems(overflowCount, [this](int k) {
-                        const int i = overflowOrder[k];
-                        Rigid *body = updateOrder[i];
-                        Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
-                                body->positionAng, body->inertialAng);
-                        for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
-                        {
-                            if (f->isManifold)
-                                static_cast<Manifold *>(f)->stampCached(body, block);
-                            else
-                                f->updatePrimal(body, alpha, block);
-                        }
-                        block.solveDelta(bodyDeltaLin[i], bodyDeltaAng[i]);
-                    });
-                    sync.arriveAndWait();
-
-                    // Combine: each bucket body applies its own delta. With
-                    // chebyshevRho > 0 the plain Jacobi estimate x + delta is
-                    // convex-combined with the previous iterate through the
-                    // Chebyshev weights (semi-iteration); otherwise the constant
-                    // jacobiRelaxation scales it. The angular delta gets the same
-                    // gamma but no prev-mixing: positions are a vector space,
-                    // rotations are not, and the first-order quat integration
-                    // stays exact as written.
-                    float relaxGamma = jacobiRelaxation;
-                    if (chebyshevRho > 0.0f)
+                // Phase B: each bucket body assembles its full block system
+                // (own inertia plus every incident constraint - manifolds
+                // stamped from the phase-A cache, other forces stamping
+                // directly) and solves for its delta.
+                sync.forItems(overflowCount, [this](int k) {
+                    const int i = overflowOrder[k];
+                    Rigid *body = updateOrder[i];
+                    Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
+                            body->positionAng, body->inertialAng);
+                    for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
                     {
-                        const float rho2 = chebyshevRho * chebyshevRho;
-                        if (chebRound == 0)
-                            relaxGamma = 1.0f;
-                        else if (chebRound == 1)
-                            relaxGamma = 1.0f / (1.0f - 0.5f * rho2);
+                        if (f->isManifold)
+                            static_cast<Manifold *>(f)->stampCached(body, block);
                         else
-                            relaxGamma = 1.0f / (1.0f - 0.25f * rho2 * chebGammaPrev);
-                        chebGammaPrev = relaxGamma;
+                            f->updatePrimal(body, alpha, block);
                     }
-                    chebRound++;
-                    sync.forItems(overflowCount, [this, relaxGamma](int k) {
-                        const int i = overflowOrder[k];
-                        Rigid *body = updateOrder[i];
-                        if (chebyshevRho <= 0.0f || !body->contactOnly)
-                        {
-                            // Plain relaxed Jacobi - the constant, or the safe fallback for
-                            // bodies coupled by joints (extrapolation diverges those).
-                            body->positionLin = body->positionLin + bodyDeltaLin[i] * jacobiRelaxation;
-                            body->positionAng = body->positionAng + bodyDeltaAng[i] * jacobiRelaxation;
-                            return;
-                        }
-                        // x_{k+1} = gamma * (x_k + delta_k) + (1 - gamma) * x_{k-1}
-                        const float3 xLin = body->positionLin;
-                        body->positionLin = relaxGamma * (xLin + bodyDeltaLin[i]) + (1.0f - relaxGamma) * bodyPrevLin[i];
-                        bodyPrevLin[i] = xLin;
-                        body->positionAng = body->positionAng + bodyDeltaAng[i] * relaxGamma;
-                    });
-                    sync.arriveAndWait();
-                }
-                else
+                    block.solveDelta(bodyDeltaLin[i], bodyDeltaAng[i]);
+                });
+                sync.arriveAndWait();
+
+                // Combine: each bucket body applies its own delta. With
+                // chebyshevRho > 0 the plain Jacobi estimate x + delta is
+                // convex-combined with the previous iterate through the
+                // Chebyshev weights (semi-iteration); otherwise the constant
+                // jacobiRelaxation scales it. The angular delta gets the same
+                // gamma but no prev-mixing: positions are a vector space,
+                // rotations are not, and the first-order quat integration
+                // stays exact as written.
+                float relaxGamma = jacobiRelaxation;
+                if (chebyshevRho > 0.0f)
                 {
-                    chebRound++;
+                    const float rho2 = chebyshevRho * chebyshevRho;
+                    if (chebRound == 0)
+                        relaxGamma = 1.0f;
+                    else if (chebRound == 1)
+                        relaxGamma = 1.0f / (1.0f - 0.5f * rho2);
+                    else
+                        relaxGamma = 1.0f / (1.0f - 0.25f * rho2 * chebGammaPrev);
+                    chebGammaPrev = relaxGamma;
                 }
+                chebRound++;
+                sync.forItems(overflowCount, [this, relaxGamma](int k) {
+                    const int i = overflowOrder[k];
+                    Rigid *body = updateOrder[i];
+                    if (chebyshevRho <= 0.0f || !body->contactOnly)
+                    {
+                        // Plain relaxed Jacobi - the constant, or the safe fallback for
+                        // bodies coupled by joints (extrapolation diverges those).
+                        body->positionLin = body->positionLin + bodyDeltaLin[i] * jacobiRelaxation;
+                        body->positionAng = body->positionAng + bodyDeltaAng[i] * jacobiRelaxation;
+                        return;
+                    }
+                    // x_{k+1} = gamma * (x_k + delta_k) + (1 - gamma) * x_{k-1}
+                    const float3 xLin = body->positionLin;
+                    body->positionLin = relaxGamma * (xLin + bodyDeltaLin[i]) + (1.0f - relaxGamma) * bodyPrevLin[i];
+                    bodyPrevLin[i] = xLin;
+                    body->positionAng = body->positionAng + bodyDeltaAng[i] * relaxGamma;
+                });
+                sync.arriveAndWait();
             }
-
-            // Dual update: one item per force, and each force only reads the (frozen)
-            // body poses and writes its own dual state, so the whole pass is independent.
-            // Frozen constraints have nothing to update: every input they read is parked.
-            // In the impulse tail the contact penalties decay first (stiffnessDecay < 1):
-            // relaxation converges poorly against a stiff ramp, softening lets the cheap
-            // rounds finish the job the Newton rounds started - fused into the same pass,
-            // same force, same order, so the decay lands before the dual reads the
-            // penalty without paying an extra pass and barrier per tail round.
-            const float decay = stiffnessDecay;
-            sync.forItems(forceCount, [this, newton, decay](int i) {
-                Force *f = forceOrder[i];
-                if (!newton && decay < 1.0f && f->isManifold) {
-                    Manifold *m = static_cast<Manifold *>(f);
-                    
-                    for (int ci = 0, n = m->numContacts; ci < n; ++ci)
-                        m->contacts[ci].penalty = min(m->contacts[ci].penalty * decay, float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX});
-                }
-                if (!constraintFrozen(f))
-                    f->updateDual(alpha);
-            });
-            sync.arriveAndWait();
-            ++roundsRun;
-
-            // Convergence probe after a Newton round: a full primal pass is expensive, so
-            // skip further rounds when the residual stops shrinking. Only the calling
-            // thread (worker 0) evaluates the reduction, and the verdict is stored in a
-            // shared atomic that EVERY participant reads BEFORE the barrier - each worker
-            // that sees `converged` skips its own remaining work but still participates
-            // in every barrier (draining instead of returning), so the barrier
-            // participation count stays equal and no worker deadlocks.
-            if (workerIndex == 0 && convergenceThreshold > 0.0f && it + 1 < targetIterations)
-            {
-                float total = 0.0f;
-                int count = 0;
-                for (Force *f = forces; f != nullptr; f = f->next)
-                    f->accumulatePenetration(total, count);
-                const float residual = count > 0 ? total / count : 0.0f;
-                converged.store(prevResidual - residual < convergenceThreshold,
-                        std::memory_order_relaxed);
-                prevResidual = residual;
-            }
-            const bool stop = converged.load(std::memory_order_relaxed);
-            if (stop)
-                break; // every participant breaks at the same iteration - barriers stay paired
-        }
-    };
-
-    // Below both break-even sizes every phase would run inline anyway, so skip the
-    // dispatch entirely. Above them the loop dispatches once for the whole set.
-    const bool tiny = static_cast<int>(updateOrder.size()) < kMinBodiesPerDispatch
-            && forceCount < kMinForcesPerDispatch;
-    if (tiny)
-    {
-        detail::NullSync sync;
-        loop(0, sync);
-    }
-    else
-    {
-        pool->runLoop(loop);
-    }
-}
-
-// BDF1 velocities after the final iteration. Per-body and independent; it covers static
-// bodies too, so their bookkeeping matches, though only movable ones get a new velocity.
-void Solver::finishVelocities()
-{
-    const int count = static_cast<int>(warmstartOrder.size());
-    pool->forCount(count, [this](int i) {
-        Rigid *body = warmstartOrder[i];
-        body->prevVelocityLin = body->velocityLin;
-        // Don't update velocity if sleeping (Godot 4.7 API)
-        if (body->mass > 0 && !body->sleeping)
-        {
-            body->velocityLin = (body->positionLin - body->initialLin) / dt;
-            body->velocityAng = (body->positionAng - body->initialAng) / dt;
-        }
-        // A locked axis reports no velocity even if constraint coupling nudged it: the
-        // lock's promise is "this axis does not move" to whoever reads state back.
-        if (body->axisLockLinear)
-        {
-            for (int k = 0; k < 3; ++k)
-            {
-                if (body->axisLockLinear & (1 << k))
-                    body->velocityLin[k] = 0.0f;
-            }
-        }
-        if (body->axisLockAngular)
-        {
-            for (int k = 0; k < 3; ++k)
-            {
-                if (body->axisLockAngular & (1 << k))
-                    body->velocityAng[k] = 0.0f;
-            }
-        }
-        // Idle detection: a movable, non-sleeping body whose velocities stayed under both
-        // thresholds for sleepFrames consecutive steps falls asleep (velocity zeroed,
-        // Godot semantics). Only touches this body's fields, so it is safe inside the
-        // parallel dispatch and deterministic regardless of thread count.
-        // Automatic sleep only for bodies whose host allows it (sleep_mode == SLEEP).
-        // A body with can_sleep=false used to enter idle sleep here anyway; the next
-        // selection then simulated it again (sleep_mode NEVER), but finishVelocities
-        // skipped its velocity update because `sleeping` was still set - the body
-        // moved with a permanently zero velocity, and contacts could pump it upward
-        // indefinitely. That was the pyramid_dbl runaway.
-        if (sleepFrames > 0 && body->mass > 0 && !body->sleeping && body->sleep_mode == 1)
-        {
-            if (length2(body->velocityLin) < sleepLinearThreshold * sleepLinearThreshold &&
-                    length2(body->velocityAng) < sleepAngularThreshold * sleepAngularThreshold)
-                ++body->stillFrames;
             else
-                body->stillFrames = 0;
-            if (body->stillFrames >= sleepFrames)
             {
-                body->sleeping = true;
-                body->velocityLin = float3{0, 0, 0};
-                body->velocityAng = float3{0, 0, 0};
+                chebRound++;
             }
         }
-    }, kMinBodiesPerDispatch);
+
+        // Dual update: one item per force, and each force only reads the (frozen)
+        // body poses and writes its own dual state, so the whole pass is independent.
+        // Frozen constraints have nothing to update: every input they read is parked.
+        // In the impulse tail the contact penalties decay first (stiffnessDecay < 1):
+        // relaxation converges poorly against a stiff ramp, softening lets the cheap
+        // rounds finish the job the Newton rounds started - fused into the same pass,
+        // same force, same order, so the decay lands before the dual reads the
+        // penalty without paying an extra pass and barrier per tail round.
+        const float decay = stiffnessDecay;
+        sync.forItems(forceCount, [this, newton, decay](int i) {
+            Force *f = forceOrder[i];
+            if (!newton && decay < 1.0f && f->isManifold) {
+                Manifold *m = static_cast<Manifold *>(f);
+                
+                for (int ci = 0, n = m->numContacts; ci < n; ++ci)
+                    m->contacts[ci].penalty = min(m->contacts[ci].penalty * decay, float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX});
+            }
+            if (!constraintFrozen(f))
+                f->updateDual(alpha);
+        });
+        sync.arriveAndWait();
+
+
+        // Convergence probe after a Newton round: a full primal pass is expensive, so
+        // skip further rounds when the residual stops shrinking. Only the calling
+        // thread (worker 0) evaluates the reduction, and the verdict is stored in a
+        // shared atomic that EVERY participant reads BEFORE the barrier - each worker
+        // that sees `r_converged` skips its own remaining work but still participates
+        // in every barrier (draining instead of returning), so the barrier
+        // participation count stays equal and no worker deadlocks.
+        if (workerIndex == 0 && convergenceThreshold > 0.0f && it + 1 < targetIterations)
+        {
+            float total = 0.0f;
+            int count = 0;
+            for (Force *f = forces; f != nullptr; f = f->next)
+                f->accumulatePenetration(total, count);
+            const float residual = count > 0 ? total / count : 0.0f;
+            r_converged.store(r_prevResidual - residual < convergenceThreshold,
+                    std::memory_order_relaxed);
+            r_prevResidual = residual;
+        }
+        const bool stop = r_converged.load(std::memory_order_relaxed);
+        if (stop)
+            break; // every participant breaks at the same iteration - barriers stay paired
+    }
 }
 
+// One body's BDF1 velocity after the final iteration. Per-body and independent, so the
+// step's flow runs it as an Independent stage; it covers static bodies too, so their
+// bookkeeping matches, though only movable ones get a new velocity.
+void Solver::finishBody(int i)
+{
+    Rigid *body = warmstartOrder[i];
+    body->prevVelocityLin = body->velocityLin;
+    // Don't update velocity if sleeping (Godot 4.7 API)
+    if (body->mass > 0 && !body->sleeping)
+    {
+        body->velocityLin = (body->positionLin - body->initialLin) / dt;
+        body->velocityAng = (body->positionAng - body->initialAng) / dt;
+    }
+    // A locked axis reports no velocity even if constraint coupling nudged it: the
+    // lock's promise is "this axis does not move" to whoever reads state back.
+    if (body->axisLockLinear)
+    {
+        for (int k = 0; k < 3; ++k)
+        {
+            if (body->axisLockLinear & (1 << k))
+                body->velocityLin[k] = 0.0f;
+        }
+    }
+    if (body->axisLockAngular)
+    {
+        for (int k = 0; k < 3; ++k)
+        {
+            if (body->axisLockAngular & (1 << k))
+                body->velocityAng[k] = 0.0f;
+        }
+    }
+    // Idle detection: a movable, non-sleeping body whose velocities stayed under both
+    // thresholds for sleepFrames consecutive steps falls asleep (velocity zeroed,
+    // Godot semantics). Only touches this body's fields, so it is safe inside the
+    // parallel dispatch and deterministic regardless of thread count.
+    // Automatic sleep only for bodies whose host allows it (sleep_mode == SLEEP).
+    // A body with can_sleep=false used to enter idle sleep here anyway; the next
+    // selection then simulated it again (sleep_mode NEVER), but the finish stage
+    // skipped its velocity update because `sleeping` was still set - the body
+    // moved with a permanently zero velocity, and contacts could pump it upward
+    // indefinitely. That was the pyramid_dbl runaway.
+    if (sleepFrames > 0 && body->mass > 0 && !body->sleeping && body->sleep_mode == 1)
+    {
+        if (length2(body->velocityLin) < sleepLinearThreshold * sleepLinearThreshold &&
+                length2(body->velocityAng) < sleepAngularThreshold * sleepAngularThreshold)
+            ++body->stillFrames;
+        else
+            body->stillFrames = 0;
+        if (body->stillFrames >= sleepFrames)
+        {
+            body->sleeping = true;
+            body->velocityLin = float3{0, 0, 0};
+            body->velocityAng = float3{0, 0, 0};
+        }
+    }
+}
 // Island-wide sleep bookkeeping. Movable, sleep-enabled bodies are grouped into islands
 // through force connectivity (union-find over the flattened body list; static bodies and
 // sleep_mode == NEVER bodies join nothing and never propagate). An island where every
@@ -812,7 +823,7 @@ void Solver::selectUpdateBodies()
             bool should_update = true;
             if (body->sleep_mode == 1) // SLEEP_MODE_SLEEP
             {
-                // Idle detection (finishVelocities) is the only way into sleep here;
+                // Idle detection (finishBody) is the only way into sleep here;
                 // a sleeping body with contacts stays out of the update set until the
                 // wake-up pass above re-admits it.
                 if (body->sleeping)
@@ -955,6 +966,7 @@ void Solver::ensurePool()
     // a single worker, which both the pool and `threads` document the same way. (Clamping 0
     // up to 1 here would silently turn the default into a serial run.)
     pool = std::make_unique<detail::JobPool>(static_cast<unsigned>(std::max(0, threads)));
+    flow = std::make_unique<detail::TaskFlow>(*pool);
 }
 
 int Solver::threadCount() const

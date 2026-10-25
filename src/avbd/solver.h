@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -25,6 +26,7 @@ namespace avbd {
 // Defined in job_pool.hpp, which is only included by solver.cpp.
 namespace detail {
 class JobPool;
+class TaskFlow;
 }
 
 // Minimum penalty parameter
@@ -110,7 +112,7 @@ struct Rigid
     // is how per-body gravity modes are expressed).
     float gravity;
     bool sleeping = false;
-    // Consecutive finishVelocities() steps with both velocities under the solver's sleep
+    // Consecutive steps with both velocities under the solver's sleep
     // thresholds; reaching sleepFrames flips `sleeping` on. Only meaningful when the body
     // is movable and sleep_mode enables sleeping.
     int stillFrames = 0;
@@ -445,25 +447,29 @@ struct Manifold : Force
     int numContacts;
     float friction;
 
-    // Incremental jacobian cache: world-space moment arms + angular jacobians captured
-    // at the last full assembly, plus the body rotations at capture time. The drift test
-    // is per BODY (rotations are loop-invariant across a manifold's contacts): rebuild
-    // everything when either rotation moved more than jacobianRebuildDistance (unit-
-    // column distance ~ 2 sin(angle/2)). Invalidated by initialize() (new contact set).
+    // Incremental moment-arm cache: world-space arms captured at the last full assembly,
+    // plus the body rotations at capture time. The drift test is per BODY (rotations are
+    // loop-invariant across a manifold's contacts): reuse the arms when neither rotation
+    // moved more than jacobianRebuildDistance (unit-column distance ~ 2 sin(angle/2)).
+    // The angular jacobian matrices the old cache stored are gone: C and the stamp both
+    // derive everything from these arms and the basis. Invalidated by initialize().
     struct JacobianCache
     {
         float3 rAWorld;
         float3 rBWorld;
-        float3x3 jAAng;
-        float3x3 jBAng;
     };
     std::array<JacobianCache, 8> jacobianCache;
     float3x3 rotACaptured = identity3x3; // body rotations at capture
     float3x3 rotBCaptured = identity3x3;
-    bool jacobiansCached = false;
+    bool armsCached = false;
     // Clamped contact forces from the primal's shared precompute pass; the two body
     // stamps read these instead of each recomputing the same C/F from the snapshot.
     std::array<float3, 8> contactForceCache;
+    // The cache above is ready for the next primal stamp: prepared by the previous
+    // round's dual (poses are unchanged since) or by preCompute(). The first body to
+    // touch this manifold in a round consumes it, so a manifold is fully recomputed at
+    // most once per round instead of once per body.
+    bool primalCacheReady = false;
 
     Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB);
 
@@ -479,10 +485,12 @@ struct Manifold : Force
 
     bool initialize() override;
     void updatePrimal(Rigid *body, float alpha, Block &block) override;
-    // Two-phase primal: preCompute (parallel over forces) evaluates the shared per-
-    // contact arms/jacobians/clamped forces once; stampCached (parallel over bodies)
-    // stamps one body's side from that cache. updatePrimal is the self-contained
-    // fallback that runs both.
+    // Two consumers share one cache. updatePrimal (the coloured Gauss-Seidel path) uses
+    // the force/moment-arm cache the previous round's dual left behind: the first body to
+    // touch the manifold this round consumes it for free, and the second color - by then
+    // poses have moved - recomputes once (preCompute) and stamps its side. The overflow
+    // bucket's Jacobi path instead runs preCompute over forces, then stampCached over
+    // bodies, so one assembly serves both sides against the same snapshot.
     void preCompute(float alpha);
     void stampCached(Rigid *body, Block &block);
     void updateDual(float alpha) override;
@@ -509,6 +517,10 @@ int collideShapes(const Shape &a, const Shape &b,
 // across threads pays for the dispatch itself.
 constexpr int kMinBodiesPerDispatch = 48;
 constexpr int kMinForcesPerDispatch = 256;
+// The broad phase's per-body preparation (AABB bound, level, cell key) costs tens of
+// nanoseconds per body, so a dispatch only pays off at a much larger batch than a body's
+// primal update does (~1 us). Below this the loop runs inline and saves the round trip.
+constexpr int kMinBodiesPerCheapDispatch = 512;
 
 // Core solver class which holds all the rigid bodies and forces, and has logic to step the simulation forward in time
 struct Solver
@@ -578,10 +590,9 @@ struct Solver
     // as a per-scene experiment rather than a win.
     float chebyshevRho = 0.0f;
 
-    // Incremental jacobian rebuild distance (metres): after the first Newton round
-    // assembles a contact's angular jacobian, later rounds reuse it while the contact's
-    // world-space moment arms have drifted less than this from the captured values.
-    // 0 disables caching (full assembly every round; default, bit-identical digests).
+    // Incremental arm-rebuild distance (metres): later rounds reuse a contact's cached
+    // world moment arms while the body rotations have drifted less than this from the
+    // captured pose. 0 disables caching (fresh arms every round; default).
     // Realistic value 1e-4 (0.1 mm): in-iteration arm drift is millimetre-scale.
     float jacobianRebuildDistance = 0.0f;
 
@@ -669,7 +680,7 @@ private:
     std::vector<Rigid *> bodiesInOrder;
     std::vector<float3> bodyAabbHalf; // cached tight AABB half extents, per bodiesInOrder
     SpatialHash broadHash;
-    std::vector<std::pair<int, int>> sweepPairs;
+    std::vector<uint64_t> sweepPairs;
 
     // Bodies that take part in the primal update (movable, awake ones), in list order.
     // The coloured Gauss-Seidel primal solves one block system per body of each
@@ -711,6 +722,8 @@ private:
     std::vector<int> bodyIsland;
 
     std::unique_ptr<detail::JobPool> pool;
+    // Classified stage sequence for the current step, rebuilt in place every frame.
+    std::unique_ptr<detail::TaskFlow> flow;
 
     // Current collision margin for this frame (dynamically adjusted)
     float currentCollisionMargin = COLLISION_MARGIN_BASE;
@@ -732,17 +745,22 @@ private:
     // Fill `forceOrder` from the solver's force list and return the count.
     int collectForces();
 
-    // The phases of a step, in the order `step()` runs them.
+    // The phases of a step (see `step()`, which sequences them through `TaskFlow`).
     void broadPhase();
     int warmstartForces();
-    void warmstartBodies();
-    void solveIterations(int forceCount);
-    // The whole iteration set as one persistent-worker loop: `targetIterations` rounds of
+    // One body's inertial/warm-start update (independent across the list).
+    void warmstartBody(int i);
+    // Decide this step's round count once, before the region starts.
+    void computeIterations(int &r_targetIterations, int &r_newtonRounds);
+    // The whole iteration set as one persistent-worker region: `targetIterations` rounds of
     // the block-Jacobi primal (one full block solve per body against the iteration-start
-    // pose, then a combine pass) plus dual passes, fenced by LoopSync barriers. Declared
-    // here so `iterate` stays testable.
-    void iterate(int targetIterations, int forceCount, int newtonRounds);
-    void finishVelocities();
+    // pose, then a combine pass) plus dual passes, fenced by LoopSync barriers. Both sync
+    // types run the identical body; NullSync is the inline/reference path.
+    template <typename Sync>
+    void iterateBody(int workerIndex, Sync &sync, int targetIterations, int forceCount,
+            int newtonRounds, float &r_prevResidual, std::atomic<bool> &r_converged);
+    // One body's BDF1 velocity / idle-detection update (independent across the list).
+    void finishBody(int i);
 
     // Island-wide sleep bookkeeping (runs when sleeping is enabled): movable bodies are
     // grouped into islands through force connectivity, and an island whose every body

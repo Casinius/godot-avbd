@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "avbd/solver.h"
@@ -419,11 +420,9 @@ static uint64_t scene_digest(int threads, int steps) {
     return state_digest(s);
 }
 
-static uint64_t mixed_digest(int threads) {
-    Solver s;
-    s.threads = threads;
-    // Bodies coupled by contacts and joints, plus a free-falling stack, so the update set
-    // is varied: contacts (coupled), joints (coupled), and singletons.
+// Bodies coupled by contacts and joints, plus a free-falling stack, so the update set
+// is varied: contacts (coupled), joints (coupled), and singletons.
+static void build_mixed(Solver &s) {
     new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
     Rigid *prev = 0;
     for (int i = 0; i < 30; i++) {
@@ -434,8 +433,41 @@ static uint64_t mixed_digest(int threads) {
     }
     for (int i = 0; i < 40; i++)
         new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {5.0f + (float)i * 1.2f, 0, 3.0f + (float)(i % 5)});
+}
+
+static uint64_t mixed_digest(int threads) {
+    Solver s;
+    s.threads = threads;
+    build_mixed(s);
     step_n(s, 240);
     return state_digest(s);
+}
+
+// Two solvers stepped from two host threads. Both must match the serial reference, and
+// neither may deadlock on the shared worker pool: a region reserves its helpers instead of
+// holding a process-global loop mutex, and every join is a per-dispatch latch. With
+// threads=4 each, two regions fit in an 8-thread machine and can overlap.
+static void test_concurrent_solvers() {
+    const uint64_t expected = mixed_digest(1);
+
+    Solver a;
+    Solver b;
+    a.threads = 4;
+    b.threads = 4;
+    build_mixed(a);
+    build_mixed(b);
+
+    std::thread ta([&a] { step_n(a, 240); });
+    std::thread tb([&b] { step_n(b, 240); });
+    ta.join();
+    tb.join();
+
+    const uint64_t da = state_digest(a);
+    const uint64_t db = state_digest(b);
+    report(da == expected, "concurrent solver A", "0x%016llx vs serial 0x%016llx",
+            (unsigned long long)da, (unsigned long long)expected);
+    report(db == expected, "concurrent solver B", "0x%016llx vs serial 0x%016llx",
+            (unsigned long long)db, (unsigned long long)expected);
 }
 
 static void test_parallel_equivalence() {
@@ -1081,6 +1113,36 @@ static int run_bench(int threads) {
             ms, count_contact_points(s), all_finite(s) ? "yes" : "NO");    return all_finite(s) ? 0 : 1;
 }
 
+// Two independent solvers stepped from two host threads: the case the old global loop
+// mutex turned into two serial runs. Reports the wall time for both, so the overlap (or
+// its absence) is visible against the single-solver number above.
+static int run_bench_two(int threads) {
+    Solver a;
+    Solver b;
+    a.threads = threads;
+    b.threads = threads;
+    build_bench_scene(a);
+    build_bench_scene(b);
+
+    const int warmup = 30;
+    const int timed = 120;
+    step_n(a, warmup);
+    step_n(b, warmup);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    std::thread ta([&a, timed] { step_n(a, timed); });
+    std::thread tb([&b, timed] { step_n(b, timed); });
+    ta.join();
+    tb.join();
+    const auto t1 = std::chrono::steady_clock::now();
+
+    const double total = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    std::printf("bench: two solvers, threads=%d each -> %.3f ms wall for %d steps (%.3f ms/step/solver), finite=%s\n",
+            a.threadCount(), total, timed, total / (double)timed,
+            all_finite(a) && all_finite(b) ? "yes" : "NO");
+    return all_finite(a) && all_finite(b) ? 0 : 1;
+}
+
 // Sweep the thread count over the same scene so the speedup (and where it stops) is
 // visible rather than claimed.
 static int run_bench_sweep() {
@@ -1180,6 +1242,8 @@ int main(int argc, char **argv) {
             return run_bench(threads);
         } else if (arg == "--bench-sweep") {
             return run_bench_sweep();
+        } else if (arg == "--bench-two") {
+            return run_bench_two(threads == 0 ? 4 : threads);
         } else if (arg == "--shape") {
             report_parallel_shape();
             return 0;
@@ -1190,7 +1254,7 @@ int main(int argc, char **argv) {
         } else if (arg == "--threads" && i + 1 < argc) {
             threads = std::atoi(argv[++i]);
         } else {
-            std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --shape | --scene NAME [--steps N]]"
+            std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --bench-two | --shape | --scene NAME [--steps N]]"
                                  " [--threads N]\n", argv[0]);
             return 2;
         }
@@ -1209,6 +1273,7 @@ int main(int argc, char **argv) {
     test_determinism();
     test_jacobi_shares();
     test_parallel_equivalence();
+    test_concurrent_solvers();
     test_colour_overflow();
     report_parallel_shape();
     test_generic_hinge();
