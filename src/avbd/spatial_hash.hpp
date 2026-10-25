@@ -28,7 +28,7 @@
  */
 
 #pragma once
-
+#include "avbd/job_pool.hpp"
 #include <array>
 #include <cstdint>
 #include <span>
@@ -50,7 +50,7 @@ public:
     // `baseCell` <= 0 selects it automatically: the median largest AABB extent
     // of the scene, so half the bodies land in the level-0 big blocks.
     void buildAndCollectPairs(std::span<Rigid *const> bodies, float baseCell,
-                              std::vector<std::pair<int, int>> &out,std::span<float3> aabbHalfExt);
+                              std::vector<std::pair<int, int>> &out,std::span<float3> aabbHalfExt,detail::JobPool& pool);
 
     // Statistics of the last build (diagnostics only).
     int levelCount = 0;

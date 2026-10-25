@@ -34,7 +34,7 @@ namespace avbd {
 }
 
 void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float baseCell,
-                                        std::vector<std::pair<int, int>> &out,std::span<float3> aabbHalfExt)
+                                        std::vector<std::pair<int, int>> &out,std::span<float3> aabbHalfExt,detail::JobPool& pool)
 {
     const int count = static_cast<int>(bodies.size());
     out.clear();
@@ -49,7 +49,7 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
     //     const float3 half = aabbHalfExt[i];
     //     extents[i] = 2.0f * std::max(half.x, std::max(half.y, half.z));
     // }
-    auto pool = detail::JobPool(8);
+
     pool.forCount(count, [&](int i) {
         const float3 h = aabbHalfExt[i];
         extents[i] = 2.0f * std::max(h.x, std::max(h.y, h.z));

@@ -208,17 +208,35 @@ void Solver::broadPhase()
     for (int i = 0; i < count; ++i)
         bodyAabbHalf[i] = aabbHalfExtent(*bodiesInOrder[i]);
 
-    broadHash.buildAndCollectPairs(bodiesInOrder, 0.0f, sweepPairs,bodyAabbHalf);
+    auto pool = detail::JobPool(8);
+    broadHash.buildAndCollectPairs(bodiesInOrder, 0.0f, sweepPairs,bodyAabbHalf,pool);
 
     radix_std::sort(sweepPairs.begin(), sweepPairs.end());
     sweepPairs.erase(std::unique(sweepPairs.begin(), sweepPairs.end()), sweepPairs.end());
-    for (const auto &[i, j] : sweepPairs)
-    {
-        Rigid *bodyA = bodiesInOrder[i];
-        Rigid *bodyB = bodiesInOrder[j];
-        if (pairOverlaps(bodyA, bodyAabbHalf[i], bodyB, bodyAabbHalf[j]))
-            new Manifold(this, bodyA, bodyB);
+    // for (const auto &[i, j] : sweepPairs)
+    // {
+    //     Rigid *bodyA = bodiesInOrder[i];
+    //     Rigid *bodyB = bodiesInOrder[j];
+    //     if (pairOverlaps(bodyA, bodyAabbHalf[i], bodyB, bodyAabbHalf[j]))
+    //         new Manifold(this, bodyA, bodyB);
+    // }
+    auto kMinPairsPerDispatch = kMinForcesPerDispatch;
+    const size_t pairCount = sweepPairs.size();
+    std::vector<uint8_t> pairValid;
+    pairValid.resize(pairCount);
+    pool.forCount(pairCount, [this,&pairValid](int k) {
+        const auto [i, j] = sweepPairs[k];
+        pairValid[k] = pairOverlaps(bodiesInOrder[i], bodyAabbHalf[i],
+                                    bodiesInOrder[j], bodyAabbHalf[j]);
+    }, kMinPairsPerDispatch);
+
+    // 串行创建：manifold 链表顺序 + pool mutex 都要求单线程
+    for (size_t k = 0; k < pairCount; k++) {
+        if (!pairValid[k]) continue;
+        const auto [i, j] = sweepPairs[k];
+        new Manifold(this, bodiesInOrder[i], bodiesInOrder[j]);
     }
+
 }
 
 // A constraint is frozen when neither of its bodies can move this step. Joints and springs
