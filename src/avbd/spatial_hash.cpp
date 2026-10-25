@@ -14,8 +14,10 @@
 #include <algorithm>
 #include <cmath>
 #include <utility>
+#include <memory>
 
 #include "solver.h"
+#include "avbd/job_pool.hpp"
 #include "radixsort.hpp"
 namespace avbd {
 
@@ -43,10 +45,18 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
     // the bodies live in the level-0 big blocks and one level up covers each
     // further doubling of size.
     extents.resize(count);
-    for (int i = 0; i < count; i++) {
-        const float3 half = aabbHalfExt[i];
-        extents[i] = 2.0f * std::max(half.x, std::max(half.y, half.z));
-    }
+    // for (int i = 0; i < count; i++) {
+    //     const float3 half = aabbHalfExt[i];
+    //     extents[i] = 2.0f * std::max(half.x, std::max(half.y, half.z));
+    // }
+    auto pool = detail::JobPool(8);
+    pool.forCount(count, [&](int i) {
+        const float3 h = aabbHalfExt[i];
+        extents[i] = 2.0f * std::max(h.x, std::max(h.y, h.z));
+    }, kMinBodiesPerDispatch);
+
+
+
     if (!(baseCell > 0.0f)) {
         std::vector<float> nonEmpty;
         nonEmpty.reserve(count);
