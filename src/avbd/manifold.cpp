@@ -223,6 +223,70 @@ void Manifold::preCompute(float alpha)
     primalCacheReady = true;
 }
 
+// void Manifold::stampCached(Rigid *body, Block &block)
+// {
+//     const bool fromIsA = body == bodyA;
+//     const float side = fromIsA ? 1.0f : -1.0f;
+
+//     // Both bodies share the linear jacobian up to sign, Jlin = ±basis, so the linear
+//     // Hessian Jlin^T K Jlin = B^T K B is the same for A and B. K is diagonal, so that
+//     // "basis sandwich" S is just a weighted sum of the three basis-row outer products.
+//     // With R = skew(rWorld) the angular jacobian is Jang = ±B R^T, which gives the whole
+//     // stamp in closed form:
+//     //   lhsLin   = S
+//     //   lhsAng   = Jang^T K Jang = R S R^T
+//     //   lhsCross = Jang^T K Jlin = R S
+//     //   rhsLin   = ±B^T F
+//     //   rhsAng   = ±R (B^T F)
+//     // This replaces the three generic 3x3 products (and their transposes) the old stamp
+//     // built per contact, per body. The symmetric results are written mirrored so the
+//     // pivot fallback in Block::solveDelta still sees a full matrix.
+//     const float3 b0 = row(basis, 0);
+//     const float3 b1 = row(basis, 1);
+//     const float3 b2 = row(basis, 2);
+
+//     for (int i = 0; i < numContacts; i++)
+//     {
+//         const float3 &F = contactForceCache[i];
+//         const float3 k = contacts[i].penalty;
+//         const float3 r = fromIsA ? jacobianCache[i].rAWorld : jacobianCache[i].rBWorld;
+
+//         // S = B^T K B, symmetric. Six values (s01 = S[0][1], and so on).
+//         const float s00 = k.x * b0.x * b0.x + k.y * b1.x * b1.x + k.z * b2.x * b2.x;
+//         const float s11 = k.x * b0.y * b0.y + k.y * b1.y * b1.y + k.z * b2.y * b2.y;
+//         const float s22 = k.x * b0.z * b0.z + k.y * b1.z * b1.z + k.z * b2.z * b2.z;
+//         const float s01 = k.x * b0.x * b0.y + k.y * b1.x * b1.y + k.z * b2.x * b2.y;
+//         const float s02 = k.x * b0.x * b0.z + k.y * b1.x * b1.z + k.z * b2.x * b2.z;
+//         const float s12 = k.x * b0.y * b0.z + k.y * b1.y * b1.z + k.z * b2.y * b2.z;
+
+//         // Column-major: column j of S is (S[0][j], S[1][j], S[2][j]).
+//         const float3x3 S{float3{s00, s01, s02}, float3{s01, s11, s12}, float3{s02, s12, s22}};
+
+//         // R S, one cross product per column of S.
+//         const float3x3 RS{cross(r, S.x), cross(r, S.y), cross(r, S.z)};
+
+//         // R S R^T, symmetric. Closed form in r and S (verified against the matrix
+//         // product); h01 = H[0][1], h02 = H[0][2], h12 = H[1][2].
+//         const float h00 = s11 * r.z * r.z - 2.0f * s12 * r.y * r.z + s22 * r.y * r.y;
+//         const float h11 = s22 * r.x * r.x - 2.0f * s02 * r.x * r.z + s00 * r.z * r.z;
+//         const float h22 = s00 * r.y * r.y - 2.0f * s01 * r.x * r.y + s11 * r.x * r.x;
+//         const float h01 = s12 * r.x * r.z + s02 * r.y * r.z - s22 * r.x * r.y - s01 * r.z * r.z;
+//         const float h02 = s12 * r.x * r.y + s01 * r.y * r.z - s11 * r.x * r.z - s02 * r.y * r.y;
+//         const float h12 = s02 * r.x * r.y + s01 * r.x * r.z - s00 * r.y * r.z - s12 * r.x * r.x;
+
+//         // B^T F and its moment about the contact arm: the only per-body part of the RHS.
+//         const float3 fw = b0 * F.x + b1 * F.y + b2 * F.z;
+//         const float3 fwAng = cross(r, fw);
+
+//         block.lhsLin += S;
+//         block.lhsAng += float3x3{float3{h00, h01, h02}, float3{h01, h11, h12}, float3{h02, h12, h22}};
+//         block.lhsCross += RS;
+//         block.rhsLin += fw * side;
+//         block.rhsAng += fwAng * side;
+//     }
+// }
+
+
 void Manifold::stampCached(Rigid *body, Block &block)
 {
     const bool fromIsA = body == bodyA;
@@ -245,6 +309,21 @@ void Manifold::stampCached(Rigid *body, Block &block)
     const float3 b1 = row(basis, 1);
     const float3 b2 = row(basis, 2);
 
+    // Outer-product components of the basis rows: loop invariants for S.
+    const float b0x2 = b0.x * b0.x, b0y2 = b0.y * b0.y, b0z2 = b0.z * b0.z;
+    const float b0xy = b0.x * b0.y, b0xz = b0.x * b0.z, b0yz = b0.y * b0.z;
+    const float b1x2 = b1.x * b1.x, b1y2 = b1.y * b1.y, b1z2 = b1.z * b1.z;
+    const float b1xy = b1.x * b1.y, b1xz = b1.x * b1.z, b1yz = b1.y * b1.z;
+    const float b2x2 = b2.x * b2.x, b2y2 = b2.y * b2.y, b2z2 = b2.z * b2.z;
+    const float b2xy = b2.x * b2.y, b2xz = b2.x * b2.z, b2yz = b2.y * b2.z;
+
+    // Accumulate in registers, then write back once.
+    float3x3 accLin{};
+    float3x3 accAng{};
+    float3x3 accCross{};
+    float3 accRhsLin{};
+    float3 accRhsAng{};
+
     for (int i = 0; i < numContacts; i++)
     {
         const float3 &F = contactForceCache[i];
@@ -252,12 +331,12 @@ void Manifold::stampCached(Rigid *body, Block &block)
         const float3 r = fromIsA ? jacobianCache[i].rAWorld : jacobianCache[i].rBWorld;
 
         // S = B^T K B, symmetric. Six values (s01 = S[0][1], and so on).
-        const float s00 = k.x * b0.x * b0.x + k.y * b1.x * b1.x + k.z * b2.x * b2.x;
-        const float s11 = k.x * b0.y * b0.y + k.y * b1.y * b1.y + k.z * b2.y * b2.y;
-        const float s22 = k.x * b0.z * b0.z + k.y * b1.z * b1.z + k.z * b2.z * b2.z;
-        const float s01 = k.x * b0.x * b0.y + k.y * b1.x * b1.y + k.z * b2.x * b2.y;
-        const float s02 = k.x * b0.x * b0.z + k.y * b1.x * b1.z + k.z * b2.x * b2.z;
-        const float s12 = k.x * b0.y * b0.z + k.y * b1.y * b1.z + k.z * b2.y * b2.z;
+        const float s00 = k.x * b0x2 + k.y * b1x2 + k.z * b2x2;
+        const float s11 = k.x * b0y2 + k.y * b1y2 + k.z * b2y2;
+        const float s22 = k.x * b0z2 + k.y * b1z2 + k.z * b2z2;
+        const float s01 = k.x * b0xy + k.y * b1xy + k.z * b2xy;
+        const float s02 = k.x * b0xz + k.y * b1xz + k.z * b2xz;
+        const float s12 = k.x * b0yz + k.y * b1yz + k.z * b2yz;
 
         // Column-major: column j of S is (S[0][j], S[1][j], S[2][j]).
         const float3x3 S{float3{s00, s01, s02}, float3{s01, s11, s12}, float3{s02, s12, s22}};
@@ -265,25 +344,35 @@ void Manifold::stampCached(Rigid *body, Block &block)
         // R S, one cross product per column of S.
         const float3x3 RS{cross(r, S.x), cross(r, S.y), cross(r, S.z)};
 
+        // Precompute second-order products of r.
+        const float rx2 = r.x * r.x, ry2 = r.y * r.y, rz2 = r.z * r.z;
+        const float rxy = r.x * r.y, rxz = r.x * r.z, ryz = r.y * r.z;
+
         // R S R^T, symmetric. Closed form in r and S (verified against the matrix
         // product); h01 = H[0][1], h02 = H[0][2], h12 = H[1][2].
-        const float h00 = s11 * r.z * r.z - 2.0f * s12 * r.y * r.z + s22 * r.y * r.y;
-        const float h11 = s22 * r.x * r.x - 2.0f * s02 * r.x * r.z + s00 * r.z * r.z;
-        const float h22 = s00 * r.y * r.y - 2.0f * s01 * r.x * r.y + s11 * r.x * r.x;
-        const float h01 = s12 * r.x * r.z + s02 * r.y * r.z - s22 * r.x * r.y - s01 * r.z * r.z;
-        const float h02 = s12 * r.x * r.y + s01 * r.y * r.z - s11 * r.x * r.z - s02 * r.y * r.y;
-        const float h12 = s02 * r.x * r.y + s01 * r.x * r.z - s00 * r.y * r.z - s12 * r.x * r.x;
+        const float h00 = s11 * rz2 - 2.0f * s12 * ryz + s22 * ry2;
+        const float h11 = s22 * rx2 - 2.0f * s02 * rxz + s00 * rz2;
+        const float h22 = s00 * ry2 - 2.0f * s01 * rxy + s11 * rx2;
+        const float h01 = s12 * rxz + s02 * ryz - s22 * rxy - s01 * rz2;
+        const float h02 = s12 * rxy + s01 * ryz - s11 * rxz - s02 * ry2;
+        const float h12 = s02 * rxy + s01 * rxz - s00 * ryz - s12 * rx2;
 
         // B^T F and its moment about the contact arm: the only per-body part of the RHS.
         const float3 fw = b0 * F.x + b1 * F.y + b2 * F.z;
         const float3 fwAng = cross(r, fw);
 
-        block.lhsLin += S;
-        block.lhsAng += float3x3{float3{h00, h01, h02}, float3{h01, h11, h12}, float3{h02, h12, h22}};
-        block.lhsCross += RS;
-        block.rhsLin += fw * side;
-        block.rhsAng += fwAng * side;
+        accLin += S;
+        accAng += float3x3{float3{h00, h01, h02}, float3{h01, h11, h12}, float3{h02, h12, h22}};
+        accCross += RS;
+        accRhsLin += fw;
+        accRhsAng += fwAng;
     }
+
+    block.lhsLin += accLin;
+    block.lhsAng += accAng;
+    block.lhsCross += accCross;
+    block.rhsLin += accRhsLin * side;
+    block.rhsAng += accRhsAng * side;
 }
 
 void Manifold::updatePrimal(Rigid *body, float alpha, Block &block)

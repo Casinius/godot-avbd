@@ -559,6 +559,16 @@ struct Solver
     // the healing those rounds did is recovered by substeps at high tick rates instead.
     int adaptiveMaxIterations = 16;
 
+    // Adaptive iteration count: target = round(iterations * mean penetration /
+    // maxPenetrationError), clamped to [2, adaptiveMaxIterations]. With the default
+    // 1e-4 m tolerance a settled stack always hits the upper bound, so `iterations` alone
+    // is not the real round count - disable this (or raise the tolerance) to make the
+    // base count authoritative. A real-time frame budget usually wants it off, or a
+    // smaller `adaptiveMaxIterations`.
+    bool adaptiveIterations = true;
+    // Penetration error treated as "solved" by the adaptive iteration estimate, in metres.
+    float maxPenetrationError = 1e-4f;
+
     // Early-exit threshold on the mean penetration residual: when a Newton round
     // improves the average residual by less than this (or worsens it), the iteration set
     // ends early - remaining rounds would polish float noise at full price. 0 disables
@@ -727,10 +737,6 @@ private:
 
     // Current collision margin for this frame (dynamically adjusted)
     float currentCollisionMargin = COLLISION_MARGIN_BASE;
-
-    // Adaptive iteration count parameters
-    float maxPenetrationError = 1e-4f; // Target penetration error tolerance
-    bool adaptiveIterations = true;    // Enable adaptive iteration count
 
     // Compute dynamic collision margin based on penetration depth and timestep
     inline float computeCollisionMargin(float penetrationDepth, float timestep)

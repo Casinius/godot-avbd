@@ -1,0 +1,23 @@
+digraph "callgraph" {
+  F55a88dfe5028 [label="avbd::detail::TaskFlow::run()\n5 740 367 727"];
+  F55a88dfe6ea8 [label="std::_Function_handler<void (b...\n5 740 367 727"];
+  F55a88dfee268 [label="BS::thread_pool<(BS::tp)0>::wo...\n35 900 376 014"];
+  F55a88e119728 [label="void avbd::Solver::iterateBody...\n41 640 743 741"];
+  F55a88e11a3a8 [label="avbd::Manifold::updateDual(flo...\n7 891 545 353"];
+  F55a88e11be38 [label="avbd::Manifold::updatePrimal(a...\n27 043 724 871"];
+  F55a88e11c538 [label="avbd::Block::apply(avbd::Rigid...\n5 562 839 984"];
+  F55a88e141598 [label="avbd::Block::solveDelta(linalg...\n4 905 318 560"];
+  F55a88e1778f8 [label="void std::move_only_function<v...\n35 900 376 014"];
+  F55a88e1a4198 [label="avbd::Manifold::preCompute(flo...\n5 960 290 765"];
+  F55a88e1a48d8 [label="avbd::Manifold::stampCached(av...\n20 446 228 692"];
+  F55a88dfe5028 -> F55a88dfe6ea8 [weight=3,label="5 740 367 727 (1 035x)"];
+  F55a88dfe6ea8 -> F55a88e119728 [weight=3,label="5 740 367 727 (1 036x)"];
+  F55a88dfee268 -> F55a88e1778f8 [weight=3,label="35 900 376 014 (7 252x)"];
+  F55a88e119728 -> F55a88e11a3a8 [weight=3,label="7 891 545 353 (7 255 068x)"];
+  F55a88e119728 -> F55a88e11be38 [weight=3,label="27 043 724 871 (14 245 008x)"];
+  F55a88e119728 -> F55a88e11c538 [weight=3,label="5 562 839 984 (5 218 424x)"];
+  F55a88e11be38 -> F55a88e1a4198 [weight=3,label="5 960 290 765 (7 594 298x)"];
+  F55a88e11be38 -> F55a88e1a48d8 [weight=3,label="20 446 228 692 (14 245 008x)"];
+  F55a88e11c538 -> F55a88e141598 [weight=3,label="4 905 318 560 (5 218 424x)"];
+  F55a88e1778f8 -> F55a88e119728 [weight=3,label="35 900 376 014 (7 252x)"];
+}

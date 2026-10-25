@@ -81,7 +81,7 @@ target("avbd")
     set_kind("shared")
     set_languages("c++23")
     set_optimize("fastest")
-    add_cxflags("-pg")
+
     set_symbols("debug")
     set_strip("none")
     add_files(table.join(avbd_core, "src/nodes/*.cpp", "src/server/*.cpp"))

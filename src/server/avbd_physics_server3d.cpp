@@ -364,6 +364,8 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     p_space.chebyshev_rho = settings->get_setting("physics/avbd/chebyshev_rho", 0.0);
     p_space.adaptive_max_iterations = settings->get_setting("physics/avbd/adaptive_max_iterations", 16.0);
     p_space.adaptive_beta = settings->get_setting("physics/avbd/adaptive_beta", false);
+    p_space.adaptive_iterations = settings->get_setting("physics/avbd/adaptive_iterations", true);
+    p_space.max_penetration_error = settings->get_setting("physics/avbd/max_penetration_error", 1e-4);
 }
 
 void AVBDPhysicsServer3D::_space_set_active(const RID &p_space, bool p_active) {
@@ -1336,6 +1338,8 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         space.solver.chebyshevRho = static_cast<float>(std::max(space.chebyshev_rho, 0.0));
         space.solver.adaptiveMaxIterations = std::max(static_cast<int>(space.adaptive_max_iterations), 2);
         space.solver.adaptiveBeta = space.adaptive_beta;
+        space.solver.adaptiveIterations = space.adaptive_iterations;
+        space.solver.maxPenetrationError = static_cast<float>(std::max(space.max_penetration_error, 0.0));
         // Idle-sleep horizon: Godot's 0.5 s default, expressed in this project's ticks
         // (30 steps at 60 Hz; 120 at 240 Hz). A fixed step count would make a
         // high-tick-rate project fall asleep four times sooner than intended.

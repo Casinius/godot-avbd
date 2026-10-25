@@ -1,0 +1,31 @@
+digraph "callgraph" {
+  F560846cca718 [label="0x0000000000111ff0\n39 700 252 642"];
+  F56084d22d608 [label="std::thread::_State_impl<std::...\n39 700 252 642"];
+  F56084d3f22c8 [label="avbd::collideShapes(avbd::Shap...\n2 303 906 126"];
+  F56084d40bc68 [label="avbd::Manifold::collide(avbd::...\n2 423 230 802"];
+  F56084d4b3458 [label="BS::thread_pool<(BS::tp)0>::wo...\n39 700 252 642"];
+  F56084d5de8f8 [label="void avbd::Solver::iterateBody...\n35 900 376 014"];
+  F56084d5df578 [label="avbd::Manifold::updateDual(flo...\n6 803 659 590"];
+  F56084d5e1008 [label="avbd::Manifold::updatePrimal(a...\n23 315 623 221"];
+  F56084d5e1708 [label="avbd::Block::apply(avbd::Rigid...\n4 795 976 949"];
+  F56084d6046a8 [label="avbd::Manifold::initialize()\n3 059 859 911"];
+  F56084d606768 [label="avbd::Block::solveDelta(linalg...\n4 229 097 873"];
+  F56084d63bc88 [label="void std::move_only_function<v...\n3 078 195 121"];
+  F56084d63c328 [label="void std::move_only_function<v...\n35 900 845 069"];
+  F56084d668bc8 [label="avbd::Manifold::preCompute(flo...\n5 138 637 315"];
+  F56084d669308 [label="avbd::Manifold::stampCached(av...\n17 627 622 184"];
+  F560846cca718 -> F56084d22d608 [weight=3,label="39 700 252 642 (8x)"];
+  F56084d22d608 -> F56084d4b3458 [weight=3,label="39 700 252 642 (8x)"];
+  F56084d40bc68 -> F56084d3f22c8 [weight=3,label="2 303 906 126 (685 774x)"];
+  F56084d4b3458 -> F56084d63bc88 [weight=3,label="3 078 195 121 (29 667x)"];
+  F56084d4b3458 -> F56084d63c328 [weight=3,label="35 900 845 069 (7 252x)"];
+  F56084d5de8f8 -> F56084d5df578 [weight=3,label="6 803 659 590 (6 254 924x)"];
+  F56084d5de8f8 -> F56084d5e1008 [weight=3,label="23 315 623 221 (12 281 268x)"];
+  F56084d5de8f8 -> F56084d5e1708 [weight=3,label="4 795 976 949 (4 499 040x)"];
+  F56084d5e1008 -> F56084d668bc8 [weight=3,label="5 138 637 315 (6 547 389x)"];
+  F56084d5e1008 -> F56084d669308 [weight=3,label="17 627 622 184 (12 281 268x)"];
+  F56084d5e1708 -> F56084d606768 [weight=3,label="4 229 097 873 (4 499 040x)"];
+  F56084d6046a8 -> F56084d40bc68 [weight=3,label="2 423 230 802 (685 774x)"];
+  F56084d63bc88 -> F56084d6046a8 [weight=3,label="3 059 859 911 (673 851x)"];
+  F56084d63c328 -> F56084d5de8f8 [weight=3,label="35 900 376 014 (7 252x)"];
+}

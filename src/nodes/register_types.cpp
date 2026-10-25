@@ -73,6 +73,8 @@ static void register_avbd_settings() {
             {"physics/avbd/chebyshev_rho", Variant(0.0)},
             {"physics/avbd/adaptive_max_iterations", Variant(16)},
             {"physics/avbd/adaptive_beta", Variant(false)},
+            {"physics/avbd/adaptive_iterations", Variant(true)},
+            {"physics/avbd/max_penetration_error", Variant(1e-4)},
     };
     for (const auto &entry : entries) {
         if (settings->has_setting(entry.first)) {
@@ -84,6 +86,7 @@ static void register_avbd_settings() {
         const StringName name(entry.first);
         settings->set_as_basic(name,
                 name == StringName("physics/avbd/adaptive_beta") ||
+                        name == StringName("physics/avbd/adaptive_iterations") ||
                         name == StringName("physics/avbd/substeps") ||
                         name == StringName("physics/avbd/iterations"));
     }

@@ -230,6 +230,11 @@ protected:
         double adaptive_max_iterations = 16;
         // Per-contact adaptive penalty ramp (augmented-Lagrangian kappa update).
         bool adaptive_beta = false;
+        // Adaptive round count (see Solver::adaptiveIterations); off keeps `iterations`
+        // authoritative, which is what a real-time frame budget usually wants.
+        bool adaptive_iterations = true;
+        // Penetration treated as solved by the adaptive estimate, in metres.
+        double max_penetration_error = 1e-4;
 
         // Debug contacts collected during the last step (world space, Godot frame).
 

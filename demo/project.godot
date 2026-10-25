@@ -28,6 +28,7 @@ common/physics_interpolation=true
 avbd/beta_linear=100000.0
 avbd/beta_angular=10.0
 avbd/threads=8
+avbd/substeps=1
 avbd/adaptive_max_iterations=12
 avbd/adaptive_beta=true
 
