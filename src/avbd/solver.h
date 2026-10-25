@@ -159,6 +159,10 @@ struct Rigid
     bool constrainedTo(Rigid *other) const;
 };
 
+// Tight world-space axis-aligned half extents of a body's collision shape. Used by
+// the broad phase and by the space queries, so both agree on the same bound.
+[[nodiscard]] float3 aabbHalfExtent(const Rigid &body) noexcept;
+
 // The 6x6 Newton system a single body solves each iteration, split into its two 3x3
 // diagonal blocks plus the coupling block, and the matching right-hand side.
 //
@@ -662,6 +666,7 @@ private:
     // step), the hierarchical spatial hash over those bodies, and the candidate
     // pair list (sorted unique (min index, other), the manifold creation order).
     std::vector<Rigid *> bodiesInOrder;
+    std::vector<float3> bodyAabbHalf; // cached tight AABB half extents, per bodiesInOrder
     SpatialHash broadHash;
     std::vector<std::pair<int, int>> sweepPairs;
 

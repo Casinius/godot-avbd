@@ -130,26 +130,7 @@ void Solver::collectAABB(float3 min, float3 max, uint32_t p_mask, std::vector<Ri
     {
         if ((body->collisionLayer & p_mask) == 0)
             continue;
-        float3 half;
-        switch (body->shape)
-        {
-            case ShapeType::Sphere:
-                half = float3{body->radius, body->radius, body->radius};
-                break;
-            case ShapeType::Cylinder:
-                // Local +Z is the axis: radius spans X/Y, height spans Z.
-                half = float3{body->size.x, body->size.x, body->size.z * 0.5f};
-                break;
-            case ShapeType::Box:
-            default:
-                half = body->size * 0.5f;
-                break;
-        }
-        const float3x3 rot = qmat(body->positionAng);
-        const float3 wx{
-                std::abs(rot[0][0]) * half.x + std::abs(rot[1][0]) * half.y + std::abs(rot[2][0]) * half.z,
-                std::abs(rot[0][1]) * half.x + std::abs(rot[1][1]) * half.y + std::abs(rot[2][1]) * half.z,
-                std::abs(rot[0][2]) * half.x + std::abs(rot[1][2]) * half.y + std::abs(rot[2][2]) * half.z};
+        const float3 wx = aabbHalfExtent(*body);
         const float3 bmin = body->positionLin - wx;
         const float3 bmax = body->positionLin + wx;
         if (!(bmin.x > max.x || bmin.y > max.y || bmin.z > max.z ||
@@ -179,17 +160,23 @@ void Solver::step()
     finishVelocities();
 }
 
-// A broad-phase candidate test: bounding spheres plus Godot's layer/mask pair rule,
-// minus pairs already joined by a force (IgnoreCollision, joints).
-static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
+// A broad-phase candidate test: tight world AABBs plus Godot's layer/mask pair
+// rule, minus pairs already joined by a force (IgnoreCollision, joints). The AABB
+// is the tight box of the actual shape, unlike a bounding-sphere test whose radius
+// is the shape's diagonal and therefore admits many far-apart candidates.
+static bool pairOverlaps(Rigid *bodyA, const float3 &aHalf, Rigid *bodyB, const float3 &bHalf)
 {
-    const float3 dp = bodyA->positionLin - bodyB->positionLin;
-    const float reach = bodyA->radius + bodyB->radius;
+    const float3 aMin = bodyA->positionLin - aHalf;
+    const float3 aMax = bodyA->positionLin + aHalf;
+    const float3 bMin = bodyB->positionLin - bHalf;
+    const float3 bMax = bodyB->positionLin + bHalf;
+    const bool boundsOverlap = !(bMin.x > aMax.x || bMin.y > aMax.y || bMin.z > aMax.z ||
+            aMin.x > bMax.x || aMin.y > bMax.y || aMin.z > bMax.z);
     // Godot semantics: the pair collides when either side's layer is in the other's
     // mask (defaults 1/1 keep every pair, as before these fields existed).
     const bool layersAllow = ((bodyA->collisionLayer & bodyB->collisionMask) != 0) ||
             ((bodyB->collisionLayer & bodyA->collisionMask) != 0);
-    return length2(dp) <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB);
+    return boundsOverlap && layersAllow && !bodyA->constrainedTo(bodyB);
 }
 
 // Contact detection: hierarchical spatial hash (big-block screen + layered
@@ -215,6 +202,12 @@ void Solver::broadPhase()
     if (count < 2)
         return;
 
+    // Cache each body's tight AABB half extents: the exact candidate filter runs on
+    // every pair, so recomputing the rotation matrix there would dominate the phase.
+    bodyAabbHalf.resize(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i)
+        bodyAabbHalf[i] = aabbHalfExtent(*bodiesInOrder[i]);
+
     broadHash.buildAndCollectPairs(bodiesInOrder, 0.0f, sweepPairs);
 
     std::sort(sweepPairs.begin(), sweepPairs.end());
@@ -223,7 +216,7 @@ void Solver::broadPhase()
     {
         Rigid *bodyA = bodiesInOrder[i];
         Rigid *bodyB = bodiesInOrder[j];
-        if (pairOverlaps(bodyA, bodyB))
+        if (pairOverlaps(bodyA, bodyAabbHalf[i], bodyB, bodyAabbHalf[j]))
             new Manifold(this, bodyA, bodyB);
     }
 }

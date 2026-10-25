@@ -10,18 +10,18 @@
  *
  * Hierarchical hashed-grid broad phase ("big-block screen + layered hash").
  *
- * Replaces the Morton LBVH. Bodies are bucketed by bounding-sphere size into
- * dyadic levels: level 0 has cells of `baseCell` (the big blocks), level l has
- * cells of baseCell * 2^l, and a body lives at the smallest level whose cell
- * fits its diameter. Each level is hashed as packed 21-bit integer coordinates
- * into a sorted key array, so a level's occupied cells form a CSR-indexed
- * bucket table without any per-step hash-map allocation.
+ * Replaces the Morton LBVH. Bodies are bucketed by the largest full extent of
+ * their tight world AABB into dyadic levels: level 0 has cells of `baseCell`
+ * (the big blocks), level l has cells of baseCell * 2^l, and a body lives at the
+ * smallest level whose cell fits its AABB. Each level is hashed as packed 21-bit
+ * integer coordinates into a sorted key array, so a level's occupied cells form
+ * a CSR-indexed bucket table without any per-step hash-map allocation.
  *
  * Pair generation: a body walks the 27-cell neighbourhood of its own centre at
- * every level from its own up to the coarsest. Two bodies whose spheres overlap
- * are at most one cell apart (Chebyshev) at any level that fits both diameters,
- * so every overlapping pair is found from the smaller body's walk; same-level
- * pairs are found from both sides and de-duplicated by the caller's sort+unique.
+ * every level from its own up to the coarsest. Two bodies whose AABBs overlap
+ * are at most one cell apart (Chebyshev) at any level that fits both AABBs, so
+ * every overlapping pair is found from the smaller body's walk; same-level pairs
+ * are found from both sides and de-duplicated by the caller's sort+unique.
  *
  * Determinism: keys, bodies and pairs are sorted integers - the output order
  * does not depend on hash iteration or thread count.
@@ -42,13 +42,13 @@ class SpatialHash
 {
 public:
     // Largest level index the hierarchy will use. The coarsest cell must fit
-    // the largest body's diameter; build() grows maxLevel until it does.
+    // the largest body's AABB extent; build() grows maxLevel until it does.
     static constexpr int kMaxLevels = 16;
 
     // Rebuild the hierarchy over `bodies` and emit every candidate pair whose
-    // bounding spheres can overlap into `out` as (min index, other index).
-    // `baseCell` <= 0 selects it automatically: the median bounding-sphere
-    // diameter of the scene, so half the bodies land in the level-0 big blocks.
+    // world AABBs can overlap into `out` as (min index, other index).
+    // `baseCell` <= 0 selects it automatically: the median largest AABB extent
+    // of the scene, so half the bodies land in the level-0 big blocks.
     void buildAndCollectPairs(std::span<Rigid *const> bodies, float baseCell,
                               std::vector<std::pair<int, int>> &out);
 
@@ -65,7 +65,7 @@ private:
     // Level l occupies keys[cellStart offsets levelStart[l] .. levelStart[l+1]).
     std::array<int, kMaxLevels + 1> levelStart{};
 
-    std::vector<float> diameters;  // per body, scratch
+    std::vector<float> extents;  // per body: largest AABB full extent, scratch
     std::vector<int> levels;       // per body level assignment
 };
 

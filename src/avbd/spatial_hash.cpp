@@ -39,34 +39,34 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
     if (count < 2)
         return;
 
-    // Automatic big-block size: the median bounding-sphere diameter, so about
-    // half the bodies live in the level-0 big blocks and one level up covers
-    // each further doubling of size.
+    // Automatic big-block size: the median largest AABB extent, so about half
+    // the bodies live in the level-0 big blocks and one level up covers each
+    // further doubling of size.
+    extents.resize(count);
+    for (int i = 0; i < count; i++) {
+        const float3 half = aabbHalfExtent(*bodies[i]);
+        extents[i] = 2.0f * std::max(half.x, std::max(half.y, half.z));
+    }
     if (!(baseCell > 0.0f)) {
-        diameters.clear();
-        diameters.reserve(count);
+        std::vector<float> nonEmpty;
+        nonEmpty.reserve(count);
         for (int i = 0; i < count; i++)
-            if (bodies[i]->radius > 0.0f)
-                diameters.push_back(2.0f * bodies[i]->radius);
-        if (diameters.empty())
+            if (extents[i] > 0.0f)
+                nonEmpty.push_back(extents[i]);
+        if (nonEmpty.empty())
             return;
-        std::nth_element(diameters.begin(), diameters.begin() + diameters.size() / 2,
-                diameters.end());
-        baseCell = diameters[diameters.size() / 2];
+        std::nth_element(nonEmpty.begin(), nonEmpty.begin() + nonEmpty.size() / 2, nonEmpty.end());
+        baseCell = nonEmpty[nonEmpty.size() / 2];
         if (!(baseCell > 0.0f))
             baseCell = 1.0f;
     }
 
-    diameters.resize(count);
-    for (int i = 0; i < count; i++)
-        diameters[i] = 2.0f * bodies[i]->radius;
-
-    // Level assignment: the smallest level whose cell fits the diameter. The
-    // coarsest level is grown to fit the largest body, so every body fits its
-    // own level's cell and the 27-cell walk below is exact.
+    // Level assignment: the smallest level whose cell fits the AABB's largest
+    // extent. The coarsest level is grown to fit the largest body, so every
+    // body's AABB fits its own level's cell and the 27-cell walk below is exact.
     float largest = 0.0f;
     for (int i = 0; i < count; i++)
-        largest = std::max(largest, diameters[i]);
+        largest = std::max(largest, extents[i]);
     top = 0;
     while (baseCell * (float)(1 << top) < largest && top < kMaxLevels - 1)
         ++top;
@@ -75,7 +75,7 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
     levels.resize(count);
     for (int i = 0; i < count; i++) {
         int l = 0;
-        while (baseCell * (float)(1 << l) < diameters[i] && l < top)
+        while (baseCell * (float)(1 << l) < extents[i] && l < top)
             ++l;
         levels[i] = l;
     }
@@ -131,9 +131,10 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
 
     // Pair walk. For body i, every level k from its own to the top: the
     // 27-cell neighbourhood at level k, each cell's bodies emitted as
-    // (min(i,j), max(i,j)). A pair of overlapping spheres is found when the
+    // (min(i,j), max(i,j)). A pair of overlapping AABBs is found when the
     // smaller-at-coarser body walks their common level (same-level pairs are
     // found from both sides); duplicates collapse in the caller's sort+unique.
+    // The caller applies the exact AABB overlap / layer / constraint filter.
     for (int i = 0; i < count; i++) {
         const float3 &pi = bodies[i]->positionLin;
         for (int l = levels[i]; l < levelCount; l++) {

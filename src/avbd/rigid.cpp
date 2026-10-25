@@ -80,6 +80,31 @@ Rigid::~Rigid()
     *p = next;
 }
 
+float3 aabbHalfExtent(const Rigid &body) noexcept
+{
+    float3 half;
+    switch (body.shape)
+    {
+        case ShapeType::Sphere:
+            half = float3{body.size.x, body.size.x, body.size.x};
+            break;
+        case ShapeType::Cylinder:
+            // Local +Z is the axis: radius spans X/Y, height spans Z.
+            half = float3{body.size.x, body.size.x, body.size.z * 0.5f};
+            break;
+        case ShapeType::Box:
+        default:
+            half = body.size * 0.5f;
+            break;
+    }
+
+    const float3x3 rot = qmat(body.positionAng);
+    return float3{
+            std::abs(rot[0][0]) * half.x + std::abs(rot[1][0]) * half.y + std::abs(rot[2][0]) * half.z,
+            std::abs(rot[0][1]) * half.x + std::abs(rot[1][1]) * half.y + std::abs(rot[2][1]) * half.z,
+            std::abs(rot[0][2]) * half.x + std::abs(rot[1][2]) * half.y + std::abs(rot[2][2]) * half.z};
+}
+
 bool Rigid::constrainedTo(Rigid* other) const
 {
     // Walk this body's own constraint list, following nextA/nextB. `Force::next` is the
