@@ -602,7 +602,13 @@ void Solver::finishVelocities()
         // thresholds for sleepFrames consecutive steps falls asleep (velocity zeroed,
         // Godot semantics). Only touches this body's fields, so it is safe inside the
         // parallel dispatch and deterministic regardless of thread count.
-        if (sleepFrames > 0 && body->mass > 0 && !body->sleeping)
+        // Automatic sleep only for bodies whose host allows it (sleep_mode == SLEEP).
+        // A body with can_sleep=false used to enter idle sleep here anyway; the next
+        // selection then simulated it again (sleep_mode NEVER), but finishVelocities
+        // skipped its velocity update because `sleeping` was still set - the body
+        // moved with a permanently zero velocity, and contacts could pump it upward
+        // indefinitely. That was the pyramid_dbl runaway.
+        if (sleepFrames > 0 && body->mass > 0 && !body->sleeping && body->sleep_mode == 1)
         {
             if (length2(body->velocityLin) < sleepLinearThreshold * sleepLinearThreshold &&
                     length2(body->velocityAng) < sleepAngularThreshold * sleepAngularThreshold)

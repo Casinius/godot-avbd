@@ -130,6 +130,14 @@ target("avbd_load_tests")
         import("scripts.run_godot_tests", {rootdir = "xmake"}).main("res://tests/test_load.gd")
     end)
 
+-- Double-pyramid stress regression (Godot headless): 420 boxes must settle
+-- without launched bodies or long-range drift.
+target("avbd_pyramid_tests")
+    set_kind("phony")
+    on_run(function (target)
+        import("scripts.run_godot_tests", {rootdir = "xmake"}).main("res://tests/test_pyramid.gd")
+    end)
+
 -- Run every tier: C++ solver tests, then all Godot suites.
 target("run_all_tests")
     set_kind("phony")
@@ -139,5 +147,6 @@ target("run_all_tests")
         runner.main("res://tests/test_solver.gd")
         runner.main("res://tests/test_constraints.gd")
         runner.main("res://tests/test_server.gd")
+        runner.main("res://tests/test_pyramid.gd")
         runner.main("res://tests/test_load.gd")
     end)
