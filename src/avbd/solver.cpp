@@ -19,8 +19,7 @@
 #include "avbd/job_pool.hpp"
 #include "avbd/list_range.hpp"
 #include "avbd/fixed_stack.hpp"
-#include "avbd/bvh/bvh.hpp"
-#include "avbd/bvh/node_storage.hpp"
+#include "avbd/spatial_hash.hpp"
 
 namespace avbd {
 
@@ -49,14 +48,15 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
     Rigid *bestBody = 0;
     float3 bestLocal = {0, 0, 0};
 
-    // Exact per-body test: ray against the body's local box, as before. Used at BVH
-    // leaves and by the no-tree fallback below, so both paths agree bit for bit.
+    // Exact per-body test: ray against the body's local box. The broad phase is
+    // a spatial hash rebuilt per step and not efficient to walk per ray, so
+    // picking scans the body list; the exact test decides.
     const auto testBody = [&](Rigid *body) {
         if ((body->collisionLayer & p_mask) == 0)
             return;
-        quat invRot = body->positionAng.conjugate();
-        float3 o = invRot * (origin - body->positionLin);
-        float3 d = invRot * dir;
+        quat invRot = qconj(body->positionAng);
+        float3 o = qrot(invRot, origin - body->positionLin);
+        float3 d = qrot(invRot, dir);
         float3 half = body->size * 0.5f;
 
         float tEnter = 0.0f;
@@ -109,76 +109,10 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
         }
     };
 
-    if (bvhNodes.size() == 0)
-    {
-        // No broad phase yet (no step has run): walk the list, as this always did.
-        // Unlike the upstream demo (which picks bodies for dragging) this also tests
-        // static bodies, so rays hit the ground and ramps.
-        for (Rigid *body = bodies; body != 0; body = body->next)
-            testBody(body);
-    }
-    else
-    {
-        // Descend the last built broad-phase tree. Node bounds are the tight
-        // AABB-of-OBB leaves aggregated upward, so a ray/AABB interval test prunes
-        // whole subtrees; pruning by the current best hit keeps the query output-
-        // sensitive. The exact per-body test above decides at the leaves.
-        const auto rayOverNode = [&](int slot, float &r_tEnter) {
-            const float3 &bmin = bvhNodes.boundsMin()[slot];
-            const float3 &bmax = bvhNodes.boundsMax()[slot];
-            float tEnter = 0.0f;
-            float tExit = bestT; // prune against the closest hit so far
-            for (int i = 0; i < 3; ++i)
-            {
-                if (std::fabs(dir[i]) < epsilon)
-                {
-                    if (origin[i] < bmin[i] || origin[i] > bmax[i])
-                        return false;
-                    continue;
-                }
-                const float invD = 1.0f / dir[i];
-                float t0 = (bmin[i] - origin[i]) * invD;
-                float t1 = (bmax[i] - origin[i]) * invD;
-                if (t0 > t1)
-                {
-                    const float tmp = t0;
-                    t0 = t1;
-                    t1 = tmp;
-                }
-                tEnter = std::max(tEnter, t0);
-                tExit = std::min(tExit, t1);
-                if (tEnter > tExit)
-                    return false;
-            }
-            r_tEnter = tEnter;
-            return true;
-        };
-
-        // Complete-tree depth bounds the descent (one pending node per level); 64
-        // covers n up to 2^31 with room to spare.
-        FixedStack<int, 64> stack;
-        stack.push(0);
-        while (!stack.empty())
-        {
-            const int slot = stack.pop();
-            if (!bvhNodes.valid(slot))
-                continue;
-            float tEnter = 0.0f;
-            if (!rayOverNode(slot, tEnter))
-                continue;
-            if (2 * slot + 1 < bvhNodes.size())
-            {
-                // Internal node (its children exist in the implicit layout).
-                stack.push(2 * slot + 1);
-                stack.push(2 * slot + 2);
-                continue;
-            }
-            const int bodyIndex = bvhNodes.bodyIndex()[slot];
-            if (bodyIndex < 0)
-                continue;
-            testBody(bodiesInOrder[bodyIndex]);
-        }
-    }
+    // Unlike the upstream demo (which picks bodies for dragging) this also tests
+    // static bodies, so rays hit the ground and ramps.
+    for (Rigid *body = bodies; body != 0; body = body->next)
+        testBody(body);
 
     if (!bestBody)
         return 0;
@@ -189,69 +123,37 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
 
 void Solver::collectAABB(float3 min, float3 max, uint32_t p_mask, std::vector<Rigid *> &out) const
 {
-    if (bvhNodes.size() == 0)
+    // The broad phase is a spatial hash rebuilt per step, so shape/point queries
+    // walk the body list: each body's bound is centre plus its tight world
+    // half-extent (the same formula the hash's spheres derive from).
+    for (Rigid *body = bodies; body != 0; body = body->next)
     {
-        // No tree yet: the list walk answers with the same overlap rule.
-        for (Rigid *body = bodies; body != 0; body = body->next)
+        if ((body->collisionLayer & p_mask) == 0)
+            continue;
+        float3 half;
+        switch (body->shape)
         {
-            if ((body->collisionLayer & p_mask) == 0)
-                continue;
-            // The body's own bound: centre plus its tight world half-extent (the same
-            // formula the broad phase builds leaves with, evaluated inline).
-            float3 bmin, bmax;
-            float3 half;
-            switch (body->shape)
-            {
-                case ShapeType::Sphere:
-                    half = float3{body->radius, body->radius, body->radius};
-                    break;
-                case ShapeType::Cylinder:
-                    half = float3{body->size.x(), body->size.z() * 0.5f, body->size.x()};
-                    break;
-                case ShapeType::Box:
-                default:
-                    half = body->size * 0.5f;
-                    break;
-            }
-            const float3x3 rot(body->positionAng);
-            const float3 wx{
-                    std::abs(rot(0, 0)) * half.x() + std::abs(rot(0, 1)) * half.y() + std::abs(rot(0, 2)) * half.z(),
-                    std::abs(rot(1, 0)) * half.x() + std::abs(rot(1, 1)) * half.y() + std::abs(rot(1, 2)) * half.z(),
-                    std::abs(rot(2, 0)) * half.x() + std::abs(rot(2, 1)) * half.y() + std::abs(rot(2, 2)) * half.z()};
-            bmin = body->positionLin - wx;
-            bmax = body->positionLin + wx;
-            if (!(bmin.x() > max.x() || bmin.y() > max.y() || bmin.z() > max.z() ||
-                        min.x() > bmax.x() || min.y() > bmax.y() || min.z() > bmax.z()))
-                out.push_back(body);
+            case ShapeType::Sphere:
+                half = float3{body->radius, body->radius, body->radius};
+                break;
+            case ShapeType::Cylinder:
+                // Local +Z is the axis: radius spans X/Y, height spans Z.
+                half = float3{body->size.x, body->size.x, body->size.z * 0.5f};
+                break;
+            case ShapeType::Box:
+            default:
+                half = body->size * 0.5f;
+                break;
         }
-        return;
-    }
-
-    const auto overlaps = [&](int slot) {
-        const float3 &bmin = bvhNodes.boundsMin()[slot];
-        const float3 &bmax = bvhNodes.boundsMax()[slot];
-        return !(bmin.x() > max.x() || bmin.y() > max.y() || bmin.z() > max.z() ||
-                min.x() > bmax.x() || min.y() > bmax.y() || min.z() > bmax.z());
-    };
-
-    FixedStack<int, 64> stack;
-    stack.push(0);
-    while (!stack.empty())
-    {
-        const int slot = stack.pop();
-        if (!bvhNodes.valid(slot) || !overlaps(slot))
-            continue;
-        if (2 * slot + 1 < bvhNodes.size())
-        {
-            stack.push(2 * slot + 1);
-            stack.push(2 * slot + 2);
-            continue;
-        }
-        const int bodyIndex = bvhNodes.bodyIndex()[slot];
-        if (bodyIndex < 0)
-            continue;
-        Rigid *body = bodiesInOrder[bodyIndex];
-        if ((body->collisionLayer & p_mask) != 0)
+        const float3x3 rot = qmat(body->positionAng);
+        const float3 wx{
+                std::abs(rot[0][0]) * half.x + std::abs(rot[1][0]) * half.y + std::abs(rot[2][0]) * half.z,
+                std::abs(rot[0][1]) * half.x + std::abs(rot[1][1]) * half.y + std::abs(rot[2][1]) * half.z,
+                std::abs(rot[0][2]) * half.x + std::abs(rot[1][2]) * half.y + std::abs(rot[2][2]) * half.z};
+        const float3 bmin = body->positionLin - wx;
+        const float3 bmax = body->positionLin + wx;
+        if (!(bmin.x > max.x || bmin.y > max.y || bmin.z > max.z ||
+                min.x > bmax.x || min.y > bmax.y || min.z > bmax.z))
             out.push_back(body);
     }
 }
@@ -287,21 +189,23 @@ static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
     // mask (defaults 1/1 keep every pair, as before these fields existed).
     const bool layersAllow = ((bodyA->collisionLayer & bodyB->collisionMask) != 0) ||
             ((bodyB->collisionLayer & bodyA->collisionMask) != 0);
-    return dp.squaredNorm() <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB);
+    return length2(dp) <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB);
 }
 
-// Contact detection: Morton LBVH (implicit heap layout), rebuilt every step.
+// Contact detection: hierarchical spatial hash (big-block screen + layered
+// hash), rebuilt every step.
 //
-// The old x-axis sweep emitted 28k candidate pairs on a 40-layer resting wall (x cannot
-// discriminate a z-pile); the Morton tree partitions in 3D so the candidate list tracks
-// the real contact surface. Bodies are ordered by 64-bit Morton code - a pure function
-// of the scene bounds and positions - and the code-sorted order is mapped into the
-// implicit heap layout of a complete binary tree: node i has children 2i+1 / 2i+2, no
-// left/right/parent arrays, best-possible cache behaviour for a pointer-free BVH.
+// The old x-axis sweep emitted 28k candidate pairs on a 40-layer resting wall,
+// and the Morton LBVH that replaced it partitioned in 3D at the cost of a tree
+// build and a recursive self-query. The hash bucketing also partitions in 3D,
+// but with none of either: bodies go into dyadic levels by bounding-sphere
+// size, each level is a sorted key table, and candidate pairs come from a
+// 27-cell walk. The candidate set is a superset of the overlapping-sphere set,
+// exactly as the tree's AABB overlap set was.
 //
-// Determinism: leaf order is the Morton-sorted body order, pair collection is leaf
-// order, and the final pair list is sorted ascending (min-index, other) - the same
-// manifold creation order contract as the sweep path.
+// Determinism: pair collection is integer-sorted and de-duplicated, and the
+// final (min-index, other) sort fixes the manifold creation order - the same
+// contract as the sweep and tree paths before it.
 void Solver::broadPhase()
 {
     bodiesInOrder.clear();
@@ -311,76 +215,7 @@ void Solver::broadPhase()
     if (count < 2)
         return;
 
-    std::vector<int> indices(count);
-    for (int i = 0; i < count; ++i)
-        indices[i] = i;
-
-    std::vector<const Rigid *> bodiesPtr;
-    bodiesPtr.reserve(count);
-    for (Rigid *b : bodiesInOrder)
-        bodiesPtr.push_back(b);
-
-    bvh::builder::Builder builder(bvhNodes, indices, bodiesPtr);
-    const int leafCount = builder.buildLBVH();
-    if (leafCount < 2)
-        return;
-    const int padded = 1;
-    int p = 1;
-    while (p < leafCount)
-        p <<= 1;
-    const int firstLeaf = p - 1;
-    (void)padded;
-
-    // Leaf slots [firstLeaf, firstLeaf + leafCount) in Morton-sorted order. The pair
-    // search is one top-down self-query: collideSubtrees walks every leaf pair between
-    // two subtrees whose aggregated bounds overlap (descending the internal side), and
-    // selfTraverse splits each internal node into its two children and recurses - each
-    // internal-node overlap test runs once per ancestor path, where the per-leaf
-    // from-root descent re-tested the top of the tree once per leaf. Empty subtrees
-    // (the right tail when n is not a power of two) are marked invalid by the builder
-    // and pruned before their uninitialized bounds are read. The body-index minmax and
-    // the final sort keep the (min-index, other) manifold order.
-    sweepPairs.clear();
-    const auto boundsOverlap = [&](int sa, int sb) {
-        const float3 &aMin = bvhNodes.boundsMin()[sa];
-        const float3 &aMax = bvhNodes.boundsMax()[sa];
-        const float3 &bMin = bvhNodes.boundsMin()[sb];
-        const float3 &bMax = bvhNodes.boundsMax()[sb];
-        // Same touching-counts-as-overlapping semantics as the old pairwise sweep.
-        return !(bMin.x() > aMax.x() || bMin.y() > aMax.y() || bMin.z() > aMax.z() ||
-                aMin.x() > bMax.x() || aMin.y() > bMax.y() || aMin.z() > bMax.z());
-    };
-    const auto collideSubtrees = [&](auto &&self, int sa, int sb) -> void {
-        if (!bvhNodes.valid(sa) || !bvhNodes.valid(sb) || !boundsOverlap(sa, sb))
-            return;
-        const bool aLeaf = sa >= firstLeaf;
-        const bool bLeaf = sb >= firstLeaf;
-        if (aLeaf && bLeaf)
-        {
-            sweepPairs.emplace_back(std::minmax(bvhNodes.bodyIndex()[sa], bvhNodes.bodyIndex()[sb]));
-            return;
-        }
-        if (!aLeaf)
-        {
-            self(self, 2 * sa + 1, sb);
-            self(self, 2 * sa + 2, sb);
-        }
-        else
-        {
-            self(self, sa, 2 * sb + 1);
-            self(self, sa, 2 * sb + 2);
-        }
-    };
-    const auto selfTraverse = [&](auto &&self, int slot) -> void {
-        if (slot >= firstLeaf)
-            return;
-        const int l = 2 * slot + 1;
-        const int r = 2 * slot + 2;
-        collideSubtrees(collideSubtrees, l, r);
-        self(self, l);
-        self(self, r);
-    };
-    selfTraverse(selfTraverse, 0);
+    broadHash.buildAndCollectPairs(bodiesInOrder, 0.0f, sweepPairs);
 
     std::sort(sweepPairs.begin(), sweepPairs.end());
     sweepPairs.erase(std::unique(sweepPairs.begin(), sweepPairs.end()), sweepPairs.end());
@@ -476,7 +311,7 @@ void Solver::warmstartBodies()
 
         // Adaptive warmstart (See original VBD paper)
         const float3 accel = (body->velocityLin - body->prevVelocityLin) / dt;
-        const float accelExt = accel.z() * std::copysign(1.0f, g);
+        const float accelExt = accel.z * std::copysign(1.0f, g);
         float accelWeight = std::clamp(accelExt / std::fabs(g), 0.0f, 1.0f);
         if (!std::isfinite(accelWeight))
             accelWeight = 0.0f;
@@ -525,15 +360,22 @@ void Solver::solveIterations(int forceCount)
     iterate(targetIterations, forceCount, newtonRounds);
 }
 
-// One worker-loop body for the whole iteration set: `iterations` rounds of the block
-// Jacobi primal (one full block solve per body against the iteration-start pose, then a
-// combine pass) followed by a dual pass, with a barrier fence at every phase boundary.
+// One worker-loop body for the whole iteration set: `iterations` rounds of the
+// colour-parallel Gauss-Seidel primal followed by a dual pass, with a barrier
+// fence at every phase boundary.
 //
-// The shape matters more than the phases: one dispatch arms the workers once per step and
-// each boundary costs a ~1-3 us barrier. The Jacobi primal needs two fences per round
-// regardless of how entangled the constraint graph is - the old colour-parallel
-// Gauss-Seidel needed one per colour, which is why dense stacking scenes starved it (and
-// why the incremental colouring's correctness was so fragile).
+// The primal runs colour by colour: every body of colour c assembles its full
+// block system against the poses the earlier colours already applied, solves it
+// and applies the update immediately - Gauss-Seidel across colours, parallel
+// and race-free within one (a colour is an independent set of the constraint
+// graph by construction). Manifolds take the self-contained updatePrimal path,
+// which recomputes the shared assembly against the live pose; each manifold is
+// seen by at most one body per colour, so nothing races.
+//
+// The colouring is capped at kMaxColours so the barrier count per round is
+// bounded; bodies the greedy colouring could not fit run one block-Jacobi round
+// after the colours (precompute, solve against the post-colour snapshot,
+// combine), using jacobiRelaxation/Chebyshev as the combine controls.
 //
 // Both sync types run the identical body: NullSync (small scenes, or another solver
 // holding the loop) executes it inline in list order, which is exactly the threads=1
@@ -549,8 +391,9 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
     int roundsRun = 0;
     std::atomic<bool> converged{false};
     const auto loop = [this, targetIterations, forceCount, newtonRounds, &prevResidual, &roundsRun, &converged](int workerIndex, auto &sync) {
-        // Per-worker Chebyshev schedule state: the recurrence is deterministic, so every
-        // worker derives the same weights without sharing anything.
+        // Per-worker Chebyshev schedule state for the overflow bucket's combine:
+        // the recurrence is deterministic, so every worker derives the same
+        // weights without sharing anything.
         int chebRound = 0;
         float chebGammaPrev = 1.0f;
         for (int it = 0; it < targetIterations; it++)
@@ -558,79 +401,115 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
             const bool newton = it < newtonRounds;
             if (newton)
             {
-                // Block projected Jacobi in three phases. Phase A precomputes each
-                // manifold's shared per-contact assembly (world arms, angular jacobians,
-                // clamped forces) once from the round's pose snapshot - work the two
-                // body stamps used to duplicate. Nobody writes a pose until the combine
-                // pass, so every phase reads the same frozen snapshot: race-free by
-                // construction, no colours, and no thread-count dependence.
-                sync.forItems(forceCount, [this](int i) {
-                    Force *f = forceOrder[i];
-                    if (!f->isManifold)
-                        return;
-                    Manifold *manifold = static_cast<Manifold *>(f);
-                    if (!manifold->bodyA->inUpdateSet && !manifold->bodyB->inUpdateSet)
-                        return; // frozen: neither side moves this round
-                    manifold->preCompute(alpha);
-                });
-                sync.arriveAndWait();
-
-                // Phase B: each body assembles its full block system (own inertia plus
-                // every incident constraint - manifolds stamped from the phase-A cache,
-                // other forces stamping directly) and solves for its delta.
-                sync.forItems(static_cast<int>(updateOrder.size()), [this](int i) {
-                    Rigid *body = updateOrder[i];
-                    Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
-                            body->positionAng, body->inertialAng);
-                    for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
-                    {
-                        if (f->isManifold)
-                            static_cast<Manifold *>(f)->stampCached(body, block);
-                        else
-                            f->updatePrimal(body, alpha, block);
-                    }
-                    block.solveDelta(bodyDeltaLin[i], bodyDeltaAng[i]);
-                });
-                sync.arriveAndWait();
-
-                // Combine: each body applies its own delta. With chebyshevRho > 0 the
-                // plain Jacobi estimate x + delta is convex-combined with the previous
-                // iterate through the Chebyshev weights (semi-iteration); otherwise the
-                // constant jacobiRelaxation scales it. The angular delta gets the same
-                // gamma but no prev-mixing: positions are a vector space, rotations are
-                // not, and the first-order quat integration stays exact as written. A
-                // body with no constraints solves to exactly its inertial pose - free
-                // flight falls out of the same path.
-                float gamma = jacobiRelaxation;
-                if (chebyshevRho > 0.0f)
+                // Colour-parallel Gauss-Seidel. One pass per colour: assemble
+                // (manifolds stamp self-contained against the live poses, other
+                // forces stamp directly), solve, apply. Bodies of one colour
+                // share no force, so the pass is race-free without a snapshot.
+                for (int c = 0; c < colourCount; c++)
                 {
-                    const float rho2 = chebyshevRho * chebyshevRho;
-                    if (chebRound == 0)
-                        gamma = 1.0f;
-                    else if (chebRound == 1)
-                        gamma = 1.0f / (1.0f - 0.5f * rho2);
-                    else
-                        gamma = 1.0f / (1.0f - 0.25f * rho2 * chebGammaPrev);
-                    chebGammaPrev = gamma;
+                    const int first = colourBegins[c];
+                    const int last = colourBegins[c + 1];
+                    if (last == first)
+                        continue; // empty colour: every worker skips the barrier alike
+                    sync.forItems(last - first, [this, first, it](int k) {
+                        Rigid *body = updateOrder[colourOrder[first + k]];
+                        Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
+                                body->positionAng, body->inertialAng);
+                        for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
+                            f->updatePrimal(body, alpha, block);
+                        block.apply(*body);
+                    });
+                    sync.arriveAndWait();
                 }
-                chebRound++;
-                sync.forItems(static_cast<int>(updateOrder.size()), [this, gamma](int i) {
-                    Rigid *body = updateOrder[i];
-                    if (chebyshevRho <= 0.0f || !body->contactOnly)
+
+                // Overflow bucket (> kMaxColours cliques): block Jacobi against
+                // the post-colour snapshot, in three phases. Phase A precomputes
+                // each manifold's shared per-contact assembly (world arms,
+                // angular jacobians, clamped forces) once - work the two body
+                // stamps used to duplicate. Nobody writes a pose until the
+                // combine pass, so every phase reads the same frozen snapshot.
+                const int overflowCount = static_cast<int>(overflowOrder.size());
+                if (overflowCount > 0)
+                {
+                    sync.forItems(forceCount, [this](int i) {
+                        Force *f = forceOrder[i];
+                        if (!f->isManifold)
+                            return;
+                        Manifold *manifold = static_cast<Manifold *>(f);
+                        const bool aIn = manifold->bodyA->inUpdateSet &&
+                                bodyColour[manifold->bodyA->updateIndex] == kOverflowColour;
+                        const bool bIn = manifold->bodyB->inUpdateSet &&
+                                bodyColour[manifold->bodyB->updateIndex] == kOverflowColour;
+                        if (!aIn && !bIn)
+                            return; // both sides solved in a colour, or frozen
+                        manifold->preCompute(alpha);
+                    });
+                    sync.arriveAndWait();
+
+                    // Phase B: each bucket body assembles its full block system
+                    // (own inertia plus every incident constraint - manifolds
+                    // stamped from the phase-A cache, other forces stamping
+                    // directly) and solves for its delta.
+                    sync.forItems(overflowCount, [this](int k) {
+                        const int i = overflowOrder[k];
+                        Rigid *body = updateOrder[i];
+                        Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
+                                body->positionAng, body->inertialAng);
+                        for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
+                        {
+                            if (f->isManifold)
+                                static_cast<Manifold *>(f)->stampCached(body, block);
+                            else
+                                f->updatePrimal(body, alpha, block);
+                        }
+                        block.solveDelta(bodyDeltaLin[i], bodyDeltaAng[i]);
+                    });
+                    sync.arriveAndWait();
+
+                    // Combine: each bucket body applies its own delta. With
+                    // chebyshevRho > 0 the plain Jacobi estimate x + delta is
+                    // convex-combined with the previous iterate through the
+                    // Chebyshev weights (semi-iteration); otherwise the constant
+                    // jacobiRelaxation scales it. The angular delta gets the same
+                    // gamma but no prev-mixing: positions are a vector space,
+                    // rotations are not, and the first-order quat integration
+                    // stays exact as written.
+                    float relaxGamma = jacobiRelaxation;
+                    if (chebyshevRho > 0.0f)
                     {
-                        // Plain relaxed Jacobi - the constant, or the safe fallback for
-                        // bodies coupled by joints (extrapolation diverges those).
-                        body->positionLin = body->positionLin + bodyDeltaLin[i] * jacobiRelaxation;
-                        body->positionAng = body->positionAng + bodyDeltaAng[i] * jacobiRelaxation;
-                        return;
+                        const float rho2 = chebyshevRho * chebyshevRho;
+                        if (chebRound == 0)
+                            relaxGamma = 1.0f;
+                        else if (chebRound == 1)
+                            relaxGamma = 1.0f / (1.0f - 0.5f * rho2);
+                        else
+                            relaxGamma = 1.0f / (1.0f - 0.25f * rho2 * chebGammaPrev);
+                        chebGammaPrev = relaxGamma;
                     }
-                    // x_{k+1} = gamma * (x_k + delta_k) + (1 - gamma) * x_{k-1}
-                    const float3 xLin = body->positionLin;
-                    body->positionLin = gamma * (xLin + bodyDeltaLin[i]) + (1.0f - gamma) * bodyPrevLin[i];
-                    bodyPrevLin[i] = xLin;
-                    body->positionAng = body->positionAng + bodyDeltaAng[i] * gamma;
-                });
-                sync.arriveAndWait();
+                    chebRound++;
+                    sync.forItems(overflowCount, [this, relaxGamma](int k) {
+                        const int i = overflowOrder[k];
+                        Rigid *body = updateOrder[i];
+                        if (chebyshevRho <= 0.0f || !body->contactOnly)
+                        {
+                            // Plain relaxed Jacobi - the constant, or the safe fallback for
+                            // bodies coupled by joints (extrapolation diverges those).
+                            body->positionLin = body->positionLin + bodyDeltaLin[i] * jacobiRelaxation;
+                            body->positionAng = body->positionAng + bodyDeltaAng[i] * jacobiRelaxation;
+                            return;
+                        }
+                        // x_{k+1} = gamma * (x_k + delta_k) + (1 - gamma) * x_{k-1}
+                        const float3 xLin = body->positionLin;
+                        body->positionLin = relaxGamma * (xLin + bodyDeltaLin[i]) + (1.0f - relaxGamma) * bodyPrevLin[i];
+                        bodyPrevLin[i] = xLin;
+                        body->positionAng = body->positionAng + bodyDeltaAng[i] * relaxGamma;
+                    });
+                    sync.arriveAndWait();
+                }
+                else
+                {
+                    chebRound++;
+                }
             }
 
             // Dual update: one item per force, and each force only reads the (frozen)
@@ -647,7 +526,7 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
                 if (!newton && decay < 1.0f && f->isManifold) {
                     Manifold *m = static_cast<Manifold *>(f);
                     for (int ci = 0, n = m->numContacts; ci < n; ++ci)
-                        m->contacts[ci].penalty = (m->contacts[ci].penalty * decay).cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX});
+                        m->contacts[ci].penalty = min(m->contacts[ci].penalty * decay, float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX});
                 }
                 if (!constraintFrozen(f))
                     f->updateDual(alpha);
@@ -732,8 +611,8 @@ void Solver::finishVelocities()
         // parallel dispatch and deterministic regardless of thread count.
         if (sleepFrames > 0 && body->mass > 0 && !body->sleeping)
         {
-            if (body->velocityLin.squaredNorm() < sleepLinearThreshold * sleepLinearThreshold &&
-                    body->velocityAng.squaredNorm() < sleepAngularThreshold * sleepAngularThreshold)
+            if (length2(body->velocityLin) < sleepLinearThreshold * sleepLinearThreshold &&
+                    length2(body->velocityAng) < sleepAngularThreshold * sleepAngularThreshold)
                 ++body->stillFrames;
             else
                 body->stillFrames = 0;
@@ -840,12 +719,17 @@ void Block::apply(Rigid &body) const noexcept
     body.positionAng = body.positionAng + dxAng;
 }
 
-// Block Jacobi needs no colours and no mass splitting: the primal is parallel over
-// bodies, each solving its full block system (own inertia plus every incident
-// constraint, stamped against the iteration-start pose snapshot) and holding the delta
-// for the combine pass. Rigid-body constraint graphs have no shared-vertex structure to
-// split around - each manifold couples exactly two bodies - so the body-level split is
-// the natural one: race-free by construction, one 6x6 solve per body per round.
+// Colour-parallel Gauss-Seidel: bodies sharing a force never solve at the same
+// instant, so each colour is an independent set - one barrier per colour carries
+// the Gauss-Seidel ordering, and the result is deterministic for a fixed
+// colouring no matter the thread count.
+//
+// The colouring is capped at kMaxColours: a body whose neighbours already used
+// every colour goes to the overflow bucket, which the primal runs as one
+// block-Jacobi round (every delta solved against the same post-colour snapshot,
+// then combined). The bucket costs three barriers when non-empty and is empty in
+// every ordinary scene; it exists so a pathological clique cannot make the
+// barrier count unbounded.
 //
 // The wake-up and island-sleep logic is unchanged from the colouring era: a sleeping body
 // sharing a force with a moving movable body re-enters the update set, and settled
@@ -873,8 +757,8 @@ void Solver::selectUpdateBodies()
             {
                 Rigid *other = (f->bodyA == body) ? f->bodyB : f->bodyA;
                 if (other != 0 && other->mass > 0 && !other->sleeping &&
-                        (other->velocityLin.squaredNorm() > lin2 ||
-                                other->velocityAng.squaredNorm() > ang2))
+                        (length2(other->velocityLin) > lin2 ||
+                                length2(other->velocityAng) > ang2))
                 {
                     body->sleeping = false;
                     body->stillFrames = 0;
@@ -893,6 +777,7 @@ void Solver::selectUpdateBodies()
 
         // Fresh per-step state; admitted bodies flip inUpdateSet below.
         body->inUpdateSet = false;
+        body->updateIndex = -1;
         body->contactOnly = true;
 
         // Sleep mode support (Godot 4.7 API)
@@ -915,7 +800,7 @@ void Solver::selectUpdateBodies()
             {
                 // Start in sleep, wake up if velocity or forces are present
                 if (!body->sleeping && 
-                    body->velocityLin.squaredNorm() == 0.0f && 
+                    length2(body->velocityLin) == 0.0f &&
                     body->forces == nullptr)
                 {
                     should_update = false;
@@ -928,6 +813,7 @@ void Solver::selectUpdateBodies()
             
             if (should_update)
             {
+                body->updateIndex = static_cast<int>(updateOrder.size());
                 updateOrder.push_back(body);
                 body->inUpdateSet = true;
             }
@@ -956,6 +842,78 @@ void Solver::selectUpdateBodies()
         if (f->bodyB != 0)
             f->bodyB->contactOnly = false;
     }
+
+    colourGraph();
+}
+
+// Greedy colouring of the update set's constraint graph, in updateOrder order:
+// each body takes the smallest colour none of its already-coloured neighbours
+// holds, capped at kMaxColours. The order is the body list order, so the colour
+// assignment is a pure function of the scene - deterministic regardless of
+// thread count. Neighbours are found through the bodies' own force lists; a
+// body not yet coloured (later in the order) constrains nothing, and overflow
+// neighbours never block a colour because the overflow bucket runs Jacobi
+// against a snapshot and is safe to overlap with any colour.
+void Solver::colourGraph()
+{
+    const int n = static_cast<int>(updateOrder.size());
+    bodyColour.assign(n, kOverflowColour);
+    colourOrder.clear();
+    overflowOrder.clear();
+
+    uint8_t used[kMaxColours];
+    for (int i = 0; i < n; i++)
+    {
+        Rigid *body = updateOrder[i];
+        for (int c = 0; c < kMaxColours; c++)
+            used[c] = 0;
+
+        for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
+        {
+            Rigid *other = (f->bodyA == body) ? f->bodyB : f->bodyA;
+            if (other == 0 || other->updateIndex < 0 || other->updateIndex >= i)
+                continue; // not in the update set, or coloured later in the pass
+            const uint8_t c = bodyColour[other->updateIndex];
+            if (c < kMaxColours)
+                used[c] = 1;
+        }
+
+        uint8_t colour = kOverflowColour;
+        for (int c = 0; c < kMaxColours; c++)
+            if (!used[c])
+            {
+                colour = static_cast<uint8_t>(c);
+                break;
+            }
+        bodyColour[i] = colour;
+    }
+
+    // Counting sort into per-colour runs (stable in updateOrder order).
+    colourBegins.assign(kMaxColours + 1, 0);
+    for (int i = 0; i < n; i++)
+        if (bodyColour[i] < kMaxColours)
+            colourBegins[bodyColour[i] + 1]++;
+        else
+            overflowOrder.push_back(i);
+    for (int c = 0; c < kMaxColours; c++)
+        colourBegins[c + 1] += colourBegins[c];
+    colourOrder.resize(n - static_cast<int>(overflowOrder.size()));
+    std::array<int, kMaxColours> cursor{};
+    for (int c = 0; c < kMaxColours; c++)
+        cursor[c] = colourBegins[c];
+    for (int i = 0; i < n; i++)
+        if (bodyColour[i] < kMaxColours)
+            colourOrder[cursor[bodyColour[i]]++] = i;
+
+    colourCount = 0;
+    for (int c = 0; c < kMaxColours; c++)
+        if (colourBegins[c + 1] > colourBegins[c])
+            colourCount = c + 1;
+
+    // The overflow bucket's Jacobi round needs the delta buffers.
+    bodyDeltaLin.resize(updateOrder.size());
+    bodyDeltaAng.resize(updateOrder.size());
+    bodyPrevLin.resize(updateOrder.size());
 }
 
 // Fill `forceOrder` with the solver's forces, so the phases can address them by index.

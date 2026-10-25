@@ -16,7 +16,6 @@
 #include <vector>
 
 #include "avbd/solver.h"
-#include "avbd/bvh/node_storage.hpp"
 
 namespace avbd {
 
@@ -65,6 +64,7 @@ void Manifold::drainPool() noexcept
     poolFreeList.clear();
 }
 
+
 bool Manifold::initialize()
 {
     // Compute friction
@@ -91,7 +91,7 @@ bool Manifold::initialize()
                 float3 newRA = newContacts[i].rA;
                 float3 newRB = newContacts[i].rB;
                 newContacts[i] = contacts[j];
-                prevErr[i] = contacts[j].C0.norm();
+                prevErr[i] = length(contacts[j].C0);
                 newContacts[i].betaScale = contacts[j].betaScale;
 
                 // If no static friction in last frame, use the new contact point locations
@@ -116,16 +116,17 @@ bool Manifold::initialize()
     for (int i = 0; i < numContacts; i++)
     {
         // Error at q-
-        float3 xA = bodyA->positionLin + bodyA->positionAng * contacts[i].rA;
-        float3 xB = bodyB->positionLin + bodyB->positionAng * contacts[i].rB;
-        contacts[i].C0 = basis * (xA - xB) + float3{COLLISION_MARGIN, 0, 0};
+        float3 xA = bodyA->positionLin + qrot(bodyA->positionAng, contacts[i].rA);
+        float3 xB = bodyB->positionLin + qrot(bodyB->positionAng, contacts[i].rB);
+        contacts[i].C0 = mul(basis, xA - xB) + float3{COLLISION_MARGIN, 0, 0};
 
-        // Clamp penetration to avoid excessive penalty forces
-        float penetration = contacts[i].C0.norm();
-        if (penetration > 0.02f) // Cap at 2cm penetration
-        {
-            contacts[i].C0 = contacts[i].C0.normalized() * 0.02f;
-        }
+        // The reference implementation reports the full penetration depth here:
+        // a deep impact then produces a proportionally large error and force, and
+        // the primal pushes the body back out within the step. Capping the depth
+        // (as this port once did, at 2 cm) removes the restoring gradient past the
+        // cap - bodies settle anywhere below it and rebound off the stored spring
+        // energy, which showed up as endless bouncing and sink-through on the
+        // round-shape scenes. No clamp.
 
         // Adaptive beta (the augmented-Lagrangian kappa update, per contact): a
         // sticking contact whose error did not shrink against last step doubles its
@@ -133,7 +134,7 @@ bool Manifold::initialize()
         // Unmatched (fresh) contacts start from the neutral multiplier.
         if (solver->adaptiveBeta && prevErr[i] > 0.0f)
         {
-            const float err = contacts[i].C0.norm();
+            const float err = length(contacts[i].C0);
             float scale = contacts[i].betaScale;
             if (err > 0.5f * prevErr[i])
                 scale = std::min(scale * 2.0f, ADAPTIVE_BETA_MAX);
@@ -154,8 +155,14 @@ bool Manifold::initialize()
         // ramped per iteration in updateDual (betaLin * |C|, capped by PENALTY_MAX).
         // The warmstart decay below is kept bit-for-bit.
         contacts[i].lambda = contacts[i].lambda * solver->alpha * solver->gamma;
-        const float clampedLambdaPenalty = std::clamp(PENALTY_MIN * solver->gamma, PENALTY_MIN, PENALTY_MAX);
-        contacts[i].penalty = float3{clampedLambdaPenalty, clampedLambdaPenalty, clampedLambdaPenalty};
+        // Warmstart the penalty too (Eq. 19). Resetting it to the floor every frame
+        // threw away the ramp the previous step had already built, so a resting body
+        // had to re-grow its support from PENALTY_MIN each frame and sank until the
+        // dual happened to catch up. The reference implementation decays and clamps
+        // the carried value instead; a fresh contact starts from the floor because
+        // its Contact was value-initialised.
+        contacts[i].penalty = clamp(contacts[i].penalty * solver->gamma, float3{PENALTY_MIN, PENALTY_MIN, PENALTY_MIN},
+                float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX});
     }
 
     return numContacts > 0;
@@ -177,8 +184,8 @@ void Manifold::preCompute(float alpha)
     float3 dqBAng = bodyB->positionAng - bodyB->initialAng;
 
     // Same rotation-matrix hoist as updateDual: body quats are loop-invariant here.
-    const float3x3 rotA(bodyA->positionAng);
-    const float3x3 rotB(bodyB->positionAng);
+    const float3x3 rotA = qmat(bodyA->positionAng);
+    const float3x3 rotB = qmat(bodyB->positionAng);
 
     // Round-0 shared assembly. The angular jacobian is a function of the world-space
     // moment arms only (rows are rWorld x basis.row(i)); computed fresh because the
@@ -190,17 +197,17 @@ void Manifold::preCompute(float alpha)
     {
         JacobianCache &cache = jacobianCache[i];
 
-        const float3 rAWorld = rotA * contacts[i].rA;
-        const float3 rBWorld = rotB * contacts[i].rB;
+        const float3 rAWorld = mul(rotA, contacts[i].rA);
+        const float3 rBWorld = mul(rotB, contacts[i].rB);
 
         // Compute the Taylor series approximation of the constraint function C(x) (Sec 4)
         // Row i of the angular jacobian is the moment arm crossed with row i of the linear one
-        // (the original custom float3x3 was row-major; Eigen's .row() keeps the semantics).
+        // (the manifold basis is authored in terms of rows; row()/setRow() keep that vocabulary).
         float3x3 jAAng, jBAng;
         for (int r = 0; r < 3; r++)
         {
-            jAAng.row(r) = rAWorld.cross(jALin.row(r));
-            jBAng.row(r) = rBWorld.cross(jBLin.row(r));
+            setRow(jAAng, r, cross(rAWorld, row(jALin, r)));
+            setRow(jBAng, r, cross(rBWorld, row(jBLin, r)));
         }
 
         // Landed in the cache: stampCached reads these for this round.
@@ -209,17 +216,17 @@ void Manifold::preCompute(float alpha)
         cache.jAAng = jAAng;
         cache.jBAng = jBAng;
 
-        float3 C = contacts[i].C0 * (1 - alpha) + jALin * dqALin + jBLin * dqBLin + jAAng * dqAAng + jBAng * dqBAng;
+        float3 C = contacts[i].C0 * (1 - alpha) + mul(jALin, dqALin) + mul(jBLin, dqBLin) + mul(jAAng, dqAAng) + mul(jBAng, dqBAng);
 
         // Compute force - the penalty is a diagonal, so K*C is componentwise.
-        float3 F = contacts[i].penalty.cwiseProduct(C) + contacts[i].lambda;
+        float3 F = cmul(contacts[i].penalty, C) + contacts[i].lambda;
 
         // Clamp normal force
         F[0] = std::min(F[0], 0.0f);
 
         // Clamp norm of friction forces to achieve a friction cone
         float bounds = std::fabs(F[0]) * friction;
-        float frictionScale = float2{F[1], F[2]}.norm();
+        float frictionScale = length(float2{F[1], F[2]});
         if (frictionScale > bounds && frictionScale > 0)
         {
             F[1] *= bounds / frictionScale;
@@ -239,21 +246,21 @@ void Manifold::stampCached(Rigid *body, Block &block)
         // The penalty is a diagonal: every K product below is a row/column scaling,
         // not a generic 3x3 product (the diagonal zeros turned a third of the old
         // multiplies into bookkeeping).
-        const auto kDiag = contacts[i].penalty.asDiagonal();
+        const float3x3 kDiag = diagonal(contacts[i].penalty.x, contacts[i].penalty.y, contacts[i].penalty.z);
         const float3x3 jLin = fromIsA ? basis : -basis;
         const float3x3 &jAng = fromIsA ? jacobianCache[i].jAAng : jacobianCache[i].jBAng;
 
         // Stamp into LHS
-        const float3x3 jLinT = jLin.transpose();
-        const float3x3 jAngTk = jAng.transpose() * kDiag;
+        const float3x3 jLinT = transpose(jLin);
+        const float3x3 jAngTk = mul(transpose(jAng), kDiag);
 
-        block.lhsLin += (jLinT * kDiag) * jLin;
-        block.lhsAng += jAngTk * jAng;
-        block.lhsCross += jAngTk * jLin;
+        block.lhsLin += mul(jLinT, kDiag, jLin);
+        block.lhsAng += mul(jAngTk, jAng);
+        block.lhsCross += mul(jAngTk, jLin);
 
         // Stamp into RHS
-        block.rhsLin += jLinT * F;
-        block.rhsAng += jAng.transpose() * F;
+        block.rhsLin += mul(jLinT, F);
+        block.rhsAng += mul(transpose(jAng), F);
     }
 }
 
@@ -274,8 +281,8 @@ void Manifold::updateDual(float alpha)
     // Both contact rotations share the two body quats, which never change inside this
     // loop: one rotation-matrix conversion (~20 ns) replaces two quat multiplies per
     // contact (~16 ns each at 8 contacts = ~256 ns/manifold).
-    const float3x3 rotA(bodyA->positionAng);
-    const float3x3 rotB(bodyB->positionAng);
+    const float3x3 rotA = qmat(bodyA->positionAng);
+    const float3x3 rotB = qmat(bodyB->positionAng);
 
     // Drift-gated jacobian reuse (the jacobianRebuildDistance semantics, now living in
     // the dual): when neither body's rotation moved further than the threshold since the
@@ -283,10 +290,10 @@ void Manifold::updateDual(float alpha)
     // the arms and crosses are simply not computed this round.
     const bool cacheable = solver->jacobianRebuildDistance > 0.0f;
     const float rebuild2 = solver->jacobianRebuildDistance * solver->jacobianRebuildDistance;
-    const float3 dA = rotA.col(0) - rotACaptured.col(0);
-    const float3 dB = rotB.col(0) - rotBCaptured.col(0);
+    const float3 dA = rotA[0] - rotACaptured[0];
+    const float3 dB = rotB[0] - rotBCaptured[0];
     const bool driftUsable = cacheable && jacobiansCached &&
-            dA.squaredNorm() <= rebuild2 && dB.squaredNorm() <= rebuild2;
+            length2(dA) <= rebuild2 && length2(dB) <= rebuild2;
 
     const float3x3 jALin = basis;
     const float3x3 jBLin = -basis;
@@ -300,15 +307,17 @@ void Manifold::updateDual(float alpha)
         }
         else
         {
-            const float3 rAWorld = rotA * contacts[i].rA;
-            const float3 rBWorld = rotB * contacts[i].rB;
+            const float3 rAWorld = mul(rotA, contacts[i].rA);
+            const float3 rBWorld = mul(rotB, contacts[i].rB);
+            jacobianCache[i].rAWorld = rAWorld;
+            jacobianCache[i].rBWorld = rBWorld;
 
             // Compute the Taylor series approximation of the constraint function C(x) (Sec 4)
             // Row i of the angular jacobian is the moment arm crossed with row i of the linear one.
             for (int j = 0; j < 3; j++)
             {
-                jAAng.row(j) = rAWorld.cross(jALin.row(j));
-                jBAng.row(j) = rBWorld.cross(jBLin.row(j));
+                setRow(jAAng, j, cross(rAWorld, row(jALin, j)));
+                setRow(jBAng, j, cross(rBWorld, row(jBLin, j)));
             }
             jacobianCache[i].jAAng = jAAng;
             jacobianCache[i].jBAng = jBAng;
@@ -320,17 +329,17 @@ void Manifold::updateDual(float alpha)
             }
         }
 
-        float3 C = contacts[i].C0 * (1 - alpha) + jALin * dqALin + jBLin * dqBLin + jAAng * dqAAng + jBAng * dqBAng;
+        float3 C = contacts[i].C0 * (1 - alpha) + mul(jALin, dqALin) + mul(jBLin, dqBLin) + mul(jAAng, dqAAng) + mul(jBAng, dqBAng);
 
         // Compute force - the penalty is a diagonal, so K*C is componentwise.
-        float3 F = contacts[i].penalty.cwiseProduct(C) + contacts[i].lambda;
+        float3 F = cmul(contacts[i].penalty, C) + contacts[i].lambda;
 
         // Clamp normal force
         F[0] = std::min(F[0], 0.0f);
 
         // Clamp norm of friction forces to achieve a friction cone
         float bounds = std::fabs(F[0]) * friction;
-        float frictionScale = float2{F[1], F[2]}.norm();
+        float frictionScale = length(float2{F[1], F[2]});
         if (frictionScale > bounds && frictionScale > 0)
         {
             F[1] *= bounds / frictionScale;
@@ -348,7 +357,7 @@ void Manifold::updateDual(float alpha)
         {
             contacts[i].penalty[1] = std::min(contacts[i].penalty[1] + beta * std::fabs(C[1]), PENALTY_MAX);
             contacts[i].penalty[2] = std::min(contacts[i].penalty[2] + beta * std::fabs(C[2]), PENALTY_MAX);
-            contacts[i].stick = float2{C[1], C[2]}.norm() < STICK_THRESH;
+            contacts[i].stick = length(float2{C[1], C[2]}) < STICK_THRESH;
         }
 
         // Leave the primal's cache ready for the next Newton round. The pose is frozen
@@ -359,10 +368,10 @@ void Manifold::updateDual(float alpha)
         // after the first.
         jacobianCache[i].jAAng = jAAng;
         jacobianCache[i].jBAng = jBAng;
-        float3 fNext = contacts[i].penalty.cwiseProduct(C) + contacts[i].lambda;
+        float3 fNext = cmul(contacts[i].penalty, C) + contacts[i].lambda;
         fNext[0] = std::min(fNext[0], 0.0f);
         const float boundsNext = std::fabs(fNext[0]) * friction;
-        const float frictionScaleNext = float2{fNext[1], fNext[2]}.norm();
+        const float frictionScaleNext = length(float2{fNext[1], fNext[2]});
         if (frictionScaleNext > boundsNext && frictionScaleNext > 0)
         {
             fNext[1] *= boundsNext / frictionScaleNext;
@@ -379,7 +388,7 @@ void Manifold::accumulatePenetration(float &r_total, int &r_count) const
 {
     for (int i = 0; i < numContacts; i++)
     {
-        const float penetration = contacts[i].C0.norm();
+        const float penetration = length(contacts[i].C0);
         if (penetration > 0.0f)
         {
             r_total += penetration;

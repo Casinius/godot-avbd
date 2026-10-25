@@ -45,7 +45,7 @@
  * MEMORY MODEL:
  * - std::memory_order_relaxed for cursor updates (no ordering needed)
  * - std::memory_order_acquire/release for barrier sync
- * - Thread-local Eigen scratch avoids false sharing
+ * - The 6x6 solves run on stack scratch, no shared mutable state
  * - Pool-based Manifold allocation avoids heap churn
  *
  * THIS HEADER IS ONLY INCLUDED BY SOLVER.CPP

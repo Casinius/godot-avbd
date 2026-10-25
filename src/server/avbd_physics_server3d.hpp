@@ -49,7 +49,6 @@
 #include <godot_cpp/variant/variant.hpp>
 
 #include "avbd/solver.h"
-#include "avbd/bvh/node_storage.hpp"
 
 namespace godot {
 

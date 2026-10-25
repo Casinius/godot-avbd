@@ -26,14 +26,13 @@
 #include <cmath>
 
 #include "avbd/solver.h"
-#include "avbd/bvh/node_storage.hpp"
 #include "avbd/maths.h"
 
 namespace avbd {
 
 namespace {
 
-const quat kIdentity = quat::Identity();
+const quat kIdentity = quatIdentity;
 
 const float3 &frameAxis(int p_axis)
 {
@@ -48,7 +47,7 @@ GenericJoint::GenericJoint(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, flo
 {
     // The arrangement the joint is created in is its zero. Held as B-relative-to-A in A's frame,
     // the same form angularValues() computes for the live pose, so the two compose directly.
-    rest = frameOrientation().conjugate() * p_bodyB->positionAng;
+    rest = qmul(qconj(frameOrientation()), p_bodyB->positionAng);
 }
 
 quat GenericJoint::frameOrientation() const
@@ -60,12 +59,12 @@ quat GenericJoint::frameOrientation() const
 
 float3 GenericJoint::anchorA() const
 {
-    return bodyA ? bodyA->positionLin + bodyA->positionAng * rA : rA;
+    return bodyA ? bodyA->positionLin + qrot(bodyA->positionAng, rA) : rA;
 }
 
 float3 GenericJoint::anchorB() const
 {
-    return bodyB->positionLin + bodyB->positionAng * rB;
+    return bodyB->positionLin + qrot(bodyB->positionAng, rB);
 }
 
 // Remove the twist about axis `p_axis` from `p_dev`, writing its angle to `r_angle`.
@@ -77,21 +76,20 @@ float3 GenericJoint::anchorB() const
 static void removeTwist(quat &p_dev, int p_axis, float &r_angle)
 {
     const float3 &n = frameAxis(p_axis);
-    const float3 vec_part(p_dev.x(), p_dev.y(), p_dev.z());
-    const float proj = vec_part.dot(n);
+    const float3 vec_part(p_dev.x, p_dev.y, p_dev.z);
+    const float proj = dot(vec_part, n);
 
-    // Pure twist quaternion: vector part is the projection onto n, w unchanged. Eigen's
-    // four-scalar Quaternion constructor is (w, x, y, z).
-    const quat twist(p_dev.w(),
-            p_dev.x() * proj, p_dev.y() * proj, p_dev.z() * proj);
-    if (twist.norm() <= 1.0e-12f)
+    // Pure twist quaternion: vector part is the projection onto n, w unchanged. linalg
+    // stores quaternions as {x, y, z, w}.
+    const quat twist{p_dev.x * proj, p_dev.y * proj, p_dev.z * proj, p_dev.w};
+    if (length(twist) <= 1.0e-12f)
     {
         r_angle = 0.0f;
         return;
     }
 
-    r_angle = 2.0f * std::atan2(proj, static_cast<float>(p_dev.w()));
-    p_dev = p_dev.normalized() * twist.inverse();
+    r_angle = 2.0f * std::atan2(proj, static_cast<float>(p_dev.w));
+    p_dev = qmul(normalize(p_dev), qinv(twist));
 }
 
 void GenericJoint::angularValues(float p_out[3]) const
@@ -111,8 +109,8 @@ void GenericJoint::angularValues(float p_out[3]) const
     // the current one gives identity exactly when the bodies are back where they started, and its
     // axis-angle in A's frame is what each degree of freedom measures.
     const quat qA = frameOrientation();
-    const quat relativeNow = qA.conjugate() * bodyB->positionAng.normalized();
-    quat dev = rest.normalized() * relativeNow.conjugate();
+    const quat relativeNow = qmul(qconj(qA), normalize(bodyB->positionAng));
+    quat dev = qmul(normalize(rest), qconj(relativeNow));
 
     // The twist about every non-locked axis belongs to that axis - a spring or a limit reads
     // its angle - and must not be visible to the locked ones. Removing one twist is exact; with
@@ -128,13 +126,13 @@ void GenericJoint::angularValues(float p_out[3]) const
     for (int i = 0; i < 3; i++)
     {
         if (angular[i].mode == AxisMode::Locked)
-            p_out[i] = static_cast<float>(dev.coeffs()(i) * 2.0f);
+            p_out[i] = static_cast<float>(dev[i] * 2.0f);
     }
 }
 
 float GenericJoint::linearValue(int p_axis) const
 {
-    const float3 offset = frameOrientation().conjugate() * (anchorA() - anchorB());
+    const float3 offset = qrot(qconj(frameOrientation()), anchorA() - anchorB());
     return offset[p_axis];
 }
 
@@ -214,9 +212,9 @@ void GenericJoint::stampAxis(Block &block, const JointAxis &p_axis, float p_valu
     float F;
     if (axisForce(p_axis, p_value, p_alpha, C, F))
     {
-        block.lhsLin += p_jLin * p_jLin.transpose() * p_axis.penalty;
-        block.lhsAng += p_jAng * p_jAng.transpose() * p_axis.penalty;
-        block.lhsCross += p_jAng * p_jLin.transpose() * p_axis.penalty;
+        block.lhsLin += outerprod(p_jLin, p_jLin) * p_axis.penalty;
+        block.lhsAng += outerprod(p_jAng, p_jAng) * p_axis.penalty;
+        block.lhsCross += outerprod(p_jAng, p_jLin) * p_axis.penalty;
         block.rhsLin += p_jLin * F;
         block.rhsAng += p_jAng * F;
     }
@@ -227,9 +225,9 @@ void GenericJoint::stampAxis(Block &block, const JointAxis &p_axis, float p_valu
     {
         const float Cs = p_value - p_axis.springEquilibrium;
         const float Fs = p_axis.springStiffness * Cs - p_axis.springDamping * p_rate;
-        block.lhsLin += p_jLin * p_jLin.transpose() * p_axis.springStiffness;
-        block.lhsAng += p_jAng * p_jAng.transpose() * p_axis.springStiffness;
-        block.lhsCross += p_jAng * p_jLin.transpose() * p_axis.springStiffness;
+        block.lhsLin += outerprod(p_jLin, p_jLin) * p_axis.springStiffness;
+        block.lhsAng += outerprod(p_jAng, p_jAng) * p_axis.springStiffness;
+        block.lhsCross += outerprod(p_jAng, p_jLin) * p_axis.springStiffness;
         block.rhsLin += p_jLin * Fs;
         block.rhsAng += p_jAng * Fs;
     }
@@ -253,10 +251,10 @@ float GenericJoint::penaltyLimit(const Rigid *p_body, float3 p_axis, bool p_angu
     float effective;
     if (p_angular)
     {
-        const float3 local = p_body->positionAng.conjugate() * p_axis;
+        const float3 local = qrot(qconj(p_body->positionAng), p_axis);
         const float3 moment = p_body->moment;
         // n^T I n for a diagonal inertia tensor.
-        effective = local.x() * local.x() * moment.x() + local.y() * local.y() * moment.y() + local.z() * local.z() * moment.z();
+        effective = local.x * local.x * moment.x + local.y * local.y * moment.y + local.z * local.z * moment.z;
     }
     else
     {
@@ -279,7 +277,7 @@ bool GenericJoint::initialize()
     std::array<float, 3> angularValue_;
     angularValues(angularValue_.data());
 
-    const float3 offset = frameOrientation().conjugate() * (anchorA() - anchorB());
+    const float3 offset = qrot(qconj(frameOrientation()), anchorA() - anchorB());
 
     for (int i = 0; i < 3; i++)
     {
@@ -300,11 +298,11 @@ bool GenericJoint::initialize()
 void GenericJoint::updatePrimal(Rigid *body, float alpha, Block &block)
 {
     const quat qA = frameOrientation();
-    const float3 rAWorld = qA * rA;
-    const float3 rBWorld = bodyB->positionAng * rB;
+    const float3 rAWorld = qrot(qA, rA);
+    const float3 rBWorld = qrot(bodyB->positionAng, rB);
 
     // Measurements, in the joint frame.
-    const float3 offset = qA.conjugate() * (anchorA() - anchorB());
+    const float3 offset = qrot(qconj(qA), anchorA() - anchorB());
     std::array<float, 3> angularValue_;
     angularValues(angularValue_.data());
 
@@ -315,8 +313,8 @@ void GenericJoint::updatePrimal(Rigid *body, float alpha, Block &block)
 
     // Relative motion of the two anchors, for spring damping: the rate of change of the linear
     // measurements, so that damping always opposes the spring.
-    const float3 vA = bodyA ? bodyA->velocityLin + bodyA->velocityAng.cross(rAWorld) : float3{0, 0, 0};
-    const float3 vB = bodyB->velocityLin + bodyB->velocityAng.cross(rBWorld);
+    const float3 vA = bodyA ? bodyA->velocityLin + cross(bodyA->velocityAng, rAWorld) : float3{0, 0, 0};
+    const float3 vB = bodyB->velocityLin + cross(bodyB->velocityAng, rBWorld);
     const float3 relativeVelocity = vA - vB;
     const float3 wA = bodyA ? bodyA->velocityAng : float3{0, 0, 0};
     const float3 wB = bodyB->velocityAng;
@@ -324,17 +322,17 @@ void GenericJoint::updatePrimal(Rigid *body, float alpha, Block &block)
     for (int i = 0; i < 3; i++)
     {
         // Linear axes are directions in the world, taken from A's reference frame.
-        const float3 axis = qA * frameAxis(i);
+        const float3 axis = qrot(qA, frameAxis(i));
 
         // Linear: translating the body moves the anchor, and so does turning it - hence the
         // moment arm term.
         const float3 jLin = axis * sign;
-        const float3 jAng = momentArm.cross(jLin);
-        stampAxis(block, linear[i], offset[i], alpha, jLin, jAng, relativeVelocity.dot(axis));
+        const float3 jAng = cross(momentArm, jLin);
+        stampAxis(block, linear[i], offset[i], alpha, jLin, jAng, dot(relativeVelocity, axis));
 
         // Angular: a pure rotation about the joint axis.
         stampAxis(block, angular[i], angularValue_[i], alpha, float3{0, 0, 0}, axis * sign,
-                (wA - wB).dot(axis));
+                dot(wA - wB, axis));
     }
 }
 
@@ -343,7 +341,7 @@ void GenericJoint::updateDual(float alpha)
     std::array<float, 3> angularValue_;
     angularValues(angularValue_.data());
 
-    const float3 offset = frameOrientation().conjugate() * (anchorA() - anchorB());
+    const float3 offset = qrot(qconj(frameOrientation()), anchorA() - anchorB());
 
     for (int i = 0; i < 3; i++)
     {
@@ -371,7 +369,7 @@ void GenericJoint::updateDual(float alpha)
             axis.lambda = F;
 
             // Grow the penalty only up to what the solver can actually resolve; see penaltyLimit.
-            const float3 axisDir = frameOrientation() * frameAxis(i);
+            const float3 axisDir = qrot(frameOrientation(), frameAxis(i));
             float cap = penaltyLimit(bodyB, axisDir, k == 1);
             if (bodyA != 0) cap = std::min(cap, penaltyLimit(bodyA, axisDir, k == 1));
             axis.penalty = std::clamp(axis.penalty + std::abs(C) * betas[k], 0.0f, cap);

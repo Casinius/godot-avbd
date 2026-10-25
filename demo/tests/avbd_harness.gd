@@ -65,9 +65,14 @@ func check_engine() -> void:
 
 # --- simulation helpers -----------------------------------------------------
 
-# Wait for `count` physics ticks; the server steps once per tick (60 Hz headless).
+# Wait for `count` logical steps. Every scenario is written against the reference
+# 60 Hz tick, so scale by the project's actual physics rate: the server steps once
+# per physics tick, and a project may run at 120/240 Hz for stability.
+const LOGICAL_TICKS_PER_SECOND := 60.0
+
 func steps(count: int) -> void:
-	for i in count:
+	var ticks := maxi(1, int(round(float(count) * float(Engine.physics_ticks_per_second) / LOGICAL_TICKS_PER_SECOND)))
+	for i in ticks:
 		await physics_frame
 
 

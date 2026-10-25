@@ -446,7 +446,7 @@ PackedVector3Array AVBDPhysicsServer3D::_space_get_contacts(const RID &p_space) 
         const avbd::Rigid *a = force->bodyA;
         const avbd::Manifold *manifold = static_cast<const avbd::Manifold *>(force);
         for (int i = 0; i < count; i++) {
-            const avbd::float3 world = a->positionLin + a->positionAng * manifold->contacts[i].rA;
+            const avbd::float3 world = a->positionLin + qrot(a->positionAng, manifold->contacts[i].rA);
             out.push_back(to_godot(world));
             if (out.size() >= static_cast<int64_t>(found->second.debug_contacts_max)) {
                 return out;
@@ -1018,7 +1018,7 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
 // The solver sim axis best aligned with a (sim-space) joint axis. The GenericJoint's
 // degrees of freedom are principal axes, so an off-axis hinge snaps to the dominant one.
 static int dominant_sim_axis(const avbd::float3 &axis_sim) {
-    const float abs_axis[3] = {std::fabs(axis_sim.x()), std::fabs(axis_sim.y()), std::fabs(axis_sim.z())};
+    const float abs_axis[3] = {std::fabs(axis_sim.x), std::fabs(axis_sim.y), std::fabs(axis_sim.z)};
     int best = 0;
     if (abs_axis[1] > abs_axis[best]) {
         best = 1;
@@ -1031,7 +1031,7 @@ static int dominant_sim_axis(const avbd::float3 &axis_sim) {
 
 // Sign of the axis' dominant component (+1 / -1), for mirroring limits.
 static float dominant_sim_axis_sign(const avbd::float3 &axis_sim, int solver_axis) {
-    const float value = solver_axis == 0 ? axis_sim.x() : (solver_axis == 1 ? axis_sim.y() : axis_sim.z());
+    const float value = solver_axis == 0 ? axis_sim.x : (solver_axis == 1 ? axis_sim.y : axis_sim.z);
     return value >= 0.0f ? 1.0f : -1.0f;
 }
 
@@ -1331,8 +1331,10 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         space.solver.chebyshevRho = static_cast<float>(std::max(space.chebyshev_rho, 0.0));
         space.solver.adaptiveMaxIterations = std::max(static_cast<int>(space.adaptive_max_iterations), 2);
         space.solver.adaptiveBeta = space.adaptive_beta;
-        // Idle-sleep horizon: 30 steps at the usual 60 Hz tick = Godot's 0.5 s default.
-        space.solver.sleepFrames = 30;
+        // Idle-sleep horizon: Godot's 0.5 s default, expressed in this project's ticks
+        // (30 steps at 60 Hz; 120 at 240 Hz). A fixed step count would make a
+        // high-tick-rate project fall asleep four times sooner than intended.
+        space.solver.sleepFrames = std::max(1, static_cast<int>(std::lround(0.5 / dt)));
 
         // Forces accumulated since the last step (persistent constant_* plus one-shot frame
         // ones) become velocity changes now, so the solver integrates them with everything else.
@@ -1356,10 +1358,10 @@ void AVBDPhysicsServer3D::_step(float p_step) {
             }
             if (torque.length_squared() > 0.0) {
                 // World-frame inverse inertia, as in the node layer's impulse paths.
-                const avbd::float3 local = body.rigid->positionAng.conjugate() * (to_sim(torque) * dt);
-                const avbd::float3 delta{local.x() / body.rigid->moment.x(),
-                        local.y() / body.rigid->moment.y(), local.z() / body.rigid->moment.z()};
-                body.rigid->velocityAng += body.rigid->positionAng * delta;
+                const avbd::float3 local = avbd::qrot(avbd::qconj(body.rigid->positionAng), to_sim(torque) * dt);
+                const avbd::float3 delta{local.x / body.rigid->moment.x,
+                        local.y / body.rigid->moment.y, local.z / body.rigid->moment.z};
+                body.rigid->velocityAng += qrot(body.rigid->positionAng, delta);
             }
         }
         prof_forces += seconds_since(prof_t_forces);
@@ -1424,13 +1426,13 @@ void AVBDPhysicsServer3D::_step(float p_step) {
                     const avbd::Rigid *self_rigid = side == 0 ? force->bodyA : force->bodyB;
                     for (int c = 0; c < count && static_cast<int32_t>(fill->frame_contacts.size()) < fill->max_contacts_reported; c++) {
                         const avbd::float3 world = self_rigid->positionLin
-                                + self_rigid->positionAng
-                                        * (side == 0 ? manifold->contacts[c].rA : manifold->contacts[c].rB);
+                                + avbd::qrot(self_rigid->positionAng,
+                                        side == 0 ? manifold->contacts[c].rA : manifold->contacts[c].rB);
                         BodyData::FrameContact fc;
                         fc.position = to_godot(world);
                         // The basis's first row points from B to A; each side reports the
                         // normal as pointing out of the other body towards itself.
-                        fc.normal = to_godot(avbd::float3{manifold->basis(0, 0), manifold->basis(0, 1), manifold->basis(0, 2)}
+                        fc.normal = to_godot(avbd::float3{manifold->basis[0][0], manifold->basis[1][0], manifold->basis[2][0]}
                                 * (side == 0 ? 1.0f : -1.0f));
                         fc.collider_body_id = other != nullptr ? id_map[other] : 0;
                         fill->frame_contacts.push_back(fc);
@@ -2420,11 +2422,11 @@ void AVBDPhysicsServer3D::_body_apply_impulse(const RID &p_body, const Vector3 &
     rigid.velocityLin += impulse / rigid.mass;
 
     if (p_position.length_squared() > 0.0) {
-        const avbd::float3 torque = to_sim(p_position).cross(impulse);
-        const avbd::float3 local = rigid.positionAng.conjugate() * torque;
-        const avbd::float3 delta{local.x() / rigid.moment.x(), local.y() / rigid.moment.y(),
-                local.z() / rigid.moment.z()};
-        rigid.velocityAng += rigid.positionAng * delta;
+        const avbd::float3 torque = avbd::cross(to_sim(p_position), impulse);
+        const avbd::float3 local = avbd::qrot(avbd::qconj(rigid.positionAng), torque);
+        const avbd::float3 delta{local.x / rigid.moment.x, local.y / rigid.moment.y,
+                local.z / rigid.moment.z};
+        rigid.velocityAng += qrot(rigid.positionAng, delta);
     }
 }
 
@@ -2434,10 +2436,10 @@ void AVBDPhysicsServer3D::_body_apply_torque_impulse(const RID &p_body, const Ve
         return;
     }
     avbd::Rigid &rigid = *body->rigid;
-    const avbd::float3 local = rigid.positionAng.conjugate() * to_sim(p_impulse);
-    const avbd::float3 delta{local.x() / rigid.moment.x(), local.y() / rigid.moment.y(),
-            local.z() / rigid.moment.z()};
-    rigid.velocityAng += rigid.positionAng * delta;
+    const avbd::float3 local = avbd::qrot(avbd::qconj(rigid.positionAng), to_sim(p_impulse));
+    const avbd::float3 delta{local.x / rigid.moment.x, local.y / rigid.moment.y,
+            local.z / rigid.moment.z};
+    rigid.velocityAng += qrot(rigid.positionAng, delta);
 }
 
 void AVBDPhysicsServer3D::_body_apply_central_force(const RID &p_body, const Vector3 &p_force) {
@@ -3050,7 +3052,7 @@ void AVBDPhysicsServer3D::_monitor_areas() {
                 }
                 s.center = to_sim(posed.origin);
                 s.rotation = to_sim(posed.basis.get_rotation_quaternion());
-                s.axis = s.rotation * avbd::float3{0, 0, 1};
+                s.axis = avbd::qrot(s.rotation, avbd::float3{0, 0, 1});
                 return s;
             }());
         }
@@ -3075,9 +3077,9 @@ void AVBDPhysicsServer3D::_monitor_areas() {
                     s.center = r->positionLin;
                     s.rotation = r->positionAng;
                     s.half = r->size * 0.5f;
-                    s.radius = r->size.x();
-                    s.halfHeight = r->size.z() * 0.5f;
-                    s.axis = r->positionAng * avbd::float3{0, 0, 1};
+                    s.radius = r->size.x;
+                    s.halfHeight = r->size.z * 0.5f;
+                    s.axis = qrot(r->positionAng, avbd::float3{0, 0, 1});
                     return s;
                 }();
                 for (const avbd::Shape &shape : area_shapes) {
@@ -3169,7 +3171,7 @@ void AVBDPhysicsServer3D::_monitor_areas() {
                         }
                         other_shape.center = to_sim(posed.origin);
                         other_shape.rotation = to_sim(posed.basis.get_rotation_quaternion());
-                        other_shape.axis = other_shape.rotation * avbd::float3{0, 0, 1};
+                        other_shape.axis = avbd::qrot(other_shape.rotation, avbd::float3{0, 0, 1});
 
                         for (const avbd::Shape &shape : area_shapes) {
                             avbd::Manifold::Contact contact{};

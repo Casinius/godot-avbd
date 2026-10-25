@@ -31,12 +31,12 @@ func test_stack_5() -> Variant:
 		worst_lateral = maxf(worst_lateral, Vector2(pos.x, pos.z).length())
 
 	print("Results: height_error=%.5f, penetration=%.5f, drift=%.5f" % [worst_y, worst_interface, worst_lateral])
-	print("Check: height<=0.2? %s, penetration<=0.05? %s, drift<=0.05? %s" % [
-		worst_y <= 0.2, worst_interface <= 0.05, worst_lateral <= 0.05])
+	print("Check: height<=0.05? %s, penetration<=0.01? %s, drift<=0.01? %s" % [
+		worst_y <= 0.05, worst_interface <= 0.01, worst_lateral <= 0.01])
 
-	check(worst_y <= 0.2, "stack height", "max |y - expected| = %.5f" % worst_y)
-	check(worst_interface <= 0.05, "stack penetration", "worst interface = %.5f m" % worst_interface)
-	check(worst_lateral <= 0.05, "stack drift", "max lateral = %.5f m" % worst_lateral)
+	check(worst_y <= 0.05, "stack height", "max |y - expected| = %.5f" % worst_y)
+	check(worst_interface <= 0.01, "stack penetration", "worst interface = %.5f m" % worst_interface)
+	check(worst_lateral <= 0.01, "stack drift", "max lateral = %.5f m" % worst_lateral)
 
 	var evidence := {"height_error": worst_y, "penetration": worst_interface, "drift": worst_lateral}
 	for node in [ground] + boxes:
@@ -67,12 +67,12 @@ func test_stack_3() -> Variant:
 		worst_lateral = maxf(worst_lateral, Vector2(pos.x, pos.z).length())
 
 	print("Results: height_error=%.5f, penetration=%.5f, drift=%.5f" % [worst_y, worst_interface, worst_lateral])
-	print("Check: height<=0.2? %s, penetration<=0.05? %s, drift<=0.05? %s" % [
-		worst_y <= 0.2, worst_interface <= 0.05, worst_lateral <= 0.05])
+	print("Check: height<=0.05? %s, penetration<=0.01? %s, drift<=0.01? %s" % [
+		worst_y <= 0.05, worst_interface <= 0.01, worst_lateral <= 0.01])
 
-	check(worst_y <= 0.2, "stack height", "max |y - expected| = %.5f" % worst_y)
-	check(worst_interface <= 0.05, "stack penetration", "worst interface = %.5f m" % worst_interface)
-	check(worst_lateral <= 0.05, "stack drift", "max lateral = %.5f m" % worst_lateral)
+	check(worst_y <= 0.05, "stack height", "max |y - expected| = %.5f" % worst_y)
+	check(worst_interface <= 0.01, "stack penetration", "worst interface = %.5f m" % worst_interface)
+	check(worst_lateral <= 0.01, "stack drift", "max lateral = %.5f m" % worst_lateral)
 
 	var evidence := {"height_error": worst_y, "penetration": worst_interface, "drift": worst_lateral}
 	for node in [ground] + boxes:

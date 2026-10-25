@@ -18,8 +18,6 @@
 
 #include "avbd/maths.h"
 #include "avbd/solver.h"
-#include "avbd/bvh/node_storage.hpp"
-#include "avbd/bvh/node_storage.hpp"
 
 namespace avbd {
 
@@ -50,10 +48,10 @@ void sceneStaticFriction(Solver *solver)
 
     const float angle = 30.0f * float(M_PI) / 180.0f;
     Rigid *ramp = new Rigid(solver, {40, 24, 1}, 0.0f, 1.0f, {0, 0, 3});
-    ramp->positionAng = quat(Eigen::AngleAxisf(angle, float3::UnitY()));
+    ramp->positionAng = angleAxis(angle, float3{0, 1, 0});
 
-    float3 rampTangent = (ramp->positionAng * float3{1, 0, 0}).normalized();
-    float3 rampNormal = (ramp->positionAng * float3{0, 0, 1}).normalized();
+    float3 rampTangent = normalize(qrot(ramp->positionAng, float3{1, 0, 0}));
+    float3 rampNormal = normalize(qrot(ramp->positionAng, float3{0, 0, 1}));
 
     for (int i = 0; i <= 10; i++)
     {

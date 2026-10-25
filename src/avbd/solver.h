@@ -18,10 +18,7 @@
 #include <span>
 
 #include "avbd/maths.h"
-#include "avbd/bvh/node_storage.hpp"
-
-// Forward declarations
-namespace bvh::nodes { class NodeStorage; }
+#include "avbd/spatial_hash.hpp"
 
 namespace avbd {
 
@@ -36,8 +33,10 @@ inline constexpr float PENALTY_MIN = 1.0f;
 inline constexpr float PENALTY_MAX = 10000000000.0f;
 // Cap of the adaptive per-contact betaScale multiplier (see Solver::adaptiveBeta).
 inline constexpr float ADAPTIVE_BETA_MAX = 64.0f;
-// Base margin for collision detection to avoid flickering contacts
-inline constexpr float COLLISION_MARGIN_BASE = 0.005f;
+// Base collision margin: a 1 mm skin keeps contacts from flickering on/off at the
+// exact surface. It is deliberately small - the margin is added to the contact
+// error, so a large value is a resting penetration floor.
+inline constexpr float COLLISION_MARGIN_BASE = 0.001f;
 // Margin damping factor per iteration
 inline constexpr float COLLISION_MARGIN_DAMPING = 0.5f;
 // Cap on penetration margin
@@ -148,6 +147,9 @@ struct Rigid
     // step: `inUpdateSet` marks the movable, awake bodies whose pose the primal phases may
     // change. Bodies outside the set (static, sleeping) are never solved or moved.
     bool inUpdateSet = false;
+    // Position of this body in Solver::updateOrder, or -1 when out of the update
+    // set. The colouring reads its neighbours' colours through it.
+    int updateIndex = -1;
     // True when every force on the body is a contact manifold. Only such bodies take the
     // Chebyshev extrapolation: the contact map is clamped and tolerates gamma > 1, hard
     // joints do not.
@@ -176,15 +178,14 @@ struct Block
     // multiplying by a reciprocal would not be bit-identical.
     Block(float mass, float3 moment, float dtSq, float3 positionLin, float3 inertialLin,
           quat positionAng, quat inertialAng) noexcept {
-        // The M/dt^2 diagonal is one value per matrix: three divisions per side instead
-        // of Eigen's nine-entry expression chain, then componentwise products.
+        // The M/dt^2 diagonal is one value per matrix, then componentwise products.
         const float3 massOverDtSq = float3{mass, mass, mass} / dtSq;
         const float3 momentOverDtSq = moment / dtSq;
-        lhsLin = diagonal(massOverDtSq.x(), massOverDtSq.y(), massOverDtSq.z());
-        lhsAng = diagonal(momentOverDtSq.x(), momentOverDtSq.y(), momentOverDtSq.z());
-        lhsCross = float3x3::Zero();
-        rhsLin = massOverDtSq.cwiseProduct(positionLin - inertialLin);
-        rhsAng = momentOverDtSq.cwiseProduct(positionAng - inertialAng);
+        lhsLin = diagonal(massOverDtSq.x, massOverDtSq.y, massOverDtSq.z);
+        lhsAng = diagonal(momentOverDtSq.x, momentOverDtSq.y, momentOverDtSq.z);
+        lhsCross = float3x3{}; // zero
+        rhsLin = cmul(massOverDtSq, positionLin - inertialLin);
+        rhsAng = cmul(momentOverDtSq, positionAng - inertialAng);
     }
 
     // Solve for the update without applying it (block-Jacobi path: each body stores its
@@ -194,10 +195,10 @@ struct Block
         std::array<std::array<float, 6>, 6> a{};
         for (int r = 0; r < 3; r++) {
             for (int c = 0; c < 3; c++) {
-                a[r][c] = lhsLin(r, c);
-                a[r + 3][c + 3] = lhsAng(r, c);
-                a[r + 3][c] = lhsCross(r, c);
-                a[r][c + 3] = lhsCross(c, r);
+                a[r][c] = lhsLin[c][r];
+                a[r + 3][c + 3] = lhsAng[c][r];
+                a[r + 3][c] = lhsCross[c][r];
+                a[r][c + 3] = lhsCross[r][c];
             }
         }
         const std::array<float, 6> b{-rhsLin[0], -rhsLin[1], -rhsLin[2], -rhsAng[0], -rhsAng[1], -rhsAng[2]};
@@ -452,8 +453,8 @@ struct Manifold : Force
         float3x3 jBAng;
     };
     std::array<JacobianCache, 8> jacobianCache;
-    float3x3 rotACaptured = float3x3::Identity(); // body rotations at capture
-    float3x3 rotBCaptured = float3x3::Identity();
+    float3x3 rotACaptured = identity3x3; // body rotations at capture
+    float3x3 rotBCaptured = identity3x3;
     bool jacobiansCached = false;
     // Clamped contact forces from the primal's shared precompute pass; the two body
     // stamps read these instead of each recomputing the same C/F from the snapshot.
@@ -547,16 +548,19 @@ struct Solver
     // the check (default: bit-identical iteration counts). Realistic value ~1e-5.
     float convergenceThreshold = 0.0f;
 
-    // Combine-pass relaxation for the block-Jacobi primal. Every body solves its full
-    // block system against the iteration-start pose snapshot (Jacobi, not Gauss-Seidel),
-    // which for stiff densely-coupled scenes can overshoot where the sequential update
-    // would not; scaling the applied delta by omega < 1 trades per-iteration progress
-    // for stability. 1.0 = unrelaxed. The Chebyshev variant replaces this constant with
-    // a per-iteration schedule. Suite sweep: 0.5-0.7 hold every rigid scene; 1.0 drifts
-    // the 32-layer pyramid.
+    // Combine-pass relaxation for the overflow bucket of the coloured primal - the
+    // bodies the greedy colouring could not fit inside kMaxColours, which run as one
+    // block-Jacobi round against a pose snapshot. Such a snapshot solve can overshoot
+    // where the coloured Gauss-Seidel updates do not; scaling the applied delta by
+    // omega < 1 trades per-iteration progress for stability. 1.0 = unrelaxed. The
+    // Chebyshev variant replaces this constant with a per-iteration schedule. The
+    // bucket is empty in ordinary scenes, so these are tuning knobs for pathological
+    // constraint cliques. Suite sweep: 0.5-0.7 hold every rigid bucket scene; 1.0
+    // drifts a fully-cliqued stack.
     float jacobiRelaxation = 0.7f;
 
-    // Chebyshev semi-iteration over the block-Jacobi primal (0 = off, the default). The
+    // Chebyshev semi-iteration over the overflow bucket's block-Jacobi round
+    // (0 = off, the default). The
     // plain Jacobi estimate x + delta is convex-combined with the previous iterate
     // through the Chebyshev weights for a symmetric iteration matrix with spectral
     // radius <= rho: gamma_0 = 1, gamma_1 = 1/(1 - rho^2/2), then
@@ -594,10 +598,6 @@ struct Solver
     Rigid *bodies = nullptr;
     Force *forces = nullptr;
 
-    // BVH for broad-phase collision detection (SAH-based)
-    bvh::nodes::NodeStorage* bvh = nullptr;
-    bool bvhBuilt = false;
-
     Solver();
     ~Solver();
 
@@ -625,16 +625,15 @@ struct Solver
     void step();
 
     // Decide which bodies the primal phases may move this step (wake-up, island sleep and
-    // the sleep-mode gate), and size the per-body delta buffers.
+    // the sleep-mode gate), size the per-body delta buffers, and colour the constraint
+    // graph for the Gauss-Seidel primal.
     void selectUpdateBodies();
+    // Greedy kMaxColours-bounded colouring of the update set's constraint graph;
+    // bodies that do not fit join the block-Jacobi overflow bucket.
+    void colourGraph();
 
     // Number of worker threads actually in use (1 when running inline).
     [[nodiscard]] int threadCount() const;
-
-    // BVH methods
-    void rebuildBvh();
-    void updateBvhBodyPosition(int bodyIndex);
-    void updateBvh();
 
     // Performance timing counters (ms).
     static double _time_broadPhase;
@@ -660,21 +659,38 @@ private:
     std::vector<Rigid *> warmstartOrder;
 
     // Broad-phase: the body list flattened to index-addressable order (rebuilt every
-    // step), plus the BVH built over those bodies and the candidate pair list.
+    // step), the hierarchical spatial hash over those bodies, and the candidate
+    // pair list (sorted unique (min index, other), the manifold creation order).
     std::vector<Rigid *> bodiesInOrder;
-    bvh::nodes::NodeStorage bvhNodes;
+    SpatialHash broadHash;
     std::vector<std::pair<int, int>> sweepPairs;
 
     // Bodies that take part in the primal update (movable, awake ones), in list order.
-    // The Jacobi primal solves one block system per body against the iteration-start
-    // pose, holding the delta in the parallel buffers below until the combine pass.
+    // The coloured Gauss-Seidel primal solves one block system per body of each
+    // colour and applies it immediately; bodies the greedy colouring cannot fit
+    // inside kMaxColours land in an overflow bucket that runs one block-Jacobi
+    // round (solve every delta against the same snapshot, then combine), using
+    // the delta buffers below.
     std::vector<Rigid *> updateOrder;
     std::vector<float3> bodyDeltaLin;
     std::vector<float3> bodyDeltaAng;
-    // Previous linear iterate per update-set body (the Chebyshev combination's x_{k-1};
-    // only read when chebyshevRho > 0). Angular iterates are not mixed: quats are not a
-    // vector space, so the angular delta only takes the schedule's gamma.
+    // Previous linear iterate per overflow-bucket body (the Chebyshev combination's
+    // x_{k-1}; only read when chebyshevRho > 0). Angular iterates are not mixed:
+    // quats are not a vector space, so the angular delta only takes the gamma.
     std::vector<float3> bodyPrevLin;
+
+    // Constraint-graph colouring, rebuilt by colourGraph() every step. Bodies of
+    // one colour share no force, so a colour's whole set can solve and apply in
+    // parallel (Gauss-Seidel between colours, one barrier each). bodyColour is
+    // indexed by updateOrder position and holds either a colour < kMaxColours or
+    // kMaxColours itself for the block-Jacobi overflow bucket.
+    static constexpr int kMaxColours = 8;
+    static constexpr uint8_t kOverflowColour = kMaxColours;
+    std::vector<uint8_t> bodyColour;
+    std::vector<int> colourBegins; // kMaxColours+1 offsets into colourOrder
+    std::vector<int> colourOrder;  // update-set indices grouped by colour
+    std::vector<int> overflowOrder; // update-set indices of the overflow bucket
+    int colourCount = 0;           // colours in use (<= kMaxColours)
 
     // The force list rebuilt each step so the phases can address forces by index, plus the
     // per-force result of initialize() so that deletion can be done in one thread after the

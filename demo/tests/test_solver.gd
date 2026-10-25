@@ -41,11 +41,13 @@ func test_rest_contact() -> Variant:
 	await steps(240)
 
 	var rest_y := box.global_position.y
-	check(absf(rest_y - 1.0) <= 0.02, "rest contact", "y=%.5f (slab top 0.5 + half box 0.5)" % rest_y)
+	var rest_penetration := 1.0 - rest_y
+	check(rest_penetration <= 0.01, "rest contact",
+			"y=%.5f, penetration=%.5f m (slab top 0.5 + half box 0.5)" % [rest_y, rest_penetration])
 	check(absf(box.linear_velocity.y) <= 0.05, "rest velocity", "vy=%.5f" % box.linear_velocity.y)
 	check(is_finite_body(box), "state finite", "pos=%v" % box.global_position)
 
-	var evidence := {"rest_y": rest_y}
+	var evidence := {"rest_y": rest_y, "penetration": rest_penetration}
 	ground.queue_free()
 	box.queue_free()
 	await frames(2)
@@ -77,9 +79,9 @@ func test_stack() -> Variant:
 		worst_interface = maxf(worst_interface, penetration)
 		worst_lateral = maxf(worst_lateral, Vector2(pos.x, pos.z).length())
 
-	check(worst_y <= 0.2, "stack height", "max |y - expected| = %.5f" % worst_y)
-	check(worst_interface <= 0.05, "stack penetration", "worst interface = %.5f m" % worst_interface)
-	check(worst_lateral <= 0.05, "stack drift", "max lateral = %.5f m" % worst_lateral)
+	check(worst_y <= 0.05, "stack height", "max |y - expected| = %.5f" % worst_y)
+	check(worst_interface <= 0.01, "stack penetration", "worst interface = %.5f m" % worst_interface)
+	check(worst_lateral <= 0.01, "stack drift", "max lateral = %.5f m" % worst_lateral)
 
 	var evidence := {"height_error": worst_y, "penetration": worst_interface, "drift": worst_lateral}
 	for node in [ground] + boxes:

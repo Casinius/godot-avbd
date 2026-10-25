@@ -10,7 +10,6 @@
 */
 
 #include "avbd/solver.h"
-#include "avbd/bvh/node_storage.hpp"
 
 namespace avbd {
 
@@ -21,9 +20,9 @@ Spring::Spring(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, fl
     // A negative rest length means "derive it from the bodies' current pose".
     if (rest < 0.0f)
     {
-        const float3 pA = p_bodyA->positionLin + p_bodyA->positionAng * rA;
-        const float3 pB = p_bodyB->positionLin + p_bodyB->positionAng * rB;
-        rest = (pA - pB).norm();
+        const float3 pA = p_bodyA->positionLin + qrot(p_bodyA->positionAng, rA);
+        const float3 pB = p_bodyB->positionLin + qrot(p_bodyB->positionAng, rB);
+        rest = length(pA - pB);
     }
 }
 
@@ -31,10 +30,10 @@ Spring::Spring(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, fl
 // and its `updateDual` does nothing: hence the unnamed parameters.
 void Spring::updatePrimal(Rigid *body, float /*alpha*/, Block &block)
 {
-    float3 pA = bodyA->positionLin + bodyA->positionAng * rA;
-    float3 pB = bodyB->positionLin + bodyB->positionAng * rB;
+    float3 pA = bodyA->positionLin + qrot(bodyA->positionAng, rA);
+    float3 pB = bodyB->positionLin + qrot(bodyB->positionAng, rB);
     float3 d = pA - pB;
-    float dLen = d.norm();
+    float dLen = length(d);
     if (dLen <= 1.0e-6f)
         return;
 
@@ -47,22 +46,22 @@ void Spring::updatePrimal(Rigid *body, float /*alpha*/, Block &block)
     float3 jAng;
     if (body == bodyA)
     {
-        rWorld = bodyA->positionAng * rA;
+        rWorld = qrot(bodyA->positionAng, rA);
         jLin = n;
-        jAng = rWorld.cross(n);
+        jAng = cross(rWorld, n);
     }
     else
     {
-        rWorld = bodyB->positionAng * rB;
+        rWorld = qrot(bodyB->positionAng, rB);
         jLin = -n;
-        jAng = -rWorld.cross(n);
+        jAng = -cross(rWorld, n);
     }
 
     float3 F = jLin * f;
     float3 Tau = jAng * f;
-    float3x3 Kll = jLin * jLin.transpose() * stiffness;
-    float3x3 Kla = jAng * jLin.transpose() * stiffness;
-    float3x3 Kaa = jAng * jAng.transpose() * stiffness;
+    float3x3 Kll = outerprod(jLin, jLin) * stiffness;
+    float3x3 Kla = outerprod(jAng, jLin) * stiffness;
+    float3x3 Kaa = outerprod(jAng, jAng) * stiffness;
 
     block.lhsLin += Kll;
     block.lhsAng += Kaa;

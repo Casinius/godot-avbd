@@ -20,11 +20,9 @@ add_rules("plugin.compile_commands.autoupdate", { outputdir = "." })
 add_requires("godotcpp4 4.5")
 -- BS::thread_pool: the job pool behind Solver's parallel update. Header-only, MIT, C++17.
 add_requires("thread-pool v5.1.0")
-add_requires("eigen 5.0.1")
 local avbd_core = {
     "src/avbd/rigid.cpp",
-    "src/avbd/bvh/node_storage.cpp",
-    "src/avbd/bvh/bvh.cpp",
+    "src/avbd/spatial_hash.cpp",
     "src/avbd/force.cpp",
     "src/avbd/joint.cpp",
     "src/avbd/generic_joint.cpp",
@@ -85,7 +83,7 @@ target("avbd")
     set_strip("none")
     add_files(table.join(avbd_core, "src/nodes/*.cpp", "src/server/*.cpp"))
     add_includedirs("src")
-    add_packages("godotcpp4", "thread-pool","eigen")
+    add_packages("godotcpp4", "thread-pool")
     add_defines("BS_THREAD_POOL_DISABLE_EXCEPTION_HANDLING")
     set_exceptions("none")
     -- Godot loads the library from the project's bin/ directory.
@@ -102,7 +100,7 @@ target("avbd_core_test")
     set_kind("binary")
     add_files(table.join(avbd_core, "test/core_test.cpp", "tools/core_scenes.cpp"))
     add_includedirs("src", "tools")
-    add_packages("thread-pool","eigen")
+    add_packages("thread-pool")
 
 -- Constraint composition tests (Godot headless, inside the demo project).
 target("avbd_constraint_tests")
