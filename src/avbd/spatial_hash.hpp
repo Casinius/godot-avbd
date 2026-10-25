@@ -33,7 +33,7 @@
 #include <cstdint>
 #include <span>
 #include <vector>
-
+#include "maths.h"
 namespace avbd {
 
 struct Rigid;
@@ -50,7 +50,7 @@ public:
     // `baseCell` <= 0 selects it automatically: the median largest AABB extent
     // of the scene, so half the bodies land in the level-0 big blocks.
     void buildAndCollectPairs(std::span<Rigid *const> bodies, float baseCell,
-                              std::vector<std::pair<int, int>> &out);
+                              std::vector<std::pair<int, int>> &out,std::span<float3> aabbHalfExt);
 
     // Statistics of the last build (diagnostics only).
     int levelCount = 0;

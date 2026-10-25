@@ -197,6 +197,7 @@ struct Block
     // block's members - no by-value matrix copies on the hot path.
     void solveDelta(float3 &r_dxLin, float3 &r_dxAng) const noexcept {
         std::array<std::array<float, 6>, 6> a{};
+        
         for (int r = 0; r < 3; r++) {
             for (int c = 0; c < 3; c++) {
                 a[r][c] = lhsLin[c][r];

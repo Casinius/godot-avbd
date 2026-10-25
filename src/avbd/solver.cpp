@@ -20,7 +20,7 @@
 #include "avbd/list_range.hpp"
 #include "avbd/fixed_stack.hpp"
 #include "avbd/spatial_hash.hpp"
-
+#include "radixsort.hpp"
 namespace avbd {
 
 Solver::Solver()
@@ -208,9 +208,9 @@ void Solver::broadPhase()
     for (int i = 0; i < count; ++i)
         bodyAabbHalf[i] = aabbHalfExtent(*bodiesInOrder[i]);
 
-    broadHash.buildAndCollectPairs(bodiesInOrder, 0.0f, sweepPairs);
+    broadHash.buildAndCollectPairs(bodiesInOrder, 0.0f, sweepPairs,bodyAabbHalf);
 
-    std::sort(sweepPairs.begin(), sweepPairs.end());
+    radix_std::sort(sweepPairs.begin(), sweepPairs.end());
     sweepPairs.erase(std::unique(sweepPairs.begin(), sweepPairs.end()), sweepPairs.end());
     for (const auto &[i, j] : sweepPairs)
     {
@@ -389,6 +389,7 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
         // weights without sharing anything.
         int chebRound = 0;
         float chebGammaPrev = 1.0f;
+        
         for (int it = 0; it < targetIterations; it++)
         {
             const bool newton = it < newtonRounds;
@@ -398,6 +399,7 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
                 // (manifolds stamp self-contained against the live poses, other
                 // forces stamp directly), solve, apply. Bodies of one colour
                 // share no force, so the pass is race-free without a snapshot.
+                
                 for (int c = 0; c < colourCount; c++)
                 {
                     const int first = colourBegins[c];
@@ -518,6 +520,7 @@ void Solver::iterate(int targetIterations, int forceCount, int newtonRounds)
                 Force *f = forceOrder[i];
                 if (!newton && decay < 1.0f && f->isManifold) {
                     Manifold *m = static_cast<Manifold *>(f);
+                    
                     for (int ci = 0, n = m->numContacts; ci < n; ++ci)
                         m->contacts[ci].penalty = min(m->contacts[ci].penalty * decay, float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX});
                 }
@@ -661,7 +664,7 @@ void Solver::islandSleep()
     // bodies enter and leave the island set as sleep_mode and mass change.
     islandForceSlots.clear();
     std::vector<Rigid *> sorted = islandBodies;
-    std::sort(sorted.begin(), sorted.end());
+    radix_std::sort(sorted.begin(), sorted.end());
     for (Force *f = forces; f != 0; f = f->next)
     {
         const auto slotOf = [&sorted](Rigid *b) -> int {
@@ -681,6 +684,7 @@ void Solver::islandSleep()
     // islandAwake[r] = true iff any member is awake; islandStill[r] = min stillFrames.
     std::vector<char> islandAwake(count, 0);
     std::vector<int> islandStill(count, INT_MAX);
+    
     for (int i = 0; i < count; ++i)
     {
         const int r = find(i);
@@ -691,6 +695,7 @@ void Solver::islandSleep()
 
     // Sleep whole islands whose every member has cleared idle detection; leave mixed or
     // awake islands exactly as they are (the per-body wake-up pass above already ran).
+    
     for (int i = 0; i < count; ++i)
     {
         const int r = find(i);

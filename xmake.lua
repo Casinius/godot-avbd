@@ -18,6 +18,7 @@ add_rules("mode.debug", "mode.release")
 add_rules("plugin.compile_commands.autoupdate", { outputdir = "." })
 
 add_requires("godotcpp4 4.5")
+add_requires("unordered_dense v4.8.1")
 -- BS::thread_pool: the job pool behind Solver's parallel update. Header-only, MIT, C++17.
 add_requires("thread-pool v5.1.0")
 local avbd_core = {
@@ -79,17 +80,20 @@ target("avbd")
     avbd_common()
     set_kind("shared")
     set_languages("c++23")
+    set_optimize("fastest")
+    add_cxflags("-pg")
     set_symbols("debug")
     set_strip("none")
     add_files(table.join(avbd_core, "src/nodes/*.cpp", "src/server/*.cpp"))
     add_includedirs("src")
-    add_packages("godotcpp4", "thread-pool")
+    add_packages("godotcpp4", "thread-pool","unordered_dense")
     add_defines("BS_THREAD_POOL_DISABLE_EXCEPTION_HANDLING")
     set_exceptions("none")
     -- Godot loads the library from the project's bin/ directory.
     after_build(function (target)
         local ext = is_plat("windows") and ".dll" or (is_plat("macosx") and ".dylib" or ".so")
         local dst = path.join(os.projectdir(), "demo","gdavbd", "bin", "libavbd.linux.x86_64" .. ext)
+        print("copying library to " .. dst)
         os.mkdir(path.directory(dst))
         os.cp(target:targetfile(), dst)
     end)
@@ -136,6 +140,16 @@ target("avbd_pyramid_tests")
     set_kind("phony")
     on_run(function (target)
         import("scripts.run_godot_tests", {rootdir = "xmake"}).main("res://tests/test_pyramid.gd")
+    end)
+
+-- Long-run penetration detection for the double pyramid (Godot headless). Reads the
+-- solver's own contact error to measure real interpenetration over a long wall of time,
+-- and flags penetration that happens while secondary (re-)collisions resolve. Slower than
+-- the pyramid regression: pass `-- --pen-seconds=N` to bound the run.
+target("avbd_penetration_tests")
+    set_kind("phony")
+    on_run(function (target)
+        import("scripts.run_godot_tests", {rootdir = "xmake"}).main("res://tests/test_penetration.gd")
     end)
 
 -- Run every tier: C++ solver tests, then all Godot suites.

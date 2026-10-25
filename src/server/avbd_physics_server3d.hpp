@@ -36,13 +36,16 @@
 #define AVBD_PHYSICS_SERVER3D_HPP
 
 #include <cstdint>
-#include <unordered_map>
+
+#include <memory>
 #include <vector>
+#include <ankerl/unordered_dense.h>
 
 #include <godot_cpp/classes/physics_direct_body_state3d.hpp>
 #include <godot_cpp/classes/physics_direct_space_state3d.hpp>
 #include <godot_cpp/classes/physics_server3d_extension.hpp>
 #include <godot_cpp/classes/physics_server3d_rendering_server_handler.hpp>
+#include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/callable.hpp>
 #include <godot_cpp/variant/rid.hpp>
 #include <godot_cpp/variant/transform3d.hpp>
@@ -185,8 +188,8 @@ public:
 
         // Parameters of the specialised joints, stored by the server enum value. Their
         // solver mapping happens at rebuild time (see rebuild_space's joint switch).
-        std::unordered_map<int, double> joint_params;
-        std::unordered_map<int, bool> joint_flags;
+        ankerl::unordered_dense::map<int, double> joint_params;
+        ankerl::unordered_dense::map<int, bool> joint_flags;
     };
 
 protected:
@@ -241,7 +244,7 @@ protected:
         // Solver-body -> server id, rebuilt with the space. The direct space state's
         // queries get their candidates back as Rigid* from the BVH; this is the O(1)
         // bridge back to RIDs (body_id_of used to scan every body per result).
-        std::unordered_map<const avbd::Rigid *, uint64_t> rigid_ids;
+        ankerl::unordered_dense::map<const avbd::Rigid *, uint64_t> rigid_ids;
     };
 
     // One area, as the engine described it. Monitored each step against the bodies of
@@ -262,19 +265,23 @@ protected:
         Callable monitor_callback;        // bodies entering/leaving this area
         Callable area_monitor_callback;   // other areas entering/leaving this area
         // Parameters recorded for the getter; they do not act on the solver this round.
-        std::unordered_map<int, Variant> params;
+        ankerl::unordered_dense::map<int, Variant> params;
         // Solver ids inside the area after the last step, for enter/exit diffing.
         std::vector<uint64_t> prev_inside_bodies;
         std::vector<uint64_t> prev_inside_areas;
     };
 
     // Object kinds are kept in separate maps so an id that arrives for the wrong kind is a miss
-    // rather than a reinterpretation.
-    std::unordered_map<uint64_t, SpaceData> spaces;
-    std::unordered_map<uint64_t, BodyData> bodies;
-    std::unordered_map<uint64_t, ShapeData> shapes;
-    std::unordered_map<uint64_t, JointData> joints;
-    std::unordered_map<uint64_t, AreaData> areas;
+    // rather than a reinterpretation. `ankerl::unordered_dense` stores values contiguously and
+    // relocates them on rehash, which is fine for the plain-data records. SpaceData owns a
+    // Solver - a non-movable RAII holder of intrusive lists whose nodes point back at it - so
+    // spaces keeps it behind a stable unique_ptr: the flat map only ever moves the handle,
+    // never the solver, and the space's address survives any rehash.
+    ankerl::unordered_dense::map<uint64_t, std::unique_ptr<SpaceData>> spaces;
+    ankerl::unordered_dense::map<uint64_t, BodyData> bodies;
+    ankerl::unordered_dense::map<uint64_t, ShapeData> shapes;
+    ankerl::unordered_dense::map<uint64_t, JointData> joints;
+    ankerl::unordered_dense::map<uint64_t, AreaData> areas;
 
     uint64_t next_id = 1;
 
@@ -313,7 +320,7 @@ protected:
 
     // Spaces whose body set changed since the last step; rebuilt at the top of _step so
     // a body joining mid-setup lands with its shapes attached.
-    std::unordered_map<uint64_t, bool> space_rebuild_pending;
+    ankerl::unordered_dense::map<uint64_t, bool> space_rebuild_pending;
 
     // Density the solver should see for a body: mass / volume of the first shape, or the house
     // density when no mass was set.
@@ -373,6 +380,15 @@ public:
     double get_solver_colour_graph_time() const;
     double get_solver_solve_time() const;
     double get_solver_finish_time() const;
+
+    // Penetration diagnostics for the headless stress suites. A manifold's contact error
+    // C0 carries the geometric overlap captured at the start of the step: its normal
+    // component is `COLLISION_MARGIN - depth`, so the depth in metres is margin - C0.x.
+    // Returns the deepest contact across every space (0 when nothing penetrates).
+    double get_solver_max_penetration() const;
+    // The deepest contact as [body_a_instance_id, body_b_instance_id, depth] (Godot
+    // instance ids, so a script can resolve the nodes). Empty when nothing penetrates.
+    Array get_solver_deepest_contact() const;
     // Get the singleton instance of AVBDPhysicsServer3D.
     static AVBDPhysicsServer3D *get_singleton();
 
@@ -383,6 +399,8 @@ protected:
         ClassDB::bind_method(D_METHOD("get_solver_colour_graph_time"), &AVBDPhysicsServer3D::get_solver_colour_graph_time);
         ClassDB::bind_method(D_METHOD("get_solver_solve_time"), &AVBDPhysicsServer3D::get_solver_solve_time);
         ClassDB::bind_method(D_METHOD("get_solver_finish_time"), &AVBDPhysicsServer3D::get_solver_finish_time);
+        ClassDB::bind_method(D_METHOD("get_solver_max_penetration"), &AVBDPhysicsServer3D::get_solver_max_penetration);
+        ClassDB::bind_method(D_METHOD("get_solver_deepest_contact"), &AVBDPhysicsServer3D::get_solver_deepest_contact);
         // Target of the ProjectSettings::settings_changed connection made in _init. Bound
         // so the StringName callable can reach it; not meant for scripts.
         ClassDB::bind_method(D_METHOD("_on_project_settings_changed"), &AVBDPhysicsServer3D::_on_project_settings_changed);

@@ -16,7 +16,7 @@
 #include <utility>
 
 #include "solver.h"
-
+#include "radixsort.hpp"
 namespace avbd {
 
 // Pack one cell coordinate triple into a 63-bit key. Coordinates are masked
@@ -32,7 +32,7 @@ namespace avbd {
 }
 
 void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float baseCell,
-                                        std::vector<std::pair<int, int>> &out)
+                                        std::vector<std::pair<int, int>> &out,std::span<float3> aabbHalfExt)
 {
     const int count = static_cast<int>(bodies.size());
     out.clear();
@@ -44,7 +44,7 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
     // further doubling of size.
     extents.resize(count);
     for (int i = 0; i < count; i++) {
-        const float3 half = aabbHalfExtent(*bodies[i]);
+        const float3 half = aabbHalfExt[i];
         extents[i] = 2.0f * std::max(half.x, std::max(half.y, half.z));
     }
     if (!(baseCell > 0.0f)) {
@@ -100,7 +100,7 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
                 (int)std::floor(p.y * invCell), (int)std::floor(p.z * invCell));
         keyed.push_back({key, l, i});
     }
-    std::sort(keyed.begin(), keyed.end(), [](const Keyed &a, const Keyed &b) {
+    radix_std::sort(keyed.begin(), keyed.end(), [](const Keyed &a, const Keyed &b) {
         if (a.level != b.level)
             return a.level < b.level;
         return a.key != b.key ? a.key < b.key : a.body < b.body;
