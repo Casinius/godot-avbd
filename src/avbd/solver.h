@@ -116,7 +116,9 @@ struct Rigid
     bool sleeping = false;
     // Consecutive finishBody() steps with both velocities under the solver's sleep
     // thresholds; reaching SolverParams::Sleep::frames flips `sleeping` on. Only meaningful when the body
-    // is movable and sleep_mode enables sleeping.
+    // is movable and sleep_mode enables sleeping. Intrusive rather than a scratch column on
+    // purpose: islandSleep() reads it for bodies that have no update slot (sleeping ones), so
+    // it cannot be keyed by Rigid::updateSlot.
     int stillFrames = 0;
 
     // Godot-style collision filtering: a pair collides when either side's layer is in the
@@ -147,10 +149,15 @@ struct Rigid
     Rigid(Rigid &&) = delete;
     Rigid &operator=(Rigid &&) = delete;
 
-    // Block-Jacobi update-set bookkeeping, rewritten by Solver::selectUpdateBodies() each
-    // step: `inUpdateSet` marks the movable, awake bodies whose pose the primal phases may
-    // change. Bodies outside the set (static, sleeping) are never solved or moved.
-    bool inUpdateSet = false;
+    // Scratch-set membership, rewritten by Solver::selectUpdateBodies() and
+    // Solver::islandSleep() each step. These are handles into the solver's per-step arrays,
+    // not state of the body: `updateSlot` is the index of this body in `Solver::updateOrder`
+    // (and therefore into the columns of Solver::BodyScratch), and -1 marks a body the primal
+    // phases may not move this step (static, sleeping). `islandSlot` is the same idea for the
+    // union-find's island body list. A handle instead of a flag: the array index the phases
+    // need is then free, and reading one says nothing about the other set.
+    int32_t updateSlot = -1;
+    int32_t islandSlot = -1;
     // True when every force on the body is a contact manifold. Only such bodies take the
     // Chebyshev extrapolation: the contact map is clamped and tolerates gamma > 1, hard
     // joints do not.
@@ -660,14 +667,29 @@ private:
 
     // Bodies that take part in the primal update (movable, awake ones), in list order.
     // The Jacobi primal solves one block system per body against the iteration-start
-    // pose, holding the delta in the parallel buffers below until the combine pass.
+    // pose, holding the delta in the scratch columns below until the combine pass.
     std::vector<Rigid *> updateOrder;
-    std::vector<float3> bodyDeltaLin;
-    std::vector<float3> bodyDeltaAng;
-    // Previous linear iterate per update-set body (the Chebyshev combination's x_{k-1};
-    // only read when chebyshevRho > 0). Angular iterates are not mixed: quats are not a
-    // vector space, so the angular delta only takes the schedule's gamma.
-    std::vector<float3> bodyPrevLin;
+
+    // The per-step, per-body working set, addressed by Rigid::updateSlot. One struct rather
+    // than loose members so the columns that travel together are declared and sized
+    // together - one resize call, in selectUpdateBodies - and an index can never be valid in
+    // one array and stale in the next.
+    struct BodyScratch
+    {
+        std::vector<float3> deltaLin; // the block solve's linear half, per body
+        std::vector<float3> deltaAng; // ... and its angular half
+        // Previous linear iterate, the Chebyshev combination's x_{k-1}; only read when
+        // chebyshevRho > 0. Angular iterates are not mixed: quats are not a vector space, so
+        // the angular delta only takes the schedule's gamma.
+        std::vector<float3> prevLin;
+
+        void resize(size_t bodyCount)
+        {
+            deltaLin.resize(bodyCount);
+            deltaAng.resize(bodyCount);
+            prevLin.resize(bodyCount);
+        }
+    } scratch;
 
     // The force list rebuilt each step so the phases can address forces by index, plus the
     // per-force result of initialize() so that deletion can be done in one thread after the
@@ -675,11 +697,10 @@ private:
     std::vector<Force *> forceOrder;
     std::vector<uint8_t> forceActive;
 
-    // Island scratch (rebuilt when sleep is active): body index base for the union-find,
-    // per-force body slots, and the island id of every movable body (-1 = no island).
+    // Island scratch (rebuilt when sleep is active): the union-find's member list, kept as a
+    // member so its capacity survives between steps. Rigid::islandSlot is the index side of
+    // the deal, which is why the per-force index pairs no longer need storing.
     std::vector<Rigid *> islandBodies;
-    std::vector<std::pair<int, int>> islandForceSlots;
-    std::vector<int> bodyIsland;
 
     std::unique_ptr<detail::JobPool> pool;
     // Sequence of classified stages for one step, rebuilt each time `runSubstep` runs.

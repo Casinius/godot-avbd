@@ -1219,7 +1219,7 @@ static void test_jacobi_shares() {
     for (const Force *f = s.forces; f != nullptr; f = f->next) {
         const Rigid *sides[2] = {f->bodyA, f->bodyB};
         for (const Rigid *side : sides) {
-            if (side != nullptr && side->mass > 0 && !side->sleeping && !side->inUpdateSet)
+            if (side != nullptr && side->mass > 0 && !side->sleeping && side->updateSlot < 0)
                 covered = false;
         }
     }

@@ -594,7 +594,7 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                 if (f->contactPointCount() <= 0)
                     return;
                 Manifold *manifold = static_cast<Manifold *>(f);
-                if (!manifold->bodyA->inUpdateSet && !manifold->bodyB->inUpdateSet)
+                if (manifold->bodyA->updateSlot < 0 && manifold->bodyB->updateSlot < 0)
                     return; // frozen: neither side moves this round
                 manifold->preCompute(params.dual.alpha);
             });
@@ -614,7 +614,7 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                     else
                         f->updatePrimal(body, params.dual.alpha, block);
                 }
-                block.solveDelta(bodyDeltaLin[i], bodyDeltaAng[i]);
+                block.solveDelta(scratch.deltaLin[i], scratch.deltaAng[i]);
             });
             sync.arriveAndWait();
 
@@ -649,15 +649,15 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                 {
                     // Plain relaxed Jacobi - the constant, or the safe fallback for
                     // bodies coupled by joints (extrapolation diverges those).
-                    body->positionLin = body->positionLin + bodyDeltaLin[i] * relax;
-                    body->positionAng = body->positionAng + bodyDeltaAng[i] * relax;
+                    body->positionLin = body->positionLin + scratch.deltaLin[i] * relax;
+                    body->positionAng = body->positionAng + scratch.deltaAng[i] * relax;
                     return;
                 }
                 // x_{k+1} = gamma * (x_k + delta_k) + (1 - gamma) * x_{k-1}
                 const float3 xLin = body->positionLin;
-                body->positionLin = gamma * (xLin + bodyDeltaLin[i]) + (1.0f - gamma) * bodyPrevLin[i];
-                bodyPrevLin[i] = xLin;
-                body->positionAng = body->positionAng + bodyDeltaAng[i] * gamma;
+                body->positionLin = gamma * (xLin + scratch.deltaLin[i]) + (1.0f - gamma) * scratch.prevLin[i];
+                scratch.prevLin[i] = xLin;
+                body->positionAng = body->positionAng + scratch.deltaAng[i] * gamma;
             });
             sync.arriveAndWait();
         }
@@ -781,8 +781,14 @@ void Solver::islandSleep()
     // sleep_mode) is unaffected.
     islandBodies.clear();
     for (Rigid *body = bodies; body != 0; body = body->next)
-        if (body->mass > 0 && body->sleep_mode == 1)
+    {
+        // Every body is tagged here, so a non-member can never carry a stale slot from a
+        // previous step: bodies enter and leave this set as sleep_mode and mass change.
+        const bool member = body->mass > 0 && body->sleep_mode == 1;
+        body->islandSlot = member ? static_cast<int32_t>(islandBodies.size()) : -1;
+        if (member)
             islandBodies.push_back(body);
+    }
 
     const int count = static_cast<int>(islandBodies.size());
     if (count < 2)
@@ -797,26 +803,18 @@ void Solver::islandSleep()
         return x;
     };
 
-    // Slot lookup: map body pointer -> island index once (sorted pointers + binary
-    // search), then each force is two O(log n) lookups. The map is rebuilt each call:
-    // bodies enter and leave the island set as sleep_mode and mass change.
-    islandForceSlots.clear();
-    std::vector<Rigid *> sorted = islandBodies;
-    std::sort(sorted.begin(), sorted.end());
+    // Each force is a union candidate. Both endpoints are read straight from the body, so
+    // the walk is O(F) with no lookup structure; a force with a null endpoint (an anchor)
+    // connects nothing. Unions run in force-list order, exactly as before.
     for (Force *f = forces; f != 0; f = f->next)
     {
-        const auto slotOf = [&sorted](Rigid *b) -> int {
-            const auto it = std::lower_bound(sorted.begin(), sorted.end(), b);
-            return (it != sorted.end() && *it == b) ? static_cast<int>(it - sorted.begin()) : -1;
-        };
-        const int ia = slotOf(f->bodyA);
-        const int ib = slotOf(f->bodyB);
+        if (f->bodyA == nullptr || f->bodyB == nullptr)
+            continue;
+        const int ia = f->bodyA->islandSlot;
+        const int ib = f->bodyB->islandSlot;
         if (ia >= 0 && ib >= 0)
-            islandForceSlots.emplace_back(ia, ib);
+            parent[find(ia)] = find(ib);
     }
-
-    for (const auto &[ia, ib] : islandForceSlots)
-        parent[find(ia)] = find(ib);
 
     // Compose islands: representative -> aggregate state.
     // islandAwake[r] = true iff any member is awake; islandStill[r] = min stillFrames.
@@ -910,8 +908,8 @@ void Solver::selectUpdateBodies()
     {
         warmstartOrder.push_back(body);
 
-        // Fresh per-step state; admitted bodies flip inUpdateSet below.
-        body->inUpdateSet = false;
+        // Fresh per-step state; admitted bodies get their update-set slot below.
+        body->updateSlot = -1;
         body->contactOnly = true;
 
         // Sleep mode support (Godot 4.7 API)
@@ -947,21 +945,16 @@ void Solver::selectUpdateBodies()
             
             if (should_update)
             {
+                body->updateSlot = static_cast<int32_t>(updateOrder.size());
                 updateOrder.push_back(body);
-                body->inUpdateSet = true;
             }
         }
-        else
-        {
-            // Static body: excluded from the update set, so nothing solves for it.
-        }
+        // Static bodies keep the -1 written above: they are never in the update set.
     }
 
-    // Per-body delta buffers for the Jacobi primal's split-solve / combine pair, plus
-    // the previous-iterate buffer the Chebyshev combination reads.
-    bodyDeltaLin.resize(updateOrder.size());
-    bodyDeltaAng.resize(updateOrder.size());
-    bodyPrevLin.resize(updateOrder.size());
+    // The only sizing point for the primal's per-body columns: one call keeps every column
+    // the same length as updateOrder, which is what Rigid::updateSlot indexes into.
+    scratch.resize(updateOrder.size());
 
     // Chebyshev eligibility: a body carrying any non-manifold force (joint, spring, world
     // anchor) extrapolates unsafely - its gamma falls back to the constant relaxation in
