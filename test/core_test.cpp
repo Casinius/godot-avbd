@@ -10,6 +10,7 @@
  *   xmake run avbd_core_test --list          # names of the ported scenes
  *   xmake run avbd_core_test --scene Stack --steps 300
  *   xmake run avbd_core_test --bench         # 512-box pyramid timing
+ *   xmake run avbd_core_test --bench-ratio --threads 8   # serial vs parallel speedup
  */
 
 #include <algorithm>
@@ -21,6 +22,8 @@
 #include <cstdlib>
 #include <ctime>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "avbd/solver.h"
@@ -420,11 +423,9 @@ static uint64_t scene_digest(int threads, int steps) {
     return state_digest(s);
 }
 
-static uint64_t mixed_digest(int threads) {
-    Solver s;
-    s.threads = threads;
-    // Bodies coupled by contacts and joints, plus a free-falling stack, so the update set
-    // is varied: contacts (coupled), joints (coupled), and singletons.
+// Bodies coupled by contacts and joints, plus a free-falling stack, so the update set
+// is varied: contacts (coupled), joints (coupled), and singletons.
+static void build_mixed(Solver &s) {
     new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
     Rigid *prev = 0;
     for (int i = 0; i < 30; i++) {
@@ -435,6 +436,12 @@ static uint64_t mixed_digest(int threads) {
     }
     for (int i = 0; i < 40; i++)
         new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {5.0f + (float)i * 1.2f, 0, 3.0f + (float)(i % 5)});
+}
+
+static uint64_t mixed_digest(int threads) {
+    Solver s;
+    s.threads = threads;
+    build_mixed(s);
     step_n(s, 240);
     return state_digest(s);
 }
@@ -460,6 +467,33 @@ static void test_parallel_equivalence() {
         report(digest == softSerial, name, "0x%016llx vs serial 0x%016llx", (unsigned long long)digest,
                 (unsigned long long)softSerial);
     }
+}
+
+// Two solvers stepped from two host threads. Both must match the serial reference, and
+// neither may deadlock on the shared worker pool: a region reserves its helpers instead of
+// holding a process-global loop mutex, and every join is a per-dispatch latch. With
+// threads=4 each, two regions fit in an 8-thread machine and can overlap.
+static void test_concurrent_solvers() {
+    const uint64_t expected = mixed_digest(1);
+
+    Solver a;
+    Solver b;
+    a.threads = 4;
+    b.threads = 4;
+    build_mixed(a);
+    build_mixed(b);
+
+    std::thread ta([&a] { step_n(a, 240); });
+    std::thread tb([&b] { step_n(b, 240); });
+    ta.join();
+    tb.join();
+
+    const uint64_t da = state_digest(a);
+    const uint64_t db = state_digest(b);
+    report(da == expected, "concurrent solver A", "0x%016llx vs serial 0x%016llx",
+            (unsigned long long)da, (unsigned long long)expected);
+    report(db == expected, "concurrent solver B", "0x%016llx vs serial 0x%016llx",
+            (unsigned long long)db, (unsigned long long)expected);
 }
 
 // Report the parallel shape of each scene: how many bodies the Jacobi primal moves.
@@ -1033,7 +1067,7 @@ static void list_scenes() {
     }
 }
 
-static int run_scene(const std::string &name, int steps, int threads) {
+static int run_scene(const std::string &name, int steps, int threads, bool adaptiveBeta) {
     const CoreScene *scene = find_scene(name);
     if (scene == nullptr) {
         std::fprintf(stderr, "unknown scene: %s\n", name.c_str());
@@ -1041,6 +1075,7 @@ static int run_scene(const std::string &name, int steps, int threads) {
     }
     Solver s;
     s.threads = threads;
+    s.adaptiveBeta = adaptiveBeta;
     scene->build(&s);
     std::printf("scene '%s': %d bodies, %d forces\n", scene->name, count_bodies(s), count_forces(s));
     step_n(s, steps);
@@ -1062,11 +1097,13 @@ static void build_bench_scene(Solver &s) {
     }
 }
 
-static int run_bench(int threads) {
+static int run_bench(int threads, bool adaptiveBeta) {
     Solver s;
     s.threads = threads;
+    s.adaptiveBeta = adaptiveBeta;
     build_bench_scene(s);
-    std::printf("bench: %d boxes, %d iterations\n", count_bodies(s), s.iterations);
+    std::printf("bench: %d boxes, %d iterations, adaptiveBeta=%s\n", count_bodies(s), s.iterations,
+            adaptiveBeta ? "on" : "off");
 
     const int warmup = 30;
     const int timed = 120;
@@ -1084,7 +1121,7 @@ static int run_bench(int threads) {
 
 // Sweep the thread count over the same scene so the speedup (and where it stops) is
 // visible rather than claimed.
-static int run_bench_sweep() {
+static int run_bench_sweep(bool adaptiveBeta) {
     const int warmup = 30;
     const int timed = 120;
     double serialMs = 0.0;
@@ -1092,6 +1129,7 @@ static int run_bench_sweep() {
     for (int threads : {1, 2, 4, 8, 12}) {
         Solver s;
         s.threads = threads;
+        s.adaptiveBeta = adaptiveBeta;
         build_bench_scene(s);
         step_n(s, warmup);
         const auto t0 = std::chrono::steady_clock::now();
@@ -1106,8 +1144,64 @@ static int run_bench_sweep() {
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// Block-Jacobi update-set coverage: two boxes at different heights collide mid-run,
+// One timed run of the bench scene. Returns ms/step and the worker count the solver
+// actually claimed, so the ratio report can name the effective width.
+static std::pair<double, int> bench_once(int threads, bool adaptiveBeta, int warmup, int timed) {
+    Solver s;
+    s.threads = threads;
+    s.adaptiveBeta = adaptiveBeta;
+    build_bench_scene(s);
+    step_n(s, warmup);
+    const auto t0 = std::chrono::steady_clock::now();
+    step_n(s, timed);
+    const auto t1 = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / (double)timed;
+    const bool ok = all_finite(s);
+    return {ok ? ms : -1.0, s.threadCount()};
+}
+
+// Serial vs parallel wall time on the same scene: the thread-accelerate ratio. Warmup
+// precedes the timed steps, and the best of three reps is reported so an unlucky
+// scheduler slice does not define the result. Efficiency is speedup / effective width,
+// which is what tells whether the extra workers are actually earning their keep.
+static int run_bench_ratio(int threads, bool adaptiveBeta) {
+    const int warmup = 30;
+    const int timed = 120;
+    const int reps = 3;
+    double serialMs = 1e30;
+    double parallelMs = 1e30;
+    int workers = 1;
+    bool finite = true;
+
+    for (int r = 0; r < reps; r++) {
+        const auto serial = bench_once(1, adaptiveBeta, warmup, timed);
+        const auto parallel = bench_once(threads, adaptiveBeta, warmup, timed);
+        finite = finite && serial.first > 0.0 && parallel.first > 0.0;
+        if (serial.first > 0.0)
+            serialMs = std::min(serialMs, serial.first);
+        if (parallel.first > 0.0)
+            parallelMs = std::min(parallelMs, parallel.first);
+        workers = parallel.second;
+    }
+
+    if (!finite || serialMs >= 1e30 || parallelMs >= 1e30) {
+        std::printf("bench-ratio: FAIL (non-finite state)\n");
+        return 1;
+    }
+
+    const double speedup = serialMs / parallelMs;
+    const double efficiency = speedup / (double)workers * 100.0;
+    Solver shape;
+    build_bench_scene(shape);
+    std::printf("bench-ratio: adaptiveBeta=%s bodies=%d\n", adaptiveBeta ? "on" : "off",
+            count_bodies(shape));
+    std::printf("bench-ratio: threads=1 %.3f ms/step, threads=%d %.3f ms/step, "
+                "speedup=%.2fx efficiency=%.1f%%\n",
+            serialMs, workers, parallelMs, speedup, efficiency);
+    return 0;
+}
+
+
 // so a contact force appears between bodies whose update-set membership was decided
 // on earlier, force-free steps. Every awake, movable body taking part in a stamping
 // force must be in the update set - otherwise the constraint is silently dropped
@@ -1135,20 +1229,143 @@ static void test_jacobi_shares() {
     (void)b;
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive beta: the per-contact ramp multiplier must react to real penetration,
+// not to the collision margin, must carry its penalty across steps only when the
+// feature is enabled, and must decay back to neutral when the contact is solved.
+// ---------------------------------------------------------------------------
+static Manifold *first_manifold(Solver &s) {
+    for (Force *f = s.forces; f != nullptr; f = f->next) {
+        if (f->contactPointCount() > 0)
+            return static_cast<Manifold *>(f);
+    }
+    return nullptr;
+}
+
+static float max_beta_scale(Solver &s) {
+    float maxScale = 0.0f;
+    for (Force *f = s.forces; f != nullptr; f = f->next) {
+        if (f->contactPointCount() <= 0)
+            continue;
+        const Manifold *m = static_cast<const Manifold *>(f);
+        for (int i = 0; i < m->numContacts; i++)
+            maxScale = std::max(maxScale, m->contacts[i].betaScale);
+    }
+    return maxScale;
+}
+
+// Prime the old contact state that initialize() reads: betaScale/penalty are carried,
+// and C0 expresses the previous step's residual as a penetration depth.
+static void prime_contacts(Manifold *m, float betaScale, float penalty, float prevDepth) {
+    for (int i = 0; i < m->numContacts; i++) {
+        m->contacts[i].betaScale = betaScale;
+        m->contacts[i].penalty = float3{penalty, penalty, penalty};
+        m->contacts[i].C0 = float3{COLLISION_MARGIN - prevDepth, 0, 0};
+    }
+}
+
+static void test_adaptive_beta() {
+    // Off path: the multiplier stays neutral.
+    {
+        Solver s;
+        new Rigid(&s, {10, 10, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
+        new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f});
+        step_n(s, 120);
+        report(first_manifold(s) != nullptr && max_beta_scale(s) == 1.0f,
+                "adaptive beta off is neutral", "max scale = %.3f", max_beta_scale(s));
+    }
+
+    // Direct mechanism: prime the old contact state, run one initialize(), read the result.
+    {
+        Solver s;
+        s.adaptiveBeta = true;
+        new Rigid(&s, {10, 10, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
+        Rigid *box = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f});
+        s.step(); // create the manifold
+        Manifold *m = first_manifold(s);
+        report(m != nullptr, "adaptive beta probe has a manifold", "contacts=%d",
+                m != nullptr ? m->numContacts : 0);
+        if (m == nullptr)
+            return;
+
+        // New violation (previous residual below the floor, fresh one above): doubles, and
+        // the carried penalty decays from its primed value instead of resetting.
+        box->positionLin[2] = 0.49f; // ~1 cm penetration
+        prime_contacts(m, 8.0f, 100.0f, 0.001f);
+        const bool initialized = m->initialize();
+        report(initialized && max_beta_scale(s) == 16.0f, "adaptive beta doubles on a new violation",
+                "max scale = %.3f", max_beta_scale(s));
+        report(m->contacts[0].penalty.x() > 50.0f, "adaptive beta carries the penalty",
+                "penalty = %.3f (primed 100, gamma %.3f)", m->contacts[0].penalty.x(), s.gamma);
+
+        // Cap holds.
+        prime_contacts(m, ADAPTIVE_BETA_MAX, 100.0f, 0.001f);
+        m->initialize();
+        report(max_beta_scale(s) == ADAPTIVE_BETA_MAX, "adaptive beta cap holds",
+                "max scale = %.3f (cap %.1f)", max_beta_scale(s), ADAPTIVE_BETA_MAX);
+
+        // Solved residual: halves back toward neutral.
+        box->positionLin[2] = 0.5f;
+        prime_contacts(m, 8.0f, 100.0f, 0.01f);
+        m->initialize();
+        report(max_beta_scale(s) == 4.0f, "adaptive beta decays when solved",
+                "max scale = %.3f", max_beta_scale(s));
+
+        // With the feature off the same primed penalty restarts at the floor.
+        s.adaptiveBeta = false;
+        prime_contacts(m, 8.0f, 100.0f, 0.01f);
+        m->initialize();
+        report(std::fabs(m->contacts[0].penalty.x() - PENALTY_MIN) < 1e-6f,
+                "adaptive beta off resets the penalty", "penalty = %.3f (floor %.3f)",
+                m->contacts[0].penalty.x(), PENALTY_MIN);
+    }
+
+    // Solved scene (no gravity): a resting contact must not ratchet.
+    {
+        Solver s;
+        s.adaptiveBeta = true;
+        s.gravity = 0.0f;
+        new Rigid(&s, {10, 10, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
+        new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f});
+        step_n(s, 300);
+        report(all_finite(s) && max_beta_scale(s) == 1.0f, "solved contact stays neutral",
+                "max scale = %.3f", max_beta_scale(s));
+    }
+
+    // Loaded scene: the multiplier may grow, but stays finite and capped.
+    {
+        Solver s;
+        s.adaptiveBeta = true;
+        new Rigid(&s, {10, 10, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
+        new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f});
+        step_n(s, 300);
+        report(all_finite(s) && max_beta_scale(s) <= ADAPTIVE_BETA_MAX,
+                "loaded contact stays capped", "max scale = %.3f (cap %.1f)",
+                max_beta_scale(s), ADAPTIVE_BETA_MAX);
+    }
+}
+
 int main(int argc, char **argv) {
     std::string scene;
     int steps = 300;
     int threads = 0; // 0 = automatic
+    bool adaptiveBeta = false;
+    bool benchRatio = false;
 
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--list") {
             list_scenes();
             return 0;
+        } else if (arg == "--adaptive-beta") {
+            adaptiveBeta = true;
         } else if (arg == "--bench") {
-            return run_bench(threads);
+            return run_bench(threads, adaptiveBeta);
         } else if (arg == "--bench-sweep") {
-            return run_bench_sweep();
+            return run_bench_sweep(adaptiveBeta);
+        } else if (arg == "--bench-ratio") {
+            // Deferred so --threads/--adaptive-beta may follow it on the command line.
+            benchRatio = true;
         } else if (arg == "--shape") {
             report_parallel_shape();
             return 0;
@@ -1159,14 +1376,18 @@ int main(int argc, char **argv) {
         } else if (arg == "--threads" && i + 1 < argc) {
             threads = std::atoi(argv[++i]);
         } else {
-            std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --shape | --scene NAME [--steps N]]"
-                                 " [--threads N]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --bench-ratio | --shape |"
+                                 " --scene NAME [--steps N]] [--threads N] [--adaptive-beta]\n", argv[0]);
             return 2;
         }
     }
 
+    if (benchRatio) {
+        return run_bench_ratio(threads, adaptiveBeta);
+    }
+
     if (!scene.empty()) {
-        return run_scene(scene, steps, threads);
+        return run_scene(scene, steps, threads, adaptiveBeta);
     }
 
     test_rest_contact();
@@ -1177,7 +1398,9 @@ int main(int argc, char **argv) {
     test_all_scenes();
     test_determinism();
     test_jacobi_shares();
+    test_adaptive_beta();
     test_parallel_equivalence();
+    test_concurrent_solvers();
     report_parallel_shape();
     test_generic_hinge();
     test_generic_axis_limit();
