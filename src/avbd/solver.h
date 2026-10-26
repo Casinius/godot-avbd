@@ -113,26 +113,23 @@ struct Rigid
     // solver's global gravity; a host may stamp a different value per body (this
     // is how per-body gravity modes are expressed).
     float gravity;
+
+    // The one-byte flags, kept in one run so their padding is spent once instead of once per
+    // field.
     bool sleeping = false;
-    // Consecutive finishBody() steps with both velocities under the solver's sleep
-    // thresholds; reaching SolverParams::Sleep::frames flips `sleeping` on. Only meaningful when the body
-    // is movable and sleep_mode enables sleeping. Intrusive rather than a scratch column on
-    // purpose: islandSleep() reads it for bodies that have no update slot (sleeping ones), so
-    // it cannot be keyed by Rigid::updateSlot.
-    int stillFrames = 0;
-
-    // Godot-style collision filtering: a pair collides when either side's layer is in the
-    // other's mask. Defaults keep every pair colliding, which is what the solver did
-    // before these existed.
-    uint32_t collisionLayer = 1;
-    uint32_t collisionMask = 1;
-
+    // True when every force on the body is a contact manifold. Only such bodies take the
+    // Chebyshev extrapolation: the contact map is clamped and tolerates gamma > 1, hard
+    // joints do not.
+    bool contactOnly = true;
     // Per-axis motion locks, bit 0..2 = solver x, y, z. A locked axis gets no gravity and
     // cannot carry velocity into a step, which is what keeps a locked body hanging in
     // place. Constraint coupling can still move it within a step; that residual is a
     // documented approximation.
     uint8_t axisLockLinear = 0;
     uint8_t axisLockAngular = 0;
+    int8_t sleep_mode = 0; // 0=NEVER, 1=SLEEP, 2=START_IN_SLEEP
+    // Three bytes of this word are still free: the next flag lands here rather than in a new
+    // cache line.
 
     // Mass and inertia follow from the shape, so it is a constructor argument rather than
     // something set afterwards: a body that exists with the wrong inertia is a bug waiting to
@@ -149,6 +146,13 @@ struct Rigid
     Rigid(Rigid &&) = delete;
     Rigid &operator=(Rigid &&) = delete;
 
+    // Consecutive finishBody() steps with both velocities under the solver's sleep
+    // thresholds; reaching SolverParams::Sleep::frames flips `sleeping` on. Only meaningful when the body
+    // is movable and sleep_mode enables sleeping. Intrusive rather than a scratch column on
+    // purpose: islandSleep() reads it for bodies that have no update slot (sleeping ones), so
+    // it cannot be keyed by Rigid::updateSlot.
+    int32_t stillFrames = 0;
+
     // Scratch-set membership, rewritten by Solver::selectUpdateBodies() and
     // Solver::islandSleep() each step. These are handles into the solver's per-step arrays,
     // not state of the body: `updateSlot` is the index of this body in `Solver::updateOrder`
@@ -158,11 +162,27 @@ struct Rigid
     // need is then free, and reading one says nothing about the other set.
     int32_t updateSlot = -1;
     int32_t islandSlot = -1;
-    // True when every force on the body is a contact manifold. Only such bodies take the
-    // Chebyshev extrapolation: the contact map is clamped and tolerates gamma > 1, hard
-    // joints do not.
-    bool contactOnly = true;
-    int sleep_mode = 0; // 0=NEVER, 1=SLEEP, 2=START_IN_SLEEP
+
+    // Godot-style collision filtering: a pair collides when either side's layer is in the
+    // other's mask. Defaults keep every pair colliding, which is what the solver did
+    // before these existed.
+    //
+    // These two, the flags above and `host` below are host vocabulary: the primal never reads
+    // them. They are read once each per step - pairOverlaps() for the layer/mask pair,
+    // warmstartBody() for the axis locks, the update-set selection for sleep_mode - so they
+    // live on the body they describe instead of costing a lookup per body per step. That is
+    // the line this struct holds: solver state and host mapping stay here, per-pass working
+    // sets go in Solver's scratch, and a new field has to say which side it belongs to.
+    uint32_t collisionLayer = 1;
+    uint32_t collisionMask = 1;
+
+    // Host-side back-pointer: the solver never reads or writes it, it exists so a host resolves
+    // a body - and, with it, its own record - from the solver object the broad phase hands back.
+    // A body the host has not registered keeps nullptr. Forces get no such pointer: a host that
+    // reaches a constraint has already reached at least one of its bodies, and the six pointers
+    // plus the vtable fill this object's first 64 bytes exactly, so a byte here would cost a
+    // whole word on every Manifold.
+    void *host = nullptr;
 
     bool constrainedTo(Rigid *other) const;
 };
@@ -203,6 +223,22 @@ struct Block
 };
 
 // Holds all user defined and derived constraint parameters, and provides a common interface for all forces.
+
+// Which constraint a Force actually is, fixed at construction. The solver dispatches on this
+// rather than calling contactPointCount() as a type test: that query answers "how many
+// contacts does this manifold hold right now", and every one of its dispatch uses wanted the
+// type. A fresh or emptied manifold is exactly where the two differ - it holds no contacts
+// yet but is still a manifold - so the count stays a reporting query and the kind carries the
+// dispatch.
+enum class ForceKind : uint8_t
+{
+    Contact,      // Manifold
+    Joint,        // Joint (revolute plus angle constraint)
+    GenericJoint, // the 6-DOF joint
+    Spring,
+    Ignore,       // exists only so the broad phase skips a pair
+};
+
 struct Force
 {
     Solver *solver;
@@ -211,8 +247,9 @@ struct Force
     Force *nextA;
     Force *nextB;
     Force *next;
+    const ForceKind kind;
 
-    Force(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB);
+    Force(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, ForceKind p_kind);
     virtual ~Force();
 
     // Same reason as Rigid: a force is a node in three intrusive lists at once.
@@ -221,13 +258,18 @@ struct Force
     Force(Force &&) = delete;
     Force &operator=(Force &&) = delete;
 
+    // Downcast, valid exactly when `kind == ForceKind::Contact`. Checking the kind is the
+    // caller's job; this does not verify it, and there is nothing cheap to verify.
+    [[nodiscard]] Manifold *asManifold();
+    [[nodiscard]] const Manifold *asManifold() const;
 
     virtual bool initialize() = 0;
     virtual void updatePrimal(Rigid *body, float alpha, Block &block) = 0;
     virtual void updateDual(float alpha) = 0;
 
-    // Number of contact points this force contributes (0 for non-contact forces).
-    // Used for statistics/reporting only; the solver never reads it.
+    // How many contact points this force currently holds (0 for every non-contact force).
+    // A reporting query - penetration statistics, the host's contact list. Dispatch uses
+    // `kind`, which is also not a virtual call.
     virtual int contactPointCount() const { return 0; }
 
     // Accumulate penetration error (total) and positive-penetration contact count, in
@@ -237,10 +279,6 @@ struct Force
     // Whether this constraint has broken and stopped acting on its bodies. Only
     // breakable joints ever report true; every other force is permanent.
     virtual bool isBroken() const { return false; }
-
-    // Host-side ownership tag. The solver never reads or writes it; it exists so a
-    // host can map a force back to its own object, including one the solver removed.
-    void *owner = nullptr;
 };
 
 // Revolute joint + angle constraint between two rigid bodies, with optional fracture
@@ -285,9 +323,10 @@ struct Spring : Force
 // Force which has no physical effect, but is used to ignore collisions between two bodies
 struct IgnoreCollision : Force
 {
-    // No state of its own, so it inherits the base constructor and overrides nothing:
-    // this force exists purely so that two bodies skip each other in the broad phase.
-    using Force::Force;
+    // No state of its own, so it overrides nothing: this force exists purely so that two
+    // bodies skip each other in the broad phase.
+    IgnoreCollision(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB)
+        : Force(p_solver, p_bodyA, p_bodyB, ForceKind::Ignore) {}
 
     bool initialize() override { return true; }
     void updatePrimal(Rigid *, float, Block &) override {}
@@ -398,12 +437,25 @@ struct Manifold : Force
         int key;
     };
 
-    // Contact point information for a single contact
+    // Contact point information for a single contact.
+    //
+    // This is the cross-step half of a manifold's state: warm-started dual variables that a
+    // resting contact carries from one step to the next, matched into the new contact set by
+    // feature id in initialize(). Anything that only means something inside the current step
+    // belongs in JacobianCache below instead - the split is the rule, and the reason it is
+    // worth a rule: Contact lives in a fixed eight-slot array, so a new field here grows every
+    // pooled manifold block and the per-slot copy loop initialize() runs to warm the set up.
+    // Before adding one, ask whether it survives the step; only then does it come here.
     struct Contact
     {
         FeaturePair feature;
         float3 rA; // contact offset in A's local space (relative to center)
         float3 rB; // contact offset in B's local space (relative to center)
+        // The contact's linear constraint at the previous step's geometry, restamped by
+        // initialize() for the current one: the stabilised form blends the live error against
+        // it, and the adaptive-beta rule reads the value just before it is overwritten to
+        // know how far this contact's error moved. Recomputed every step, but its predecessor
+        // has to survive the boundary - which is what puts it here rather than in the cache.
         float3 C0;
         float3 penalty;
         float3 lambda;
@@ -424,6 +476,10 @@ struct Manifold : Force
     // is per BODY (rotations are loop-invariant across a manifold's contacts): rebuild
     // everything when either rotation moved more than jacobianRebuildDistance (unit-
     // column distance ~ 2 sin(angle/2)). Invalidated by initialize() (new contact set).
+    //
+    // Step-scoped state, the other half of the split documented on Contact: a field that
+    // only means something inside the current iteration set goes here, not into the
+    // eight-slot persistent array.
     struct JacobianCache
     {
         float3 rAWorld;
@@ -465,6 +521,11 @@ struct Manifold : Force
 
     static int collide(Rigid *bodyA, Rigid *bodyB, std::span<Contact> contacts, float3x3 &basis);
 };
+
+// Defined here rather than in Force, which is where they are declared: the downcast needs
+// Manifold to be complete, and that happens further down this header.
+inline Manifold *Force::asManifold() { return static_cast<Manifold *>(this); }
+inline const Manifold *Force::asManifold() const { return static_cast<const Manifold *>(this); }
 
 // Discrete shape-pair collision query: up to 8 contact points between two `Shape`s,
 // independent of any solver. `contacts` must hold at least 8 slots (`Manifold`'s

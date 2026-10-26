@@ -36,6 +36,7 @@
 #define AVBD_PHYSICS_SERVER3D_HPP
 
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -80,6 +81,10 @@ public:
 
 protected:
     struct BodyData {
+        // This record's key in `bodies`. A solver body points back here through avbd::Rigid::host,
+        // and the id is what turns it into a RID again - the query paths and the contact reports
+        // both need it, and neither should have to look a record up by address.
+        uint64_t server_id = 0;
         RID space;
         uint64_t instance_id = 0;
         PhysicsServer3D::BodyMode mode = PhysicsServer3D::BODY_MODE_RIGID;
@@ -111,8 +116,15 @@ protected:
         // Collision exceptions: solver ids of bodies this one must never touch.
         std::vector<uint64_t> exceptions;
 
-        // Sleep.
-        bool sleeping = false;
+        // Sleep, one field per producer. `sleep_reported` is the solver's last word: written
+        // only by the end-of-step snapshot, read when a rebuild re-creates the solver body.
+        // `sleep_requested` is a set_sleep_state() call that has not met the solver's word yet -
+        // it is set when the host asks, applied to the solver body at once if it exists (and
+        // remembered as well, so a rebuild in the same step restores the same value), and
+        // replaced by the next report. They were one field, which both directions wrote and
+        // only comments kept from overwriting each other.
+        std::optional<bool> sleep_requested;
+        bool sleep_reported = false;
         bool can_sleep = true;
 
         // Gravity scale (BODY_PARAM_GRAVITY_SCALE); damping is remembered for the getters
@@ -221,11 +233,6 @@ protected:
 
         // Cached direct space state handed to the engine; owned, freed with the space.
         AVBDDirectSpaceState3D *direct_state = nullptr;
-
-        // Solver-body -> server id, rebuilt with the space. The direct space state's
-        // queries get their candidates back as Rigid* from the BVH; this is the O(1)
-        // bridge back to RIDs (body_id_of used to scan every body per result).
-        std::unordered_map<const avbd::Rigid *, uint64_t> rigid_ids;
     };
 
     // One area, as the engine described it. Monitored each step against the bodies of
@@ -281,6 +288,12 @@ protected:
     ShapeData *find_shape(const RID &p_rid);
     SpaceData *find_space(const RID &p_rid);
     AreaData *find_area(const RID &p_rid);
+
+    // The record a solver body belongs to, read through avbd::Rigid::host. Null for a body this
+    // server never registered - one of the node layer's, or one whose record has been freed
+    // while its solver body is still live. A dereference where the query paths used to hash.
+    BodyData *host_of(avbd::Rigid *p_rigid) const;
+    const BodyData *host_of(const avbd::Rigid *p_rigid) const;
 
     // Godot keeps gravity in the project settings rather than handing it to the server.
     static void read_project_gravity(SpaceData &p_space);

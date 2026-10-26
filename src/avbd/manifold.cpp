@@ -21,7 +21,7 @@
 namespace avbd {
 
 Manifold::Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB)
-    : Force(p_solver, p_bodyA, p_bodyB), numContacts(0)
+    : Force(p_solver, p_bodyA, p_bodyB, ForceKind::Contact), numContacts(0)
 {
 }
 
