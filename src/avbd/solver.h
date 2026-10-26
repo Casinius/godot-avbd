@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -36,16 +37,16 @@ class TaskFlow;
 inline constexpr float PENALTY_MIN = 1.0f;
 // Maximum penalty parameter
 inline constexpr float PENALTY_MAX = 10000000000.0f;
-// Cap of the adaptive per-contact betaScale multiplier (see Solver::adaptiveBeta).
+// Cap of the adaptive per-contact betaScale multiplier (see SolverParams::Dual::adaptiveBeta).
 inline constexpr float ADAPTIVE_BETA_MAX = 64.0f;
-// Base margin for collision detection to avoid flickering contacts
-inline constexpr float COLLISION_MARGIN_BASE = 0.005f;
-// Margin damping factor per iteration
-inline constexpr float COLLISION_MARGIN_DAMPING = 0.5f;
-// Cap on penetration margin
-inline constexpr float COLLISION_MARGIN_MAX = 0.02f;
-// Base collision margin for compatibility
-inline constexpr float COLLISION_MARGIN = COLLISION_MARGIN_BASE;
+// Speculative contact margin: the normal constraint is satisfied at the margin surface,
+// not at true zero separation, so a resting contact does not flicker in and out of the
+// broad phase.
+inline constexpr float COLLISION_MARGIN = 0.005f;
+// Cap on the contact error a manifold will model: deeper than this, the residual is
+// clamped (a shape that fell through its partner is not going to be rescued by one more
+// unit of penalty).
+inline constexpr float PENETRATION_MAX = 0.02f;
 // Position threshold for sticking contacts (ie static friction)
 inline constexpr float STICK_THRESH = 0.00001f;
 
@@ -114,7 +115,7 @@ struct Rigid
     float gravity;
     bool sleeping = false;
     // Consecutive finishBody() steps with both velocities under the solver's sleep
-    // thresholds; reaching sleepFrames flips `sleeping` on. Only meaningful when the body
+    // thresholds; reaching SolverParams::Sleep::frames flips `sleeping` on. Only meaningful when the body
     // is movable and sleep_mode enables sleeping.
     int stillFrames = 0;
 
@@ -401,7 +402,7 @@ struct Manifold : Force
         float3 lambda;
         bool stick;
         // Personal multiplier on the betaLin penalty ramp, carried across steps with
-        // the warmstart. Adaptive beta (Solver::adaptiveBeta) raises it for contacts
+        // the warmstart. Adaptive beta (SolverParams::Dual::adaptiveBeta) raises it for contacts
         // whose error stopped shrinking and lets it fall back for converging ones.
         float betaScale = 1.0f;
     };
@@ -476,81 +477,113 @@ int collideShapes(const Shape &a, const Shape &b,
 constexpr int kMinBodiesPerDispatch = 48;
 constexpr int kMinForcesPerDispatch = 256;
 
+// Tuning knobs, grouped by the phase that reads them, so a host can hand the whole set over
+// in one assignment (Solver::setParams) instead of copying field by field, and so every knob
+// has one name and one clamp site.
+//
+// Deliberately NOT in here: dt, gravity, iterations and threads. Those are per-tick inputs
+// the phases read bare and often - dt alone appears in the inertial prediction, the Block
+// construction and the BDF1 finish - and nesting them would add a hop to the hottest lines
+// for no clarity.
+struct SolverParams
+{
+    // The force law and the warm-start decay: read by every constraint, in every primal and
+    // dual pass. `beta*` in particular is unit dependent, which is why these are exposed
+    // rather than fixed.
+    struct Dual
+    {
+        float alpha = 0.99f;       // Stabilization parameter, in (0, 1]
+        float betaLin = 10000.0f;  // Penalty ramping for linear constraints
+        float betaAng = 100.0f;    // Penalty ramping for angular constraints
+        float gamma = 0.999f;      // Warmstarting decay, < 1
+
+        // Adaptive beta: per-contact penalty-ramp multipliers carried across steps,
+        // raised (x2, capped) for contacts whose error did not shrink against last step
+        // and decayed (x0.5, floored at 1) for converging ones - the classic augmented
+        // Lagrangian kappa update, per constraint instead of a global betaLin.
+        bool adaptiveBeta = false;
+        // Residual penetration depth (metres) at or below which a contact counts as solved
+        // by the adaptive-beta update: the multiplier decays toward 1 instead of doubling,
+        // so float-scale noise on a resting contact cannot ratchet it to the cap.
+        float adaptiveBetaErrorFloor = 1e-3f;
+    } dual;
+
+    // How the iteration set is scheduled and relaxed: read by computeIterations and by the
+    // primal/dual rounds, never by the constraint code.
+    struct Primal
+    {
+        // Real-time phase split: the first ceil(newtonRatio * iterations) rounds run the full
+        // Newton primal (dense 6x6 solve); the remaining rounds skip the primal entirely and
+        // run dual-only relaxation on the existing jacobians. 1.0 = original AVBD behaviour.
+        // Newton carries the stiff corrections; the dual-only tail is where the convergence
+        // is cheapest to give up.
+        float newtonRatio = 1.0f;
+        // Per-iteration multiplicative decay applied to contact penalties during the
+        // dual-only tail: a stiff penalty converges slowly under relaxation, softening it
+        // lets the cheap rounds actually converge instead of spinning. 1.0 = no decay.
+        float stiffnessDecay = 1.0f;
+
+        // Upper bound of the adaptive iteration boost. The boost multiplies the round count
+        // by the penetration ratio, so at impact moments a scene pays this many dense rounds
+        // per substep - the frame spike the profiler blames. Lower it for smoother frames;
+        // the healing those rounds did is recovered by substeps at high tick rates instead.
+        int adaptiveMaxIterations = 16;
+
+        // Early-exit threshold on the mean penetration residual: when a Newton round
+        // improves the average residual by less than this (or worsens it), the iteration set
+        // ends early - remaining rounds would polish float noise at full price. 0 disables
+        // the check (default: bit-identical iteration counts). Realistic value ~1e-5.
+        float convergenceThreshold = 0.0f;
+
+        // Combine-pass relaxation for the block-Jacobi primal. Every body solves its full
+        // block system against the iteration-start pose snapshot (Jacobi, not Gauss-Seidel),
+        // which for stiff densely-coupled scenes can overshoot where the sequential update
+        // would not; scaling the applied delta by omega < 1 trades per-iteration progress
+        // for stability. 1.0 = unrelaxed. The Chebyshev variant replaces this constant with
+        // a per-iteration schedule. Suite sweep: 0.5-0.7 hold every rigid scene; 1.0 drifts
+        // the 32-layer pyramid.
+        float jacobiRelaxation = 0.7f;
+
+        // Chebyshev semi-iteration over the block-Jacobi primal (0 = off, the default). The
+        // plain Jacobi estimate x + delta is convex-combined with the previous iterate
+        // through the Chebyshev weights for a symmetric iteration matrix with spectral
+        // radius <= rho: gamma_0 = 1, gamma_1 = 1/(1 - rho^2/2), then
+        // gamma_{k+1} = 1/(1 - rho^2 * gamma_k / 4). Only pure-contact bodies take it
+        // (Rigid::contactOnly): extrapolation diverges joint chains. Suite sweeps: rho=0.9
+        // recovers deep-stack penetration (0.058 -> 0.027 m on the 10-box stack) but
+        // diverges the 32-layer stack's interfaces; rho=0.7 is safe but the prev-mixing
+        // smoothing gives back what the extrapolation gains. The textbook schedule assumes
+        // a linear map; this one is clamped with ramping penalties, so it ships default-off
+        // as a per-scene experiment rather than a win.
+        float chebyshevRho = 0.0f;
+
+        // Incremental jacobian rebuild distance (metres): after the first Newton round
+        // assembles a contact's angular jacobian, later rounds reuse it while the contact's
+        // world-space moment arms have drifted less than this from the captured values.
+        // 0 disables caching (full assembly every round; default, bit-identical digests).
+        // Realistic value 1e-4 (0.1 mm): in-iteration arm drift is millimetre-scale.
+        float jacobianRebuildDistance = 0.0f;
+    } primal;
+
+    // Idle detection: a movable body whose BDF1 velocities stay under both thresholds for
+    // `frames` consecutive steps falls asleep (velocity zeroed, Godot semantics).
+    // 0 disables automatic sleeping; the core tests rely on the default for bit-identical
+    // digests. Thresholds follow Godot's space-parameter defaults.
+    struct Sleep
+    {
+        float linearThreshold = 0.1f;       // m/s
+        float angularThreshold = 0.139626f; // rad/s (Godot default: 8 deg/s)
+        int frames = 0;                     // steps below thresholds before sleeping
+    } sleep;
+};
+
 // Core solver class which holds all the rigid bodies and forces, and has logic to step the simulation forward in time
 struct Solver
 {
-    // Parameter defaults. Tuned for metre/kilogram/second scenes; `beta*` in particular is
-    // unit dependent, which is why they are exposed rather than fixed.
+    // Per-tick inputs, tuned for metre/kilogram/second scenes.
     float dt = 1.0f / 60.0f; // Timestep
     float gravity = -10.0f;  // Gravity, along -Z
     int iterations = 10;     // Solver iterations per step
-
-    float alpha = 0.99f;    // Stabilization parameter, in (0, 1]
-    float betaLin = 10000.0f;  // Penalty ramping for linear constraints
-    float betaAng = 100.0f;    // Penalty ramping for angular constraints
-    float gamma = 0.999f;      // Warmstarting decay, < 1
-
-    // Real-time phase split: the first ceil(newtonRatio * iterations) rounds run the full
-    // Newton primal (dense 6x6 solve); the remaining rounds skip the primal entirely and
-    // run dual-only relaxation on the existing jacobians. 1.0 = original AVBD behaviour.
-    // Newton carries the stiff corrections; the dual-only tail is where the convergence
-    // is cheapest to give up.
-    float newtonRatio = 1.0f;
-    // Per-iteration multiplicative decay applied to contact penalties during the
-    // dual-only tail: a stiff penalty converges slowly under relaxation, softening it
-    // lets the cheap rounds actually converge instead of spinning. 1.0 = no decay.
-    float stiffnessDecay = 1.0f;
-
-    // Adaptive beta: per-contact penalty-ramp multipliers carried across steps,
-    // raised (x2, capped) for contacts whose error did not shrink against last step
-    // and decayed (x0.5, floored at 1) for converging ones - the classic augmented
-    // Lagrangian kappa update, per constraint instead of a global betaLin.
-    bool adaptiveBeta = false;
-    // Residual penetration depth (metres) at or below which a contact counts as solved
-    // by the adaptive-beta update: the multiplier decays toward 1 instead of doubling,
-    // so float-scale noise on a resting contact cannot ratchet it to the cap.
-    float adaptiveBetaErrorFloor = 1e-3f;
-
-    // Upper bound of the adaptive iteration boost. The boost multiplies the round count
-    // by the penetration ratio, so at impact moments a scene pays this many dense rounds
-    // per substep - the frame spike the profiler blames. Lower it for smoother frames;
-    // the healing those rounds did is recovered by substeps at high tick rates instead.
-    int adaptiveMaxIterations = 16;
-
-    // Early-exit threshold on the mean penetration residual: when a Newton round
-    // improves the average residual by less than this (or worsens it), the iteration set
-    // ends early - remaining rounds would polish float noise at full price. 0 disables
-    // the check (default: bit-identical iteration counts). Realistic value ~1e-5.
-    float convergenceThreshold = 0.0f;
-
-    // Combine-pass relaxation for the block-Jacobi primal. Every body solves its full
-    // block system against the iteration-start pose snapshot (Jacobi, not Gauss-Seidel),
-    // which for stiff densely-coupled scenes can overshoot where the sequential update
-    // would not; scaling the applied delta by omega < 1 trades per-iteration progress
-    // for stability. 1.0 = unrelaxed. The Chebyshev variant replaces this constant with
-    // a per-iteration schedule. Suite sweep: 0.5-0.7 hold every rigid scene; 1.0 drifts
-    // the 32-layer pyramid.
-    float jacobiRelaxation = 0.7f;
-
-    // Chebyshev semi-iteration over the block-Jacobi primal (0 = off, the default). The
-    // plain Jacobi estimate x + delta is convex-combined with the previous iterate
-    // through the Chebyshev weights for a symmetric iteration matrix with spectral
-    // radius <= rho: gamma_0 = 1, gamma_1 = 1/(1 - rho^2/2), then
-    // gamma_{k+1} = 1/(1 - rho^2 * gamma_k / 4). Only pure-contact bodies take it
-    // (Rigid::contactOnly): extrapolation diverges joint chains. Suite sweeps: rho=0.9
-    // recovers deep-stack penetration (0.058 -> 0.027 m on the 10-box stack) but
-    // diverges the 32-layer stack's interfaces; rho=0.7 is safe but the prev-mixing
-    // smoothing gives back what the extrapolation gains. The textbook schedule assumes
-    // a linear map; this one is clamped with ramping penalties, so it ships default-off
-    // as a per-scene experiment rather than a win.
-    float chebyshevRho = 0.0f;
-
-    // Incremental jacobian rebuild distance (metres): after the first Newton round
-    // assembles a contact's angular jacobian, later rounds reuse it while the contact's
-    // world-space moment arms have drifted less than this from the captured values.
-    // 0 disables caching (full assembly every round; default, bit-identical digests).
-    // Realistic value 1e-4 (0.1 mm): in-iteration arm drift is millimetre-scale.
-    float jacobianRebuildDistance = 0.0f;
 
     // Worker threads for the per-body phases. 0 = one per hardware thread, 1 = run
     // everything inline on the calling thread. The result does not depend on this value:
@@ -558,21 +591,26 @@ struct Solver
     // its own delta.
     int threads = 0;
 
-    // Idle detection: a movable body whose BDF1 velocities stay under both thresholds for
-    // this many consecutive steps falls asleep (velocity zeroed, Godot semantics).
-    // 0 disables automatic sleeping; the core tests rely on the default for bit-identical
-    // digests. Thresholds follow Godot's space-parameter defaults.
-    float sleepLinearThreshold = 0.1f;       // m/s
-    float sleepAngularThreshold = 0.139626f; // rad/s (Godot default: 8 deg/s)
-    int sleepFrames = 0;                     // steps below thresholds before sleeping
+    SolverParams params;
+
+    // The host's entry point for the tuning knobs. Range fixing happens here, once, so the
+    // phases can read their knobs bare and a bad project setting cannot reach the math.
+    void setParams(SolverParams p)
+    {
+        p.primal.newtonRatio = std::clamp(p.primal.newtonRatio, 0.0f, 1.0f);
+        p.primal.stiffnessDecay = std::clamp(p.primal.stiffnessDecay, 0.0f, 1.0f);
+        p.primal.jacobianRebuildDistance = std::max(p.primal.jacobianRebuildDistance, 0.0f);
+        p.primal.chebyshevRho = std::max(p.primal.chebyshevRho, 0.0f);
+        p.primal.adaptiveMaxIterations = std::max(p.primal.adaptiveMaxIterations, 2);
+        p.sleep.linearThreshold = std::max(p.sleep.linearThreshold, 0.0f);
+        p.sleep.angularThreshold = std::max(p.sleep.angularThreshold, 0.0f);
+        p.sleep.frames = std::max(p.sleep.frames, 0);
+        params = p;
+    }
 
     // Heads of the two intrusive lists. Owned: `clear()` deletes through them.
     Rigid *bodies = nullptr;
     Force *forces = nullptr;
-
-    // BVH for broad-phase collision detection (SAH-based)
-    bvh::nodes::NodeStorage* bvh = nullptr;
-    bool bvhBuilt = false;
 
     Solver();
     ~Solver();
@@ -606,27 +644,6 @@ struct Solver
 
     // Number of worker threads actually in use (1 when running inline).
     [[nodiscard]] int threadCount() const;
-
-    // BVH methods
-    void rebuildBvh();
-    void updateBvhBodyPosition(int bodyIndex);
-    void updateBvh();
-
-    // Performance timing counters (ms).
-    static double _time_broadPhase;
-    static double _time_colourGraph;
-    static double _time_solve;
-    static double _time_finish;
-
-    // Performance timing getters (ms). Returns 0 if timing is not active.
-    [[nodiscard]] static double get_broadPhase_time() { return 0.0; }
-    [[nodiscard]] static double get_colourGraph_time() { return 0.0; }
-    [[nodiscard]] static double get_solve_time() { return 0.0; }
-    [[nodiscard]] static double get_finish_time() { return 0.0; }
-    // Reset all timing counters to zero.
-    static void reset_timing();
-    // Get current CPU time in microseconds.
-    static double get_time();
 
 private:
     // Every body in list order. The inertial/warmstart and BDF1 phases run over this,
@@ -668,20 +685,9 @@ private:
     // Sequence of classified stages for one step, rebuilt each time `runSubstep` runs.
     std::unique_ptr<detail::TaskFlow> flow;
 
-    // Current collision margin for this frame (dynamically adjusted)
-    float currentCollisionMargin = COLLISION_MARGIN_BASE;
-
     // Adaptive iteration count parameters
     float maxPenetrationError = 1e-4f; // Target penetration error tolerance
     bool adaptiveIterations = true;    // Enable adaptive iteration count
-
-    // Compute dynamic collision margin based on penetration depth and timestep
-    inline float computeCollisionMargin(float penetrationDepth, float timestep)
-    {
-        // Dynamically reduce penetration margin as solver converges
-        // Use penetration depth to avoid oscillation
-        return std::min(COLLISION_MARGIN_BASE + penetrationDepth * 0.1f *timestep, COLLISION_MARGIN_MAX);
-    }
 
     // Create the pool on first use so that a serial solver never spawns threads.
     void ensurePool();

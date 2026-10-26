@@ -348,19 +348,24 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
         return;
     }
 
+    avbd::SolverParams &params = p_space.params;
     p_space.threads = static_cast<int>(settings->get_setting("physics/avbd/threads", 0));
     p_space.iterations = static_cast<int>(settings->get_setting("physics/avbd/iterations", 4));
-    p_space.alpha = settings->get_setting("physics/avbd/alpha", 0.99);
-    p_space.beta_linear = settings->get_setting("physics/avbd/beta_linear", 1e5);
-    p_space.beta_angular = settings->get_setting("physics/avbd/beta_angular", 1e2);
-    p_space.gamma = settings->get_setting("physics/avbd/gamma", 0.999);
     p_space.substeps = static_cast<int>(settings->get_setting("physics/avbd/substeps", 2));
-    p_space.newton_ratio = settings->get_setting("physics/avbd/newton_ratio", 0.5);
-    p_space.stiffness_decay = settings->get_setting("physics/avbd/stiffness_decay", 0.8);
-    p_space.jacobian_rebuild_distance = settings->get_setting("physics/avbd/jacobian_rebuild_distance", 0.0);
-    p_space.chebyshev_rho = settings->get_setting("physics/avbd/chebyshev_rho", 0.0);
-    p_space.adaptive_max_iterations = settings->get_setting("physics/avbd/adaptive_max_iterations", 16.0);
-    p_space.adaptive_beta = settings->get_setting("physics/avbd/adaptive_beta", false);
+
+    params.dual.alpha = static_cast<float>(settings->get_setting("physics/avbd/alpha", 0.99));
+    params.dual.betaLin = static_cast<float>(settings->get_setting("physics/avbd/beta_linear", 1e5));
+    params.dual.betaAng = static_cast<float>(settings->get_setting("physics/avbd/beta_angular", 1e2));
+    params.dual.gamma = static_cast<float>(settings->get_setting("physics/avbd/gamma", 0.999));
+    params.dual.adaptiveBeta = static_cast<bool>(settings->get_setting("physics/avbd/adaptive_beta", false));
+
+    params.primal.newtonRatio = static_cast<float>(settings->get_setting("physics/avbd/newton_ratio", 0.5));
+    params.primal.stiffnessDecay = static_cast<float>(settings->get_setting("physics/avbd/stiffness_decay", 0.8));
+    params.primal.jacobianRebuildDistance =
+            static_cast<float>(settings->get_setting("physics/avbd/jacobian_rebuild_distance", 0.0));
+    params.primal.chebyshevRho = static_cast<float>(settings->get_setting("physics/avbd/chebyshev_rho", 0.0));
+    params.primal.adaptiveMaxIterations =
+            static_cast<int>(settings->get_setting("physics/avbd/adaptive_max_iterations", 16.0));
 }
 
 void AVBDPhysicsServer3D::_space_set_active(const RID &p_space, bool p_active) {
@@ -917,7 +922,7 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
         axis_locks_to_sim(body.axis_locks, body.rigid->axisLockLinear, body.rigid->axisLockAngular);
         body.rigid->sleeping = body.sleeping;
         // Solver sleep modes: 0 = never sleeps, 1 = may sleep. Idle detection lives in the
-        // solver (Solver::sleepFrames); can_sleep only opens the gate.
+        // solver (SolverParams::Sleep::frames); can_sleep only opens the gate.
         body.rigid->sleep_mode = body.can_sleep ? 1 : 0;
         body.rigid->gravity = space->solver.gravity * static_cast<float>(body.gravity_scale);
     }
@@ -1319,20 +1324,12 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         const int substeps = space.substeps > 0 ? space.substeps : 1;
         space.solver.dt = dt / static_cast<float>(substeps);
         space.solver.iterations = space.iterations > 0 ? space.iterations : space.solver.iterations;
-        space.solver.alpha = static_cast<float>(space.alpha);
-        space.solver.betaLin = static_cast<float>(space.beta_linear);
-        space.solver.betaAng = static_cast<float>(space.beta_angular);
-        space.solver.gamma = static_cast<float>(space.gamma);
         space.solver.threads = space.threads;
-        // Newton/impulse phase split and tail-stiffness decay (real-time trade-off knobs).
-        space.solver.newtonRatio = static_cast<float>(std::clamp(space.newton_ratio, 0.0, 1.0));
-        space.solver.stiffnessDecay = static_cast<float>(std::clamp(space.stiffness_decay, 0.0, 1.0));
-        space.solver.jacobianRebuildDistance = static_cast<float>(std::max(space.jacobian_rebuild_distance, 0.0));
-        space.solver.chebyshevRho = static_cast<float>(std::max(space.chebyshev_rho, 0.0));
-        space.solver.adaptiveMaxIterations = std::max(static_cast<int>(space.adaptive_max_iterations), 2);
-        space.solver.adaptiveBeta = space.adaptive_beta;
+        avbd::SolverParams params = space.params;
         // Idle-sleep horizon: 30 steps at the usual 60 Hz tick = Godot's 0.5 s default.
-        space.solver.sleepFrames = 30;
+        // Stamped per step rather than read from settings, because it counts solver steps.
+        params.sleep.frames = 30;
+        space.solver.setParams(params);
 
         // Forces accumulated since the last step (persistent constant_* plus one-shot frame
         // ones) become velocity changes now, so the solver integrates them with everything else.
@@ -2176,37 +2173,9 @@ double AVBDPhysicsServer3D::body_state_step() const {
     return 0.0;
 }
 
-double AVBDPhysicsServer3D::get_solver_broad_phase_time() const {
-    for (const auto &[id, space] : spaces) {
-        (void)id;
-        return space.solver.get_broadPhase_time();
-    }
-    return 0.0;
-}
-
-double AVBDPhysicsServer3D::get_solver_colour_graph_time() const {
-    for (const auto &[id, space] : spaces) {
-        (void)id;
-        return space.solver.get_colourGraph_time();
-    }
-    return 0.0;
-}
-
-double AVBDPhysicsServer3D::get_solver_solve_time() const {
-    for (const auto &[id, space] : spaces) {
-        (void)id;
-        return space.solver.get_solve_time();
-    }
-    return 0.0;
-}
-
-double AVBDPhysicsServer3D::get_solver_finish_time() const {
-    for (const auto &[id, space] : spaces) {
-        (void)id;
-        return space.solver.get_finish_time();
-    }
-    return 0.0;
-}
+// Solver phase timings were exposed here once the solver had per-phase counters; the
+// counters were dead code (every getter returned a constant), and the live instrumentation
+// is the AVBD_PROFILE step profile in _step. The GDScript surface is gone with them.
 
 AVBDPhysicsServer3D *AVBDPhysicsServer3D::get_singleton() {
     return SpaceData::singleton;

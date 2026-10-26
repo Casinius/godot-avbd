@@ -501,6 +501,7 @@ void Solver::warmstartBody(int i)
 // region starts; every participant then reads the same values.
 void Solver::computeIterations(int &r_targetIterations, int &r_newtonRounds)
 {
+    const SolverParams::Primal &primal = params.primal;
     int targetIterations = iterations;
 
     if (adaptiveIterations)
@@ -518,14 +519,14 @@ void Solver::computeIterations(int &r_targetIterations, int &r_newtonRounds)
             targetIterations = static_cast<int>(std::round(iterations * avgPenetration / maxPenetrationError));
         }
         targetIterations = std::max(2, targetIterations);  // Minimum 2 iterations
-        targetIterations = std::min(targetIterations, adaptiveMaxIterations); // Impact-moment cost bound; see the member comment.
+        targetIterations = std::min(targetIterations, primal.adaptiveMaxIterations); // Impact-moment cost bound; see the knob comment.
     }
 
     r_targetIterations = targetIterations;
     // newtonRatio splits the set: the leading rounds run primal + dual, the tail runs
     // dual-only relaxation (optionally with penalty decay via stiffnessDecay).
     r_newtonRounds = std::clamp(
-            static_cast<int>(std::ceil(newtonRatio * static_cast<float>(targetIterations))), 0, targetIterations);
+            static_cast<int>(std::ceil(primal.newtonRatio * static_cast<float>(targetIterations))), 0, targetIterations);
 }
 
 // One step: body warmstart (independent), the block-Jacobi iteration region, then the BDF1
@@ -595,7 +596,7 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                 Manifold *manifold = static_cast<Manifold *>(f);
                 if (!manifold->bodyA->inUpdateSet && !manifold->bodyB->inUpdateSet)
                     return; // frozen: neither side moves this round
-                manifold->preCompute(alpha);
+                manifold->preCompute(params.dual.alpha);
             });
             sync.arriveAndWait();
 
@@ -611,7 +612,7 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                     if (f->contactPointCount() > 0)
                         static_cast<Manifold *>(f)->stampCached(body, block);
                     else
-                        f->updatePrimal(body, alpha, block);
+                        f->updatePrimal(body, params.dual.alpha, block);
                 }
                 block.solveDelta(bodyDeltaLin[i], bodyDeltaAng[i]);
             });
@@ -625,10 +626,14 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
             // not, and the first-order quat integration stays exact as written. A
             // body with no constraints solves to exactly its inertial pose - free
             // flight falls out of the same path.
-            float gamma = jacobiRelaxation;
-            if (chebyshevRho > 0.0f)
+            // Read once per round: both are loop-invariant inside the combine pass, where
+            // every body in the update set reads them.
+            const float relax = params.primal.jacobiRelaxation;
+            const float rho = params.primal.chebyshevRho;
+            float gamma = relax;
+            if (rho > 0.0f)
             {
-                const float rho2 = chebyshevRho * chebyshevRho;
+                const float rho2 = rho * rho;
                 if (chebRound == 0)
                     gamma = 1.0f;
                 else if (chebRound == 1)
@@ -638,14 +643,14 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                 chebGammaPrev = gamma;
             }
             chebRound++;
-            sync.forItems(static_cast<int>(updateOrder.size()), [this, gamma](int i) {
+            sync.forItems(static_cast<int>(updateOrder.size()), [this, gamma, rho, relax](int i) {
                 Rigid *body = updateOrder[i];
-                if (chebyshevRho <= 0.0f || !body->contactOnly)
+                if (rho <= 0.0f || !body->contactOnly)
                 {
                     // Plain relaxed Jacobi - the constant, or the safe fallback for
                     // bodies coupled by joints (extrapolation diverges those).
-                    body->positionLin = body->positionLin + bodyDeltaLin[i] * jacobiRelaxation;
-                    body->positionAng = body->positionAng + bodyDeltaAng[i] * jacobiRelaxation;
+                    body->positionLin = body->positionLin + bodyDeltaLin[i] * relax;
+                    body->positionAng = body->positionAng + bodyDeltaAng[i] * relax;
                     return;
                 }
                 // x_{k+1} = gamma * (x_k + delta_k) + (1 - gamma) * x_{k-1}
@@ -663,9 +668,9 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
         // In the impulse tail, decay the contact penalties first (stiffnessDecay < 1):
         // relaxation converges poorly against a stiff ramp, softening lets the cheap
         // rounds finish the job the Newton rounds started.
-        if (!newton && stiffnessDecay < 1.0f)
+        if (!newton && params.primal.stiffnessDecay < 1.0f)
         {
-            const float decay = stiffnessDecay;
+            const float decay = params.primal.stiffnessDecay;
             const float cap = PENALTY_MAX;
             sync.forItems(forceCount, [this, decay, cap](int i) {
                 Force *f = forceOrder[i];
@@ -681,7 +686,7 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
         }
         sync.forItems(forceCount, [this](int i) {
             if (!constraintFrozen(forceOrder[i]))
-                forceOrder[i]->updateDual(alpha);
+                forceOrder[i]->updateDual(params.dual.alpha);
         });
         sync.arriveAndWait();
 
@@ -692,14 +697,14 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
         // that sees `converged` skips its own remaining work but still participates
         // in every barrier (draining instead of returning), so the barrier
         // participation count stays equal and no worker deadlocks.
-        if (workerIndex == 0 && convergenceThreshold > 0.0f && it + 1 < targetIterations)
+        if (workerIndex == 0 && params.primal.convergenceThreshold > 0.0f && it + 1 < targetIterations)
         {
             float total = 0.0f;
             int count = 0;
             for (Force *f = forces; f != nullptr; f = f->next)
                 f->accumulatePenetration(total, count);
             const float residual = count > 0 ? total / count : 0.0f;
-            converged.store(prevResidual - residual < convergenceThreshold,
+            converged.store(prevResidual - residual < params.primal.convergenceThreshold,
                     std::memory_order_relaxed);
             prevResidual = residual;
         }
@@ -713,6 +718,7 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
 // bodies too, so their bookkeeping matches, though only movable ones get a new velocity.
 void Solver::finishBody(int i)
 {
+    const SolverParams::Sleep &sleepParams = params.sleep;
     Rigid *body = warmstartOrder[i];
     body->prevVelocityLin = body->velocityLin;
     // Don't update velocity if sleeping (Godot 4.7 API)
@@ -740,17 +746,17 @@ void Solver::finishBody(int i)
         }
     }
     // Idle detection: a movable, non-sleeping body whose velocities stayed under both
-    // thresholds for sleepFrames consecutive steps falls asleep (velocity zeroed,
+    // thresholds for SolverParams::Sleep::frames consecutive steps falls asleep (velocity zeroed,
     // Godot semantics). Only touches this body's fields, so it is safe inside the
     // parallel dispatch and deterministic regardless of thread count.
-    if (sleepFrames > 0 && body->mass > 0 && !body->sleeping)
+    if (sleepParams.frames > 0 && body->mass > 0 && !body->sleeping)
     {
-        if (body->velocityLin.squaredNorm() < sleepLinearThreshold * sleepLinearThreshold &&
-                body->velocityAng.squaredNorm() < sleepAngularThreshold * sleepAngularThreshold)
+        if (body->velocityLin.squaredNorm() < sleepParams.linearThreshold * sleepParams.linearThreshold &&
+                body->velocityAng.squaredNorm() < sleepParams.angularThreshold * sleepParams.angularThreshold)
             ++body->stillFrames;
         else
             body->stillFrames = 0;
-        if (body->stillFrames >= sleepFrames)
+        if (body->stillFrames >= sleepParams.frames)
         {
             body->sleeping = true;
             body->velocityLin = float3{0, 0, 0};
@@ -762,14 +768,15 @@ void Solver::finishBody(int i)
 // Island-wide sleep bookkeeping. Movable, sleep-enabled bodies are grouped into islands
 // through force connectivity (union-find over the flattened body list; static bodies and
 // sleep_mode == NEVER bodies join nothing and never propagate). An island where every
-// member cleared idle detection this step (stillFrames >= sleepFrames or already
+// member cleared idle detection this step (stillFrames >= Sleep::frames or already
 // sleeping) is put to sleep as a unit: Godot semantics, and it removes the
 // partially-assembled-chain edge case where the bottom box qualifies a step before the
 // boxes above it. Deterministic: the union-find walks the force list in list order and
 // the minimum-body-index island representative is independent of visit order.
 void Solver::islandSleep()
 {
-    // Only bodies that can sleep join an island. With the default sleepFrames = 0 this
+    const int sleepFrames = params.sleep.frames;
+    // Only bodies that can sleep join an island. With the default sleep.frames = 0 this
     // whole pass is skipped by the caller, so the core suite (which never sets
     // sleep_mode) is unaffected.
     islandBodies.clear();
@@ -873,10 +880,10 @@ void Solver::selectUpdateBodies()
     // must be allowed to fall asleep together, one body at a time. Serial and read-only
     // over the force adjacency apart from the examined body itself, so the outcome is
     // fixed regardless of thread count.
-    if (sleepFrames > 0)
+    if (params.sleep.frames > 0)
     {
-        const float lin2 = sleepLinearThreshold * sleepLinearThreshold;
-        const float ang2 = sleepAngularThreshold * sleepAngularThreshold;
+        const float lin2 = params.sleep.linearThreshold * params.sleep.linearThreshold;
+        const float ang2 = params.sleep.angularThreshold * params.sleep.angularThreshold;
         for (Rigid *body = bodies; body != 0; body = body->next)
         {
             if (!body->sleeping || body->sleep_mode != 1)

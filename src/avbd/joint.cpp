@@ -48,17 +48,17 @@ bool Joint::initialize()
 
     // Warmstart the dual variables and penalty parameters (Eq. 19)
     // Penalty is safely clamped to a minimum and maximum value
-    lambdaLin = lambdaLin * solver->alpha * solver->gamma;
-    lambdaAng = lambdaAng * solver->alpha * solver->gamma;
+    lambdaLin = lambdaLin * solver->params.dual.alpha * solver->params.dual.gamma;
+    lambdaAng = lambdaAng * solver->params.dual.alpha * solver->params.dual.gamma;
     penaltyLin = float3{
-        std::clamp(penaltyLin.x() * solver->gamma, PENALTY_MIN, PENALTY_MAX),
-        std::clamp(penaltyLin.y() * solver->gamma, PENALTY_MIN, PENALTY_MAX),
-        std::clamp(penaltyLin.z() * solver->gamma, PENALTY_MIN, PENALTY_MAX)
+        std::clamp(penaltyLin.x() * solver->params.dual.gamma, PENALTY_MIN, PENALTY_MAX),
+        std::clamp(penaltyLin.y() * solver->params.dual.gamma, PENALTY_MIN, PENALTY_MAX),
+        std::clamp(penaltyLin.z() * solver->params.dual.gamma, PENALTY_MIN, PENALTY_MAX)
     };
     penaltyAng = float3{
-        std::clamp(penaltyAng.x() * solver->gamma, PENALTY_MIN, PENALTY_MAX),
-        std::clamp(penaltyAng.y() * solver->gamma, PENALTY_MIN, PENALTY_MAX),
-        std::clamp(penaltyAng.z() * solver->gamma, PENALTY_MIN, PENALTY_MAX)
+        std::clamp(penaltyAng.x() * solver->params.dual.gamma, PENALTY_MIN, PENALTY_MAX),
+        std::clamp(penaltyAng.y() * solver->params.dual.gamma, PENALTY_MIN, PENALTY_MAX),
+        std::clamp(penaltyAng.z() * solver->params.dual.gamma, PENALTY_MIN, PENALTY_MAX)
     };
 
     // Clamp penalty to material stiffness
@@ -193,10 +193,10 @@ void Joint::updateDual(float alpha)
         }
 
         // Update the penalty parameter and clamp to material stiffness if we are within the force bounds (Eq. 16)
-        penaltyLin = (penaltyLin + C.cwiseAbs() * solver->betaLin).cwiseMin(float3{stiffnessLin, stiffnessLin, stiffnessLin}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
+        penaltyLin = (penaltyLin + C.cwiseAbs() * solver->params.dual.betaLin).cwiseMin(float3{stiffnessLin, stiffnessLin, stiffnessLin}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
 
         // Angular
-        penaltyAng = (penaltyAng + C.cwiseAbs() * solver->betaAng).cwiseMin(float3{stiffnessAng, stiffnessAng, stiffnessAng}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
+        penaltyAng = (penaltyAng + C.cwiseAbs() * solver->params.dual.betaAng).cwiseMin(float3{stiffnessAng, stiffnessAng, stiffnessAng}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
     }
     // Angular constraint
     if (penaltyAng.squaredNorm() > 0)
@@ -218,7 +218,7 @@ void Joint::updateDual(float alpha)
         }
 
         // Update the penalty parameter and clamp to material stiffness if we are within the force bounds (Eq. 16)
-        penaltyAng = (penaltyAng + C.cwiseAbs() * solver->betaAng).cwiseMin(float3{stiffnessAng, stiffnessAng, stiffnessAng}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
+        penaltyAng = (penaltyAng + C.cwiseAbs() * solver->params.dual.betaAng).cwiseMin(float3{stiffnessAng, stiffnessAng, stiffnessAng}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
     }
 
     // Fracture test
