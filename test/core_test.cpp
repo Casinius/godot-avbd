@@ -61,9 +61,9 @@ static void step_n(Solver &s, int n) {
         return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0f;
     }();
     if (relax > 0.0f)
-        s.jacobiRelaxation = relax;
+        s.params.primal.jacobiRelaxation = relax;
     if (rho > 0.0f)
-        s.chebyshevRho = rho;
+        s.params.primal.chebyshevRho = rho;
     for (int i = 0; i < n; i++) {
         s.step();
     }
@@ -645,7 +645,7 @@ static void test_spin_retention() {
 // as the axis is stiffened, so this is the check that catches it.
 static float limit_excursion(float p_betaAng) {
     Solver s;
-    s.betaAng = p_betaAng;
+    s.params.dual.betaAng = p_betaAng;
     GenericRig rig(s, {0, 0, 0});
     for (int i = 0; i < 3; i++)
         rig.setAxis(i, false, AxisMode::Locked);
@@ -1041,12 +1041,12 @@ static void test_pick_mask() {
 
 // ---------------------------------------------------------------------------
 // Idle sleep: a settled stack of sleep-enabled boxes must fall asleep on its own
-// (Solver::sleepFrames idle detection), and sleeping must not corrupt state. The core
-// suite default keeps sleepFrames = 0, so this is opt-in behaviour.
+// (SolverParams::Sleep::frames idle detection), and sleeping must not corrupt state. The core
+// suite default keeps Sleep::frames = 0, so this is opt-in behaviour.
 // ---------------------------------------------------------------------------
 static void test_idle_sleep() {
     Solver s;
-    s.sleepFrames = 5;
+    s.params.sleep.frames = 5;
     new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
     Rigid *a = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f});
     Rigid *b = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 1.5f});
@@ -1075,7 +1075,7 @@ static int run_scene(const std::string &name, int steps, int threads, bool adapt
     }
     Solver s;
     s.threads = threads;
-    s.adaptiveBeta = adaptiveBeta;
+    s.params.dual.adaptiveBeta = adaptiveBeta;
     scene->build(&s);
     std::printf("scene '%s': %d bodies, %d forces\n", scene->name, count_bodies(s), count_forces(s));
     step_n(s, steps);
@@ -1100,7 +1100,7 @@ static void build_bench_scene(Solver &s) {
 static int run_bench(int threads, bool adaptiveBeta) {
     Solver s;
     s.threads = threads;
-    s.adaptiveBeta = adaptiveBeta;
+    s.params.dual.adaptiveBeta = adaptiveBeta;
     build_bench_scene(s);
     std::printf("bench: %d boxes, %d iterations, adaptiveBeta=%s\n", count_bodies(s), s.iterations,
             adaptiveBeta ? "on" : "off");
@@ -1129,7 +1129,7 @@ static int run_bench_sweep(bool adaptiveBeta) {
     for (int threads : {1, 2, 4, 8, 12}) {
         Solver s;
         s.threads = threads;
-        s.adaptiveBeta = adaptiveBeta;
+        s.params.dual.adaptiveBeta = adaptiveBeta;
         build_bench_scene(s);
         step_n(s, warmup);
         const auto t0 = std::chrono::steady_clock::now();
@@ -1149,7 +1149,7 @@ static int run_bench_sweep(bool adaptiveBeta) {
 static std::pair<double, int> bench_once(int threads, bool adaptiveBeta, int warmup, int timed) {
     Solver s;
     s.threads = threads;
-    s.adaptiveBeta = adaptiveBeta;
+    s.params.dual.adaptiveBeta = adaptiveBeta;
     build_bench_scene(s);
     step_n(s, warmup);
     const auto t0 = std::chrono::steady_clock::now();
@@ -1278,7 +1278,7 @@ static void test_adaptive_beta() {
     // Direct mechanism: prime the old contact state, run one initialize(), read the result.
     {
         Solver s;
-        s.adaptiveBeta = true;
+        s.params.dual.adaptiveBeta = true;
         new Rigid(&s, {10, 10, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
         Rigid *box = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f});
         s.step(); // create the manifold
@@ -1296,7 +1296,7 @@ static void test_adaptive_beta() {
         report(initialized && max_beta_scale(s) == 16.0f, "adaptive beta doubles on a new violation",
                 "max scale = %.3f", max_beta_scale(s));
         report(m->contacts[0].penalty.x() > 50.0f, "adaptive beta carries the penalty",
-                "penalty = %.3f (primed 100, gamma %.3f)", m->contacts[0].penalty.x(), s.gamma);
+                "penalty = %.3f (primed 100, gamma %.3f)", m->contacts[0].penalty.x(), s.params.dual.gamma);
 
         // Cap holds.
         prime_contacts(m, ADAPTIVE_BETA_MAX, 100.0f, 0.001f);
@@ -1312,7 +1312,7 @@ static void test_adaptive_beta() {
                 "max scale = %.3f", max_beta_scale(s));
 
         // With the feature off the same primed penalty restarts at the floor.
-        s.adaptiveBeta = false;
+        s.params.dual.adaptiveBeta = false;
         prime_contacts(m, 8.0f, 100.0f, 0.01f);
         m->initialize();
         report(std::fabs(m->contacts[0].penalty.x() - PENALTY_MIN) < 1e-6f,
@@ -1323,7 +1323,7 @@ static void test_adaptive_beta() {
     // Solved scene (no gravity): a resting contact must not ratchet.
     {
         Solver s;
-        s.adaptiveBeta = true;
+        s.params.dual.adaptiveBeta = true;
         s.gravity = 0.0f;
         new Rigid(&s, {10, 10, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
         new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f});
@@ -1335,7 +1335,7 @@ static void test_adaptive_beta() {
     // Loaded scene: the multiplier may grow, but stays finite and capped.
     {
         Solver s;
-        s.adaptiveBeta = true;
+        s.params.dual.adaptiveBeta = true;
         new Rigid(&s, {10, 10, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
         new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f});
         step_n(s, 300);

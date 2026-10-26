@@ -201,33 +201,16 @@ protected:
 
         // Solver parameters, read from project settings at space creation and stamped
         // into the solver every step (so a changed setting shows up without a restart).
+        // threads/iterations/substeps stay loose: they are per-tick inputs the solver reads
+        // bare, not tuning knobs, and `substeps` never reaches the solver at all.
         int threads = 0;
         int iterations = 10;
-        double alpha = 0.99;
-        double beta_linear = 10000.0;
-        double beta_angular = 100.0;
-        double gamma = 0.999;
         int substeps = 1;
-        // Fraction of solver iterations that run the full Newton primal (6x6 dense
-        // solve); the rest run as cheap sequential-impulse-style dual-only passes.
-        // 1.0 = original AVBD behaviour. Real-time scenes trade accuracy for speed here.
-        double newton_ratio = 1.0;
-        // Per-iteration multiplicative decay applied to contact penalties once the
-        // Newton phase ends: stiff-penalty tails converge slowly, softening them lets the
-        // cheaper iterations finish the job. 1.0 = no decay (original behaviour).
-        double stiffness_decay = 1.0;
-        // Rotation drift (unit-column distance, ~2 sin(angle/2)) above which a manifold's
-        // cached angular jacobians are rebuilt. 0 disables the cache and reassembles them
-        // for every contact on every iteration (original behaviour).
-        double jacobian_rebuild_distance = 0.0;
-        // Chebyshev semi-iteration spectral-radius bound over the Jacobi primal.
-        // 0 = off (constant relaxation); 0.9-0.99 is the useful range.
-        double chebyshev_rho = 0.0;
-        // Upper bound of the adaptive iteration boost. 16 keeps the reference quality;
-        // 8 trades deep-impact penetration for flat frame cost (see the load sweep).
-        double adaptive_max_iterations = 16;
-        // Per-contact adaptive penalty ramp (augmented-Lagrangian kappa update).
-        bool adaptive_beta = false;
+
+        // The one copy of the tuning knobs (see avbd::SolverParams): project settings land
+        // here, and `solver.setParams()` hands the whole set over each step. Range fixing
+        // happens inside setParams, once.
+        avbd::SolverParams params;
 
         // Debug contacts collected during the last step (world space, Godot frame).
 
@@ -369,21 +352,11 @@ public:
     double body_state_step() const;
     PhysicsDirectSpaceState3D *body_state_space_state(const RID &p_body);
 
-    // Solver performance timing (ms).
-    double get_solver_broad_phase_time() const;
-    double get_solver_colour_graph_time() const;
-    double get_solver_solve_time() const;
-    double get_solver_finish_time() const;
     // Get the singleton instance of AVBDPhysicsServer3D.
     static AVBDPhysicsServer3D *get_singleton();
 
 protected:
     static void _bind_methods() {
-        // Solver performance timing
-        ClassDB::bind_method(D_METHOD("get_solver_broad_phase_time"), &AVBDPhysicsServer3D::get_solver_broad_phase_time);
-        ClassDB::bind_method(D_METHOD("get_solver_colour_graph_time"), &AVBDPhysicsServer3D::get_solver_colour_graph_time);
-        ClassDB::bind_method(D_METHOD("get_solver_solve_time"), &AVBDPhysicsServer3D::get_solver_solve_time);
-        ClassDB::bind_method(D_METHOD("get_solver_finish_time"), &AVBDPhysicsServer3D::get_solver_finish_time);
         // Target of the ProjectSettings::settings_changed connection made in _init. Bound
         // so the StringName callable can reach it; not meant for scripts.
         ClassDB::bind_method(D_METHOD("_on_project_settings_changed"), &AVBDPhysicsServer3D::_on_project_settings_changed);

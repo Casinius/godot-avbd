@@ -289,8 +289,8 @@ bool GenericJoint::initialize()
         JointAxis *both[2] = {&linear[i], &angular[i]};
         for (JointAxis *axis : both)
         {
-            axis->lambda *= solver->alpha * solver->gamma;
-            axis->penalty = std::clamp(axis->penalty * solver->gamma, PENALTY_MIN, PENALTY_MAX);
+            axis->lambda *= solver->params.dual.alpha * solver->params.dual.gamma;
+            axis->penalty = std::clamp(axis->penalty * solver->params.dual.gamma, PENALTY_MIN, PENALTY_MAX);
         }
     }
 
@@ -349,7 +349,7 @@ void GenericJoint::updateDual(float alpha)
     {
         JointAxis *both[2] = {&linear[i], &angular[i]};
         const float values[2] = {offset[i], angularValue_[i]};
-        const float betas[2] = {solver->betaLin, solver->betaAng};
+        const float betas[2] = {solver->params.dual.betaLin, solver->params.dual.betaAng};
 
         for (int k = 0; k < 2; k++)
         {

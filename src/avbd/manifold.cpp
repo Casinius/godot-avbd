@@ -66,6 +66,10 @@ void Manifold::drainPool() noexcept
 
 bool Manifold::initialize()
 {
+    // Local view of the knobs this function reads: warm-start decay and the adaptive-beta
+    // ramp rule. Hoisting keeps the contact loop below free of the parameter path.
+    const SolverParams::Dual &dual = solver->params.dual;
+
     // Compute friction
     friction = std::sqrt(bodyA->friction * bodyB->friction);
 
@@ -122,9 +126,9 @@ bool Manifold::initialize()
 
         // Clamp penetration to avoid excessive penalty forces
         float penetration = contacts[i].C0.norm();
-        if (penetration > 0.02f) // Cap at 2cm penetration
+        if (penetration > PENETRATION_MAX)
         {
-            contacts[i].C0 = contacts[i].C0.normalized() * 0.02f;
+            contacts[i].C0 = contacts[i].C0.normalized() * PENETRATION_MAX;
         }
 
         // Adaptive beta (the augmented-Lagrangian kappa update, per contact): a
@@ -134,10 +138,10 @@ bool Manifold::initialize()
         // penetration depth (the margin is not an error to converge), and a residual at
         // or below the floor is treated as solved so float-scale noise on a resting
         // contact cannot ratchet the multiplier to the cap.
-        if (solver->adaptiveBeta && prevErr[i] >= 0.0f)
+        if (dual.adaptiveBeta && prevErr[i] >= 0.0f)
         {
             const float err = std::max(0.0f, COLLISION_MARGIN - contacts[i].C0.x());
-            const float floor = solver->adaptiveBetaErrorFloor;
+            const float floor = dual.adaptiveBetaErrorFloor;
             float scale = contacts[i].betaScale;
             if (err <= floor)
                 scale = std::max(scale * 0.5f, 1.0f);
@@ -161,21 +165,21 @@ bool Manifold::initialize()
         // (~300 us/step across a full manifold set). Penalty starts at PENALTY_MIN and is
         // ramped per iteration in updateDual (betaLin * |C|, capped by PENALTY_MAX).
         // The warmstart decay below is kept bit-for-bit.
-        contacts[i].lambda = contacts[i].lambda * solver->alpha * solver->gamma;
-        if (solver->adaptiveBeta)
+        contacts[i].lambda = contacts[i].lambda * dual.alpha * dual.gamma;
+        if (dual.adaptiveBeta)
         {
             // Adaptive beta is a per-contact ramp multiplier, so the penalty it produced
             // must survive into the next step: decay the carried value (Eq. 19) instead
             // of restarting from the floor, which threw the ramp away and made a resting
             // body re-grow its support every frame. Unmatched contacts are zero-initialised,
             // so this lands on PENALTY_MIN for a fresh contact.
-            contacts[i].penalty = (contacts[i].penalty * solver->gamma)
+            contacts[i].penalty = (contacts[i].penalty * dual.gamma)
                     .cwiseMax(float3{PENALTY_MIN, PENALTY_MIN, PENALTY_MIN})
                     .cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX});
         }
         else
         {
-            const float clampedLambdaPenalty = std::clamp(PENALTY_MIN * solver->gamma, PENALTY_MIN, PENALTY_MAX);
+            const float clampedLambdaPenalty = std::clamp(PENALTY_MIN * dual.gamma, PENALTY_MIN, PENALTY_MAX);
             contacts[i].penalty = float3{clampedLambdaPenalty, clampedLambdaPenalty, clampedLambdaPenalty};
         }
     }
@@ -193,6 +197,10 @@ bool Manifold::initialize()
 // used to recompute.
 void Manifold::preCompute(float alpha)
 {
+    // Read once per round, not once per contact: the drift test below is per body, and the
+    // value cannot change inside this loop.
+    const float rebuildDistance = solver->params.primal.jacobianRebuildDistance;
+
     float3 dqALin = bodyA->positionLin - bodyA->initialLin;
     float3 dqAAng = bodyA->positionAng - bodyA->initialAng;
     float3 dqBLin = bodyB->positionLin - bodyB->initialLin;
@@ -207,8 +215,8 @@ void Manifold::preCompute(float alpha)
     // iterations solely because the body rotations do. The drift test is per BODY (the
     // two body rotations are loop-invariant): hoisted out of the contact loop so the
     // per-contact work in the cached path is a straight copy of the cached jacobians.
-    const bool cacheable = solver->jacobianRebuildDistance > 0.0f;
-    const float rebuild2 = solver->jacobianRebuildDistance * solver->jacobianRebuildDistance;
+    const bool cacheable = rebuildDistance > 0.0f;
+    const float rebuild2 = rebuildDistance * rebuildDistance;
     const float3 dA = rotA.col(0) - rotACaptured.col(0);
     const float3 dB = rotB.col(0) - rotBCaptured.col(0);
     const bool cacheUsable = cacheable && jacobiansCached &&
@@ -315,6 +323,8 @@ void Manifold::updatePrimal(Rigid *body, float alpha, Block &block)
 
 void Manifold::updateDual(float alpha)
 {
+    const float betaLinBase = solver->params.dual.betaLin;
+
     float3 dqALin = bodyA->positionLin - bodyA->initialLin;
     float3 dqAAng = bodyA->positionAng - bodyA->initialAng;
     float3 dqBLin = bodyB->positionLin - bodyB->initialLin;
@@ -364,7 +374,7 @@ void Manifold::updateDual(float alpha)
         contacts[i].lambda = F;
 
         // Update the penalty parameter and clamp to material stiffness if we are within the force bounds (Eq. 16)
-        const float beta = solver->betaLin * contacts[i].betaScale;
+        const float beta = betaLinBase * contacts[i].betaScale;
         if (F[0] < 0)
             contacts[i].penalty[0] = std::min(contacts[i].penalty[0] + beta * std::fabs(C[0]), PENALTY_MAX);
         if (frictionScale <= bounds)
