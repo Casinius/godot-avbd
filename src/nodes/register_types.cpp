@@ -75,6 +75,9 @@ static void register_avbd_settings() {
             // Time past this is dropped, which is what keeps a stall from becoming a longer
             // internal step.
             {"physics/avbd/max_catchup_ticks", Variant(4)},
+            // Delivery smoothing, not a solver knob: the scene is handed the blend of the last two
+            // deliveries instead of the newest pose. Off keeps every existing project's numbers.
+            {"physics/avbd/interpolate_poses", Variant(false)},
             {"physics/avbd/newton_ratio", Variant(1.0)},
             {"physics/avbd/stiffness_decay", Variant(0.8)},
             {"physics/avbd/jacobian_rebuild_distance", Variant(0.0)},

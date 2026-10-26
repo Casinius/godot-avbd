@@ -46,6 +46,23 @@ int AVBDSoftWorld3D::get_body_count() const {
     return static_cast<int>(std::ranges::distance(avbd::next_range(solver.bodies)));
 }
 
+void AVBDSoftWorld3D::set_tick_rate(double p_tick_rate) {
+    // 0 means "no clock"; anything else is a rate the solver can actually divide by.
+    tick_rate = p_tick_rate > 0.0 ? std::clamp(p_tick_rate, 1.0, 1000.0) : 0.0;
+}
+
+double AVBDSoftWorld3D::get_tick_rate() const {
+    return tick_rate;
+}
+
+void AVBDSoftWorld3D::set_max_catchup_ticks(int p_ticks) {
+    max_catchup_ticks = std::clamp(p_ticks, 1, 64);
+}
+
+int AVBDSoftWorld3D::get_max_catchup_ticks() const {
+    return max_catchup_ticks;
+}
+
 void AVBDSoftWorld3D::rebuild() {
     _collect(this);
     _rebuild();
@@ -163,7 +180,21 @@ void AVBDSoftWorld3D::_physics_process(double p_delta) {
     }
 
     solver.threads = threads;
-    solver.dt = static_cast<float>(p_delta);
+
+    // The same two clocks the physics server offers. With a rate the solver steps on its own fixed
+    // dt and the scene tree's delta only says how much of it has been paid for; without one the
+    // delta is the step, which is what this node always did - and what made a lattice soft or stiff
+    // depend on the game's tick rate.
+    int ticks = 1;
+    double alpha = 1.0;
+    if (tick_rate > 0.0) {
+        clock.tick_dt = 1.0 / tick_rate;
+        clock.max_ticks = max_catchup_ticks;
+        ticks = clock.consume(p_delta, alpha);
+        solver.dt = static_cast<float>(clock.tick_dt);
+    } else {
+        solver.dt = static_cast<float>(p_delta);
+    }
 
     // Static grounds follow their node: if a user or animation moved one, adopt the pose.
     for (GroundEntry &entry : grounds) {
@@ -177,12 +208,21 @@ void AVBDSoftWorld3D::_physics_process(double p_delta) {
         entry.rigid->velocityAng = avbd::float3{0, 0, 0};
     }
 
-    solver.step();
+    for (int tick = 0; tick < ticks; tick++) {
+        // The pose entering the last tick is the half the visuals blend from, so snapshot it there
+        // rather than after the step. A notification that ran no tick leaves the pair alone, which
+        // is right: nothing new was simulated, and alpha has moved closer to the live pose.
+        if (tick + 1 == ticks) {
+            for (AVBDSoftBody3D *node : soft_bodies) {
+                node->_store_state();
+            }
+        }
+        solver.step();
+    }
 
     const Transform3D sim_in_node = node_in_sim(this, this).affine_inverse();
     for (AVBDSoftBody3D *node : soft_bodies) {
-        node->_store_state();
-        node->_sync_visuals(sim_in_node);
+        node->_sync_visuals(sim_in_node, alpha);
     }
 }
 
@@ -213,4 +253,14 @@ void AVBDSoftWorld3D::_bind_methods() {
 
     ClassDB::bind_method(D_METHOD("get_body_count"), &AVBDSoftWorld3D::get_body_count);
     ClassDB::bind_method(D_METHOD("rebuild"), &AVBDSoftWorld3D::rebuild);
+
+    ClassDB::bind_method(D_METHOD("set_tick_rate", "tick_rate"), &AVBDSoftWorld3D::set_tick_rate);
+    ClassDB::bind_method(D_METHOD("get_tick_rate"), &AVBDSoftWorld3D::get_tick_rate);
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "tick_rate", PROPERTY_HINT_RANGE, "0,1000,0.1,or_greater,suffix:Hz"),
+            "set_tick_rate", "get_tick_rate");
+
+    ClassDB::bind_method(D_METHOD("set_max_catchup_ticks", "ticks"), &AVBDSoftWorld3D::set_max_catchup_ticks);
+    ClassDB::bind_method(D_METHOD("get_max_catchup_ticks"), &AVBDSoftWorld3D::get_max_catchup_ticks);
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "max_catchup_ticks", PROPERTY_HINT_RANGE, "1,64,1"),
+            "set_max_catchup_ticks", "get_max_catchup_ticks");
 }

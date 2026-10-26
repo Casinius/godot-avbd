@@ -256,16 +256,27 @@ void AVBDSoftBody3D::_build(avbd::Solver &p_solver, const Transform3D &p_node_in
     }
 }
 
-void AVBDSoftBody3D::_sync_visuals(const Transform3D &p_sim_in_node) {
+void AVBDSoftBody3D::_sync_visuals(const Transform3D &p_sim_in_node, double p_alpha) {
     sim_in_node = p_sim_in_node;
     Ref<MultiMesh> mm = get_multimesh();
     if (mm.is_null()) {
         return;
     }
     const int count = std::min(mm->get_instance_count(), static_cast<int>(rigids.size()));
+    // A blend needs a previous pose for every instance drawn; without one, or with the clock
+    // already past the last tick, the live pose is the answer.
+    const bool blend = p_alpha < 1.0 && cells.has_value() &&
+            cells->size() >= static_cast<std::size_t>(count);
     for (int i = 0; i < count; i++) {
         const avbd::Rigid *body = rigids[i];
-        mm->set_instance_transform(i, p_sim_in_node * sim_transform(body->positionLin, body->positionAng));
+        const Transform3D live = p_sim_in_node * sim_transform(body->positionLin, body->positionAng);
+        Transform3D pose = live;
+        if (blend) {
+            const Cell &previous = (*cells)[i];
+            pose = (p_sim_in_node * sim_transform(previous.position, previous.rotation))
+                    .interpolate_with(live, p_alpha);
+        }
+        mm->set_instance_transform(i, pose);
     }
 }
 

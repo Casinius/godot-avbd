@@ -12,7 +12,9 @@
  * One instance per space is cached by the server and re-pointed at each body before
  * the callbacks run, so the engine never holds a stale view. Every getter reads the
  * avbd::Rigid live; setters write straight through to it, mirroring what the engine's
- * own `_integrate_forces` users expect.
+ * own `_integrate_forces` users expect. The one exception is the pose: a space that
+ * interpolates hands the sync callback the blended delivery instead, and treats a
+ * write-back of exactly that pose as the echo it is.
  *
  * The converter lives in src/nodes/godot_convert.hpp and maps Godot's Y-up scene
  * space onto the solver's Z-up space.
@@ -39,6 +41,12 @@ class AVBDDirectBodyState3D : public PhysicsDirectBodyState3DExtension {
     AVBDPhysicsServer3D *server = nullptr;
     avbd::Rigid *rigid = nullptr; // the body this instance currently views
     RID body_rid;
+    // The pose the scene was shown for this body, when the space blends one. Read back out of
+    // _get_transform so the node moves to the delivery rather than to the solver's newer pose,
+    // and compared in _set_transform so echoing that pose into the server cannot drag the solver
+    // back to what was only ever drawn. Null for a plain live view, which is every other read.
+    Transform3D delivered;
+    bool has_delivered = false;
 
 protected:
     static void _bind_methods() {}
@@ -47,8 +55,11 @@ public:
     AVBDDirectBodyState3D() = default;
     ~AVBDDirectBodyState3D() override = default;
 
-    // Re-aim the cached instance at one body before its callbacks run.
-    void bind(AVBDPhysicsServer3D *p_server, avbd::Rigid *p_rigid, const RID &p_body_rid);
+    // Re-aim the cached instance at one body before its callbacks run. Pass p_delivered for the
+    // engine's scene sync, so the pose it reads is the pose its write-back will be matched
+    // against; pass nothing for scripted integration, which must see and write the solver itself.
+    void bind(AVBDPhysicsServer3D *p_server, avbd::Rigid *p_rigid, const RID &p_body_rid,
+            const Transform3D *p_delivered = nullptr);
 
     // --- reads/writes onto the bound body ------------------------------------
     Vector3 _get_total_gravity() const override;
