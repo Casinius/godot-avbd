@@ -303,8 +303,24 @@ void Solver::broadPhase()
     pool->forCount(pairCount, [this, &pairValid](int k) {
         const int i = pairFirst(sweepPairs[k]);
         const int j = pairSecond(sweepPairs[k]);
-        pairValid[k] = pairOverlaps(bodiesInOrder[i], bodyAabbHalf[i],
+        auto overlaps = pairOverlaps(bodiesInOrder[i], bodyAabbHalf[i],
                                     bodiesInOrder[j], bodyAabbHalf[j]);
+        pairValid[k] = overlaps;
+        if (!overlaps) return;
+
+        // 睡眠 + awake 的 AABB 重叠就唤醒。不需要真实接触——AABB 已经含 margin，
+        // 重叠意味着"下几个 substep 内会碰"。写 sleeping=false 是幂等的，多个
+        // 线程对同一 body 写 false 是安全的。
+        if (bodiesInOrder[i]->sleeping && !bodiesInOrder[j]->sleeping && bodiesInOrder[j]->mass > 0.0f)
+        {
+            bodiesInOrder[i]->sleeping = false;
+            bodiesInOrder[i]->stillFrames = 0;
+        }
+        else if (bodiesInOrder[j]->sleeping && !bodiesInOrder[i]->sleeping && bodiesInOrder[i]->mass > 0.0f)
+        {
+            bodiesInOrder[j]->sleeping = false;
+            bodiesInOrder[j]->stillFrames = 0;
+        }
     }, kMinPairsPerDispatch);
 
     // 串行创建：manifold 链表顺序 + pool mutex 都要求单线程

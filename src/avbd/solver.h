@@ -23,6 +23,9 @@
 
 namespace avbd {
 
+
+
+
 // Defined in job_pool.hpp, which is only included by solver.cpp.
 namespace detail {
 class JobPool;
@@ -805,5 +808,10 @@ private:
     // the partially-asleep contact chain from thrashing between states.
     void islandSleep();
 };
+
+
+
+
+
 
 } // namespace avbd
