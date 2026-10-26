@@ -67,6 +67,14 @@ static void register_avbd_settings() {
             {"physics/avbd/beta_angular", Variant(100.0)},
             {"physics/avbd/gamma", Variant(0.999)},
             {"physics/avbd/substeps", Variant(2)},
+            // 0 = the engine step is the clock, split across `substeps`. A project that wants the
+            // solver's own fixed tick sets a rate here (the suite measurements below were taken
+            // at 60 and 120) and physics_ticks_per_second becomes a sampling rate for it.
+            {"physics/avbd/tick_rate", Variant(0.0)},
+            // Ceiling on the ticks one engine step may run when the clock has fallen behind.
+            // Time past this is dropped, which is what keeps a stall from becoming a longer
+            // internal step.
+            {"physics/avbd/max_catchup_ticks", Variant(4)},
             {"physics/avbd/newton_ratio", Variant(1.0)},
             {"physics/avbd/stiffness_decay", Variant(0.8)},
             {"physics/avbd/jacobian_rebuild_distance", Variant(0.0)},
@@ -85,6 +93,7 @@ static void register_avbd_settings() {
         settings->set_as_basic(name,
                 name == StringName("physics/avbd/adaptive_beta") ||
                         name == StringName("physics/avbd/substeps") ||
+                        name == StringName("physics/avbd/tick_rate") ||
                         name == StringName("physics/avbd/iterations"));
     }
 }

@@ -72,7 +72,11 @@ struct StepProfile {
     uint32_t over_2ms_ticks = 0; // ticks above a 2 ms budget in the window
     uint32_t rebuilds = 0;
     int threads_used = 1;
-    int substeps = 0;
+    // The clock's own output: the most ticks any one engine call ran, and the whole ticks
+    // the catch-up cap refused to run. Together they say whether this window spent its time
+    // simulating or dilating.
+    int ticks_run = 0;
+    uint64_t ticks_dropped = 0;
     int iterations = 0;
 };
 
@@ -290,6 +294,16 @@ void AVBDPhysicsServer3D::_set_active(bool p_active) {
     // SceneTree::set_pause calls PhysicsServer3D.set_active(!paused): this is the point
     // where simulation must follow the game. _step refuses to run while false.
     server_active = p_active;
+    if (!p_active) {
+        // _step returns before touching the clocks while inactive, so nothing accrues during a
+        // pause. What is left is the sub-tick remainder from the last step before it: spending
+        // that across an arbitrary pause gap would put the resume's first tick at a phase the
+        // scene has no claim on, so the bank is emptied instead.
+        for (auto &[id, space] : spaces) {
+            (void)id;
+            space.clock.reset();
+        }
+    }
 }
 
 void AVBDPhysicsServer3D::_sync() {
@@ -361,6 +375,31 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     p_space.threads = static_cast<int>(settings->get_setting("physics/avbd/threads", 0));
     p_space.iterations = static_cast<int>(settings->get_setting("physics/avbd/iterations", 4));
     p_space.substeps = static_cast<int>(settings->get_setting("physics/avbd/substeps", 2));
+
+    // The internal clock. 0 (or a project that never sets it) leaves the engine step in charge;
+    // any rate pins the solver's dt and makes the engine step a sampling rate. Clamped here
+    // because a rate that rounds to zero dt would silently freeze the solver.
+    double tick_rate = static_cast<double>(settings->get_setting("physics/avbd/tick_rate", 0.0));
+    if (tick_rate > 0.0) {
+        tick_rate = std::clamp(tick_rate, 1.0, 1000.0);
+    }
+    p_space.tick_rate = tick_rate;
+    const int catchup = static_cast<int>(settings->get_setting("physics/avbd/max_catchup_ticks", 4));
+    p_space.max_catchup_ticks = std::clamp(catchup, 1, 64);
+    p_space.clock.max_ticks = p_space.max_catchup_ticks;
+    if (tick_rate > 0.0) {
+        // Legal, but the point of the clock is that the solver no longer runs per engine tick.
+        // Sampling below the rate the solver steps at throws ticks away.
+        const double engine_rate = static_cast<double>(
+                settings->get_setting("physics/common/physics_ticks_per_second", 60.0));
+        if (tick_rate < engine_rate && !warned_slow_tick_rate) {
+            warned_slow_tick_rate = true;
+            WARN_PRINT(vformat("AVBD physics server: avbd/tick_rate (%f) is below "
+                               "physics/common/physics_ticks_per_second (%f); the solver will run "
+                               "fewer steps than the engine asks for and drop the surplus time.",
+                    tick_rate, engine_rate));
+        }
+    }
 
     params.dual.alpha = static_cast<float>(settings->get_setting("physics/avbd/alpha", 0.99));
     params.dual.betaLin = static_cast<float>(settings->get_setting("physics/avbd/beta_linear", 1e5));
@@ -1269,8 +1308,13 @@ void AVBDPhysicsServer3D::rebuild_cone_twist_joint(SpaceData *space, const Joint
 // Run every active space for one step, then tell each body what happened.
 //
 // Stepping follows the game: while the engine has the server inactive (SceneTree paused)
-// nothing steps. Solver parameters are stamped from project settings every step, and each
-// space runs `substeps` solver steps per engine step with dt split across them.
+// nothing steps. Solver parameters are stamped from project settings every step.
+//
+// How much simulation one engine call covers is the space's clock, not the call. With
+// physics/avbd/tick_rate set the space banks the step and hands back whole internal ticks -
+// possibly none, possibly several, never more than the catch-up cap - so the solver's dt and the
+// engine's rate are independent. Without a rate the old behaviour stands: one step split across
+// `substeps`, dt taken from the engine.
 void AVBDPhysicsServer3D::_step(float p_step) {
     if (!server_active) {
         return;
@@ -1290,7 +1334,8 @@ void AVBDPhysicsServer3D::_step(float p_step) {
     double prof_solver = 0.0;
     double prof_contacts = 0.0;
     int prof_threads = 1;
-    int prof_substeps = 0;
+    int prof_ticks = 0;
+    uint64_t prof_dropped = 0;
     int prof_iterations = 0;
     int prof_rebuild_count = 0;
     bool stepped_any = false;
@@ -1324,19 +1369,33 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         }
         prof_params += seconds_since(prof_t_params);
 
-        const float dt = static_cast<float>(p_step);
+        // Two clocks, chosen by physics/avbd/tick_rate. With a rate the solver advances on its
+        // own fixed tick and the engine step only says how much of it has been paid for; without
+        // one the engine step is the clock and splits across `substeps` as it always did.
         const int substeps = space.substeps > 0 ? space.substeps : 1;
-        space.solver.dt = dt / static_cast<float>(substeps);
-        space.solver.iterations = space.iterations > 0 ? space.iterations : space.solver.iterations;
-        space.solver.threads = space.threads;
-        avbd::SolverParams params = space.params;
-        // Idle-sleep horizon: 30 steps at the usual 60 Hz tick = Godot's 0.5 s default.
-        // Stamped per step rather than read from settings, because it counts solver steps.
-        params.sleep.frames = 30;
-        space.solver.setParams(params);
+        double alpha = 1.0; // unused until the pose snapshots read it (A2)
+        int ticks = 0;
+        if (space.tick_rate > 0.0) {
+            space.clock.tick_dt = 1.0 / space.tick_rate;
+            const uint64_t dropped_before = space.clock.dropped_ticks;
+            ticks = space.clock.consume(p_step, alpha);
+            prof_dropped += space.clock.dropped_ticks - dropped_before;
+            space.solver.dt = static_cast<float>(space.clock.tick_dt);
+        } else {
+            ticks = substeps;
+            space.solver.dt = static_cast<float>(p_step) / static_cast<float>(substeps);
+        }
+        prof_ticks = std::max(prof_ticks, ticks);
 
-        // Forces accumulated since the last step (persistent constant_* plus one-shot frame
-        // ones) become velocity changes now, so the solver integrates them with everything else.
+        // Forces accumulated since the last call (persistent constant_* plus one-shot frame ones)
+        // become velocity changes now, so the solver integrates them with everything else.
+        //
+        // This runs on every engine call, including one that buys no tick. `frame_force` holds
+        // what the scene asked for during this call, and the velocity change it stands for is
+        // F/m * p_step - the sampling the scene made. Consuming it instead with the span the
+        // clock happened to run would double-count a force that arrived in a call which ran
+        // nothing, which is exactly what a solver tick slower than the engine tick produces.
+        const float dt = static_cast<float>(p_step);
         const ProfClock::time_point prof_t_forces = ProfClock::now();
         for (auto &[body_id, body] : bodies) {
             if (id_of(body.space) != id || body.rigid == nullptr || body.rigid->mass <= 0.0f) {
@@ -1365,8 +1424,23 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         }
         prof_forces += seconds_since(prof_t_forces);
 
+        if (ticks == 0) {
+            // Less than one internal tick has arrived. Whatever the forces above put into the
+            // bodies' velocities waits here for the tick that spends it; nothing else in this
+            // call has a changed state to report, so the space is left alone.
+            continue;
+        }
+
+        space.solver.iterations = space.iterations > 0 ? space.iterations : space.solver.iterations;
+        space.solver.threads = space.threads;
+        avbd::SolverParams params = space.params;
+        // Idle-sleep horizon: 30 steps at the usual 60 Hz tick = Godot's 0.5 s default.
+        // Stamped per step rather than read from settings, because it counts solver steps.
+        params.sleep.frames = 30;
+        space.solver.setParams(params);
+
         const ProfClock::time_point prof_t_solver = ProfClock::now();
-        for (int sub = 0; sub < substeps; sub++) {
+        for (int tick = 0; tick < ticks; tick++) {
             space.solver.step();
         }
         prof_solver += seconds_since(prof_t_solver);
@@ -1457,7 +1531,6 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         }
 
         prof_threads = std::max(prof_threads, space.solver.threadCount());
-        prof_substeps = std::max(prof_substeps, substeps);
         prof_iterations = std::max(prof_iterations, space.solver.iterations);
     }
 
@@ -1483,15 +1556,16 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         if (prof_total > 2.0e6)
             prof.over_2ms_ticks++;
         prof.threads_used = std::max(prof.threads_used, prof_threads);
-        prof.substeps = prof_substeps;
+        prof.ticks_run = std::max(prof.ticks_run, prof_ticks);
+        prof.ticks_dropped += prof_dropped;
         prof.iterations = prof_iterations;
         prof.ticks++;
         if (prof.ticks % 240 == 0) {
             constexpr double to_us = 0.001;
             std::fprintf(stdout,
-                    "[avbd-profile] ticks=%llu total=%.1fus max=%.1fus solver=%.1fus(max %.1fus) sync=%.1fus(max %.1fus) "
+                    "[avbd-profile] calls=%llu total=%.1fus max=%.1fus solver=%.1fus(max %.1fus) sync=%.1fus(max %.1fus) "
                     "contacts=%.1fus rebuild=%.1fus(max %.1fus x%u) params=%.1fus forces=%.1fus over2ms=%u "
-                    "threads=%d substeps=%d iterations=%d\n",
+                    "threads=%d ticks/call=%d dropped=%llu iterations=%d\n",
                     static_cast<unsigned long long>(prof.ticks), prof.total_ns * to_us,
                     prof.max_total_ns * to_us,
                     prof.solver_ns * to_us, prof.max_solver_ns * to_us,
@@ -1499,9 +1573,12 @@ void AVBDPhysicsServer3D::_step(float p_step) {
                     prof.contacts_ns * to_us,
                     prof.rebuild_ns * to_us, prof.max_rebuild_ns * to_us, prof.rebuilds,
                     prof.params_ns * to_us, prof.forces_ns * to_us, prof.over_2ms_ticks,
-                    prof.threads_used, prof.substeps, prof.iterations);
+                    prof.threads_used, prof.ticks_run,
+                    static_cast<unsigned long long>(prof.ticks_dropped), prof.iterations);
             std::fflush(stdout);
             prof.ticks = 0;
+            prof.ticks_run = 0;
+            prof.ticks_dropped = 0;
             prof.total_ns = 0.0;
             prof.solver_ns = 0.0;
             prof.sync_ns = 0.0;
@@ -2165,7 +2242,10 @@ Vector3 AVBDPhysicsServer3D::body_state_contact_collider_velocity(const RID &p_b
 }
 
 double AVBDPhysicsServer3D::body_state_step() const {
-    // Every space steps with the engine's fixed timestep; report the common value.
+    // The solver's own step length, which is what it integrates a callback's velocity over.
+    // Under physics/avbd/tick_rate that is the internal tick rather than a slice of the engine
+    // step; the server's own force integration still uses the engine step, because that is the
+    // interval a script's add_force() call actually covers.
     for (const auto &[id, space] : spaces) {
         (void)id;
         return space.solver.dt;
