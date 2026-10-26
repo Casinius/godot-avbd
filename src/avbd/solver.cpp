@@ -407,8 +407,14 @@ void Solver::broadPhase()
 // sleep win: a settled scene stops paying SAT refresh + dual updates for all its contacts.
 static bool constraintFrozen(const Force *f)
 {
-    if (f->contactPointCount() <= 0)
+    if (f->kind != ForceKind::Contact)
         return false; // joints / springs / soft constraints keep their exact behaviour
+    // A manifold that holds no contacts is not frozen but pending: a fresh one (the broad
+    // phase news these every step) or one a previous step emptied. initialize() is what tells
+    // the two apart, and it deletes the manifold that comes back with nothing.
+    const Manifold *manifold = f->asManifold();
+    if (manifold->numContacts <= 0)
+        return false;
     const auto awake = [](const Rigid *b) { return b != nullptr && b->mass > 0.0f && !b->sleeping; };
     return !awake(f->bodyA) && !awake(f->bodyB);
 }
@@ -591,9 +597,9 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
             // construction, no colours, and no thread-count dependence.
             sync.forItems(forceCount, [this](int i) {
                 Force *f = forceOrder[i];
-                if (f->contactPointCount() <= 0)
+                if (f->kind != ForceKind::Contact)
                     return;
-                Manifold *manifold = static_cast<Manifold *>(f);
+                Manifold *manifold = f->asManifold();
                 if (manifold->bodyA->updateSlot < 0 && manifold->bodyB->updateSlot < 0)
                     return; // frozen: neither side moves this round
                 manifold->preCompute(params.dual.alpha);
@@ -609,8 +615,8 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                         body->positionAng, body->inertialAng);
                 for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
                 {
-                    if (f->contactPointCount() > 0)
-                        static_cast<Manifold *>(f)->stampCached(body, block);
+                    if (f->kind == ForceKind::Contact)
+                        f->asManifold()->stampCached(body, block);
                     else
                         f->updatePrimal(body, params.dual.alpha, block);
                 }
@@ -674,10 +680,9 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
             const float cap = PENALTY_MAX;
             sync.forItems(forceCount, [this, decay, cap](int i) {
                 Force *f = forceOrder[i];
-                // contactPointCount() > 0 iff the force is a Manifold; other forces
-                // keep their own penalty ramp untouched.
-                if (f->contactPointCount() > 0) {
-                    Manifold *m = static_cast<Manifold *>(f);
+                // Contacts only: joints and springs keep their own penalty ramp untouched.
+                if (f->kind == ForceKind::Contact) {
+                    Manifold *m = f->asManifold();
                     for (int ci = 0, n = m->numContacts; ci < n; ++ci)
                         m->contacts[ci].penalty = (m->contacts[ci].penalty * decay).cwiseMin(float3{cap, cap, cap});
                 }
@@ -961,7 +966,7 @@ void Solver::selectUpdateBodies()
     // the combine pass. Walk the force lists once, after warmstartForces() has pruned.
     for (Force *f = forces; f != 0; f = f->next)
     {
-        if (f->contactPointCount() > 0)
+        if (f->kind == ForceKind::Contact)
             continue;
         if (f->bodyA != 0)
             f->bodyA->contactOnly = false;

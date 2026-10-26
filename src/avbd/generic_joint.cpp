@@ -44,7 +44,7 @@ const float3 &frameAxis(int p_axis)
 } // namespace
 
 GenericJoint::GenericJoint(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, float3 p_rB)
-    : Force(p_solver, p_bodyA, p_bodyB), rA(p_rA), rB(p_rB)
+    : Force(p_solver, p_bodyA, p_bodyB, ForceKind::GenericJoint), rA(p_rA), rB(p_rB)
 {
     // The arrangement the joint is created in is its zero. Held as B-relative-to-A in A's frame,
     // the same form angularValues() computes for the live pose, so the two compose directly.

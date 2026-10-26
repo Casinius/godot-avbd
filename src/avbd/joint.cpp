@@ -27,7 +27,7 @@ inline float3x3 geometricStiffnessBallSocket(int k, float3 v)
 
 Joint::Joint(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, float3 p_rB,
         float p_stiffnessLin, float p_stiffnessAng, float p_fracture)
-    : Force(p_solver, p_bodyA, p_bodyB), rA(p_rA), rB(p_rB), stiffnessLin(p_stiffnessLin),
+    : Force(p_solver, p_bodyA, p_bodyB, ForceKind::Joint), rA(p_rA), rB(p_rB), stiffnessLin(p_stiffnessLin),
     stiffnessAng(p_stiffnessAng), fracture(p_fracture), broken(false)
 {
     // Dual variables and penalties start at zero and are built up over the first steps.

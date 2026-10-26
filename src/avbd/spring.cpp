@@ -16,7 +16,7 @@ namespace avbd {
 
 Spring::Spring(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, float3 p_rB,
         float p_stiffness, float p_rest)
-    : Force(p_solver, p_bodyA, p_bodyB), rA(p_rA), rB(p_rB), rest(p_rest), stiffness(p_stiffness)
+    : Force(p_solver, p_bodyA, p_bodyB, ForceKind::Spring), rA(p_rA), rB(p_rB), rest(p_rest), stiffness(p_stiffness)
 {
     // A negative rest length means "derive it from the bodies' current pose".
     if (rest < 0.0f)

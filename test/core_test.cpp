@@ -1236,8 +1236,8 @@ static void test_jacobi_shares() {
 // ---------------------------------------------------------------------------
 static Manifold *first_manifold(Solver &s) {
     for (Force *f = s.forces; f != nullptr; f = f->next) {
-        if (f->contactPointCount() > 0)
-            return static_cast<Manifold *>(f);
+        if (f->kind == ForceKind::Contact)
+            return f->asManifold();
     }
     return nullptr;
 }
@@ -1245,9 +1245,9 @@ static Manifold *first_manifold(Solver &s) {
 static float max_beta_scale(Solver &s) {
     float maxScale = 0.0f;
     for (Force *f = s.forces; f != nullptr; f = f->next) {
-        if (f->contactPointCount() <= 0)
+        if (f->kind != ForceKind::Contact)
             continue;
-        const Manifold *m = static_cast<const Manifold *>(f);
+        const Manifold *m = f->asManifold();
         for (int i = 0; i < m->numContacts; i++)
             maxScale = std::max(maxScale, m->contacts[i].betaScale);
     }

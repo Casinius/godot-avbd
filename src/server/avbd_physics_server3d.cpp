@@ -270,13 +270,14 @@ int32_t AVBDPhysicsServer3D::_get_process_info(PhysicsServer3D::ProcessInfo p_in
         case PhysicsServer3D::INFO_ISLAND_COUNT:
             return static_cast<int32_t>(spaces.size());
         case PhysicsServer3D::INFO_COLLISION_PAIRS: {
-            // Manifolds are the forces with contact points.
+            // Collision pairs are the manifolds; every other force couples bodies that
+            // are not touching.
             int32_t count = 0;
             for (const auto &[id, space] : spaces) {
                 (void)id;
                 count += static_cast<int32_t>(std::ranges::count_if(
                         avbd::next_range(space.solver.forces),
-                        [](const avbd::Force *force) { return force->contactPointCount() > 0; }));
+                        [](const avbd::Force *force) { return force->kind == avbd::ForceKind::Contact; }));
             }
             return count;
         }
@@ -312,7 +313,15 @@ void AVBDPhysicsServer3D::_free_rid(const RID &p_rid) {
         spaces.erase(space_found);
         return;
     }
-    if (bodies.erase(id) > 0) {
+    const auto body_found = bodies.find(id);
+    if (body_found != bodies.end()) {
+        // The record goes now; the solver body it owned stays live until the space rebuilds,
+        // so detach it first. A body with a null host is one the host no longer claims, and the
+        // query paths skip it instead of naming a record that is gone.
+        if (body_found->second.rigid != nullptr) {
+            body_found->second.rigid->host = nullptr;
+        }
+        bodies.erase(body_found);
         return;
     }
     if (shapes.erase(id) > 0) {
@@ -443,13 +452,13 @@ PackedVector3Array AVBDPhysicsServer3D::_space_get_contacts(const RID &p_space) 
     // The engine's debug contacts are world-space points of recent contacts; serve the
     // first-shape contact points of every manifold seen this step.
     for (const avbd::Force *force = found->second.solver.forces; force != nullptr; force = force->next) {
-        const int count = force->contactPointCount();
-        if (count <= 0) {
+        if (force->kind != avbd::ForceKind::Contact) {
             continue;
         }
         // Walk the manifold's stored contacts: rA/rB are local offsets from each body.
         const avbd::Rigid *a = force->bodyA;
-        const avbd::Manifold *manifold = static_cast<const avbd::Manifold *>(force);
+        const avbd::Manifold *manifold = force->asManifold();
+        const int count = manifold->numContacts;
         for (int i = 0; i < count; i++) {
             const avbd::float3 world = a->positionLin + a->positionAng * manifold->contacts[i].rA;
             out.push_back(to_godot(world));
@@ -914,13 +923,18 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
 
         body.rigid = new avbd::Rigid(&space->solver, extents, type, density_for(body), body.friction,
                 to_sim(body.transform.origin), to_sim(body.linear_velocity));
+        // The one bridge from a solver body back to this record; every query result and every
+        // contact report resolves through it.
+        body.rigid->host = &body;
         // The same Y-up to Z-up mapping the node layer uses, applied to the orientation too.
         body.rigid->positionAng = to_sim(body.transform.basis.get_rotation_quaternion());
         body.rigid->velocityAng = to_sim(body.angular_velocity);
         body.rigid->collisionLayer = body.collision_layer;
         body.rigid->collisionMask = body.collision_mask;
         axis_locks_to_sim(body.axis_locks, body.rigid->axisLockLinear, body.rigid->axisLockAngular);
-        body.rigid->sleeping = body.sleeping;
+        // The host's pending request wins over the last reported state; a body the solver had
+        // parked comes back parked.
+        body.rigid->sleeping = body.sleep_requested.value_or(body.sleep_reported);
         // Solver sleep modes: 0 = never sleeps, 1 = may sleep. Idle detection lives in the
         // solver (SolverParams::Sleep::frames); can_sleep only opens the gate.
         body.rigid->sleep_mode = body.can_sleep ? 1 : 0;
@@ -943,16 +957,6 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
                 continue;
             }
             new avbd::IgnoreCollision(&space->solver, body.rigid, other_found->second.rigid);
-        }
-    }
-
-    // Solver-body -> server id index for the query paths: the BVH hands candidates back
-    // as Rigid*, and this is the O(1) bridge to RIDs. Rebuilt here because every Rigid
-    // was just re-created.
-    space->rigid_ids.clear();
-    for (auto &[id, body] : bodies) {
-        if (id_of(body.space) == space_id && body.rigid != nullptr) {
-            space->rigid_ids.emplace(body.rigid, id);
         }
     }
 
@@ -1391,26 +1395,18 @@ void AVBDPhysicsServer3D::_step(float p_step) {
             }
         }
         if (any_reports) {
-            // Rigid -> owning record, resolved once for the whole manifold walk.
-            std::unordered_map<const avbd::Rigid *, BodyData *> rigid_map;
-            std::unordered_map<const BodyData *, uint64_t> id_map;
-            for (auto &[bid, b] : bodies) {
-                if (id_of(b.space) == id && b.rigid != nullptr) {
-                    b.frame_contacts.clear();
-                    rigid_map.emplace(b.rigid, &b);
-                    id_map.emplace(&b, bid);
-                }
-            }
+            // Manifolds are the reporting force. Each endpoint names its own record through
+            // avbd::Rigid::host, so the walk needs no side tables.
             for (avbd::Force *force = space.solver.forces; force != nullptr; force = force->next) {
-                const int count = force->contactPointCount();
+                if (force->kind != avbd::ForceKind::Contact) {
+                    continue;
+                }
+                const avbd::Manifold *manifold = force->asManifold();
+                const int count = manifold->numContacts;
                 if (count <= 0) {
                     continue;
                 }
-                const avbd::Manifold *manifold = static_cast<const avbd::Manifold *>(force);
-                const auto it_a = rigid_map.find(force->bodyA);
-                const auto it_b = rigid_map.find(force->bodyB);
-                BodyData *data[2] = {it_a != rigid_map.end() ? it_a->second : nullptr,
-                        it_b != rigid_map.end() ? it_b->second : nullptr};
+                BodyData *data[2] = {host_of(force->bodyA), host_of(force->bodyB)};
 
                 for (int side = 0; side < 2; side++) {
                     BodyData *fill = data[side];
@@ -1429,7 +1425,7 @@ void AVBDPhysicsServer3D::_step(float p_step) {
                         // normal as pointing out of the other body towards itself.
                         fc.normal = to_godot(avbd::float3{manifold->basis(0, 0), manifold->basis(0, 1), manifold->basis(0, 2)}
                                 * (side == 0 ? 1.0f : -1.0f));
-                        fc.collider_body_id = other != nullptr ? id_map[other] : 0;
+                        fc.collider_body_id = other != nullptr ? other->server_id : 0;
                         fill->frame_contacts.push_back(fc);
                     }
                 }
@@ -1454,10 +1450,10 @@ void AVBDPhysicsServer3D::_step(float p_step) {
             body.transform = transform;
             body.linear_velocity = to_godot(rigid->velocityLin);
             body.angular_velocity = to_godot(rigid->velocityAng);
-            // Keep the host copy in step with the solver's sleep state: the pre-step sync
-            // writes body.sleeping back into body.rigid->sleeping, so a solver-side sleep
-            // decision would otherwise be overwritten on the next step.
-            body.sleeping = rigid->sleeping;
+            body.sleep_reported = rigid->sleeping;
+            body.sleep_requested.reset();
+            // The solver's word for this step. It replaces any request the host made before
+            // it, and rebuild_space() restores exactly this when the body is next created.
         }
 
         prof_threads = std::max(prof_threads, space.solver.threadCount());
@@ -1920,6 +1916,7 @@ bool AVBDPhysicsServer3D::_generic_6dof_joint_get_flag(const RID &p_joint, Vecto
 RID AVBDPhysicsServer3D::_body_create() {
     const uint64_t id = next_id++;
     bodies.emplace(std::piecewise_construct, std::forward_as_tuple(id), std::forward_as_tuple());
+    bodies.find(id)->second.server_id = id;
     return make_rid(id);
 }
 
@@ -2008,7 +2005,9 @@ void AVBDPhysicsServer3D::_body_set_state(const RID &p_body, PhysicsServer3D::Bo
             break;
 
         case PhysicsServer3D::BODY_STATE_SLEEPING: {
-            body->sleeping = p_value;
+            // Recorded as the host's request: it is what a rebuild restores until the solver
+            // reports a state of its own.
+            body->sleep_requested = p_value;
             if (body->rigid != nullptr) {
                 body->rigid->sleeping = p_value;
                 if (p_value) {
@@ -2049,7 +2048,8 @@ Variant AVBDPhysicsServer3D::_body_get_state(const RID &p_body, PhysicsServer3D:
         case PhysicsServer3D::BODY_STATE_ANGULAR_VELOCITY:
             return body.angular_velocity;
         case PhysicsServer3D::BODY_STATE_SLEEPING:
-            return body.rigid != nullptr ? body.rigid->sleeping : body.sleeping;
+            return body.rigid != nullptr ? body.rigid->sleeping
+                                         : body.sleep_requested.value_or(body.sleep_reported);
         case PhysicsServer3D::BODY_STATE_CAN_SLEEP:
             return body.can_sleep;
         default:
@@ -2235,11 +2235,11 @@ std::vector<AVBDPhysicsServer3D::QueryCandidate> AVBDPhysicsServer3D::query_cand
     std::vector<QueryCandidate> out;
     out.reserve(rigids.size());
     for (const avbd::Rigid *rigid : rigids) {
-        const auto id = space.rigid_ids.find(rigid);
-        if (id == space.rigid_ids.end()) {
-            continue;
+        const BodyData *host = host_of(rigid);
+        if (host == nullptr) {
+            continue; // a body the server no longer claims
         }
-        out.push_back(QueryCandidate{const_cast<avbd::Rigid *>(rigid), id->second});
+        out.push_back(QueryCandidate{const_cast<avbd::Rigid *>(rigid), host->server_id});
     }
     return out;
 }
@@ -2253,15 +2253,20 @@ avbd::Rigid *AVBDPhysicsServer3D::solver_pick(const RID &p_space, avbd::float3 p
     return space->solver.pick(p_origin, p_dir, r_local, p_mask);
 }
 
+AVBDPhysicsServer3D::BodyData *AVBDPhysicsServer3D::host_of(avbd::Rigid *p_rigid) const {
+    return p_rigid != nullptr && p_rigid->host != nullptr ? static_cast<BodyData *>(p_rigid->host) : nullptr;
+}
+
+const AVBDPhysicsServer3D::BodyData *AVBDPhysicsServer3D::host_of(const avbd::Rigid *p_rigid) const {
+    return host_of(const_cast<avbd::Rigid *>(p_rigid));
+}
+
 uint64_t AVBDPhysicsServer3D::body_id_of(const RID &p_space, const avbd::Rigid *p_rigid) const {
-    // O(1) through the space's solver-body index (rebuilt with the space); the BVH
-    // query paths resolve every result through here.
-    const auto found = spaces.find(id_of(p_space));
-    if (found == spaces.end()) {
-        return 0;
-    }
-    const auto id = found->second.rigid_ids.find(p_rigid);
-    return id != found->second.rigid_ids.end() ? id->second : 0;
+    // One dereference: the solver body points at its own record, and the record knows the id
+    // it lives under. The space still filters - a body of another space is not an answer here,
+    // which is what the per-space index used to guarantee by construction.
+    const BodyData *body = host_of(p_rigid);
+    return body != nullptr && body->space == p_space ? body->server_id : 0;
 }
 
 RID AVBDPhysicsServer3D::solver_pick_rid(const RID &p_space, const avbd::Rigid *p_rigid) {
