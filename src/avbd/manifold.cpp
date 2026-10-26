@@ -311,8 +311,10 @@ void Manifold::stampCached(Rigid *body, Block &block)
     for (int i = 0; i < numContacts; i++)
     {
         const float3 &F = contactForceCache[i];
+        if (F[0] == 0.0f && F[1] == 0.0f && F[2] == 0.0f) continue;
+        
         const float3 r = fromIsA ? jacobianCache[i].rAWorld : jacobianCache[i].rBWorld;
-
+        
         const BasisHessian &s = linHessian[i];
         const float s00 = s.s00, s01 = s.s01, s02 = s.s02;
         const float s11 = s.s11, s12 = s.s12, s22 = s.s22;
