@@ -149,53 +149,97 @@ void Solver::clear()
         delete bodies;
 }
 
-// One step, expressed as a classified task flow:
-//   serial      - broad phase (internally independent prep/filter stages)
-//   serial      - warm-start forces (independent initialisation + serial deletion)
-//   serial      - update-set selection and colouring
-//   independent - per-body inertial/warm-start update
-//   serial      - adaptive round count for this step
-//   region      - the colour-parallel Gauss-Seidel iteration set
-//   independent - BDF1 velocities and idle detection
-//
-// The flow is built before it runs, so values a later stage needs from an earlier one are
-// captured by reference and read when that stage executes. The region falls back to an
-// inline NullSync run when the step is too small to pay for waking workers.
+// One tick, as a classified task flow. The broad phase / force warmstart / update-set
+// selection run once on the calling thread (they already parallelise their own stages),
+// then `runSubstep` runs the per-body warmstart, the colour-parallel iteration region and
+// the velocity finish. `runSubstep` builds the flow because interleaved substepping calls
+// it more than once per tick.
 void Solver::step()
 {
     ensurePool();
-    flow->clear();
+    broadPhase();
+    const int forceCount = warmstartForces();
+    selectUpdateBodies();
 
-    int forceCount = 0;
     int targetIterations = iterations;
     int newtonRounds = iterations;
+    computeIterations(targetIterations, newtonRounds);
+    runSubstep(forceCount, targetIterations, newtonRounds, true);
+}
+
+// One substep: body warmstart (independent), the colour-parallel Gauss-Seidel region,
+// then the BDF1 velocity finish (independent). Idle detection only runs on the tick's
+// final substep, so substeps cannot sleep bodies faster than ticks.
+void Solver::runSubstep(int forceCount, int targetIterations, int newtonRounds, bool idleDetection)
+{
     float prevResidual = 0.0f;
     std::atomic<bool> converged{false};
 
-    flow->serial([this] { broadPhase(); });
-    flow->serial([this, &forceCount] { forceCount = warmstartForces(); });
-    flow->serial([this] { selectUpdateBodies(); });
-
+    flow->clear();
     flow->independent([this] { return static_cast<int>(warmstartOrder.size()); },
             kMinBodiesPerDispatch, [this](int i) { warmstartBody(i); });
 
-    flow->serial([this, &targetIterations, &newtonRounds] {
-        computeIterations(targetIterations, newtonRounds);
-    });
-
     flow->region(
-            [this, &forceCount, &targetIterations, &newtonRounds, &prevResidual, &converged](int workerIndex, auto &sync) {
+            [this, forceCount, targetIterations, newtonRounds, &prevResidual, &converged](int workerIndex, auto &sync) {
                 iterateBody(workerIndex, sync, targetIterations, forceCount, newtonRounds, prevResidual, converged);
             },
-            [this, &forceCount] {
+            [this, forceCount] {
                 return static_cast<int>(updateOrder.size()) < kMinBodiesPerDispatch
                         && forceCount < kMinForcesPerDispatch;
             });
 
     flow->independent([this] { return static_cast<int>(warmstartOrder.size()); },
-            kMinBodiesPerDispatch, [this](int i) { finishBody(i); });
+            kMinBodiesPerDispatch, [this, idleDetection](int i) { finishBody(i, idleDetection); });
 
     flow->run();
+}
+
+// Interleaved substepping: collision/forces/update-set once per tick, then a small number
+// of iterations per substep with the contact error rebased at each substep start. This is
+// the cheaper alternative to running the full iteration set once per substep; it trades
+// some constraint freshness (the contact set is not refreshed inside the tick) for a
+// much lower round count. `dt` is already the substep dt.
+void Solver::stepInterleaved(int substeps, int roundsPerSubstep)
+{
+    ensurePool();
+    if (substeps <= 1) {
+        step();
+        return;
+    }
+
+    broadPhase();
+    const int forceCount = warmstartForces();
+    selectUpdateBodies();
+
+    int targetTick = iterations;
+    int newtonTick = iterations;
+    computeIterations(targetTick, newtonTick);
+
+    // Explicit budget wins; otherwise split the tick's adaptive target evenly.
+    const int rounds = roundsPerSubstep > 0
+            ? std::min(roundsPerSubstep, adaptiveMaxIterations)
+            : std::max(2, (targetTick + substeps - 1) / substeps);
+    const int newton = std::clamp(
+            static_cast<int>(std::ceil(newtonRatio * static_cast<float>(rounds))), 0, rounds);
+
+    for (int sub = 0; sub < substeps; ++sub) {
+        if (sub > 0) {
+            rebaseContacts(forceCount);
+        }
+        runSubstep(forceCount, rounds, newton, sub + 1 == substeps);
+    }
+}
+
+// Rebase every manifold's constraint error at the current pose. Parallel over forces; a
+// manifold only writes its own C0, so this is independent work.
+void Solver::rebaseContacts(int forceCount)
+{
+    pool->forCount(forceCount, [this](int i) {
+        Force *f = forceOrder[i];
+        if (f->isManifold) {
+            static_cast<Manifold *>(f)->rebaseContacts();
+        }
+    }, kMinForcesPerDispatch);
 }
 
 // A broad-phase candidate test: tight world AABBs plus Godot's layer/mask pair
@@ -569,7 +613,7 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                 Manifold *m = static_cast<Manifold *>(f);
                 
                 for (int ci = 0, n = m->numContacts; ci < n; ++ci)
-                    m->contacts[ci].penalty = min(m->contacts[ci].penalty * decay, float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX});
+                    m->contactPenalty[ci] = min(m->contactPenalty[ci] * decay, float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX});
             }
             if (!constraintFrozen(f))
                 f->updateDual(alpha);
@@ -604,7 +648,7 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
 // One body's BDF1 velocity after the final iteration. Per-body and independent, so the
 // step's flow runs it as an Independent stage; it covers static bodies too, so their
 // bookkeeping matches, though only movable ones get a new velocity.
-void Solver::finishBody(int i)
+void Solver::finishBody(int i, bool idleDetection)
 {
     Rigid *body = warmstartOrder[i];
     body->prevVelocityLin = body->velocityLin;
@@ -642,7 +686,7 @@ void Solver::finishBody(int i)
     // skipped its velocity update because `sleeping` was still set - the body
     // moved with a permanently zero velocity, and contacts could pump it upward
     // indefinitely. That was the pyramid_dbl runaway.
-    if (sleepFrames > 0 && body->mass > 0 && !body->sleeping && body->sleep_mode == 1)
+    if (idleDetection && sleepFrames > 0 && body->mass > 0 && !body->sleeping && body->sleep_mode == 1)
     {
         if (length2(body->velocityLin) < sleepLinearThreshold * sleepLinearThreshold &&
                 length2(body->velocityAng) < sleepAngularThreshold * sleepAngularThreshold)

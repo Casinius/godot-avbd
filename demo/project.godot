@@ -21,6 +21,8 @@ config/features=PackedStringArray("4.7")
 [physics]
 
 3d/run_on_separate_thread=true
+; 240 Hz is the sampling/interpolation rate. The solver advances on its own
+; internal tick (avbd/internal_ticks_per_second) and this rate only samples it.
 common/physics_ticks_per_second=240
 3d/physics_engine="AVBD"
 3d/solver/solver_iterations=4
@@ -28,7 +30,10 @@ common/physics_interpolation=true
 avbd/beta_linear=100000.0
 avbd/beta_angular=10.0
 avbd/threads=8
-avbd/substeps=1
+avbd/internal_ticks_per_second=120
+avbd/interleaved_substeps=true
+avbd/rounds_per_substep=2
+avbd/substeps=2
 avbd/adaptive_max_iterations=12
 avbd/adaptive_beta=true
 

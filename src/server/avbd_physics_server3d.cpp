@@ -366,6 +366,17 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     p_space.adaptive_beta = settings->get_setting("physics/avbd/adaptive_beta", false);
     p_space.adaptive_iterations = settings->get_setting("physics/avbd/adaptive_iterations", true);
     p_space.max_penetration_error = settings->get_setting("physics/avbd/max_penetration_error", 1e-4);
+    p_space.interleaved_substeps = settings->get_setting("physics/avbd/interleaved_substeps", false);
+    p_space.rounds_per_substep = static_cast<int>(settings->get_setting("physics/avbd/rounds_per_substep", 0.0));
+    const double internal_hz = std::max(static_cast<double>(settings->get_setting(
+            "physics/avbd/internal_ticks_per_second", 0.0)), 0.0);
+    if (internal_hz != p_space.internal_ticks_per_second) {
+        // A rate change is a schedule change: do not carry a stale backlog into it.
+        p_space.internal_accumulator = 0.0;
+    }
+    p_space.internal_ticks_per_second = internal_hz;
+    p_space.max_internal_steps = std::max(static_cast<int>(settings->get_setting(
+            "physics/avbd/max_internal_steps", 4.0)), 1);
 }
 
 void AVBDPhysicsServer3D::_space_set_active(const RID &p_space, bool p_active) {
@@ -1322,9 +1333,7 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         }
         prof_params += seconds_since(prof_t_params);
 
-        const float dt = static_cast<float>(p_step);
         const int substeps = space.substeps > 0 ? space.substeps : 1;
-        space.solver.dt = dt / static_cast<float>(substeps);
         space.solver.iterations = space.iterations > 0 ? space.iterations : space.solver.iterations;
         space.solver.alpha = static_cast<float>(space.alpha);
         space.solver.betaLin = static_cast<float>(space.beta_linear);
@@ -1340,47 +1349,78 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         space.solver.adaptiveBeta = space.adaptive_beta;
         space.solver.adaptiveIterations = space.adaptive_iterations;
         space.solver.maxPenetrationError = static_cast<float>(std::max(space.max_penetration_error, 0.0));
-        // Idle-sleep horizon: Godot's 0.5 s default, expressed in this project's ticks
-        // (30 steps at 60 Hz; 120 at 240 Hz). A fixed step count would make a
-        // high-tick-rate project fall asleep four times sooner than intended.
+
+        // Godot's physics tick is the sampling rate. If an internal rate is configured,
+        // accumulate engine time and advance the solver on its own fixed tick; the engine
+        // tick then only samples the state. 0 keeps the legacy one-solver-tick-per-engine-
+        // tick behaviour. The catch-up cap drops a backlog instead of spiralling.
+        double dt = p_step;
+        int tickCount = 1;
+        if (space.internal_ticks_per_second > 0.0) {
+            dt = 1.0 / space.internal_ticks_per_second;
+            space.internal_accumulator += p_step;
+            tickCount = 0;
+            while (space.internal_accumulator + 1.0e-9 >= dt && tickCount < space.max_internal_steps) {
+                space.internal_accumulator -= dt;
+                ++tickCount;
+            }
+            if (space.internal_accumulator >= dt) {
+                space.internal_accumulator = std::fmod(space.internal_accumulator, dt);
+            }
+        }
+        space.solver.dt = static_cast<float>(dt / static_cast<double>(substeps));
+        // Idle-sleep horizon: Godot's 0.5 s default, expressed in internal ticks. A fixed
+        // step count would make a high-tick-rate project fall asleep sooner than intended.
         space.solver.sleepFrames = std::max(1, static_cast<int>(std::lround(0.5 / dt)));
 
-        // Forces accumulated since the last step (persistent constant_* plus one-shot frame
-        // ones) become velocity changes now, so the solver integrates them with everything else.
-        const ProfClock::time_point prof_t_forces = ProfClock::now();
-        for (auto &[body_id, body] : bodies) {
-            if (id_of(body.space) != id || body.rigid == nullptr || body.rigid->mass <= 0.0f) {
-                continue;
-            }
-            // A body with scripted integration applies its own forces in its callback.
-            if (body.omit_force_integration) {
+        for (int tick = 0; tick < tickCount; ++tick) {
+            const float tickDt = static_cast<float>(dt);
+
+            // Forces accumulated since the last solver tick (persistent constant_* plus
+            // one-shot frame ones) become velocity changes now, so the solver integrates
+            // them with everything else. With an internal tick, a one-shot force waits
+            // until the next internal tick rather than being consumed by a sample.
+            const ProfClock::time_point prof_t_forces = ProfClock::now();
+            for (auto &[body_id, body] : bodies) {
+                if (id_of(body.space) != id || body.rigid == nullptr || body.rigid->mass <= 0.0f) {
+                    continue;
+                }
+                // A body with scripted integration applies its own forces in its callback.
+                if (body.omit_force_integration) {
+                    body.frame_force = Vector3();
+                    body.frame_torque = Vector3();
+                    continue;
+                }
+                const Vector3 force = body.constant_force + body.frame_force;
+                const Vector3 torque = body.constant_torque + body.frame_torque;
                 body.frame_force = Vector3();
                 body.frame_torque = Vector3();
-                continue;
+                if (force.length_squared() > 0.0) {
+                    body.rigid->velocityLin += to_sim(force) / body.rigid->mass * tickDt;
+                }
+                if (torque.length_squared() > 0.0) {
+                    // World-frame inverse inertia, as in the node layer's impulse paths.
+                    const avbd::float3 local = avbd::qrot(avbd::qconj(body.rigid->positionAng), to_sim(torque) * tickDt);
+                    const avbd::float3 delta{local.x / body.rigid->moment.x,
+                            local.y / body.rigid->moment.y, local.z / body.rigid->moment.z};
+                    body.rigid->velocityAng += qrot(body.rigid->positionAng, delta);
+                }
             }
-            const Vector3 force = body.constant_force + body.frame_force;
-            const Vector3 torque = body.constant_torque + body.frame_torque;
-            body.frame_force = Vector3();
-            body.frame_torque = Vector3();
-            if (force.length_squared() > 0.0) {
-                body.rigid->velocityLin += to_sim(force) / body.rigid->mass * dt;
-            }
-            if (torque.length_squared() > 0.0) {
-                // World-frame inverse inertia, as in the node layer's impulse paths.
-                const avbd::float3 local = avbd::qrot(avbd::qconj(body.rigid->positionAng), to_sim(torque) * dt);
-                const avbd::float3 delta{local.x / body.rigid->moment.x,
-                        local.y / body.rigid->moment.y, local.z / body.rigid->moment.z};
-                body.rigid->velocityAng += qrot(body.rigid->positionAng, delta);
-            }
-        }
-        prof_forces += seconds_since(prof_t_forces);
+            prof_forces += seconds_since(prof_t_forces);
 
-        const ProfClock::time_point prof_t_solver = ProfClock::now();
-        for (int sub = 0; sub < substeps; sub++) {
-            space.solver.step();
+            const ProfClock::time_point prof_t_solver = ProfClock::now();
+            if (space.interleaved_substeps && substeps > 1) {
+                space.solver.stepInterleaved(substeps, space.rounds_per_substep);
+            } else {
+                for (int sub = 0; sub < substeps; sub++) {
+                    space.solver.step();
+                }
+            }
+            prof_solver += seconds_since(prof_t_solver);
         }
-        prof_solver += seconds_since(prof_t_solver);
-        stepped_any = true;
+        if (tickCount > 0) {
+            stepped_any = true;
+        }
 
         // Area monitoring runs once per engine step, after the solver's output is in hand
         // and before the scene reads anything back.
@@ -2232,7 +2272,7 @@ double AVBDPhysicsServer3D::get_solver_max_penetration() const {
             }
             const auto *manifold = static_cast<const avbd::Manifold *>(force);
             for (int i = 0; i < manifold->numContacts; i++) {
-                const double depth = static_cast<double>(avbd::COLLISION_MARGIN - manifold->contacts[i].C0.x);
+                const double depth = static_cast<double>(avbd::COLLISION_MARGIN - manifold->contactC0[i].x);
                 if (depth > worst) {
                     worst = depth;
                 }
@@ -2254,7 +2294,7 @@ Array AVBDPhysicsServer3D::get_solver_deepest_contact() const {
             }
             const auto *manifold = static_cast<const avbd::Manifold *>(force);
             for (int i = 0; i < manifold->numContacts; i++) {
-                const double depth = static_cast<double>(avbd::COLLISION_MARGIN - manifold->contacts[i].C0.x);
+                const double depth = static_cast<double>(avbd::COLLISION_MARGIN - manifold->contactC0[i].x);
                 if (depth <= worst) {
                     continue;
                 }

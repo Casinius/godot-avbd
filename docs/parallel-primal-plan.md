@@ -21,6 +21,8 @@ Independent / Region 三分类 + 共享 worker 预算）已经实现，单独写
 | `preCompute` 每 manifold 每轮两次 | 已实现（位一致） | 串行 −13%，8 线程 CPU −9%；状态摘要不变 |
 | `stampCached` basis 三明治 + 手写下三角 | 已实现 | instructions −11%，串行 wall −8.8%，8 线程 −9.2%，见 §3.4 |
 | `preCompute`/`updateDual` 的 C 也进 basis 框架 | 已实现 | instructions −15%，串行 wall −14%，8 线程 −13.5%；`JacobianCache` 每 manifold 少 576 B，见 §3.5 |
+| R8：S 复用 + `Contact` 热/冷拆分 | 已实现 | S 缓存 8T −5%/1T −4%，SoA 再 −2%；逐位一致，见 `docs/refactor-review.md` R8 |
+| R7：交错子步 + 内部 tick | 已实现 | 采样 240/内部 120，substeps 2、每 substep 2 轮；dbl 每内部 tick 4.8 ms（预算 8.33），见 `docs/godot-performance.md` §5 |
 | Welsh-Powell 着色 | **已回退 greedy** | 实测颜色数不降反升（Pyramid 4→5），见 §4 |
 | 并行设施 | 已改造 | `TaskFlow` 三分类 + 共享 `Scheduler` + region 槽位预算；删除全局 `try_lock`/`wait()`。单 solver 无可测回归，双 solver 吞吐 +24%（4 线程），见 `docs/job-pool-plan.md` |
 | 并行设施是否还要重构 | 暂不需要 | 指令数跨线程数完全一致，8 SMT 线程 ~2.3×（三明治后）；瓶颈是 BSP 结构与 SMT/频率。任务图（R2）留到 >8 物理核/多世界 |
@@ -309,8 +311,8 @@ Pyramid 的建体顺序恰好接近该图的 4 色解，按度数重排反而打
 - **P3 着色收敛 A/B**：用 Pyramid / Pyramid XL / Soft Body / Bridge 量
   “达到同一穿透阈值所需轮数”，再决定 Welsh-Powell / DSATUR / greedy。
   顺带把 overflow 的 phase A 从“扫全 force”改成“只扫 overflow 相关 manifold 列表”。
-- **P4 manifold 布局**：`Contact`/`JacobianCache`/`contactForceCache` 拆成 SoA
-  或按 4 接触点分块，减少 1.4 KB 结构在 preCompute/dual 两次遍历时的 cache miss。
+- ~~**P4 manifold 布局**~~：已完成 R8（`Contact` 只留几何，热状态拆 SoA；S 每轮
+  只算一次）。后续可继续按 4 接触点分块，但收益已经不大。
 
 ### R1：按岛（island）分解 + 岛内颜色
 
@@ -336,7 +338,7 @@ Pyramid 的建体顺序恰好接近该图的 4 色解，按度数重排反而打
 
 ## 7. 验证清单
 
-- [x] `xmake run avbd_core_test`：88 checks / 0 failures（含 1/2/3/4/8/12 线程摘要一致，
+- [x] `xmake run avbd_core_test`：90 checks / 0 failures（含 1/2/3/4/8/12 线程摘要一致，
       以及两个 solver 并发步进的摘要一致）
 - [x] `stack_300` 摘要：preCompute 优化保持 `0x325f1faf5aab76b6` 位一致；
       三明治重写后、C 重构后各重锚一次（当前 `0x31bd6ae6440b4a5a`，预期内）

@@ -426,23 +426,40 @@ struct Manifold : Force
         int key;
     };
 
-    // Contact point information for a single contact
+    // Contact point geometry. This is what collision detection writes; the hot solver
+    // state lives in the parallel arrays below, so the per-contact stride the primal and
+    // dual walk stays small.
     struct Contact
     {
         FeaturePair feature;
         float3 rA; // contact offset in A's local space (relative to center)
         float3 rB; // contact offset in B's local space (relative to center)
-        float3 C0;
-        float3 penalty;
-        float3 lambda;
-        bool stick;
-        // Personal multiplier on the betaLin penalty ramp, carried across steps with
-        // the warmstart. Adaptive beta (Solver::adaptiveBeta) raises it for contacts
-        // whose error stopped shrinking and lets it fall back for converging ones.
-        float betaScale = 1.0f;
+    };
+
+    // The symmetric linear Hessian B^T K B, six independent entries: K is diagonal and
+    // the basis is orthonormal, so every pair of bodies of this manifold shares it. It
+    // changes only when the penalty changes, so initialize()/updateDual() refresh it once
+    // per round and both body stamps read it.
+    struct BasisHessian
+    {
+        float s00, s01, s02, s11, s12, s22;
     };
 
     std::array<Contact, 8> contacts;
+
+    // Hot contact state, split out of Contact. preCompute/updateDual/stampCached walk
+    // these arrays, so moving them next to each other keeps each loop's working set
+    // contiguous instead of striding over the geometry record.
+    std::array<float3, 8> contactC0;        // constraint value at q-
+    std::array<float3, 8> contactPenalty;
+    std::array<float3, 8> contactLambda;
+    std::array<uint8_t, 8> contactStick;
+    // Personal multiplier on the betaLin penalty ramp, carried across steps with the
+    // warmstart. Adaptive beta (Solver::adaptiveBeta) raises it for contacts whose error
+    // stopped shrinking and lets it fall back for converging ones.
+    std::array<float, 8> contactBetaScale;
+    std::array<BasisHessian, 8> linHessian;
+
     float3x3 basis; // Normal in the first row (pointing from B to A), and tangents in the second and third rows
     int numContacts;
     float friction;
@@ -485,6 +502,10 @@ struct Manifold : Force
 
     bool initialize() override;
     void updatePrimal(Rigid *body, float alpha, Block &block) override;
+    // Recompute C0 at the current (substep-start) pose without re-running collision
+    // detection. Used between interleaved substeps: the contact set stays, only the
+    // constraint error is rebased. Invalidates the prepared primal force cache.
+    void rebaseContacts();
     // Two consumers share one cache. updatePrimal (the coloured Gauss-Seidel path) uses
     // the force/moment-arm cache the previous round's dual left behind: the first body to
     // touch the manifold this round consumes it for free, and the second color - by then
@@ -654,6 +675,11 @@ struct Solver
     // the sleep-mode gate), size the per-body delta buffers, and colour the constraint
     // graph for the Gauss-Seidel primal.
     void selectUpdateBodies();
+    // Interleaved substeps: one broad phase / force warmstart / update-set selection per
+    // tick, then `substeps` rounds of (body warmstart, primal+dual, velocity finish) with
+    // the contact error rebased between them. `roundsPerSubstep` 0 splits the tick's
+    // adaptive target evenly. `dt` must already be the substep dt.
+    void stepInterleaved(int substeps, int roundsPerSubstep);
     // Greedy kMaxColours-bounded colouring of the update set's constraint graph;
     // bodies that do not fit join the block-Jacobi overflow bucket.
     void colourGraph();
@@ -765,8 +791,13 @@ private:
     template <typename Sync>
     void iterateBody(int workerIndex, Sync &sync, int targetIterations, int forceCount,
             int newtonRounds, float &r_prevResidual, std::atomic<bool> &r_converged);
-    // One body's BDF1 velocity / idle-detection update (independent across the list).
-    void finishBody(int i);
+    // One body's BDF1 velocity update (independent across the list). Idle detection only
+    // runs on the final substep, so substeps do not sleep bodies faster than ticks.
+    void finishBody(int i, bool idleDetection);
+    // One substep's body warmstart, iteration region, and velocity finish, as a flow.
+    void runSubstep(int forceCount, int targetIterations, int newtonRounds, bool idleDetection);
+    // Rebase every manifold's contact error at the current pose (parallel over forces).
+    void rebaseContacts(int forceCount);
 
     // Island-wide sleep bookkeeping (runs when sleeping is enabled): movable bodies are
     // grouped into islands through force connectivity, and an island whose every body

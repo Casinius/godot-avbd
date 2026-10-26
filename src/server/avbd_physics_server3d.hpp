@@ -235,6 +235,16 @@ protected:
         bool adaptive_iterations = true;
         // Penetration treated as solved by the adaptive estimate, in metres.
         double max_penetration_error = 1e-4;
+        // Interleaved substepping: one collision/update-set pass per tick, then a small
+        // fixed round budget per substep (see Solver::stepInterleaved).
+        bool interleaved_substeps = false;
+        int rounds_per_substep = 0;
+        // Godot's physics tick is a sampling rate. When internal_ticks_per_second is
+        // non-zero the solver advances on its own fixed tick and the engine tick only
+        // samples the state; 0 keeps the legacy one-solver-tick-per-engine-tick.
+        double internal_ticks_per_second = 0.0;
+        int max_internal_steps = 4;
+        double internal_accumulator = 0.0;
 
         // Debug contacts collected during the last step (world space, Godot frame).
 

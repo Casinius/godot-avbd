@@ -75,6 +75,10 @@ static void register_avbd_settings() {
             {"physics/avbd/adaptive_beta", Variant(false)},
             {"physics/avbd/adaptive_iterations", Variant(true)},
             {"physics/avbd/max_penetration_error", Variant(1e-4)},
+            {"physics/avbd/interleaved_substeps", Variant(false)},
+            {"physics/avbd/rounds_per_substep", Variant(0)},
+            {"physics/avbd/internal_ticks_per_second", Variant(0.0)},
+            {"physics/avbd/max_internal_steps", Variant(4)},
     };
     for (const auto &entry : entries) {
         if (settings->has_setting(entry.first)) {
@@ -87,6 +91,8 @@ static void register_avbd_settings() {
         settings->set_as_basic(name,
                 name == StringName("physics/avbd/adaptive_beta") ||
                         name == StringName("physics/avbd/adaptive_iterations") ||
+                        name == StringName("physics/avbd/interleaved_substeps") ||
+                        name == StringName("physics/avbd/internal_ticks_per_second") ||
                         name == StringName("physics/avbd/substeps") ||
                         name == StringName("physics/avbd/iterations"));
     }

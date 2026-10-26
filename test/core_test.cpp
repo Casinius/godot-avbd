@@ -387,6 +387,32 @@ static uint64_t stack_digest() {
     return state_digest(s);
 }
 
+// Interleaved substepping: one broad phase/update-set per tick, then a few rounds per
+// substep with the contact error rebased. Same scene twice must agree; the pile must stay
+// finite and bounded (the double-pyramid regression is the Godot-side equivalent).
+static uint64_t interleaved_digest(int threads = 0) {
+    Solver s;
+    s.threads = threads;
+    s.dt = 1.0f / 120.0f; // two substeps per 1/60 tick
+    new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
+    for (int i = 0; i < 10; i++)
+        new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, i * 1.5f + 1.0f});
+    for (int i = 0; i < 300; i++)
+        s.stepInterleaved(2, 3);
+    return state_digest(s);
+}
+
+static void test_interleaved_substeps() {
+    const uint64_t a = interleaved_digest(1);
+    const uint64_t b = interleaved_digest(1);
+    report(a == b, "interleaved substeps deterministic", "0x%016llx vs 0x%016llx",
+            (unsigned long long)a, (unsigned long long)b);
+    const uint64_t parallel = interleaved_digest(8);
+    report(parallel == a, "interleaved digest threads=8", "0x%016llx vs serial 0x%016llx",
+            (unsigned long long)parallel, (unsigned long long)a);
+    std::printf("     digest interleaved_300 = 0x%016llx\n", (unsigned long long)a);
+}
+
 static void test_determinism() {
     const uint64_t a = stack_digest();
     const uint64_t b = stack_digest();
@@ -1271,6 +1297,7 @@ int main(int argc, char **argv) {
     test_soft_lattice();
     test_all_scenes();
     test_determinism();
+    test_interleaved_substeps();
     test_jacobi_shares();
     test_parallel_equivalence();
     test_concurrent_solvers();
