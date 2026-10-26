@@ -51,6 +51,7 @@
 
 #include "avbd/solver.h"
 #include "avbd/bvh/node_storage.hpp"
+#include "server/fixed_clock.hpp"
 
 namespace godot {
 
@@ -219,6 +220,16 @@ protected:
         int iterations = 10;
         int substeps = 1;
 
+        // Internal tick rate, from physics/avbd/tick_rate. Zero means "the engine's step is the
+        // clock": the step splits across `substeps` solver steps as it always did. Above zero
+        // this space owns a clock, the solver's dt is fixed at 1/tick_rate, and the engine step
+        // only says how much of that tick has been paid for.
+        double tick_rate = 0.0;
+        avbd::FixedClock clock;
+        // Ticks one call may run when the accumulator holds more than it can spend. The surplus
+        // is dropped, so a stall dilates time instead of enlarging the internal dt.
+        int max_catchup_ticks = 4;
+
         // The one copy of the tuning knobs (see avbd::SolverParams): project settings land
         // here, and `solver.setParams()` hands the whole set over each step. Range fixing
         // happens inside setParams, once.
@@ -279,6 +290,11 @@ protected:
 
     // Cached state objects handed to the engine's callbacks; re-aimed per body before use.
     AVBDDirectBodyState3D *body_state = nullptr;
+
+    // One-shot latch for the tick-rate warning: read_project_params runs per space and again on
+    // every settings change, and a project that deliberately samples below its solver rate does
+    // not want the notice on every one of those reads.
+    bool warned_slow_tick_rate = false;
 
     uint64_t id_of(const RID &p_rid) const;
     RID make_rid(uint64_t p_id) const;
