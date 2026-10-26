@@ -36,8 +36,9 @@ def write_override(adaptive_beta):
     path = os.path.join(demo_dir(), "override.cfg")
     with open(path, "w") as f:
         f.write('[physics]\n\n3d/physics_engine="AVBD"\n')
-        if adaptive_beta:
-            f.write("avbd/adaptive_beta=true\n")
+        # Always pin the flag: project.godot may enable adaptive beta, and the plain
+        # (off) gate must stay off regardless of what the demo defaults to.
+        f.write("avbd/adaptive_beta=%s\n" % ("true" if adaptive_beta else "false"))
     return path
 
 

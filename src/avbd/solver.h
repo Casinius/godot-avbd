@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -25,9 +26,10 @@ namespace bvh::nodes { class NodeStorage; }
 
 namespace avbd {
 
-// Defined in job_pool.hpp, which is only included by solver.cpp.
+// Defined in job_pool.hpp / taskflow.hpp, which are only included by solver.cpp.
 namespace detail {
 class JobPool;
+class TaskFlow;
 }
 
 // Minimum penalty parameter
@@ -111,7 +113,7 @@ struct Rigid
     // is how per-body gravity modes are expressed).
     float gravity;
     bool sleeping = false;
-    // Consecutive finishVelocities() steps with both velocities under the solver's sleep
+    // Consecutive finishBody() steps with both velocities under the solver's sleep
     // thresholds; reaching sleepFrames flips `sleeping` on. Only meaningful when the body
     // is movable and sleep_mode enables sleeping.
     int stillFrames = 0;
@@ -504,6 +506,10 @@ struct Solver
     // and decayed (x0.5, floored at 1) for converging ones - the classic augmented
     // Lagrangian kappa update, per constraint instead of a global betaLin.
     bool adaptiveBeta = false;
+    // Residual penetration depth (metres) at or below which a contact counts as solved
+    // by the adaptive-beta update: the multiplier decays toward 1 instead of doubling,
+    // so float-scale noise on a resting contact cannot ratchet it to the cap.
+    float adaptiveBetaErrorFloor = 1e-3f;
 
     // Upper bound of the adaptive iteration boost. The boost multiplies the round count
     // by the penetration ratio, so at impact moments a scene pays this many dense rounds
@@ -659,6 +665,8 @@ private:
     std::vector<int> bodyIsland;
 
     std::unique_ptr<detail::JobPool> pool;
+    // Sequence of classified stages for one step, rebuilt each time `runSubstep` runs.
+    std::unique_ptr<detail::TaskFlow> flow;
 
     // Current collision margin for this frame (dynamically adjusted)
     float currentCollisionMargin = COLLISION_MARGIN_BASE;
@@ -683,14 +691,21 @@ private:
     // The phases of a step, in the order `step()` runs them.
     void broadPhase();
     int warmstartForces();
-    void warmstartBodies();
-    void solveIterations(int forceCount);
-    // The whole iteration set as one persistent-worker loop: `targetIterations` rounds of
+    // One body's inertial/warm-start update (independent across the list).
+    void warmstartBody(int i);
+    // Decide this step's round count once, before the region starts.
+    void computeIterations(int &r_targetIterations, int &r_newtonRounds);
+    // The whole iteration set as one persistent-worker region: `targetIterations` rounds of
     // the block-Jacobi primal (one full block solve per body against the iteration-start
-    // pose, then a combine pass) plus dual passes, fenced by LoopSync barriers. Declared
-    // here so `iterate` stays testable.
-    void iterate(int targetIterations, int forceCount, int newtonRounds);
-    void finishVelocities();
+    // pose, then a combine pass) plus dual passes, fenced by LoopSync barriers. Both sync
+    // types run the identical body; NullSync is the inline/reference path.
+    template <typename Sync>
+    void iterateBody(int workerIndex, Sync &sync, int targetIterations, int forceCount,
+            int newtonRounds, float &r_prevResidual, std::atomic<bool> &r_converged);
+    // One body's BDF1 velocity update and idle detection (independent across the list).
+    void finishBody(int i);
+    // One step's body warmstart, iteration region, and velocity finish, as a flow.
+    void runSubstep(int forceCount, int targetIterations, int newtonRounds);
 
     // Island-wide sleep bookkeeping (runs when sleeping is enabled): movable bodies are
     // grouped into islands through force connectivity, and an island whose every body

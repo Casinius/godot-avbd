@@ -90,8 +90,9 @@ bool Manifold::initialize()
                 float3 newRA = newContacts[i].rA;
                 float3 newRB = newContacts[i].rB;
                 newContacts[i] = contacts[j];
-                prevErr[i] = contacts[j].C0.norm();
-                newContacts[i].betaScale = contacts[j].betaScale;
+                // Penetration depth, not |C0|: C0's normal component carries the collision
+                // margin, so a resting contact would otherwise look like a constant error.
+                prevErr[i] = std::max(0.0f, COLLISION_MARGIN - contacts[j].C0.x());
 
                 // If no static friction in last frame, use the new contact point locations
                 if (!contacts[j].stick)
@@ -129,12 +130,20 @@ bool Manifold::initialize()
         // Adaptive beta (the augmented-Lagrangian kappa update, per contact): a
         // sticking contact whose error did not shrink against last step doubles its
         // personal ramp multiplier; a well-converging one halves it back toward 1.
-        // Unmatched (fresh) contacts start from the neutral multiplier.
-        if (solver->adaptiveBeta && prevErr[i] > 0.0f)
+        // Unmatched (fresh) contacts start from the neutral multiplier. The residual is
+        // penetration depth (the margin is not an error to converge), and a residual at
+        // or below the floor is treated as solved so float-scale noise on a resting
+        // contact cannot ratchet the multiplier to the cap.
+        if (solver->adaptiveBeta && prevErr[i] >= 0.0f)
         {
-            const float err = contacts[i].C0.norm();
+            const float err = std::max(0.0f, COLLISION_MARGIN - contacts[i].C0.x());
+            const float floor = solver->adaptiveBetaErrorFloor;
             float scale = contacts[i].betaScale;
-            if (err > 0.5f * prevErr[i])
+            if (err <= floor)
+                scale = std::max(scale * 0.5f, 1.0f);
+            else if (prevErr[i] <= floor)
+                scale = std::min(scale * 2.0f, ADAPTIVE_BETA_MAX);
+            else if (err > 0.5f * prevErr[i])
                 scale = std::min(scale * 2.0f, ADAPTIVE_BETA_MAX);
             else if (err < 0.1f * prevErr[i])
                 scale = std::max(scale * 0.5f, 1.0f);
@@ -153,8 +162,22 @@ bool Manifold::initialize()
         // ramped per iteration in updateDual (betaLin * |C|, capped by PENALTY_MAX).
         // The warmstart decay below is kept bit-for-bit.
         contacts[i].lambda = contacts[i].lambda * solver->alpha * solver->gamma;
-        const float clampedLambdaPenalty = std::clamp(PENALTY_MIN * solver->gamma, PENALTY_MIN, PENALTY_MAX);
-        contacts[i].penalty = float3{clampedLambdaPenalty, clampedLambdaPenalty, clampedLambdaPenalty};
+        if (solver->adaptiveBeta)
+        {
+            // Adaptive beta is a per-contact ramp multiplier, so the penalty it produced
+            // must survive into the next step: decay the carried value (Eq. 19) instead
+            // of restarting from the floor, which threw the ramp away and made a resting
+            // body re-grow its support every frame. Unmatched contacts are zero-initialised,
+            // so this lands on PENALTY_MIN for a fresh contact.
+            contacts[i].penalty = (contacts[i].penalty * solver->gamma)
+                    .cwiseMax(float3{PENALTY_MIN, PENALTY_MIN, PENALTY_MIN})
+                    .cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX});
+        }
+        else
+        {
+            const float clampedLambdaPenalty = std::clamp(PENALTY_MIN * solver->gamma, PENALTY_MIN, PENALTY_MAX);
+            contacts[i].penalty = float3{clampedLambdaPenalty, clampedLambdaPenalty, clampedLambdaPenalty};
+        }
     }
 
     return numContacts > 0;
