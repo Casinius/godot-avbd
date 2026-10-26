@@ -41,9 +41,10 @@ class AVBDSoftBody3D : public MultiMeshInstance3D {
     double stiffness_linear = 1000.0;
     double stiffness_angular = 250.0;
 
-    // Latest simulated pose of each cell. A rebuild recreates the solver, so the poses are
-    // kept here to put the lattice back where it was rather than resetting it to its spawn
-    // layout. Absent until the lattice has been built once.
+    // Pose of each cell as of the tick that is about to run. Two things use it: a rebuild
+    // recreates the solver, so the poses put the lattice back where it was instead of resetting it
+    // to its spawn layout, and the visuals blend from it towards the live pose when the world runs
+    // its own tick. Absent until the lattice has been built once.
     struct Cell {
         avbd::float3 position;
         avbd::quat rotation;
@@ -97,9 +98,12 @@ public:
 
     // --- simulation interface, used by AVBDSoftWorld3D ---------------------------
     void _build(avbd::Solver &p_solver, const Transform3D &p_node_in_sim);
+    // Snapshot the live cell poses into `cells`, i.e. make them "the previous tick".
     void _store_state();
     void _clear();
-    void _sync_visuals(const Transform3D &p_sim_in_node);
+    // Push the cells into the MultiMesh. p_alpha is how far the world's clock has come into the
+    // tick after the one `cells` holds: 1 draws the live pose, less blends towards it.
+    void _sync_visuals(const Transform3D &p_sim_in_node, double p_alpha);
     avbd::Rigid *_get_cell_rigid(std::size_t p_index) const;
 };
 

@@ -146,6 +146,11 @@ AVBDPhysicsServer3D::SpaceData *AVBDPhysicsServer3D::find_space(const RID &p_rid
     return found == spaces.end() ? nullptr : &found->second;
 }
 
+const AVBDPhysicsServer3D::SpaceData *AVBDPhysicsServer3D::find_space(const RID &p_rid) const {
+    const auto found = spaces.find(id_of(p_rid));
+    return found == spaces.end() ? nullptr : &found->second;
+}
+
 // -----------------------------------------------------------------------------
 // Lifecycle
 // -----------------------------------------------------------------------------
@@ -237,12 +242,26 @@ void AVBDPhysicsServer3D::_flush_queries() {
             if (!body.sync.is_valid() && !body.force_integration_callback.is_valid()) {
                 continue;
             }
-            body_state->bind(this, body.rigid, make_rid(body_id));
+            // The pose this body's node is about to be moved to. Only a space that interpolates
+            // has one that differs from the solver's, and the lookup that finds it is per body, so
+            // the common path is a single flag test.
+            const SpaceData *space = any_interpolating ? find_space(body.space) : nullptr;
+            Transform3D shown;
+            const bool blend = space != nullptr && space->interpolate_poses;
+            if (blend) {
+                shown = delivered_transform(body, *space);
+            }
+            body_state->bind(this, body.rigid, make_rid(body_id), blend ? &shown : nullptr);
             if (body.sync.is_valid()) {
                 one_arg[0] = body_state;
                 body.sync.callv(one_arg);
             }
             if (body.force_integration_callback.is_valid()) {
+                // Re-aim the shared instance at the solver's real pose: a script that reads the
+                // transform here is about to write something back into the simulation.
+                if (blend) {
+                    body_state->bind(this, body.rigid, make_rid(body_id));
+                }
                 if (body.force_integration_userdata.get_type() != Variant::NIL) {
                     two_args[0] = body_state;
                     two_args[1] = body.force_integration_userdata;
@@ -399,6 +418,19 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
                                "fewer steps than the engine asks for and drop the surplus time.",
                     tick_rate, engine_rate));
         }
+    }
+
+    // Delivery smoothing. The clock's leftover is what a blend is drawn at, and this switch says
+    // whether the scene gets the blend or the newest simulated pose.
+    p_space.interpolate_poses = static_cast<bool>(settings->get_setting("physics/avbd/interpolate_poses", false));
+    any_interpolating = any_interpolating || p_space.interpolate_poses;
+    if (p_space.interpolate_poses && !warned_double_interpolation &&
+            static_cast<bool>(settings->get_setting("physics/common/physics_interpolation", false))) {
+        warned_double_interpolation = true;
+        WARN_PRINT("AVBD physics server: avbd/interpolate_poses is on while "
+                   "physics/common/physics_interpolation is also on. The engine already blends the "
+                   "poses it is delivered, so both layers smooth the same pair and the motion lags "
+                   "by about twice one solver tick. Turn one of them off.");
     }
 
     params.dual.alpha = static_cast<float>(settings->get_setting("physics/avbd/alpha", 0.99));
@@ -1373,7 +1405,7 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         // own fixed tick and the engine step only says how much of it has been paid for; without
         // one the engine step is the clock and splits across `substeps` as it always did.
         const int substeps = space.substeps > 0 ? space.substeps : 1;
-        double alpha = 1.0; // unused until the pose snapshots read it (A2)
+        double alpha = 1.0;
         int ticks = 0;
         if (space.tick_rate > 0.0) {
             space.clock.tick_dt = 1.0 / space.tick_rate;
@@ -1385,6 +1417,11 @@ void AVBDPhysicsServer3D::_step(float p_step) {
             ticks = substeps;
             space.solver.dt = static_cast<float>(p_step) / static_cast<float>(substeps);
         }
+        // The delivery path reads this instead of the local: a call that bought no tick still
+        // moves the blend closer to the pose the next tick will produce, and that is what makes
+        // a slow solver tick look smooth. Without a clock the leftover is meaningless, so the
+        // blend is the newest pose (alpha 1) and nothing changes.
+        space.interpolation_alpha = alpha;
         prof_ticks = std::max(prof_ticks, ticks);
 
         // Forces accumulated since the last call (persistent constant_* plus one-shot frame ones)
@@ -1521,6 +1558,12 @@ void AVBDPhysicsServer3D::_step(float p_step) {
             transform.origin = to_godot(rigid->positionLin);
             transform.basis = Basis(to_godot(rigid->positionAng).normalized());
 
+            // The pair an interpolated delivery blends between. Both halves move one *delivery*
+            // forward, not one tick: the scene can only observe one pose per engine call, so the
+            // interval between two of them is the only span a blend can be drawn across. When a
+            // call runs several ticks they all land in the newer half, and the leftover the clock
+            // reports slides the shown pose between the two - which is a steady lag, never a jitter.
+            body.pose_prev = body.transform;
             body.transform = transform;
             body.linear_velocity = to_godot(rigid->velocityLin);
             body.angular_velocity = to_godot(rigid->velocityAng);
@@ -2043,11 +2086,25 @@ void AVBDPhysicsServer3D::_body_set_state(const RID &p_body, PhysicsServer3D::Bo
     }
 
     switch (p_state) {
-        case PhysicsServer3D::BODY_STATE_TRANSFORM:
-            body->transform = p_value;
+        case PhysicsServer3D::BODY_STATE_TRANSFORM: {
+            const Transform3D incoming = p_value;
+            // Godot pushes a body's node transform back here whenever the node changes, and the
+            // engine's own sync moves that node to the pose this server delivered. When the
+            // delivery is a blend, the echo is a pose the solver has already left behind, and
+            // writing it would drag the simulation backwards a fraction of a tick - and wake
+            // everything it touched. A write that lands on what we just handed out is not a move.
+            // Only tested when the space blends: with the switch off the delivered pose is
+            // `transform` itself and the write is the ordinary one.
+            const SpaceData *space = find_space(body->space);
+            if (space != nullptr && space->interpolate_poses &&
+                    poses_match(incoming, delivered_transform(*body, *space))) {
+                break;
+            }
+            body->transform = incoming;
+            // A teleport is the body's pose right now, so both halves of the pair move to it and
+            // the next blend starts from here rather than sliding out of the old pose.
+            body->pose_prev = body->transform;
             if (body->rigid != nullptr) {
-                // A transform set from the scene is the body's new pose right now, so the solver
-                // is told to match rather than being left to interpolate towards it.
                 const Transform3D &t = body->transform;
                 body->rigid->positionLin = avbd::float3{static_cast<float>(t.origin.x),
                         static_cast<float>(-t.origin.z), static_cast<float>(t.origin.y)};
@@ -2057,6 +2114,7 @@ void AVBDPhysicsServer3D::_body_set_state(const RID &p_body, PhysicsServer3D::Bo
                 body->rigid->stillFrames = 0;
             }
             break;
+        }
 
         case PhysicsServer3D::BODY_STATE_LINEAR_VELOCITY:
             body->linear_velocity = p_value;
@@ -2110,6 +2168,13 @@ void AVBDPhysicsServer3D::_body_set_state(const RID &p_body, PhysicsServer3D::Bo
     }
 }
 
+Transform3D AVBDPhysicsServer3D::delivered_transform(const BodyData &p_body, const SpaceData &p_space) {
+    if (!p_space.interpolate_poses || p_space.interpolation_alpha >= 1.0 || !p_body.pose_prev.has_value()) {
+        return p_body.transform;
+    }
+    return p_body.pose_prev->interpolate_with(p_body.transform, p_space.interpolation_alpha);
+}
+
 Variant AVBDPhysicsServer3D::_body_get_state(const RID &p_body, PhysicsServer3D::BodyState p_state) const {
     const auto found = bodies.find(id_of(p_body));
     if (found == bodies.end()) {
@@ -2118,8 +2183,10 @@ Variant AVBDPhysicsServer3D::_body_get_state(const RID &p_body, PhysicsServer3D:
     const BodyData &body = found->second;
 
     switch (p_state) {
-        case PhysicsServer3D::BODY_STATE_TRANSFORM:
-            return body.transform;
+        case PhysicsServer3D::BODY_STATE_TRANSFORM: {
+            const SpaceData *space = find_space(body.space);
+            return Variant(space != nullptr ? delivered_transform(body, *space) : body.transform);
+        }
         case PhysicsServer3D::BODY_STATE_LINEAR_VELOCITY:
             return body.linear_velocity;
         case PhysicsServer3D::BODY_STATE_ANGULAR_VELOCITY:

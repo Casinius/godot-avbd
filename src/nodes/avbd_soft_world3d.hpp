@@ -32,6 +32,7 @@
 
 #include "avbd/solver.h"
 #include "avbd/bvh/node_storage.hpp"
+#include "avbd/fixed_clock.hpp"
 
 namespace godot {
 
@@ -42,6 +43,15 @@ class AVBDSoftWorld3D : public Node3D {
 
     double gravity = 9.8;
     int threads = 0;
+
+    // The solver's own timestep, the same clock the physics server runs. 0 keeps the old
+    // behaviour: one step per physics notification, sized by whatever delta the scene tree
+    // handed over - which makes the lattice's stability depend on the game's tick rate.
+    double tick_rate = 0.0;
+    // Ticks one physics notification may run when the clock has fallen behind. The surplus
+    // logical time is dropped rather than simulated as a longer step.
+    int max_catchup_ticks = 4;
+    avbd::FixedClock clock;
 
     avbd::Solver solver;
     std::vector<AVBDSoftBody3D *> soft_bodies;
@@ -80,6 +90,15 @@ public:
 
     // Number of lattice cells currently simulated (reporting only).
     int get_body_count() const;
+
+    // Solver ticks per second. 0 = one step per physics notification, its length the scene tree's
+    // delta; any rate pins the solver's dt and turns the notification into a sampling of it.
+    void set_tick_rate(double p_tick_rate);
+    double get_tick_rate() const;
+
+    // Ceiling on the ticks one physics notification runs when the clock is behind.
+    void set_max_catchup_ticks(int p_ticks);
+    int get_max_catchup_ticks() const;
 
     // Force a re-scan and rebuild without waiting for the next tree change.
     void rebuild();

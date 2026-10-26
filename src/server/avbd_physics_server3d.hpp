@@ -51,7 +51,7 @@
 
 #include "avbd/solver.h"
 #include "avbd/bvh/node_storage.hpp"
-#include "server/fixed_clock.hpp"
+#include "avbd/fixed_clock.hpp"
 
 namespace godot {
 
@@ -94,6 +94,11 @@ protected:
         std::vector<RID> shape_rids;         // live shape records, for refreshing snapshots
         std::vector<Transform3D> shape_transforms;
         Transform3D transform;               // last pose the scene asked for
+        // The pose delivered before that one - the other half of the pair an interpolated
+        // delivery blends between. Absent until the first snapshot has happened, so nothing can
+        // blend towards a pose the body never had. A teleport fills both halves at once, which
+        // is what keeps a move from blending through itself.
+        std::optional<Transform3D> pose_prev;
         Vector3 linear_velocity;
         Vector3 angular_velocity;
 
@@ -230,6 +235,14 @@ protected:
         // is dropped, so a stall dilates time instead of enlarging the internal dt.
         int max_catchup_ticks = 4;
 
+        // How far into the next tick this call's step left the clock, in [0,1]. The clock produces
+        // it and the delivery path consumes it, so it is stamped on every call - including the
+        // ones that ran no tick, which is exactly when a blended pose still has to advance.
+        double interpolation_alpha = 1.0;
+        // physics/avbd/interpolate_poses. Off by default: without it a delivery is the newest
+        // simulated pose, which is what every suite here measures and what the solver digests.
+        bool interpolate_poses = false;
+
         // The one copy of the tuning knobs (see avbd::SolverParams): project settings land
         // here, and `solver.setParams()` hands the whole set over each step. Range fixing
         // happens inside setParams, once.
@@ -295,6 +308,18 @@ protected:
     // every settings change, and a project that deliberately samples below its solver rate does
     // not want the notice on every one of those reads.
     bool warned_slow_tick_rate = false;
+    // Same latch shape for the interpolation warning: Godot's own physics_interpolation blends
+    // the poses it is delivered, so turning both on double-blends the same pair.
+    bool warned_double_interpolation = false;
+    // Whether any space at all interpolates, so the delivery loop can skip the per-body space
+    // lookup when none does. Set with the setting; a project that leaves smoothing off never pays
+    // for it.
+    bool any_interpolating = false;
+
+    // The pose the scene is allowed to see: the newest simulated one, or - when the space
+    // interpolates and a previous delivery exists - the blend of the last two deliveries at
+    // wherever the clock stands inside the next tick.
+    static Transform3D delivered_transform(const BodyData &p_body, const SpaceData &p_space);
 
     uint64_t id_of(const RID &p_rid) const;
     RID make_rid(uint64_t p_id) const;
@@ -303,6 +328,9 @@ protected:
     const BodyData *find_body(const RID &p_rid) const;
     ShapeData *find_shape(const RID &p_rid);
     SpaceData *find_space(const RID &p_rid);
+    // The read side of a delivery: _body_get_state needs the space's clock to blend, and it runs
+    // inside a const API.
+    const SpaceData *find_space(const RID &p_rid) const;
     AreaData *find_area(const RID &p_rid);
 
     // The record a solver body belongs to, read through avbd::Rigid::host. Null for a body this
