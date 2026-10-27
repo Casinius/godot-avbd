@@ -146,15 +146,50 @@ struct Rigid
     Rigid(Rigid &&) = delete;
     Rigid &operator=(Rigid &&) = delete;
 
-    // Consecutive finishBody() steps with both velocities under the solver's sleep
-    // thresholds; reaching SolverParams::Sleep::frames flips `sleeping` on. Only meaningful when the body
-    // is movable and sleep_mode enables sleeping. Intrusive rather than a scratch column on
-    // purpose: islandSleep() reads it for bodies that have no update slot (sleeping ones), so
-    // it cannot be keyed by Rigid::updateSlot.
+    // Sleep bookkeeping. All of it intrusive rather than a scratch column on purpose: a sleeping
+    // body has no update slot (`updateSlot` is -1, it is out of the primal set), and the wake pass
+    // reads this state for exactly those bodies; it also has to survive between steps, which the
+    // per-step scratch does not.
+    //
+    // Idle credit: steps in which finishBody() found the body quiet, capped at the budget in
+    // Solver::sleepFrames. Solver::updateSleepIslands() is the only thing that turns it into
+    // `sleeping`, and it does so for a whole island at once.
     int32_t stillFrames = 0;
+    // Consecutive steps the wake evidence has held for this sleeping body. One step's velocity
+    // spike is a numerical nuisance, not a disturbance, so a body has to earn its wake-up over
+    // SolverParams::Sleep::wakeDebounce steps.
+    int32_t wakeFrames = 0;
+    // The pose the rest test measures drift against: a one-tenth-per-step low-pass of the body's
+    // own pose, so what it reports is roughly "how far has this body travelled over the last ten
+    // steps". That is the position-domain, and therefore dt-independent, version of the idle test -
+    // the velocity half of the test divides the same travel by the tick, which at 240 Hz reads four
+    // times the speed it does at 60 Hz for a body that is moving exactly as slowly.
+    float3 sleepRefLin;
+    quat sleepRefAng;
+
+    // Snap the rest window onto the current pose and drop the idle credit. A reference pose from
+    // before a teleport, a wake-up or a rebuild says nothing about where the body is now, and
+    // leaving it would either hold the body awake while the window catches up or, worse, hand it
+    // back credit measured against a pose it no longer has.
+    void resetRestWindow()
+    {
+        sleepRefLin = positionLin;
+        sleepRefAng = positionAng;
+        stillFrames = 0;
+        wakeFrames = 0;
+    }
+
+    // Forced wake, the one that does not go through the island pass: a host that moves a body,
+    // gives it a velocity or asks for it awake has broken the assumption the sleep state was built
+    // on, and its rest window has to start over.
+    void wake()
+    {
+        sleeping = false;
+        resetRestWindow();
+    }
 
     // Scratch-set membership, rewritten by Solver::selectUpdateBodies() and
-    // Solver::islandSleep() each step. These are handles into the solver's per-step arrays,
+    // Solver::updateSleepIslands() each step. These are handles into the solver's per-step arrays,
     // not state of the body: `updateSlot` is the index of this body in `Solver::updateOrder`
     // (and therefore into the columns of Solver::BodyScratch), and -1 marks a body the primal
     // phases may not move this step (static, sleeping). `islandSlot` is the same idea for the
@@ -801,10 +836,16 @@ struct SolverParams
         bool contacts = true;
     } projection;
 
-    // Idle detection: a movable body whose BDF1 velocities stay under both thresholds falls asleep
-    // (velocity zeroed, Godot semantics) once that has held for `timeToSleep` seconds.
-    // 0 disables automatic sleeping, which is the default the core tests measure against; the
-    // Godot server opens it at Godot's own space default. Thresholds are Godot's too.
+    // Idle detection: a movable body whose recent travel (see Rigid::sleepRefLin) stays under the
+    // tolerances falls asleep - velocity zeroed, Godot semantics - once that has held for
+    // `timeToSleep` seconds. 0 disables automatic sleeping, which is the default the core tests
+    // measure against; the Godot server opens it at Godot's own space default.
+    //
+    // The velocity thresholds are deliberately NOT part of the rest test: solver jitter is a fixed
+    // distance per step, so its BDF1 velocity is a distance divided by the tick and no velocity
+    // gate can be tick-rate independent. They still own the loudest half of the idle decision
+    // (hysteresisRatio) and the whole of the wake test in Solver::updateSleepIslands, which is
+    // where a fast neighbour is the question being asked anyway.
     struct Sleep
     {
         float linearThreshold = 0.1f;       // m/s
@@ -814,6 +855,26 @@ struct SolverParams
         // budget counted in steps would sleep everything twice as early. Solver::sleepFrames is
         // the same budget converted for the dt of the tick being run.
         float timeToSleep = 0.0f;
+        // The position half of the rest test: how far the body may have travelled over the window
+        // its reference pose defines (roughly ten steps) and still count as idle. Metres and
+        // radians, so neither depends on the tick the scene runs on. Both sit well above the
+        // collision margin's own 5 mm of resting overlap because that overlap is a static offset
+        // the reference pose follows, not travel - only movement accumulates against it.
+        float positionTolerance = 0.005f;
+        float rotationTolerance = 0.02f;
+        // Hysteresis. A body inside the tolerances earns a step of idle credit; a body beyond
+        // `hysteresisRatio` times a tolerance loses all of it; in between it only leaks credit, so
+        // a stack whose top box twitches at one and a half times the tolerance does not have to
+        // restart its whole budget from nothing. The ratio is the width of that middle band, and
+        // the reason it exists is the thing this section is about: the transition itself used to be
+        // the disturbance.
+        float hysteresisRatio = 3.0f;
+        // Steps a wake condition has to hold for before the island is woken. One step of a
+        // neighbour's velocity is the same noise the rest test rides out, and an island that wakes
+        // on it restarts every budget inside it - which is what a settled stack did at high tick
+        // rates, over and over. A neighbour moving `hysteresisRatio` times the threshold is not
+        // noise, and wakes the island on the spot.
+        int wakeDebounce = 2;
     } sleep;
 };
 
@@ -849,6 +910,12 @@ struct Solver
         p.sleep.linearThreshold = std::max(p.sleep.linearThreshold, 0.0f);
         p.sleep.angularThreshold = std::max(p.sleep.angularThreshold, 0.0f);
         p.sleep.timeToSleep = std::max(p.sleep.timeToSleep, 0.0f);
+        p.sleep.positionTolerance = std::max(p.sleep.positionTolerance, 0.0f);
+        p.sleep.rotationTolerance = std::max(p.sleep.rotationTolerance, 0.0f);
+        // Below 1 the leaky band is empty and the hard-reset threshold sits inside the quiet
+        // threshold, which would reset the credit of a body the same step it earned it.
+        p.sleep.hysteresisRatio = std::max(p.sleep.hysteresisRatio, 1.0f);
+        p.sleep.wakeDebounce = std::max(p.sleep.wakeDebounce, 1);
         params = p;
     }
 
@@ -997,11 +1064,14 @@ private:
     // One step's body warmstart, iteration region, and velocity finish, as a flow.
     void runSubstep(int forceCount, int targetIterations, int newtonRounds);
 
-    // Island-wide sleep bookkeeping (runs when sleeping is enabled): movable bodies are
-    // grouped into islands through force connectivity, and an island whose every body
-    // cleared idle detection this step puts all its members to sleep together. Prevents
-    // the partially-asleep contact chain from thrashing between states.
-    void islandSleep();
+    // Island-wide sleep bookkeeping, and the only thing that changes `sleeping` on the solver's own
+    // authority (it runs when sleeping is enabled): movable sleep-enabled bodies are grouped into
+    // islands through force connectivity, an island whose every member has earned its idle credit
+    // sleeps as a unit, and an island whose sleeper has held wake evidence for
+    // Sleep::wakeDebounce steps wakes as a unit. Either half alone thrashes: boxes sleeping one at a
+    // time leaves a chain that is part static and part solved, and waking one box of a settled
+    // island restarts the credit of every body it touches.
+    void updateSleepIslands();
 };
 
 } // namespace avbd

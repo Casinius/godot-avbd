@@ -264,10 +264,14 @@ Vector3 AVBDDirectBodyState3D::_get_constant_torque() const {
 
 void AVBDDirectBodyState3D::_set_sleep_state(bool p_enabled) {
     if (rigid != nullptr) {
-        rigid->sleeping = p_enabled;
         if (p_enabled) {
+            rigid->sleeping = true;
             rigid->velocityLin = avbd::float3{0, 0, 0};
             rigid->velocityAng = avbd::float3{0, 0, 0};
+        } else {
+            // Waking through Rigid::wake(), not the flag alone: a script that woke this body
+            // invalidated the idle credit and the rest window measured under it.
+            rigid->wake();
         }
     }
 }
