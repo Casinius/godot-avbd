@@ -1230,6 +1230,121 @@ static void test_jacobi_shares() {
 }
 
 // ---------------------------------------------------------------------------
+// The position projection layer (SolverParams::Projection), four things in the order they
+// matter: off it must not exist, even through the host's own entry point; on, the same scene
+// ends with less penetration than it would have; the layer must not make the answer depend on
+// how many threads ran it; and what it moved must be visible in the pose and - at the default
+// velocity transfer - nowhere else.
+// ---------------------------------------------------------------------------
+static void build_stack(Solver &s, std::vector<Rigid *> &r_boxes) {
+    new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
+    for (int i = 0; i < 10; i++) {
+        r_boxes.push_back(new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, i * 1.5f + 1.0f}));
+    }
+}
+
+// Same measure test_stack_stability asserts on: how far the worst interface has sunk, counting
+// the slab as the bottom of the stack. Body order, not list order - the list is not the stack.
+static float worst_stack_penetration(const std::vector<Rigid *> &boxes) {
+    float worst = 0.0f;
+    for (size_t i = 0; i < boxes.size(); i++) {
+        const float z = boxes[i]->positionLin.z();
+        worst = std::max(worst, 1.0f - (i == 0 ? z : z - boxes[i - 1]->positionLin.z()));
+    }
+    return worst;
+}
+
+static uint64_t projection_stack(const SolverParams &p, int threads, float &r_worst) {
+    Solver s;
+    s.threads = threads;
+    s.setParams(p);
+    std::vector<Rigid *> boxes;
+    build_stack(s, boxes);
+    step_n(s, 300);
+    r_worst = worst_stack_penetration(boxes);
+    return state_digest(s);
+}
+
+// A sphere sunk 10 cm into the slab, with the Newton primal switched off (newtonRatio 0 leaves
+// the dual-only rounds, which never write a pose). The projection is then the only thing that
+// moves the body, so the distance it moved and the velocity the step reports can be compared
+// against each other exactly - which is what projection_velocity_transfer means.
+static void projection_probe(int steps, float transfer, float &r_z, float &r_vz) {
+    Solver s;
+    s.threads = 1;
+    s.gravity = 0.0f;
+    SolverParams p;
+    p.projection.rounds = 8;
+    p.projection.scale = 1.0f;
+    p.projection.maxCorrection = 0.05f;
+    p.projection.velocityTransfer = transfer;
+    p.primal.newtonRatio = 0.0f;
+    s.setParams(p);
+    new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
+    Rigid *ball = new Rigid(&s, {0.5f, 0, 0}, ShapeType::Sphere, 1.0f, 0.5f, {0, 0, 0.9f});
+    step_n(s, steps);
+    r_z = ball->positionLin.z();
+    r_vz = ball->velocityLin.z();
+}
+
+static void test_projection() {
+    // 1. Off, through the clamp site the host uses. Every digest printed by this binary was
+    //    measured before the layer existed, so this is the one that has to keep matching.
+    {
+        float worst = 0.0f;
+        const uint64_t digest = projection_stack(SolverParams{}, 1, worst);
+        const uint64_t reference = stack_digest();
+        report(digest == reference, "projection off is bit-neutral", "0x%016llx vs default 0x%016llx",
+                (unsigned long long)digest, (unsigned long long)reference);
+    }
+
+    // 2. On: the same 300 steps of the same stack, and the scene must end shallower.
+    {
+        float offWorst = 0.0f, onWorst = 0.0f;
+        projection_stack(SolverParams{}, 1, offWorst);
+        SolverParams on;
+        on.projection.rounds = 4;
+        const uint64_t serial = projection_stack(on, 1, onWorst);
+        report(onWorst < offWorst, "projection heals penetration", "worst interface %.5f m vs %.5f m off",
+                onWorst, offWorst);
+        report(onWorst <= 0.05f, "projection holds the stack bound", "worst interface %.5f m (limit 0.05)", onWorst);
+
+        for (int t : {2, 4, 8}) {
+            float w = 0.0f;
+            const uint64_t digest = projection_stack(on, t, w);
+            char name[64];
+            std::snprintf(name, sizeof(name), "projection digest threads=%d", t);
+            report(digest == serial, name, "0x%016llx vs serial, worst %.5f m", (unsigned long long)digest, w);
+        }
+    }
+
+    // 3. The correction is positional; the velocity is a choice.
+    {
+        constexpr float dt = 1.0f / 60.0f; // Solver::dt, which the probe leaves at its default
+        // Eight steps: the sunk sphere starts 10 cm under the surface and the error the layer sees
+        // is capped at PENETRATION_MAX per step, so the climb is what takes it the rest of the way.
+        float z0 = 0.0f, v0 = 0.0f;
+        projection_probe(8, 0.0f, z0, v0);
+        // The body ends one margin short of touching: the projection stops at the surface the
+        // solver itself aims at, which is COLLISION_MARGIN inside contact.
+        const float target = 1.0f - COLLISION_MARGIN;
+        report(std::fabs(z0 - target) < 1e-3f, "projection reaches the constraint",
+                "centre z=%.5f (target %.5f, sunk to 0.9)", z0, target);
+        report(std::fabs(v0) < 1e-3f, "the lift is not kept as velocity", "vz=%.6f after 8 steps", v0);
+
+        // One step, so the lift is a single dt of velocity and the two transfer settings differ
+        // by exactly that: giving it back leaves the body where it was put, at rest.
+        float one0 = 0.0f, lift0 = 0.0f, one1 = 0.0f, lift1 = 0.0f;
+        projection_probe(1, 0.0f, one0, lift0);
+        projection_probe(1, 1.0f, one1, lift1);
+        report(one0 == one1, "velocity transfer does not move the pose", "z=%.6f vs %.6f", one0, one1);
+        report(std::fabs(lift0) < 1e-3f, "transfer 0 gives the move back", "vz=%.6f", lift0);
+        report(std::fabs(lift1 - (one1 - 0.9f) / dt) < 1e-2f, "transfer 1 keeps it as velocity",
+                "vz=%.4f (lift %.4f m over one dt)", lift1, one1 - 0.9f);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Adaptive beta: the per-contact ramp multiplier must react to real penetration,
 // not to the collision margin, must carry its penalty across steps only when the
 // feature is enabled, and must decay back to neutral when the contact is solved.
@@ -1398,6 +1513,7 @@ int main(int argc, char **argv) {
     test_all_scenes();
     test_determinism();
     test_jacobi_shares();
+    test_projection();
     test_adaptive_beta();
     test_parallel_equivalence();
     test_concurrent_solvers();

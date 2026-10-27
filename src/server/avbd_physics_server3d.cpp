@@ -446,6 +446,18 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     params.primal.chebyshevRho = static_cast<float>(settings->get_setting("physics/avbd/chebyshev_rho", 0.0));
     params.primal.adaptiveMaxIterations =
             static_cast<int>(settings->get_setting("physics/avbd/adaptive_max_iterations", 16.0));
+
+    // The position projection layer. Off by default here as well: it changes every delivered pose,
+    // so a project has to ask for it. `rounds` is the switch, the rest shape what it does.
+    params.projection.rounds =
+            static_cast<int>(settings->get_setting("physics/avbd/projection_rounds", 0.0));
+    params.projection.scale = static_cast<float>(settings->get_setting("physics/avbd/projection_scale", 0.9));
+    params.projection.maxCorrection =
+            static_cast<float>(settings->get_setting("physics/avbd/projection_max_correction", 0.01));
+    params.projection.velocityTransfer =
+            static_cast<float>(settings->get_setting("physics/avbd/projection_velocity_transfer", 0.0));
+    params.projection.dualFeedback =
+            static_cast<bool>(settings->get_setting("physics/avbd/projection_dual_feedback", true));
 }
 
 void AVBDPhysicsServer3D::_space_set_active(const RID &p_space, bool p_active) {

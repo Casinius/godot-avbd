@@ -321,6 +321,170 @@ void Manifold::updatePrimal(Rigid *body, float alpha, Block &block)
     stampCached(body, block);
 }
 
+// The projection's measure pass: for each contact row that is on the wrong side of its own
+// equilibrium, the multiplier that would take it to zero, split across the two bodies by their
+// compliance - and only that, written into this manifold's cache. Nothing here touches a body;
+// the share pass reads these back and each body applies its own half.
+//
+// The error is recomputed here rather than taken from `contactForceCache`, and from the current
+// poses rather than the round's snapshot: this pass runs after the dual update, and the whole
+// point is to report what is left once every constraint has had its say.
+//
+// Unlike the primal and the dual it is measured *unstabilised* - C0 + J.dq instead of the
+// C0.(1-alpha) + J.dq those two read. Both expressions share one zero, the speculative-margin
+// plane a few millimetres inside touching where the solver wants a contact to rest anyway, so the
+// two passes aim at the same surface; they differ only in how much of the distance to it one step
+// is allowed to close. alpha is what makes a deep contact heal over several steps rather than
+// one, and that delay is exactly what this layer exists to pay for: the guarantee a penalty method
+// cannot give is a legal pose at the end of the step, and a projection that asked only for the
+// percent the stabilisation leaves on the table could not give it.
+void Manifold::projectMeasure(float scale, float maxCorrection)
+{
+    // The ceiling is on how far one *body* may be moved by one pass, and a body takes shares from
+    // many contacts, so it is applied where those are summed - in the share pass.
+    (void)maxCorrection;
+
+    const Compliance cA = complianceOf(bodyA);
+    const Compliance cB = complianceOf(bodyB);
+    // Leaving the cache as it is here is safe, and it is worth saying why: a stale share is only
+    // ever read by a body that can move, and a body that can move takes this early return away.
+    if (cA.immobile() && cB.immobile())
+        return;
+
+    const float dtSq = solver->dt * solver->dt;
+    const float3 dqALin = bodyA->positionLin - bodyA->initialLin;
+    const float3 dqAAng = bodyA->positionAng - bodyA->initialAng;
+    const float3 dqBLin = bodyB->positionLin - bodyB->initialLin;
+    const float3 dqBAng = bodyB->positionAng - bodyB->initialAng;
+    const float3x3 rotA(bodyA->positionAng);
+    const float3x3 rotB(bodyB->positionAng);
+
+    // A multiplier is a force once it is divided by the square of the step, because that is how
+    // the primal reads one back: a body's response to a stamped force is dt^2 * F / m. Charging
+    // the projected correction to the multiplier says "this much of the contact force has already
+    // been delivered, by moving the pose instead of pushing through it", which is what stops the
+    // next round's penalty ramp from re-buying the same correction.
+    const bool feedback = solver->params.projection.dualFeedback && dtSq > 0.0f;
+
+    // A contact patch is one constraint seen through up to eight points, and this is a Jacobi
+    // shares one correction evenly instead - exact for a single contact, and for a patch it moves
+    // the bodies by the mean of what its corners asked for. The disagreement between the corners
+    // is left to the angular half, where it becomes the torque that levels the box.
+    const float patch = 1.0f / static_cast<float>(numContacts > 0 ? numContacts : 1);
+
+    for (int i = 0; i < numContacts; i++)
+    {
+        JacobianCache &cache = jacobianCache[i];
+        cache.projLambda = float3{0, 0, 0};
+        cache.projectedRows = 0;
+
+        const float3 rAWorld = rotA * contacts[i].rA;
+        const float3 rBWorld = rotB * contacts[i].rB;
+        float3x3 jAAng, jBAng;
+        for (int r = 0; r < 3; r++)
+        {
+            jAAng.row(r) = rAWorld.cross(basis.row(r));
+            jBAng.row(r) = rBWorld.cross(-basis.row(r));
+        }
+
+        const float3 C = contacts[i].C0 + basis * dqALin - basis * dqBLin
+                + jAAng * dqAAng + jBAng * dqBAng;
+
+        // Normal first: the friction cone the tangential rows may use is sized by it.
+        float3 mu = float3{0, 0, 0};
+        uint8_t rows = 0;
+        if (C[0] < 0.0f)
+        {
+            const float w = cA.row(basis.row(0), rAWorld) + cB.row(basis.row(0), rBWorld);
+            if (w > 0.0f)
+            {
+                mu[0] = -C[0] * scale / w;
+                rows = 1;
+            }
+        }
+
+        // Tangential rows only carry static friction, and only up to the cone the normal
+        // correction opened: a sliding contact is *supposed* to move along its tangents, and
+        // projecting its error would be projecting the slide away.
+        if (rows != 0 && contacts[i].stick)
+        {
+            const float cone = friction * std::fabs(mu[0]);
+            for (int r = 1; r < 3; r++)
+            {
+                if (C[r] == 0.0f)
+                    continue;
+                const float w = cA.row(basis.row(r), rAWorld) + cB.row(basis.row(r), rBWorld);
+                if (w > 0.0f)
+                    mu[r] = -C[r] * scale / w;
+            }
+            const float slip = float2{mu[1], mu[2]}.norm();
+            if (slip > cone && slip > 0.0f)
+            {
+                mu[1] *= cone / slip;
+                mu[2] *= cone / slip;
+            }
+            if (mu[1] != 0.0f)
+                rows |= 2;
+            if (mu[2] != 0.0f)
+                rows |= 4;
+        }
+
+        // Scaled after the cone clamp, so the ratio between the rows the cone allows is kept.
+        mu = mu * patch;
+        cache.projLambda = mu;
+        cache.projectedRows = rows;
+
+        if (feedback && rows != 0)
+        {
+            float3 &lambda = contacts[i].lambda;
+            lambda = lambda - mu / dtSq;
+            // The same two clamps updateDual applies to a force, for the same reasons: a contact
+            // can only press, and friction cannot exceed what pressing provides.
+            lambda[0] = std::min(lambda[0], 0.0f);
+            const float bounds = std::fabs(lambda[0]) * friction;
+            const float held = float2{lambda[1], lambda[2]}.norm();
+            if (held > bounds && held > 0.0f)
+            {
+                lambda[1] *= bounds / held;
+                lambda[2] *= bounds / held;
+            }
+        }
+    }
+}
+
+void Manifold::projectShare(const Rigid *body, float3 &r_deltaLin, float3 &r_deltaAng) const
+{
+    const bool isA = body == bodyA;
+    if (!isA && body != bodyB)
+        return;
+
+    const Compliance c = complianceOf(isA ? bodyA : bodyB);
+    if (c.immobile())
+        return;
+
+    const float3x3 rot(isA ? bodyA->positionAng : bodyB->positionAng);
+    const float sign = isA ? 1.0f : -1.0f;
+    for (int i = 0; i < numContacts; i++)
+    {
+        const uint8_t rows = jacobianCache[i].projectedRows;
+        if (rows == 0)
+            continue;
+        const float3 &mu = jacobianCache[i].projLambda;
+        const float3 arm = rot * (isA ? contacts[i].rA : contacts[i].rB);
+        for (int r = 0; r < 3; r++)
+        {
+            if ((rows & (1 << r)) == 0)
+                continue;
+            // The row's Jacobian flips sign with the side it is stamped into, exactly as the
+            // primal's does, so the two bodies are always moved towards the constraint, never
+            // one towards and one away from the same error.
+            const float3 n = basis.row(r);
+            r_deltaLin = r_deltaLin + n * (sign * mu[r] * c.invMass);
+            r_deltaAng = r_deltaAng + c.invInertiaTimes(arm.cross(n)) * (sign * mu[r]);
+        }
+    }
+}
+
 void Manifold::updateDual(float alpha)
 {
     const float betaLinBase = solver->params.dual.betaLin;
@@ -373,14 +537,28 @@ void Manifold::updateDual(float alpha)
         // Store updated force
         contacts[i].lambda = F;
 
+        // A row the projection already moved to its target this round is not a residual the
+        // penalty needs to grow against: ramping it would buy the correction a second time, and
+        // the second bill is what turns a projection into an oscillator. The mask is consumed
+        // here, so a row only skips the ramp for the one dual pass that follows the pass which
+        // projected it. With the layer off the mask is always empty and this changes nothing.
+        uint8_t projected = 0;
+        if (solver->params.projection.dualFeedback)
+        {
+            projected = jacobianCache[i].projectedRows;
+            jacobianCache[i].projectedRows = 0;
+        }
+
         // Update the penalty parameter and clamp to material stiffness if we are within the force bounds (Eq. 16)
         const float beta = betaLinBase * contacts[i].betaScale;
-        if (F[0] < 0)
+        if (F[0] < 0 && (projected & 1) == 0)
             contacts[i].penalty[0] = std::min(contacts[i].penalty[0] + beta * std::fabs(C[0]), PENALTY_MAX);
         if (frictionScale <= bounds)
         {
-            contacts[i].penalty[1] = std::min(contacts[i].penalty[1] + beta * std::fabs(C[1]), PENALTY_MAX);
-            contacts[i].penalty[2] = std::min(contacts[i].penalty[2] + beta * std::fabs(C[2]), PENALTY_MAX);
+            if ((projected & 2) == 0)
+                contacts[i].penalty[1] = std::min(contacts[i].penalty[1] + beta * std::fabs(C[1]), PENALTY_MAX);
+            if ((projected & 4) == 0)
+                contacts[i].penalty[2] = std::min(contacts[i].penalty[2] + beta * std::fabs(C[2]), PENALTY_MAX);
             contacts[i].stick = float2{C[1], C[2]}.norm() < STICK_THRESH;
         }
     }

@@ -84,6 +84,22 @@ static void register_avbd_settings() {
             {"physics/avbd/chebyshev_rho", Variant(0.0)},
             {"physics/avbd/adaptive_max_iterations", Variant(16)},
             {"physics/avbd/adaptive_beta", Variant(false)},
+            // The position projection layer: a positional pass over the constraints that declares
+            // itself hard (contacts, locked and limited joint axes), so a delivered pose is legal
+            // even where a penalty method can only approach one. Rounds is the switch and 0 keeps
+            // a project exactly as it was; 2-4 is where the measurement starts to pay.
+            {"physics/avbd/projection_rounds", Variant(0)},
+            {"physics/avbd/projection_scale", Variant(0.9)},
+            // Ceiling on how far one body may be moved by one pass, metres. It is a per-body
+            // ceiling rather than a per-contact one, so a body pinched between many contacts is
+            // moved once per pass and not once per pinch.
+            {"physics/avbd/projection_max_correction", Variant(0.01)},
+            // 0 = the projected move is given back out of the step's velocity, so the layer costs
+            // no momentum; 1 = standard PBD, where the move *is* the velocity.
+            {"physics/avbd/projection_velocity_transfer", Variant(0.0)},
+            // Charge the correction to the constraint's force multiplier so the next round's
+            // penalty ramp does not buy the same lift twice.
+            {"physics/avbd/projection_dual_feedback", Variant(true)},
     };
     for (const auto &entry : entries) {
         if (settings->has_setting(entry.first)) {
@@ -95,6 +111,7 @@ static void register_avbd_settings() {
         const StringName name(entry.first);
         settings->set_as_basic(name,
                 name == StringName("physics/avbd/adaptive_beta") ||
+                        name == StringName("physics/avbd/projection_rounds") ||
                         name == StringName("physics/avbd/substeps") ||
                         name == StringName("physics/avbd/tick_rate") ||
                         name == StringName("physics/avbd/iterations"));
