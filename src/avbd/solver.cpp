@@ -824,10 +824,10 @@ void Solver::finishBody(int i)
         body->velocityLin = (body->positionLin - body->initialLin) / dt;
         body->velocityAng = (body->positionAng - body->initialAng) / dt;
         // BDF1 cannot tell a projection's move from a body's own: both are a change of pose
-        // inside the step. projection_velocity_transfer says which of them the scene keeps. At
-        // 0 (the default) the layer is purely positional - the pose is legal and the velocity is
-        // what it would have been without the correction, so nothing is injected. At 1 the
-        // correction is indistinguishable from motion, which is standard PBD.
+        // inside the step. projection_velocity_transfer says which of them the scene keeps. At 1
+        // (the default) the correction is indistinguishable from motion, which is standard PBD; at
+        // 0 the layer is purely positional - the pose is legal and the velocity is what it would
+        // have been without it - and that mismatch is what measured badly on the jointed scenes.
         if (params.projection.rounds > 0 && params.projection.velocityTransfer < 1.0f
                 && body->updateSlot >= 0)
         {

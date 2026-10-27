@@ -377,6 +377,11 @@ void Manifold::projectMeasure(float scale, float maxCorrection)
         JacobianCache &cache = jacobianCache[i];
         cache.projLambda = float3{0, 0, 0};
         cache.projectedRows = 0;
+        // Out of scope. Those two fields are the share pass's only window into this row, so
+        // clearing them and stopping is what takes a contact out of the layer; skipping the clear
+        // would re-apply whatever the previous pass measured.
+        if (!solver->params.projection.contacts)
+            continue;
 
         const float3 rAWorld = rotA * contacts[i].rA;
         const float3 rBWorld = rotB * contacts[i].rB;

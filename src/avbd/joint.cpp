@@ -190,6 +190,11 @@ void Joint::projectMeasure(float scale, float maxCorrection)
     // constraint that has since decided it is soft.
     projLin = float3{0, 0, 0};
 
+    // Out of scope, after the clear: the share pass reads projLin and nothing else, so a joint left
+    // measuring nothing must leave it holding nothing.
+    if (!solver->params.projection.joints)
+        return;
+
     if (!std::isinf(stiffnessLin))
         return;
 
