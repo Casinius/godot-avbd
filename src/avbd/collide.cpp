@@ -34,7 +34,9 @@ enum AxisType
 {
     AXIS_FACE_A,
     AXIS_FACE_B,
-    AXIS_EDGE
+    AXIS_EDGE,
+    AXIS_CYL_SAMPLE,
+    AXIS_CYL_CORNER
 };
 
 struct OBB
@@ -636,33 +638,52 @@ inline bool pointInCylinder(const Shape& cyl, const float3& p, float3& r_push, f
 }
 
 // A candidate contact before it is handed to the manifold, with the penetration depth that
-// decides whether it is worth keeping.
+// decides whether it is worth keeping, and the identity of the sampled feature.
 struct Candidate
 {
     float3 xA;
     float3 xB;
     float3 normal; // points from the shape the sample belongs to, outwards
     float depth;
+    // Stable identity of the sample that produced this contact: a path tag, which shape
+    // owns the sample, and its local index. Warm-start matching keys on this, so it must
+    // not depend on the depth ranking (a rank-keyed contact resets its state whenever the
+    // ranking moves, which for sampled cylinders is almost every tick).
+    uint32_t feature;
 };
 
 // Emit the deepest MAX_CONTACTS candidates. Ranking by depth rather than taking them in sampling
 // order is what keeps a contact set sensible when there are more samples than the budget: the
 // shallow ones are the ones to drop.
+//
+// The ranking is an insertion sort into a stack array: stable (equal depths keep sampling
+// order) and allocation-free, unlike the vector + stable_sort copy this replaces.
 inline void emitRanked(const Shape& shapeA, const Shape& shapeB,
                        std::span<const Candidate> candidates,
                        std::span<Manifold::Contact> contacts, int& contactCount)
 {
-    // Make a copy since we need to sort the candidates
-    std::vector<Candidate> sortedCandidates(candidates.begin(), candidates.end());
-
-    std::ranges::stable_sort(sortedCandidates, std::greater{},
-            [](const Candidate& c) { return c.depth; });
+    std::array<Candidate, MAX_CANDIDATES> ranked;
+    const int candidateCount = static_cast<int>(candidates.size());
+    for (int i = 0; i < candidateCount; ++i)
+    {
+        const Candidate &c = candidates[static_cast<size_t>(i)];
+        int j = i;
+        while (j > 0 && ranked[j - 1].depth < c.depth)
+        {
+            ranked[j] = ranked[j - 1];
+            --j;
+        }
+        ranked[j] = c;
+    }
 
     std::array<float3, MAX_CONTACTS> midpoints;
     contactCount = 0;
-    for (const Candidate& c : std::views::take(sortedCandidates, MAX_CONTACTS))
+    const int emitCount = std::min(candidateCount, MAX_CONTACTS);
+    for (int i = 0; i < emitCount; ++i)
     {
-        if (!addContact(shapeA, shapeB, contacts, contactCount, midpoints.data(), c.xA, c.xB, contactCount + 1))
+        const Candidate &c = ranked[i];
+        if (!addContact(shapeA, shapeB, contacts, contactCount, midpoints.data(), c.xA, c.xB,
+                static_cast<int>(c.feature)))
             break;
     }
 }
@@ -676,11 +697,37 @@ inline void emitRanked(const Shape& shapeA, const Shape& shapeB,
 // first N of an ordered ring would cover one arc and leave the other side unsupported - which
 // tips the body over. With a stride coprime to the sample count, any prefix is spread around the
 // circle.
+// The rim angles are the same on every call, so the sine and cosine table is built once.
+// The entries are produced by the same `std::cos` / `std::sin` of the same float angle the
+// per-sample code used, which keeps the sampled positions bit-identical.
+struct RimTrig
+{
+    float cos[RIM_SAMPLES];
+    float sin[RIM_SAMPLES];
+};
+
+inline const RimTrig &rimTrig()
+{
+    static const RimTrig table = [] {
+        RimTrig t{};
+        for (size_t i = 0; i < RIM_SAMPLES; ++i)
+        {
+            const int step = static_cast<int>(i) * 5 % RIM_SAMPLES;
+            const float a = 6.28318530718f * (float)step / (float)RIM_SAMPLES;
+            t.cos[i] = std::cos(a);
+            t.sin[i] = std::sin(a);
+        }
+        return t;
+    }();
+    return table;
+}
+
 inline void cylinderSamples(const Shape& cyl, float3* out, int& count)
 {
     count = 0;
     const float3 x = qrot(cyl.rotation, float3{1, 0, 0});
     const float3 y = qrot(cyl.rotation, float3{0, 1, 0});
+    const RimTrig &trig = rimTrig();
 
     // Both caps, centres first so a flat contact has a central point.
     for (int end = -1; end <= 1; end += 2)
@@ -689,9 +736,7 @@ inline void cylinderSamples(const Shape& cyl, float3* out, int& count)
         out[count++] = capCentre;
         for (size_t i = 0; i < RIM_SAMPLES; ++i)
         {
-            const int step = (i * 5) % RIM_SAMPLES;
-            const float a = 6.28318530718f * (float)step / (float)RIM_SAMPLES;
-            out[count++] = capCentre + (x * std::cos(a) + y * std::sin(a)) * cyl.radius;
+            out[count++] = capCentre + (x * trig.cos[i] + y * trig.sin[i]) * cyl.radius;
         }
     }
 
@@ -702,9 +747,7 @@ inline void cylinderSamples(const Shape& cyl, float3* out, int& count)
         const float3 ringCentre = cyl.center + cyl.axis * t;
         for (size_t i = 0; i < RIM_SAMPLES; ++i)
         {
-            const int step = (i * 5) % RIM_SAMPLES;
-            const float a = 6.28318530718f * (float)step / (float)RIM_SAMPLES;
-            out[count++] = ringCentre + (x * std::cos(a) + y * std::sin(a)) * cyl.radius;
+            out[count++] = ringCentre + (x * trig.cos[i] + y * trig.sin[i]) * cyl.radius;
         }
     }
 }
@@ -840,6 +883,8 @@ inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
         c.xB = cylinderIsA ? samples[i] + pushOut * depth : samples[i];
         c.normal = cylinderIsA ? -pushOut : pushOut;
         c.depth = depth;
+        c.feature = (uint32_t(AXIS_CYL_SAMPLE) << 24)
+                | (uint32_t(cylinderIsA ? 1u : 0u) << 20) | static_cast<uint32_t>(i);
         normalAB += c.normal;
     }
 
@@ -861,6 +906,8 @@ inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
         c.xB = cylinderIsA ? cornerWorld : cornerWorld + pushOut * surfaceDist;
         c.normal = cylinderIsA ? pushOut : -pushOut;
         c.depth = surfaceDist;
+        c.feature = (uint32_t(AXIS_CYL_CORNER) << 24)
+                | (uint32_t(cylinderIsA ? 0u : 1u) << 20) | static_cast<uint32_t>(corner);
         normalAB += c.normal;
     }
 
@@ -906,6 +953,8 @@ inline int collideCylinderCylinder(const Shape& a, const Shape& b,
             c.xB = fromIsA ? samples[i] + pushOut * surfaceDist : samples[i];
             c.normal = fromIsA ? -pushOut : pushOut;
             c.depth = surfaceDist;
+            c.feature = (uint32_t(AXIS_CYL_SAMPLE) << 24)
+                    | (uint32_t(fromIsA ? 1u : 0u) << 20) | static_cast<uint32_t>(i);
             normalAB += c.normal;
         }
     }

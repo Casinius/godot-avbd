@@ -20,27 +20,42 @@
  *                 phase fences. Owns a participant budget for its lifetime. A small step
  *                 can run the same body inline with NullSync instead (`inlineWhen`).
  *
- * The flow is built before it runs (that is what lets stages be cheap closures), so a
- * later stage reads values produced by an earlier one through a captured reference.
+ * Stages are a tagged variant of plain function pointers and a `void *ctx`, not
+ * `std::function`: building a step allocates nothing, and there is no type-erased thunk
+ * per stage. The context is an object owned by the caller (a stack `SubstepCtx`), so a
+ * stage never outlives the values it reads.
  */
 
 #ifndef AVBD_TASKFLOW_HPP
 #define AVBD_TASKFLOW_HPP
 
-#include <functional>
-#include <utility>
+#include <variant>
 #include <vector>
 
 #include "avbd/job_pool.hpp"
 
 namespace avbd::detail {
 
-enum class TaskKind : unsigned char
-{
-    Serial,
-    Independent,
-    Region,
+struct SerialStage {
+    void (*run)(void *ctx) noexcept;
+    void *ctx;
 };
+
+struct IndependentStage {
+    int (*count)(void *ctx) noexcept;
+    void (*item)(void *ctx, int i) noexcept;
+    int minItems;
+    void *ctx;
+};
+
+struct RegionStage {
+    void (*runInline)(void *ctx) noexcept;   // body(0, NullSync)
+    void (*runParallel)(void *ctx) noexcept; // body(w, LoopSync) on every participant
+    bool (*inlineWhen)(void *ctx) noexcept;  // may be null
+    void *ctx;
+};
+
+using Stage = std::variant<SerialStage, IndependentStage, RegionStage>;
 
 class TaskFlow {
 public:
@@ -57,39 +72,23 @@ public:
     void clear() { entries.clear(); }
 
     // A single-threaded stage: the calling thread runs it, and nothing else overlaps.
-    void serial(std::function<void()> fn) {
-        Entry entry;
-        entry.kind = TaskKind::Serial;
-        entry.run = [fn = std::move(fn)](bool) { fn(); };
-        entries.push_back(std::move(entry));
+    void serial(void (*fn)(void *ctx) noexcept, void *ctx) {
+        entries.push_back(SerialStage{fn, ctx});
     }
 
-    // `count()` is evaluated when the flow runs, not when it is built: the update set and
-    // the force list change earlier in the same step.
-    void independent(std::function<int()> count, int minItems, std::function<void(int)> fn) {
-        Entry entry;
-        entry.kind = TaskKind::Independent;
-        entry.minItems = minItems;
-        entry.count = std::move(count);
-        entry.item = std::move(fn);
-        entries.push_back(std::move(entry));
+    // `count(ctx)` is evaluated when the flow runs, not when it is built: the update set
+    // and the force list change earlier in the same step.
+    void independent(int (*count)(void *ctx) noexcept, void (*item)(void *ctx, int i) noexcept,
+            int minItems, void *ctx) {
+        entries.push_back(IndependentStage{count, item, minItems, ctx});
     }
 
     // A barrier-synchronized region. `inlineWhen` (optional) lets a small step run the same
-    // body on the calling thread with NullSync, skipping the dispatch and the barrier.
-    template <typename F>
-    void region(F &&fn, std::function<bool()> inlineWhen = {}) {
-        Entry entry;
-        entry.kind = TaskKind::Region;
-        entry.inlineWhen = std::move(inlineWhen);
-        entry.run = [&pool = pool, body = std::forward<F>(fn)](bool inlineNow) mutable {
-            if (inlineNow) {
-                pool.runRegionInline(body);
-            } else {
-                pool.runRegion(body);
-            }
-        };
-        entries.push_back(std::move(entry));
+    // body on the calling thread with NullSync, skipping the dispatch and the barrier. The
+    // two bodies are separate thunks because the sync type is part of the callee signature.
+    void region(void (*runInline)(void *ctx) noexcept, void (*runParallel)(void *ctx) noexcept,
+            bool (*inlineWhen)(void *ctx) noexcept, void *ctx) {
+        entries.push_back(RegionStage{runInline, runParallel, inlineWhen, ctx});
     }
 
     // Execute every stage in order. A stage only starts after the previous one has fully
@@ -97,36 +96,29 @@ public:
     // directly; the difference is that the joins are per-dispatch and a region owns its
     // budget instead of a process-global mutex.
     void run() {
-        for (Entry &entry : entries) {
-            switch (entry.kind) {
-                case TaskKind::Serial:
-                    entry.run(false);
-                    break;
-                case TaskKind::Independent:
-                    pool.forCount(entry.count(), entry.item, entry.minItems);
-                    break;
-                case TaskKind::Region: {
-                    const bool inlineNow = pool.threadCount() <= 1
-                            || (entry.inlineWhen && entry.inlineWhen());
-                    entry.run(inlineNow);
-                    break;
+        for (Stage &stage : entries) {
+            if (auto *serial = std::get_if<SerialStage>(&stage)) {
+                serial->run(serial->ctx);
+            } else if (auto *independent = std::get_if<IndependentStage>(&stage)) {
+                pool.forCount(independent->count(independent->ctx),
+                        [item = independent->item, ctx = independent->ctx](int i) { item(ctx, i); },
+                        independent->minItems);
+            } else {
+                auto *region = std::get_if<RegionStage>(&stage);
+                const bool inlineNow = pool.threadCount() <= 1
+                        || (region->inlineWhen && region->inlineWhen(region->ctx));
+                if (inlineNow) {
+                    region->runInline(region->ctx);
+                } else {
+                    region->runParallel(region->ctx);
                 }
             }
         }
     }
 
 private:
-    struct Entry {
-        TaskKind kind = TaskKind::Serial;
-        int minItems = 0;
-        std::function<int()> count;       // Independent: item count, evaluated at run time
-        std::function<void(int)> item;    // Independent: one item
-        std::function<bool()> inlineWhen; // Region: run inline instead of dispatching
-        std::function<void(bool)> run;    // Serial/Region: bool = run inline
-    };
-
     JobPool &pool;
-    std::vector<Entry> entries;
+    std::vector<Stage> entries;
 };
 
 } // namespace avbd::detail

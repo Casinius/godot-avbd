@@ -50,14 +50,17 @@ namespace {
 // `(level, cell)` pairs this way replaces the former comparator over a 24-byte struct:
 // the keys are unsigned integers, the payload rides along, and equal keys may come out
 // in any order (a cell's bodies are re-sorted by the pair sort downstream anyway).
-void radixSortKeyed(std::vector<uint64_t> &keys, std::vector<int> &payload)
+void radixSortKeyed(std::vector<uint64_t> &keys, std::vector<int> &payload,
+        std::vector<uint64_t> &tmpKeys, std::vector<int> &tmpPayload)
 {
     const std::size_t n = keys.size();
     if (n < 2)
         return;
 
-    std::vector<uint64_t> tmpKeys(n);
-    std::vector<int> tmpPayload(n);
+    if (tmpKeys.size() < n)
+        tmpKeys.resize(n);
+    if (tmpPayload.size() < n)
+        tmpPayload.resize(n);
     uint64_t *srcKeys = keys.data();
     uint64_t *dstKeys = tmpKeys.data();
     int *srcPayload = payload.data();
@@ -120,8 +123,8 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
     }, kMinBodiesPerCheapDispatch);
 
     if (!(baseCell > 0.0f)) {
-        std::vector<float> nonEmpty;
-        nonEmpty.reserve(count);
+        nonEmpty.clear();
+        nonEmpty.reserve(static_cast<size_t>(count));
         for (int i = 0; i < count; i++)
             if (extents[i] > 0.0f)
                 nonEmpty.push_back(extents[i]);
@@ -160,8 +163,8 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
     // race-free (this used to be a serial push_back). The radix sort below is stable but
     // need not preserve body order for equal keys: cell contents have no defined order,
     // and the caller's pair sort removes every trace of it.
-    std::vector<uint64_t> keyedKeys(static_cast<size_t>(count));
-    std::vector<int> keyedBodies(static_cast<size_t>(count));
+    keyedKeys.resize(static_cast<size_t>(count));
+    keyedBodies.resize(static_cast<size_t>(count));
     pool.forCount(count, [&](int i) {
         const int l = levels[i];
         const float invCell = 1.0f / (baseCell * (float)(1 << l));
@@ -170,7 +173,7 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
                 (int)std::floor(p.y * invCell), (int)std::floor(p.z * invCell)));
         keyedBodies[i] = i;
     }, kMinBodiesPerCheapDispatch);
-    radixSortKeyed(keyedKeys, keyedBodies);
+    radixSortKeyed(keyedKeys, keyedBodies, radixKeysTmp, radixBodiesTmp);
 
     keys.clear();
     cellStart.clear();
@@ -209,6 +212,12 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
     // therefore chunk-dependent, which is harmless: the caller radix-sorts and
     // de-duplicates the packed pairs, so the final order is a pure function of the
     // candidate set.
+    //
+    // The cell key is (x << 40) | (y << 20) | z, so inside one level the table is
+    // sorted by x, then y, then z. A column of constant (x, y) is therefore a
+    // contiguous run sorted by z. One binary search lands on the first cell with
+    // z >= the window's low end; the at-most-three occupied z values in the
+    // window are then adjacent entries, so the walk needs 9 searches, not 27.
     const auto walk = [&](int chunk, int firstBody, int lastBody) {
         std::vector<uint64_t> &buf = pairChunks[chunk];
         buf.clear();
@@ -221,25 +230,54 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
                 const int cz = (int)std::floor(pi.z * invCell);
                 const int first = levelStart[l];
                 const int last = levelStart[l + 1];
-                for (int dz = -1; dz <= 1; dz++) {
-                    for (int dy = -1; dy <= 1; dy++) {
-                        for (int dx = -1; dx <= 1; dx++) {
-                            const uint64_t key = cellKey(cx + dx, cy + dy, cz + dz);
-                            // Binary search the key within this level's range.
+
+                // One z interval per column, or two when the window wraps through 0.
+                int zLo[2];
+                int zHi[2];
+                int zRanges = 0;
+                const int czMasked = static_cast<int>(static_cast<uint32_t>(cz) & kCellCoordMask);
+                if (czMasked == 0) {
+                    zLo[zRanges] = 0;
+                    zHi[zRanges++] = 1;
+                    zLo[zRanges] = static_cast<int>(kCellCoordMask);
+                    zHi[zRanges++] = static_cast<int>(kCellCoordMask);
+                } else if (czMasked == static_cast<int>(kCellCoordMask)) {
+                    zLo[zRanges] = czMasked - 1;
+                    zHi[zRanges++] = czMasked;
+                    zLo[zRanges] = 0;
+                    zHi[zRanges++] = 0;
+                } else {
+                    zLo[zRanges] = czMasked - 1;
+                    zHi[zRanges++] = czMasked + 1;
+                }
+
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        const uint64_t columnStart = cellKey(cx + dx, cy + dy, 0);
+                        const uint64_t columnPrefix = columnStart >> kCellCoordBits;
+                        for (int r = 0; r < zRanges; r++) {
+                            // First cell in the column at or after the window's low end.
+                            const uint64_t startKey = cellKey(cx + dx, cy + dy, zLo[r]);
                             int lo = first, hi = last;
                             while (lo < hi) {
                                 const int mid = (lo + hi) / 2;
-                                if (keys[mid] < key)
+                                if (keys[mid] < startKey)
                                     lo = mid + 1;
                                 else
                                     hi = mid;
                             }
-                            if (lo >= last || keys[lo] != key)
-                                continue;
-                            for (int s = cellStart[lo]; s < cellStart[lo + 1]; s++) {
-                                const int j = cellBodies[s];
-                                if (j != i)
-                                    buf.push_back(packPair(i, j));
+                            for (int p = lo; p < last; p++) {
+                                const uint64_t key = keys[p];
+                                if ((key >> kCellCoordBits) != columnPrefix)
+                                    break;
+                                const int z = static_cast<int>(key & kCellCoordMask);
+                                if (z > zHi[r])
+                                    break;
+                                for (int s = cellStart[p]; s < cellStart[p + 1]; s++) {
+                                    const int j = cellBodies[s];
+                                    if (j != i)
+                                        buf.push_back(packPair(i, j));
+                                }
                             }
                         }
                     }

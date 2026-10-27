@@ -97,6 +97,13 @@ private:
 
     std::vector<float> extents;  // per body: largest AABB full extent, scratch
     std::vector<int> levels;       // per body level assignment
+    // Scratch grown once and reused every step: the (level, cell, body) sort inputs, the
+    // radix ping-pong buffers, and the median filter for the automatic cell size.
+    std::vector<uint64_t> keyedKeys;
+    std::vector<int> keyedBodies;
+    std::vector<uint64_t> radixKeysTmp;
+    std::vector<int> radixBodiesTmp;
+    std::vector<float> nonEmpty;
     // Per-chunk pair buffers for the parallel walk (capacity survives across steps, so a
     // steady scene allocates nothing here).
     std::vector<std::vector<uint64_t>> pairChunks;

@@ -33,9 +33,9 @@ avbd/threads=8
 avbd/internal_ticks_per_second=120
 avbd/interleaved_substeps=true
 avbd/rounds_per_substep=2
-avbd/substeps=2
+avbd/substeps=1
 avbd/adaptive_max_iterations=12
-avbd/adaptive_beta=true
+#avbd/adaptive_beta=true
 avbd/contact_grace_ticks=0
 avbd/speculative_margin=0.02
 

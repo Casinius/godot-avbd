@@ -105,26 +105,4 @@ float3 aabbHalfExtent(const Rigid &body) noexcept
             std::abs(rot[0][2]) * half.x + std::abs(rot[1][2]) * half.y + std::abs(rot[2][2]) * half.z};
 }
 
-bool Rigid::constrainedTo(Rigid* other) const
-{
-    // Walk this body's own constraint list, following nextA/nextB. `Force::next` is the
-    // solver-wide chain, so following it here would make every broad phase pair test
-    // O(every force in the scene) instead of O(this body's constraints) - which, with the
-    // pair test running once per candidate pair per step, costs more than the whole rest of
-    // the solver put together.
-    for (Force* f = forces; f != 0; f = (f->bodyA == this) ? f->nextA : f->nextB)
-        if ((f->bodyA == this && f->bodyB == other) || (f->bodyA == other && f->bodyB == this))
-        {
-            // A dormant manifold (contact grace) does not join the pair: the pair must
-            // still wake on AABB overlap and re-enter the broad phase, or a sleeping body
-            // behind a dormant manifold is invisible to an incoming body and gets tunneled
-            // through. The dormant manifold itself revives in its own initialize().
-            if (f->isManifold && static_cast<const Manifold*>(f)->numContacts == 0
-                    && static_cast<const Manifold*>(f)->dormantTicks > 0)
-                continue;
-            return true;
-        }
-    return false;
-}
-
 } // namespace avbd

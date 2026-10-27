@@ -31,10 +31,6 @@ Solver::Solver()
 Solver::~Solver()
 {
     clear();
-    // Release the contact-block cache this solver's churn filled. Blocks outlive their
-    // solver on purpose (a destroyed contact is recycled by the next one), but when the
-    // whole simulation shuts down the cache must not leak.
-    Manifold::drainPool();
 }
 
 Rigid *Solver::pick(float3 origin, float3 dir, float3 &local)
@@ -145,8 +141,12 @@ void Solver::clear()
     while (forces)
         delete forces;
 
+    manifolds.clear();
+
     while (bodies)
         delete bodies;
+
+    forceAdjacency.clear();
 }
 
 // One tick, as a classified task flow. The broad phase / force warmstart / update-set
@@ -165,8 +165,62 @@ void Solver::step()
     int newtonRounds = iterations;
     computeIterations(targetIterations, newtonRounds);
     runSubstep(forceCount, targetIterations, newtonRounds, true);
-    projectContacts(forceCount);
-    rebaseContacts(forceCount);
+    projectContacts();
+    rebaseContacts();
+}
+
+// The flow stages read one substep's arguments and scratch through this context. It is
+// declared in solver.h and defined here so the storage and lifetime stay private to the
+// implementation; runSubstep owns it on the stack and the flow never outlives it.
+struct Solver::SubstepCtx {
+    Solver *solver = nullptr;
+    int forceCount = 0;
+    int targetIterations = 0;
+    int newtonRounds = 0;
+    bool idleDetection = false;
+    float prevResidual = 0.0f;
+    std::atomic<bool> converged{false};
+};
+
+int Solver::flowWarmstartCount(void *ctx) noexcept
+{
+    return static_cast<int>(static_cast<SubstepCtx *>(ctx)->solver->warmstartOrder.size());
+}
+
+void Solver::flowWarmstartItem(void *ctx, int i) noexcept
+{
+    static_cast<SubstepCtx *>(ctx)->solver->warmstartBody(i);
+}
+
+bool Solver::flowIterateInlineWhen(void *ctx) noexcept
+{
+    const SubstepCtx &c = *static_cast<SubstepCtx *>(ctx);
+    return static_cast<int>(c.solver->updateOrder.size()) < kMinBodiesPerDispatch
+            && c.forceCount + c.solver->manifolds.count() < kMinForcesPerDispatch;
+}
+
+void Solver::flowIterateInline(void *ctx) noexcept
+{
+    SubstepCtx &c = *static_cast<SubstepCtx *>(ctx);
+    c.solver->pool->runRegionInline([&c](int workerIndex, auto &sync) {
+        c.solver->iterateBody(workerIndex, sync, c.targetIterations, c.forceCount, c.newtonRounds,
+                c.prevResidual, c.converged);
+    });
+}
+
+void Solver::flowIterateParallel(void *ctx) noexcept
+{
+    SubstepCtx &c = *static_cast<SubstepCtx *>(ctx);
+    c.solver->pool->runRegion([&c](int workerIndex, auto &sync) {
+        c.solver->iterateBody(workerIndex, sync, c.targetIterations, c.forceCount, c.newtonRounds,
+                c.prevResidual, c.converged);
+    });
+}
+
+void Solver::flowFinishItem(void *ctx, int i) noexcept
+{
+    SubstepCtx &c = *static_cast<SubstepCtx *>(ctx);
+    c.solver->finishBody(i, c.idleDetection);
 }
 
 // One substep: body warmstart (independent), the colour-parallel Gauss-Seidel region,
@@ -174,24 +228,20 @@ void Solver::step()
 // final substep, so substeps cannot sleep bodies faster than ticks.
 void Solver::runSubstep(int forceCount, int targetIterations, int newtonRounds, bool idleDetection)
 {
-    float prevResidual = 0.0f;
-    std::atomic<bool> converged{false};
+    SubstepCtx ctx;
+    ctx.solver = this;
+    ctx.forceCount = forceCount;
+    ctx.targetIterations = targetIterations;
+    ctx.newtonRounds = newtonRounds;
+    ctx.idleDetection = idleDetection;
 
     flow->clear();
-    flow->independent([this] { return static_cast<int>(warmstartOrder.size()); },
-            kMinBodiesPerDispatch, [this](int i) { warmstartBody(i); });
-
-    flow->region(
-            [this, forceCount, targetIterations, newtonRounds, &prevResidual, &converged](int workerIndex, auto &sync) {
-                iterateBody(workerIndex, sync, targetIterations, forceCount, newtonRounds, prevResidual, converged);
-            },
-            [this, forceCount] {
-                return static_cast<int>(updateOrder.size()) < kMinBodiesPerDispatch
-                        && forceCount < kMinForcesPerDispatch;
-            });
-
-    flow->independent([this] { return static_cast<int>(warmstartOrder.size()); },
-            kMinBodiesPerDispatch, [this, idleDetection](int i) { finishBody(i, idleDetection); });
+    flow->independent(&Solver::flowWarmstartCount, &Solver::flowWarmstartItem, kMinBodiesPerDispatch,
+            &ctx);
+    flow->region(&Solver::flowIterateInline, &Solver::flowIterateParallel,
+            &Solver::flowIterateInlineWhen, &ctx);
+    flow->independent(&Solver::flowWarmstartCount, &Solver::flowFinishItem, kMinBodiesPerDispatch,
+            &ctx);
 
     flow->run();
 }
@@ -238,30 +288,28 @@ void Solver::stepInterleaved(int substeps, int roundsPerSubstep)
 
     for (int sub = 0; sub < substeps; ++sub) {
         if (sub > 0) {
-            rebaseContacts(forceCount);
+            rebaseContacts();
         }
         runSubstep(forceCount, rounds, newton, sub + 1 == substeps);
     }
     // Once per tick, not per substep: the correction is positional and velocities are
     // already final, so a second pass inside the same tick would only re-fight the first.
-    projectContacts(forceCount);
+    projectContacts();
     // The tick's stored error is the one the solver saw when its contacts were initialized;
     // the bodies have moved since. Rebase it at the final pose so what the host reads back
     // (the penetration diagnostic) is the geometry the pair actually ended the tick with,
     // not a one-tick-old pose. The next tick's initialize() replaces it from its own
     // collision pass either way; this only feeds prevErr (adaptive beta) and the host.
-    rebaseContacts(forceCount);
+    rebaseContacts();
 }
 
-// Rebase every manifold's constraint error at the current pose. Parallel over forces; a
+// Rebase every manifold's constraint error at the current pose. Parallel over slots; a
 // manifold only writes its own C0, so this is independent work.
-void Solver::rebaseContacts(int forceCount)
+void Solver::rebaseContacts()
 {
-    pool->forCount(forceCount, [this](int i) {
-        Force *f = forceOrder[i];
-        if (f->isManifold) {
-            static_cast<Manifold *>(f)->rebaseContacts();
-        }
+    const int manifoldCount = manifolds.count();
+    pool->forCount(manifoldCount, [this](int i) {
+        manifolds.rebase(manifolds.live[i]);
     }, kMinForcesPerDispatch);
 }
 
@@ -325,9 +373,10 @@ void applyLocked(Rigid &body, float3 &dLin, float3 &dAng) noexcept
 // that body's side of the manifold actually moved. It is strictly dissipative - it can
 // only remove speed, never add it - so the pass behaves like a restitution-0 resolve for
 // impacts the penalty ramp missed, and leaves everything else untouched.
-void Solver::projectContacts(int forceCount)
+void Solver::projectContacts()
 {
-    if (!positionProjection || forceCount <= 0 || projectionIterations <= 0)
+    const int manifoldCount = manifolds.count();
+    if (!positionProjection || manifoldCount <= 0 || projectionIterations <= 0)
         return;
 
     const float slop = projectionSlop;
@@ -337,14 +386,14 @@ void Solver::projectContacts(int forceCount)
 
     for (int iter = 0; iter < projectionIterations; iter++)
     {
-        for (int i = 0; i < forceCount; i++)
+        for (uint32_t slot : manifolds.live)
         {
-            Force *f = forceOrder[i];
-            if (!f->isManifold)
+            Rigid *A = manifolds.bodyA[slot];
+            Rigid *B = manifolds.bodyB[slot];
+            const int first = ManifoldStore::base(slot);
+            const int contactCount = manifolds.contactCount(slot);
+            if (contactCount == 0)
                 continue;
-            Manifold *m = static_cast<Manifold *>(f);
-            Rigid *A = m->bodyA;
-            Rigid *B = m->bodyB;
 
             // Only bodies the solve itself was allowed to move may be projected: static
             // bodies are immovable, and a sleeping one must stay exactly where it was parked
@@ -358,7 +407,7 @@ void Solver::projectContacts(int forceCount)
 
             // Row 0 of the basis is the contact normal pointing from B to A, so pushing A
             // along +n and B along -n separates the pair.
-            const float3 n = m->basis.x;
+            const float3 n = manifolds.basis[slot].x;
 
             // Accumulate over the manifold's contacts and apply once. Applying each contact
             // in turn moves the body before the next one is measured, so a symmetric set -
@@ -367,10 +416,10 @@ void Solver::projectContacts(int forceCount)
             // sideways. Summing first restores the cancellation, and the manifold still
             // sees its neighbours' latest poses, so sweeps stay Gauss-Seidel across forces.
             float3 dLinA{0, 0, 0}, dAngA{0, 0, 0}, dLinB{0, 0, 0}, dAngB{0, 0, 0};
-            for (int k = 0; k < m->numContacts; k++)
+            for (int k = 0; k < contactCount; k++)
             {
-                const float3 rA = qrot(A->positionAng, m->contacts[k].rA);
-                const float3 rB = qrot(B->positionAng, m->contacts[k].rB);
+                const float3 rA = qrot(A->positionAng, manifolds.contacts[first + k].rA);
+                const float3 rB = qrot(B->positionAng, manifolds.contacts[first + k].rB);
                 const float depth = -dot(n, (A->positionLin + rA) - (B->positionLin + rB)) - slop;
                 if (depth <= 0.0f)
                     continue;
@@ -433,12 +482,59 @@ void Solver::projectContacts(int forceCount)
     }
 }
 
+// The body on the other side of an adjacency entry, or null when the entry does not
+// touch `body`.
+[[nodiscard]] static Rigid *otherBody(const ForceRef &ref, const Rigid *body,
+        const ManifoldStore &manifolds) noexcept
+{
+    if (ref.isManifold())
+    {
+        const uint32_t slot = ref.slot();
+        Rigid *a = manifolds.bodyA[slot];
+        Rigid *b = manifolds.bodyB[slot];
+        if (a == body)
+            return b;
+        if (b == body)
+            return a;
+        return nullptr;
+    }
+    const Force *f = ref.asForce();
+    if (f->bodyA == body)
+        return f->bodyB;
+    if (f->bodyB == body)
+        return f->bodyA;
+    return nullptr;
+}
+
+// True when a force already joins the pair. Mirrors Rigid::constrainedTo: any joint,
+// spring or ignore pair counts, and a live manifold counts, but a dormant one (contact
+// grace) does not - the pair must still wake on AABB overlap and re-enter the narrow
+// phase, or a sleeping body behind a dormant manifold is invisible to an incoming body.
+[[nodiscard]] static bool pairConstrained(const ForceAdjacency &adjacency,
+        const ManifoldStore &manifolds, Rigid *bodyA, Rigid *bodyB)
+{
+    for (const ForceRef &ref : adjacency.of(bodyA->broadIndex))
+    {
+        if (otherBody(ref, bodyA, manifolds) != bodyB)
+            continue;
+        if (ref.isManifold())
+        {
+            const uint32_t slot = ref.slot();
+            if (manifolds.contactCount(slot) == 0 && manifolds.dormantTicks[slot] > 0)
+                continue;
+        }
+        return true;
+    }
+    return false;
+}
+
 // A broad-phase candidate test: swept world AABBs plus Godot's layer/mask pair
 // rule, minus pairs already joined by a force (IgnoreCollision, joints). The box
 // starts from the tight bounds of the actual shape - unlike a bounding-sphere test
 // whose radius is the shape's diagonal and therefore admits many far-apart
 // candidates - and is grown to cover the body's motion for the step.
-static bool pairOverlaps(Rigid *bodyA, const float3 &aHalf, const float3 &aCenter,
+static bool pairOverlaps(const ForceAdjacency &adjacency, const ManifoldStore &manifolds,
+                         Rigid *bodyA, const float3 &aHalf, const float3 &aCenter,
                          Rigid *bodyB, const float3 &bHalf, const float3 &bCenter)
 {
     const float3 aMin = aCenter - aHalf;
@@ -451,7 +547,7 @@ static bool pairOverlaps(Rigid *bodyA, const float3 &aHalf, const float3 &aCente
     // mask (defaults 1/1 keep every pair, as before these fields existed).
     const bool layersAllow = ((bodyA->collisionLayer & bodyB->collisionMask) != 0) ||
             ((bodyB->collisionLayer & bodyA->collisionMask) != 0);
-    return boundsOverlap && layersAllow && !bodyA->constrainedTo(bodyB);
+    return boundsOverlap && layersAllow && !pairConstrained(adjacency, manifolds, bodyA, bodyB);
 }
 
 // Contact detection: hierarchical spatial hash (big-block screen + layered
@@ -474,6 +570,14 @@ void Solver::broadPhase()
     bodiesInOrder.insert(bodiesInOrder.end(), next_range(bodies).begin(), next_range(bodies).end());
 
     const int count = static_cast<int>(bodiesInOrder.size());
+    for (int i = 0; i < count; i++)
+        bodiesInOrder[i]->broadIndex = i;
+
+    // Pair existence and AABB wake-up read the constraint graph, so it has to be current
+    // before the candidate filter runs. Built again after warm-starting, when the live
+    // manifold set has changed.
+    buildForceAdjacency();
+
     if (count < 2)
         return;
 
@@ -508,19 +612,19 @@ void Solver::broadPhase()
 
     // Pairs are packed (min<<32 | max), so integer order is lexicographic order over the
     // old std::pair and the sort takes the radix path instead of std::sort's comparator.
-    radix_std::sort(sweepPairs.begin(), sweepPairs.end());
+    radix_std::sort_with_buffer(sweepPairs.begin(), sweepPairs.end(), pairSortScratch);
     sweepPairs.erase(std::unique(sweepPairs.begin(), sweepPairs.end()), sweepPairs.end());
 
     auto kMinPairsPerDispatch = kMinForcesPerDispatch;
     const size_t pairCount = sweepPairs.size();
-    std::vector<uint8_t> pairValid;
-    pairValid.resize(pairCount);
-    pool->forCount(pairCount, [this, &pairValid](int k) {
+    broadPairValid.resize(pairCount);
+    pool->forCount(pairCount, [this](int k) {
         const int i = pairFirst(sweepPairs[k]);
         const int j = pairSecond(sweepPairs[k]);
-        auto overlaps = pairOverlaps(bodiesInOrder[i], bodyAabbHalf[i], bodyAabbCenter[i],
-                                    bodiesInOrder[j], bodyAabbHalf[j], bodyAabbCenter[j]);
-        pairValid[k] = overlaps;
+        auto overlaps = pairOverlaps(forceAdjacency, manifolds, bodiesInOrder[i], bodyAabbHalf[i],
+                                    bodyAabbCenter[i], bodiesInOrder[j], bodyAabbHalf[j],
+                                    bodyAabbCenter[j]);
+        broadPairValid[k] = overlaps;
         if (!overlaps) return;
 
         // 睡眠 + awake 的 AABB 重叠就唤醒。不需要真实接触——AABB 已经含 margin，
@@ -538,21 +642,21 @@ void Solver::broadPhase()
         }
     }, kMinPairsPerDispatch);
 
-    // 串行创建：manifold 链表顺序 + pool mutex 都要求单线程
+    // 串行创建：manifold 顺序决定后续所有阶段的遍历顺序，必须单线程
     for (size_t k = 0; k < pairCount; k++) {
-        if (!pairValid[k]) continue;
+        if (!broadPairValid[k]) continue;
         const int i = pairFirst(sweepPairs[k]);
         const int j = pairSecond(sweepPairs[k]);
         // A dormant manifold (contact grace) let this pair back into the candidate set
-        // (constrainedTo skips dormant ones so overlap can wake sleepers); it will revive
-        // in its own initialize(), so creating a second manifold here would double the
-        // pair's constraints.
+        // (pairConstrained skips dormant ones so overlap can wake sleepers); it will
+        // revive in its own initialize(), so creating a second manifold here would double
+        // the pair's constraints.
         bool exists = false;
-        for (Force *f = bodiesInOrder[i]->forces; f != nullptr;
-                f = (f->bodyA == bodiesInOrder[i]) ? f->nextA : f->nextB)
+        for (const ForceRef &ref : forceAdjacency.of(i))
         {
-            if ((f->bodyA == bodiesInOrder[i] && f->bodyB == bodiesInOrder[j])
-                    || (f->bodyA == bodiesInOrder[j] && f->bodyB == bodiesInOrder[i]))
+            if (!ref.isManifold())
+                continue;
+            if (otherBody(ref, bodiesInOrder[i], manifolds) == bodiesInOrder[j])
             {
                 exists = true;
                 break;
@@ -560,81 +664,93 @@ void Solver::broadPhase()
         }
         if (exists)
             continue;
-        new Manifold(this, bodiesInOrder[i], bodiesInOrder[j]);
+        (void)manifolds.acquire(bodiesInOrder[i], bodiesInOrder[j]);
     }
 
-}
-
-// A constraint is frozen when neither of its bodies can move this step. Joints and springs
-// stay out of this path: their initialize() does more than refresh contacts (initial
-// error, spring setup), and the core suite pins their per-scene force counts. Manifolds
-// between parked bodies (static or already asleep) are the pure case - the colouring
-// already skips such bodies in the primal pass - and freezing their bookkeeping is the
-// sleep win: a settled scene stops paying SAT refresh + dual updates for all its contacts.
-static bool constraintFrozen(const Force *f)
-{
-    if (!f->isManifold)
-        return false; // joints / springs / soft constraints keep their exact behaviour
-    const auto awake = [](const Rigid *b) { return b != nullptr && b->mass > 0.0f && !b->sleeping; };
-    return !awake(f->bodyA) && !awake(f->bodyB);
 }
 
 // Bring every force up to date for this step, and drop the ones that have gone inactive.
 //
 // Initialising is independent work - a force only reads the body poses and writes its own
-// warm-started state - so it runs in parallel. Deleting is not: an inactive force (an empty
-// manifold, a broken joint) unlinks itself from the solver and from both bodies' lists, so
-// that mutation happens in one thread, in list order, once the parallel pass has finished.
+// warm-started state - so it runs in parallel. Deleting is not: an inactive force (a
+// broken joint) unlinks itself from the solver and from both bodies' lists, so that
+// mutation happens in one thread, in list order, once the parallel pass has finished.
+// Manifolds live in the store, so "deleting" one is removing its slot from the live list
+// and returning it to the free list.
 //
-// Returns the number of forces left, and leaves `forceOrder` indexing exactly those.
+// Returns the number of non-manifold forces left, and leaves `forceOrder` indexing those.
 int Solver::warmstartForces()
 {
-    int forceCount = collectForces();
+    const int forceCount = collectForces();
     forceActive.resize(forceCount);
     pool->forCount(forceCount, [this](int i) {
-        Force *f = forceOrder[i];
-        // Frozen constraints keep their state verbatim; nothing they read can move.
-        forceActive[i] = constraintFrozen(f) || f->initialize() ? 1 : 0;
+        forceActive[i] = forceOrder[i]->initialize() ? 1 : 0;
     }, kMinForcesPerDispatch);
 
+    // One pass both reaps and compacts: `forceOrder` is list order, and deleting a force
+    // only unlinks it from that list, so the survivors keep the exact order a second
+    // collectForces() would produce.
+    int write = 0;
     for (int i = 0; i < forceCount; i++)
     {
+        Force *f = forceOrder[i];
         if (!forceActive[i])
         {
-            // Grace: a manifold that went dormant this tick (initialize parked it) keeps
-            // its hot state for contactGraceTicks ticks instead of being reaped. initialize
-            // only enters dormancy while the grace setting is positive, so with the
-            // default 0 this branch never fires and the delete below is unchanged.
-            if (forceOrder[i]->isManifold && contactGraceTicks > 0
-                    && static_cast<Manifold *>(forceOrder[i])->dormantTicks > 0)
+            delete f; // unlinks itself from the solver and both bodies
+            continue;
+        }
+        forceOrder[write++] = f;
+    }
+    const int liveForceCount = write;
+
+    const int manifoldCount = manifolds.count();
+    manifoldActive.resize(static_cast<size_t>(manifoldCount));
+    pool->forCount(manifoldCount, [this](int i) {
+        const uint32_t slot = manifolds.live[i];
+        // Frozen constraints keep their state verbatim; nothing they read can move.
+        manifoldActive[i] = manifolds.frozen(slot) || manifolds.initialize(slot, *this) ? 1 : 0;
+    }, kMinForcesPerDispatch);
+
+    // Dormant manifolds (contact grace) keep their slot and hot state for a few ticks
+    // instead of being reaped. initialize only enters dormancy while the grace setting is
+    // positive, so with the default 0 this branch never fires.
+    int liveWrite = 0;
+    for (int i = 0; i < manifoldCount; i++)
+    {
+        const uint32_t slot = manifolds.live[i];
+        if (!manifoldActive[i])
+        {
+            if (contactGraceTicks > 0 && manifolds.dormantTicks[slot] > 0)
+            {
+                manifolds.live[liveWrite++] = slot;
                 continue;
+            }
 #ifdef AVBD_DIAG
             diag.reapedManifolds++;
 #endif
-            delete forceOrder[i]; // unlinks itself from the solver and both bodies
+            manifolds.release(slot);
+            continue;
         }
+        manifolds.live[liveWrite++] = slot;
     }
-
-    forceCount = collectForces(); // the sweep above invalidated the index
+    manifolds.live.resize(static_cast<size_t>(liveWrite));
 
 #ifdef AVBD_DIAG
     {
         int soft = 0;
         const float softLimit = 0.1f * betaLin;
-        for (int i = 0; i < forceCount; i++)
-        {
-            Force *f = forceOrder[i];
-            if (!f->isManifold)
-                continue;
-            Manifold *m = static_cast<Manifold *>(f);
-            for (int ci = 0; ci < m->numContacts; ci++)
-                if (m->contactPenalty[ci].x < softLimit)
+        for (uint32_t slot : manifolds.live)
+            for (int ci = 0, n = manifolds.contactCount(slot); ci < n; ci++)
+                if (manifolds.contactPenalty[ManifoldStore::base(slot) + ci].x < softLimit)
                     soft++;
-        }
         diag.softContacts = soft;
     }
 #endif
-    return forceCount;
+
+    // The live manifold set and force list are final for the step; the colouring, primal,
+    // wake-up and island passes read this adjacency.
+    buildForceAdjacency();
+    return liveForceCount;
 }
 
 // Compute one body's inertial position and warm-start it (Eq. 2 and the adaptive
@@ -704,8 +820,8 @@ void Solver::computeIterations(int &r_targetIterations, int &r_newtonRounds)
         // Estimate total penetration error from current manifolds
         float totalPenetration = 0.0f;
         int penetrationCount = 0;
-        for (Force *f = forces; f != nullptr; f = f->next)
-            f->accumulatePenetration(totalPenetration, penetrationCount);
+        for (uint32_t slot : manifolds.live)
+            manifolds.accumulatePenetration(slot, *this, totalPenetration, penetrationCount);
 
         // Adaptive iteration count: more iterations needed if penetration is large
         if (penetrationCount > 0)
@@ -779,8 +895,13 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                     Rigid *body = updateOrder[colourOrder[first + k]];
                     Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
                             body->positionAng, body->inertialAng);
-                    for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
-                        f->updatePrimal(body, alpha, block);
+                    for (const ForceRef &ref : forceAdjacency.of(body->broadIndex))
+                    {
+                        if (ref.isManifold())
+                            manifolds.updatePrimal(ref.slot(), *this, body, alpha, block);
+                        else
+                            ref.asForce()->updatePrimal(body, alpha, block);
+                    }
                     block.apply(*body);
                 });
                 sync.arriveAndWait();
@@ -795,18 +916,15 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
             const int overflowCount = static_cast<int>(overflowOrder.size());
             if (overflowCount > 0)
             {
-                sync.forItems(forceCount, [this](int i) {
-                    Force *f = forceOrder[i];
-                    if (!f->isManifold)
-                        return;
-                    Manifold *manifold = static_cast<Manifold *>(f);
-                    const bool aIn = manifold->bodyA->inUpdateSet &&
-                            bodyColour[manifold->bodyA->updateIndex] == kOverflowColour;
-                    const bool bIn = manifold->bodyB->inUpdateSet &&
-                            bodyColour[manifold->bodyB->updateIndex] == kOverflowColour;
+                sync.forItems(manifolds.count(), [this](int i) {
+                    const uint32_t slot = manifolds.live[i];
+                    const bool aIn = manifolds.bodyA[slot]->inUpdateSet &&
+                            bodyColour[manifolds.bodyA[slot]->updateIndex] == kOverflowColour;
+                    const bool bIn = manifolds.bodyB[slot]->inUpdateSet &&
+                            bodyColour[manifolds.bodyB[slot]->updateIndex] == kOverflowColour;
                     if (!aIn && !bIn)
                         return; // both sides solved in a colour, or frozen
-                    manifold->preCompute(alpha);
+                    manifolds.preCompute(slot, *this, alpha);
                 });
                 sync.arriveAndWait();
 
@@ -819,12 +937,12 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                     Rigid *body = updateOrder[i];
                     Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
                             body->positionAng, body->inertialAng);
-                    for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
+                    for (const ForceRef &ref : forceAdjacency.of(body->broadIndex))
                     {
-                        if (f->isManifold)
-                            static_cast<Manifold *>(f)->stampCached(body, block);
+                        if (ref.isManifold())
+                            manifolds.stampCached(ref.slot(), body, block);
                         else
-                            f->updatePrimal(body, alpha, block);
+                            ref.asForce()->updatePrimal(body, alpha, block);
                     }
                     block.solveDelta(bodyDeltaLin[i], bodyDeltaAng[i]);
                 });
@@ -885,16 +1003,21 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
         // same force, same order, so the decay lands before the dual reads the
         // penalty without paying an extra pass and barrier per tail round.
         const float decay = stiffnessDecay;
-        sync.forItems(forceCount, [this, newton, decay](int i) {
-            Force *f = forceOrder[i];
-            if (!newton && decay < 1.0f && f->isManifold) {
-                Manifold *m = static_cast<Manifold *>(f);
-                
-                for (int ci = 0, n = m->numContacts; ci < n; ++ci)
-                    m->contactPenalty[ci] = min(m->contactPenalty[ci] * decay, float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX});
+        const int manifoldCount = manifolds.count();
+        sync.forItems(manifoldCount + forceCount,
+                [this, newton, decay, manifoldCount](int k) {
+            if (k < manifoldCount)
+            {
+                // Contacts first: decay (tail only) then the dual, same item as before so
+                // the decay lands before the dual reads the penalty.
+                const uint32_t slot = manifolds.live[k];
+                if (!newton && decay < 1.0f)
+                    manifolds.decayPenalties(slot, decay);
+                if (!manifolds.frozen(slot))
+                    manifolds.updateDual(slot, *this, alpha);
+                return;
             }
-            if (!constraintFrozen(f))
-                f->updateDual(alpha);
+            forceOrder[k - manifoldCount]->updateDual(alpha);
         });
         sync.arriveAndWait();
 
@@ -910,8 +1033,8 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
         {
             float total = 0.0f;
             int count = 0;
-            for (Force *f = forces; f != nullptr; f = f->next)
-                f->accumulatePenetration(total, count);
+            for (uint32_t slot : manifolds.live)
+                manifolds.accumulatePenetration(slot, *this, total, count);
             const float residual = count > 0 ? total / count : 0.0f;
             r_converged.store(r_prevResidual - residual < convergenceThreshold,
                     std::memory_order_relaxed);
@@ -1010,26 +1133,26 @@ void Solver::islandSleep()
         return x;
     };
 
-    // Slot lookup: map body pointer -> island index once (sorted pointers + binary
-    // search), then each force is two O(log n) lookups. The map is rebuilt each call:
-    // bodies enter and leave the island set as sleep_mode and mass change.
-    islandForceSlots.clear();
-    std::vector<Rigid *> sorted = islandBodies;
-    radix_std::sort(sorted.begin(), sorted.end());
-    for (Force *f = forces; f != 0; f = f->next)
-    {
-        const auto slotOf = [&sorted](Rigid *b) -> int {
-            const auto it = std::lower_bound(sorted.begin(), sorted.end(), b);
-            return (it != sorted.end() && *it == b) ? static_cast<int>(it - sorted.begin()) : -1;
-        };
-        const int ia = slotOf(f->bodyA);
-        const int ib = slotOf(f->bodyB);
-        if (ia >= 0 && ib >= 0)
-            islandForceSlots.emplace_back(ia, ib);
-    }
+    // Body -> island slot through the broad-phase index: one array write per island body,
+    // then every constraint is two O(1) lookups (no pointer sort and binary search).
+    bodyIsland.assign(bodiesInOrder.size(), -1);
+    for (int i = 0; i < count; ++i)
+        bodyIsland[static_cast<size_t>(islandBodies[i]->broadIndex)] = i;
 
-    for (const auto &[ia, ib] : islandForceSlots)
-        parent[find(ia)] = find(ib);
+    const auto join = [&](Rigid *a, Rigid *b) {
+        if (a == nullptr || b == nullptr)
+            return;
+        if (a->broadIndex < 0 || b->broadIndex < 0)
+            return;
+        const int ia = bodyIsland[static_cast<size_t>(a->broadIndex)];
+        const int ib = bodyIsland[static_cast<size_t>(b->broadIndex)];
+        if (ia >= 0 && ib >= 0)
+            parent[find(ia)] = find(ib);
+    };
+    for (uint32_t slot : manifolds.live)
+        join(manifolds.bodyA[slot], manifolds.bodyB[slot]);
+    for (Force *f = forces; f != 0; f = f->next)
+        join(f->bodyA, f->bodyB);
 
     // Compose islands: representative -> aggregate state.
     // islandAwake[r] = true iff any member is awake; islandStill[r] = min stillFrames.
@@ -1108,9 +1231,9 @@ void Solver::selectUpdateBodies()
         {
             if (!body->sleeping || body->sleep_mode != 1)
                 continue;
-            for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
+            for (const ForceRef &ref : forceAdjacency.of(body->broadIndex))
             {
-                Rigid *other = (f->bodyA == body) ? f->bodyB : f->bodyA;
+                Rigid *other = otherBody(ref, body, manifolds);
                 if (other != 0 && other->mass > 0 && !other->sleeping &&
                         (length2(other->velocityLin) > lin2 ||
                                 length2(other->velocityAng) > ang2))
@@ -1156,7 +1279,7 @@ void Solver::selectUpdateBodies()
                 // Start in sleep, wake up if velocity or forces are present
                 if (!body->sleeping && 
                     length2(body->velocityLin) == 0.0f &&
-                    body->forces == nullptr)
+                    forceAdjacency.of(body->broadIndex).empty())
                 {
                     should_update = false;
                 }
@@ -1187,11 +1310,9 @@ void Solver::selectUpdateBodies()
 
     // Chebyshev eligibility: a body carrying any non-manifold force (joint, spring, world
     // anchor) extrapolates unsafely - its gamma falls back to the constant relaxation in
-    // the combine pass. Walk the force lists once, after warmstartForces() has pruned.
+    // the combine pass. Every force in the list is non-manifold; contacts do not count.
     for (Force *f = forces; f != 0; f = f->next)
     {
-        if (f->isManifold)
-            continue;
         if (f->bodyA != 0)
             f->bodyA->contactOnly = false;
         if (f->bodyB != 0)
@@ -1223,9 +1344,9 @@ void Solver::colourGraph()
         for (int c = 0; c < kMaxColours; c++)
             used[c] = 0;
 
-        for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
+        for (const ForceRef &ref : forceAdjacency.of(body->broadIndex))
         {
-            Rigid *other = (f->bodyA == body) ? f->bodyB : f->bodyA;
+            Rigid *other = otherBody(ref, body, manifolds);
             if (other == 0 || other->updateIndex < 0 || other->updateIndex >= i)
                 continue; // not in the update set, or coloured later in the pass
             const uint8_t c = bodyColour[other->updateIndex];
@@ -1271,7 +1392,8 @@ void Solver::colourGraph()
     bodyPrevLin.resize(updateOrder.size());
 }
 
-// Fill `forceOrder` with the solver's forces, so the phases can address them by index.
+// Fill `forceOrder` with the solver's non-manifold forces, so the phases can address them
+// by index. Manifolds live in the store and are addressed by slot.
 int Solver::collectForces()
 {
     forceOrder.clear();
@@ -1279,16 +1401,23 @@ int Solver::collectForces()
     return static_cast<int>(forceOrder.size());
 }
 
+void Solver::buildForceAdjacency()
+{
+    forceAdjacency.build(bodiesInOrder, forces, manifolds);
+}
+
 void Solver::ensurePool()
 {
-    if (pool != nullptr)
-        return;
-
     // Pass the value straight through: 0 means "one worker per hardware thread" and 1 means
     // a single worker, which both the pool and `threads` document the same way. (Clamping 0
     // up to 1 here would silently turn the default into a serial run.)
-    pool = std::make_unique<detail::JobPool>(static_cast<unsigned>(std::max(0, threads)));
+    const int requested = std::max(0, threads);
+    if (pool != nullptr && poolThreads == requested)
+        return;
+
+    pool = std::make_unique<detail::JobPool>(static_cast<unsigned>(requested));
     flow = std::make_unique<detail::TaskFlow>(*pool);
+    poolThreads = requested;
 }
 
 int Solver::threadCount() const

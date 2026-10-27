@@ -173,13 +173,15 @@ struct Rigid
     // Position of this body in Solver::updateOrder, or -1 when out of the update
     // set. The colouring reads its neighbours' colours through it.
     int updateIndex = -1;
+    // Position of this body in Solver::bodiesInOrder, rewritten by the broad phase every
+    // step. The constraint adjacency and the pair-existence check address bodies through
+    // it, so a rebuild never has to hash pointers.
+    int broadIndex = -1;
     // True when every force on the body is a contact manifold. Only such bodies take the
     // Chebyshev extrapolation: the contact map is clamped and tolerates gamma > 1, hard
     // joints do not.
     bool contactOnly = true;
     int sleep_mode = 0; // 0=NEVER, 1=SLEEP, 2=START_IN_SLEEP
-
-    bool constrainedTo(Rigid *other) const;
 };
 
 // Tight world-space axis-aligned half extents of a body's collision shape. Used by
@@ -280,12 +282,6 @@ struct Force
     // Whether this constraint has broken and stopped acting on its bodies. Only
     // breakable joints ever report true; every other force is permanent.
     virtual bool isBroken() const { return false; }
-
-    // True for collision manifolds. The primal's per-body dispatch used a virtual
-    // contactPointCount() call per incident force per round to learn this; a plain
-    // flag keeps the hot walk free of indirect calls (5% of serial time at 1653
-    // bodies was the vtable tax).
-    bool isManifold = false;
 
     // Host-side ownership tag. The solver never reads or writes it; it exists so a
     // host can map a force back to its own object, including one the solver removed.
@@ -430,8 +426,13 @@ private:
             float3 p_jAng, float p_rate) const;
 };
 
-// Collision manifold between two rigid bodies, which contains up to eight frictional contact points
-struct Manifold : Force
+// Maximum contact points a manifold can carry. The collision paths emit at most eight.
+inline constexpr int kMaxManifoldContacts = 8;
+
+// Collision manifold types. Manifolds themselves live in the solver's ManifoldStore
+// (structure of arrays, stable slots) rather than in per-pair objects, so this struct is
+// a namespace for the shared records plus the solver-free pair query.
+struct Manifold
 {
     // Used to track contact features between frames
     union FeaturePair
@@ -448,8 +449,8 @@ struct Manifold : Force
     };
 
     // Contact point geometry. This is what collision detection writes; the hot solver
-    // state lives in the parallel arrays below, so the per-contact stride the primal and
-    // dual walk stays small.
+    // state lives in ManifoldStore's parallel arrays, so the per-contact stride the primal
+    // and dual walk stays small.
     struct Contact
     {
         FeaturePair feature;
@@ -466,89 +467,137 @@ struct Manifold : Force
         float s00, s01, s02, s11, s12, s22;
     };
 
-    std::array<Contact, 8> contacts;
+    // Shape-pair collision query at the bodies' current poses: the solver's narrow phase
+    // entry, also used by space queries.
+    static int collide(Rigid *bodyA, Rigid *bodyB, std::span<Contact> contacts, float3x3 &basis);
+};
 
-    // Hot contact state, split out of Contact. preCompute/updateDual/stampCached walk
-    // these arrays, so moving them next to each other keeps each loop's working set
-    // contiguous instead of striding over the geometry record.
-    std::array<float3, 8> contactC0;        // constraint value at q-
-    std::array<float3, 8> contactPenalty;
-    std::array<float3, 8> contactLambda;
-    std::array<uint8_t, 8> contactStick;
+// Every collision manifold of one solver, as parallel arrays over stable slots.
+//
+// A slot is allocated from `freeList` (or appended) and stays put until the manifold is
+// released; `live` lists the slots that currently own a manifold, in creation order, so
+// every per-manifold phase is a compact walk over `live`. Contact state is indexed
+// `slot * kMaxManifoldContacts + k`; the fixed stride wastes a partly unused tail on
+// manifolds with few contacts, but keeps warm-start matching, parallel per-slot writes
+// and the per-slot passes trivial.
+struct ManifoldStore
+{
+    // Per-slot state.
+    std::vector<Rigid *> bodyA, bodyB;
+    std::vector<float3x3> basis; // normal in the first row (B -> A), tangents in rows 2/3
+    std::vector<uint8_t> numContacts;
+    std::vector<float> friction;
+    std::vector<uint8_t> flags;
+    std::vector<int32_t> dormantTicks;
+    std::vector<int32_t> dormantSavedCount;
+    // Drift-gated arm cache: world arms captured at the last full assembly, plus the body
+    // rotations at capture time (see Solver::jacobianRebuildDistance).
+    std::vector<float3x3> rotACaptured, rotBCaptured;
+
+    // Per-contact state, stride kMaxManifoldContacts.
+    std::vector<Manifold::Contact> contacts;
+    std::vector<float3> contactC0; // constraint value at q-
+    std::vector<float3> contactPenalty, contactLambda;
+    std::vector<float3> contactForceCache;
+    std::vector<float3> rAWorld, rBWorld; // cached world arms
+    std::vector<uint8_t> contactStick;
     // Personal multiplier on the betaLin penalty ramp, carried across steps with the
     // warmstart. Adaptive beta (Solver::adaptiveBeta) raises it for contacts whose error
     // stopped shrinking and lets it fall back for converging ones.
-    std::array<float, 8> contactBetaScale;
-    std::array<BasisHessian, 8> linHessian;
+    std::vector<float> contactBetaScale;
+    std::vector<Manifold::BasisHessian> linHessian;
 
-    float3x3 basis; // Normal in the first row (pointing from B to A), and tangents in the second and third rows
-    int numContacts;
-    float friction;
+    std::vector<uint32_t> live;     // slots owning a manifold, walk order
+    std::vector<uint32_t> freeList; // recycled slots, not in `live`
 
-    // Incremental moment-arm cache: world-space arms captured at the last full assembly,
-    // plus the body rotations at capture time. The drift test is per BODY (rotations are
-    // loop-invariant across a manifold's contacts): reuse the arms when neither rotation
-    // moved more than jacobianRebuildDistance (unit-column distance ~ 2 sin(angle/2)).
-    // The angular jacobian matrices the old cache stored are gone: C and the stamp both
-    // derive everything from these arms and the basis. Invalidated by initialize().
-    struct JacobianCache
+    // flags
+    static constexpr uint8_t kArmsCached = 1;
+    static constexpr uint8_t kPrimalCacheReady = 2;
+
+    [[nodiscard]] uint32_t acquire(Rigid *p_bodyA, Rigid *p_bodyB);
+    // Return a slot to the free list. The caller removes it from `live`.
+    void release(uint32_t slot) noexcept;
+    void clear();
+
+    [[nodiscard]] int count() const noexcept { return static_cast<int>(live.size()); }
+    [[nodiscard]] static constexpr int base(uint32_t slot) noexcept
     {
-        float3 rAWorld;
-        float3 rBWorld;
-    };
-    std::array<JacobianCache, 8> jacobianCache;
-    float3x3 rotACaptured = identity3x3; // body rotations at capture
-    float3x3 rotBCaptured = identity3x3;
-    bool armsCached = false;
-    // Clamped contact forces from the primal's shared precompute pass; the two body
-    // stamps read these instead of each recomputing the same C/F from the snapshot.
-    std::array<float3, 8> contactForceCache;
-    // The cache above is ready for the next primal stamp: prepared by the previous
-    // round's dual (poses are unchanged since) or by preCompute(). The first body to
-    // touch this manifold in a round consumes it, so a manifold is fully recomputed at
-    // most once per round instead of once per body.
-    bool primalCacheReady = false;
+        return static_cast<int>(slot) * kMaxManifoldContacts;
+    }
+    [[nodiscard]] int contactCount(uint32_t slot) const noexcept { return numContacts[slot]; }
+    [[nodiscard]] bool dormant(uint32_t slot) const noexcept { return dormantTicks[slot] > 0; }
 
-    // Contact-grace dormancy (Solver::contactGraceTicks). While the pair's swept AABBs
-    // stay apart, initialize() parks the manifold here instead of letting warmstartForces
-    // reap it: `dormantSavedCount` is the live contact count whose geometry and hot state
-    // (penalty/lambda/betaScale/stick, untouched by a zero-contact merge) survive until
-    // the pair returns, and `dormantTicks` counts dormant ticks toward the grace limit.
-    // numContacts is held at 0 while dormant so every per-contact solve loop no-ops.
-    int dormantTicks = 0;
-    int dormantSavedCount = 0;
+    // Neither body can move this step: the manifold's bookkeeping is parked verbatim.
+    [[nodiscard]] bool frozen(uint32_t slot) const noexcept;
 
-    Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB);
-
-    // Class-specific pooled allocation: manifolds churn with contact formation and
-    // separation (broad phase news them, warmstartForces deletes them), so recycled blocks
-    // avoid the heap on the hot path. The constructor still fully runs on every new
-    // expression, so a recycled block is indistinguishable from a fresh one.
-    static void *operator new(std::size_t count);
-    static void operator delete(void *ptr) noexcept;
-    // Release every cached block (called when a solver dies; blocks outlive solvers by
-    // design so a surviving solver's next contact pays no allocation).
-    static void drainPool() noexcept;
-
-    bool initialize() override;
-    void updatePrimal(Rigid *body, float alpha, Block &block) override;
-    // Recompute C0 at the current (substep-start) pose without re-running collision
-    // detection. Used between interleaved substeps: the contact set stays, only the
-    // constraint error is rebased. Invalidates the prepared primal force cache.
-    void rebaseContacts();
+    // Refresh the contact set for the step and warm-start the hot state. Returns false
+    // when the pair separated (and is not parked in the contact-grace window); the slot
+    // stays allocated either way and the caller decides whether to release it.
+    bool initialize(uint32_t slot, Solver &solver);
+    // Recompute C0 at the current pose without re-running collision detection. Used between
+    // interleaved substeps; invalidates the prepared primal force cache.
+    void rebase(uint32_t slot) noexcept;
     // Two consumers share one cache. updatePrimal (the coloured Gauss-Seidel path) uses
     // the force/moment-arm cache the previous round's dual left behind: the first body to
-    // touch the manifold this round consumes it for free, and the second color - by then
+    // touch the manifold this round consumes it for free, and the second colour - by then
     // poses have moved - recomputes once (preCompute) and stamps its side. The overflow
-    // bucket's Jacobi path instead runs preCompute over forces, then stampCached over
+    // bucket's Jacobi path instead runs preCompute over slots, then stampCached over
     // bodies, so one assembly serves both sides against the same snapshot.
-    void preCompute(float alpha);
-    void stampCached(Rigid *body, Block &block);
-    void updateDual(float alpha) override;
-    int contactPointCount() const override { return numContacts; }
-    void accumulatePenetration(float &r_total, int &r_count) const override;
+    void preCompute(uint32_t slot, const Solver &solver, float alpha) noexcept;
+    void stampCached(uint32_t slot, Rigid *body, Block &block) const noexcept;
+    void updatePrimal(uint32_t slot, const Solver &solver, Rigid *body, float alpha, Block &block);
+    void updateDual(uint32_t slot, const Solver &solver, float alpha) noexcept;
+    // Impulse-tail penalty decay (Solver::stiffnessDecay), fused ahead of the dual.
+    void decayPenalties(uint32_t slot, float decay) noexcept;
+    void accumulatePenetration(uint32_t slot, const Solver &solver, float &r_total,
+            int &r_count) const noexcept;
+};
 
-    static int collide(Rigid *bodyA, Rigid *bodyB, std::span<Contact> contacts, float3x3 &basis);
+// One incident constraint in the per-body adjacency: a non-manifold Force* (low bit 0,
+// pointers are aligned) or a manifold slot tag (low bit 1).
+struct ForceRef
+{
+    uintptr_t value = 0;
+
+    [[nodiscard]] static ForceRef manifold(uint32_t slot) noexcept
+    {
+        return { (static_cast<uintptr_t>(slot) << 1) | 1u };
+    }
+    [[nodiscard]] static ForceRef force(Force *f) noexcept
+    {
+        return { reinterpret_cast<uintptr_t>(f) };
+    }
+    [[nodiscard]] bool isManifold() const noexcept { return (value & 1u) != 0; }
+    [[nodiscard]] uint32_t slot() const noexcept { return static_cast<uint32_t>(value >> 1); }
+    [[nodiscard]] Force *asForce() const noexcept
+    {
+        return reinterpret_cast<Force *>(value);
+    }
+};
+
+// Per-body constraint adjacency in CSR form, keyed by Rigid::broadIndex. Rebuilt every
+// step (before the broad phase for the pair filter, after warmstart for the solve): the
+// colouring, the primal walk, the sleep wake-up and the island grouping read it instead
+// of following the intrusive body lists. Manifold references carry a store slot.
+struct ForceAdjacency
+{
+    std::vector<uint32_t> start; // bodyCount + 1 offsets
+    std::vector<ForceRef> refs;
+
+    void clear();
+    // `bodies` is the step's flattened body list; every body in it has a valid
+    // Rigid::broadIndex. Bodies outside it are skipped (they are not part of the step).
+    void build(std::span<Rigid *const> bodies, const Force *forceHead, const ManifoldStore &manifolds);
+    [[nodiscard]] std::span<const ForceRef> of(int bodyIndex) const noexcept
+    {
+        if (bodyIndex < 0 || static_cast<size_t>(bodyIndex) + 1 >= start.size())
+            return {};
+        return std::span<const ForceRef>(refs.data() + start[bodyIndex],
+                start[bodyIndex + 1] - start[bodyIndex]);
+    }
+
+private:
+    std::vector<uint32_t> cursor; // fill positions, reused across builds
 };
 
 // Discrete shape-pair collision query: up to 8 contact points between two `Shape`s,
@@ -769,6 +818,45 @@ struct Solver
     // (layer & p_mask) != 0. Backs the direct space state's shape and point queries;
     // the same no-tree fallback applies.
     void collectAABB(float3 min, float3 max, uint32_t p_mask, std::vector<Rigid *> &out) const;
+    // Manifold store accessors for hosts and diagnostics. `index` is a position in the
+    // live list, not a store slot; the slot is an implementation detail.
+    [[nodiscard]] int manifoldCount() const { return manifolds.count(); }
+    [[nodiscard]] Rigid *manifoldBodyA(int index) const
+    {
+        return manifolds.bodyA[manifolds.live[static_cast<size_t>(index)]];
+    }
+    [[nodiscard]] Rigid *manifoldBodyB(int index) const
+    {
+        return manifolds.bodyB[manifolds.live[static_cast<size_t>(index)]];
+    }
+    [[nodiscard]] int manifoldContactCount(int index) const
+    {
+        return manifolds.contactCount(manifolds.live[static_cast<size_t>(index)]);
+    }
+    [[nodiscard]] const Manifold::Contact &manifoldContact(int index, int k) const
+    {
+        const uint32_t slot = manifolds.live[static_cast<size_t>(index)];
+        return manifolds.contacts[static_cast<size_t>(ManifoldStore::base(slot) + k)];
+    }
+    // Constraint value at the step-start pose: x is the normal error (positive = overlap).
+    [[nodiscard]] float3 manifoldContactError(int index, int k) const
+    {
+        const uint32_t slot = manifolds.live[static_cast<size_t>(index)];
+        return manifolds.contactC0[static_cast<size_t>(ManifoldStore::base(slot) + k)];
+    }
+    // First basis row: the contact normal, pointing from B to A.
+    [[nodiscard]] float3 manifoldNormal(int index) const
+    {
+        return manifolds.basis[manifolds.live[static_cast<size_t>(index)]].x;
+    }
+    // Total contact points across live manifolds (statistics only).
+    [[nodiscard]] int manifoldContactPoints() const
+    {
+        int total = 0;
+        for (uint32_t slot : manifolds.live)
+            total += manifolds.numContacts[slot];
+        return total;
+    }
     // Delete every body and force.
     void clear();
     void step();
@@ -823,6 +911,10 @@ private:
     std::vector<float3> bodyAabbCenter;
     SpatialHash broadHash;
     std::vector<uint64_t> sweepPairs;
+    // Per-step scratch (reused capacity): exact-filter results for the candidate pairs and
+    // the radix sort's ping-pong buffer.
+    std::vector<uint8_t> broadPairValid;
+    std::vector<uint64_t> pairSortScratch;
 
     // Bodies that take part in the primal update (movable, awake ones), in list order.
     // The coloured Gauss-Seidel primal solves one block system per body of each
@@ -851,19 +943,29 @@ private:
     std::vector<int> overflowOrder; // update-set indices of the overflow bucket
     int colourCount = 0;           // colours in use (<= kMaxColours)
 
-    // The force list rebuilt each step so the phases can address forces by index, plus the
-    // per-force result of initialize() so that deletion can be done in one thread after the
-    // parallel initialisation.
+    // Every collision manifold of this solver, as stable store slots (no per-step
+    // allocation, no global pool).
+    ManifoldStore manifolds;
+    // Per-body constraint adjacency, keyed by Rigid::broadIndex. Rebuilt at the start of
+    // the broad phase (pair filter) and again after warm-starting (colour/primal/sleep).
+    ForceAdjacency forceAdjacency;
+    // The non-manifold force list rebuilt each step so the phases can address joints,
+    // springs and ignore pairs by index, plus the per-force result of initialize() so the
+    // deletion can be done in one thread after the parallel initialisation.
     std::vector<Force *> forceOrder;
     std::vector<uint8_t> forceActive;
+    // Per-slot initialize() result for the step's manifolds (parallel fill, serial reap).
+    std::vector<uint8_t> manifoldActive;
 
-    // Island scratch (rebuilt when sleep is active): body index base for the union-find,
-    // per-force body slots, and the island id of every movable body (-1 = no island).
+    // Island scratch (rebuilt when sleep is active): the movable bodies that may sleep and
+    // the island id of every body, indexed by Rigid::broadIndex (-1 = not an island body).
     std::vector<Rigid *> islandBodies;
-    std::vector<std::pair<int, int>> islandForceSlots;
     std::vector<int> bodyIsland;
 
     std::unique_ptr<detail::JobPool> pool;
+    // Requested thread count the pool was built for; a change rebuilds it (a solver whose
+    // `threads` is set after the first step otherwise keeps the old width forever).
+    int poolThreads = -1;
     // Classified stage sequence for the current step, rebuilt in place every frame.
     std::unique_ptr<detail::TaskFlow> flow;
 
@@ -902,11 +1004,24 @@ private:
     void finishBody(int i, bool idleDetection);
     // One substep's body warmstart, iteration region, and velocity finish, as a flow.
     void runSubstep(int forceCount, int targetIterations, int newtonRounds, bool idleDetection);
-    // Rebase every manifold's contact error at the current pose (parallel over forces).
-    void rebaseContacts(int forceCount);
+
+    // Flow stage context. Lives on runSubstep's stack for the duration of flow->run(), so
+    // stage thunks take it as an opaque pointer with no allocation and no type erasure.
+    struct SubstepCtx;
+    static int flowWarmstartCount(void *ctx) noexcept;
+    static void flowWarmstartItem(void *ctx, int i) noexcept;
+    static void flowIterateInline(void *ctx) noexcept;
+    static void flowIterateParallel(void *ctx) noexcept;
+    static bool flowIterateInlineWhen(void *ctx) noexcept;
+    static void flowFinishItem(void *ctx, int i) noexcept;
+    // Rebase every manifold's contact error at the current pose (parallel over slots).
+    void rebaseContacts();
     // Push overlapping contacts apart in position only, after the velocity finish, so the
     // overlap cannot exceed what the penalty solve happened to hold (see positionProjection).
-    void projectContacts(int forceCount);
+    void projectContacts();
+    // Rebuild the per-body constraint adjacency from the current force list and manifold
+    // store. Serial: the lists are mutated only on the calling thread at this point.
+    void buildForceAdjacency();
 
     // Island-wide sleep bookkeeping (runs when sleeping is enabled): movable bodies are
     // grouped into islands through force connectivity, and an island whose every body

@@ -274,13 +274,13 @@ int32_t AVBDPhysicsServer3D::_get_process_info(PhysicsServer3D::ProcessInfo p_in
         case PhysicsServer3D::INFO_ISLAND_COUNT:
             return static_cast<int32_t>(spaces.size());
         case PhysicsServer3D::INFO_COLLISION_PAIRS: {
-            // Manifolds are the forces with contact points.
+            // A manifold with at least one contact is a colliding pair.
             int32_t count = 0;
             for (const auto &[id, space] : spaces) {
                 (void)id;
-                count += static_cast<int32_t>(std::ranges::count_if(
-                        avbd::next_range(space->solver.forces),
-                        [](const avbd::Force *force) { return force->contactPointCount() > 0; }));
+                for (int i = 0; i < space->solver.manifoldCount(); i++)
+                    if (space->solver.manifoldContactCount(i) > 0)
+                        count++;
             }
             return count;
         }
@@ -470,16 +470,19 @@ PackedVector3Array AVBDPhysicsServer3D::_space_get_contacts(const RID &p_space) 
     }
     // The engine's debug contacts are world-space points of recent contacts; serve the
     // first-shape contact points of every manifold seen this step.
-    for (const avbd::Force *force = found->second->solver.forces; force != nullptr; force = force->next) {
-        const int count = force->contactPointCount();
+    const avbd::Solver &solver = found->second->solver;
+    for (int m = 0; m < solver.manifoldCount(); m++) {
+        const int count = solver.manifoldContactCount(m);
         if (count <= 0) {
             continue;
         }
         // Walk the manifold's stored contacts: rA/rB are local offsets from each body.
-        const avbd::Rigid *a = force->bodyA;
-        const avbd::Manifold *manifold = static_cast<const avbd::Manifold *>(force);
+        const avbd::Rigid *a = solver.manifoldBodyA(m);
+        if (a == nullptr) {
+            continue;
+        }
         for (int i = 0; i < count; i++) {
-            const avbd::float3 world = a->positionLin + qrot(a->positionAng, manifold->contacts[i].rA);
+            const avbd::float3 world = a->positionLin + qrot(a->positionAng, solver.manifoldContact(m, i).rA);
             out.push_back(to_godot(world));
             if (out.size() >= static_cast<int64_t>(found->second->debug_contacts_max)) {
                 return out;
@@ -494,11 +497,7 @@ int32_t AVBDPhysicsServer3D::_space_get_contact_count(const RID &p_space) const 
     if (found == spaces.end()) {
         return 0;
     }
-    int32_t count = 0;
-    for (const avbd::Force *force = found->second->solver.forces; force != nullptr; force = force->next) {
-        count += force->contactPointCount();
-    }
-    return count;
+    return found->second->solver.manifoldContactPoints();
 }
 
 // -----------------------------------------------------------------------------
@@ -1474,31 +1473,31 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         // believes is deepest, but measure it with a real SAT pass at the current pose, so
         // the number always describes the geometry the host can see. One extra narrow
         // phase per step, on the stepping thread.
-        const avbd::Manifold *deepest = nullptr;
+        avbd::Rigid *deepest_a = nullptr;
+        avbd::Rigid *deepest_b = nullptr;
         double deepest_stored = 0.0;
-        for (const avbd::Force *force = space.solver.forces; force != nullptr; force = force->next) {
-            if (!force->isManifold) {
-                continue;
-            }
-            const auto *manifold = static_cast<const avbd::Manifold *>(force);
-            for (int i = 0; i < manifold->numContacts; i++) {
-                const double depth = static_cast<double>(avbd::COLLISION_MARGIN - manifold->contactC0[i].x);
+        for (int m = 0; m < space.solver.manifoldCount(); m++) {
+            const int contacts = space.solver.manifoldContactCount(m);
+            for (int i = 0; i < contacts; i++) {
+                const double depth = static_cast<double>(avbd::COLLISION_MARGIN
+                        - space.solver.manifoldContactError(m, i).x);
                 if (depth > deepest_stored) {
                     deepest_stored = depth;
-                    deepest = manifold;
+                    deepest_a = space.solver.manifoldBodyA(m);
+                    deepest_b = space.solver.manifoldBodyB(m);
                 }
             }
         }
-        if (deepest != nullptr) {
+        if (deepest_a != nullptr) {
             std::array<avbd::Manifold::Contact, 8> fresh{};
             avbd::float3x3 freshBasis{};
-            const int freshCount = avbd::Manifold::collide(deepest->bodyA, deepest->bodyB,
+            const int freshCount = avbd::Manifold::collide(deepest_a, deepest_b,
                     std::span<avbd::Manifold::Contact>(fresh), freshBasis);
             for (int i = 0; i < freshCount; i++) {
-                const avbd::float3 xA = deepest->bodyA->positionLin
-                        + avbd::qrot(deepest->bodyA->positionAng, fresh[i].rA);
-                const avbd::float3 xB = deepest->bodyB->positionLin
-                        + avbd::qrot(deepest->bodyB->positionAng, fresh[i].rB);
+                const avbd::float3 xA = deepest_a->positionLin
+                        + avbd::qrot(deepest_a->positionAng, fresh[i].rA);
+                const avbd::float3 xB = deepest_b->positionLin
+                        + avbd::qrot(deepest_b->positionAng, fresh[i].rB);
                 const avbd::float3 c0 = avbd::mul(freshBasis, xA - xB)
                         + avbd::float3{avbd::COLLISION_MARGIN, 0, 0};
                 const double depth = static_cast<double>(avbd::COLLISION_MARGIN - c0.x);
@@ -1506,8 +1505,8 @@ void AVBDPhysicsServer3D::_step(float p_step) {
                     continue;
                 }
                 diag_max_penetration = depth;
-                const auto it_a = space.rigid_ids.find(deepest->bodyA);
-                const auto it_b = space.rigid_ids.find(deepest->bodyB);
+                const auto it_a = space.rigid_ids.find(deepest_a);
+                const auto it_b = space.rigid_ids.find(deepest_b);
                 const auto rec_a = bodies.find(it_a != space.rigid_ids.end() ? it_a->second : 0);
                 const auto rec_b = bodies.find(it_b != space.rigid_ids.end() ? it_b->second : 0);
                 diag_deepest_a = rec_a != bodies.end() ? rec_a->second.instance_id : 0;
@@ -1548,16 +1547,18 @@ void AVBDPhysicsServer3D::_step(float p_step) {
                     id_map.emplace(&b, bid);
                 }
             }
-            for (avbd::Force *force = space.solver.forces; force != nullptr; force = force->next) {
-                const int count = force->contactPointCount();
+            for (int m = 0; m < space.solver.manifoldCount(); m++) {
+                const int count = space.solver.manifoldContactCount(m);
                 if (count <= 0) {
                     continue;
                 }
-                const avbd::Manifold *manifold = static_cast<const avbd::Manifold *>(force);
-                const auto it_a = rigid_map.find(force->bodyA);
-                const auto it_b = rigid_map.find(force->bodyB);
+                avbd::Rigid *body_a = space.solver.manifoldBodyA(m);
+                avbd::Rigid *body_b = space.solver.manifoldBodyB(m);
+                const auto it_a = rigid_map.find(body_a);
+                const auto it_b = rigid_map.find(body_b);
                 BodyData *data[2] = {it_a != rigid_map.end() ? it_a->second : nullptr,
                         it_b != rigid_map.end() ? it_b->second : nullptr};
+                const avbd::float3 normal = space.solver.manifoldNormal(m);
 
                 for (int side = 0; side < 2; side++) {
                     BodyData *fill = data[side];
@@ -1565,17 +1566,17 @@ void AVBDPhysicsServer3D::_step(float p_step) {
                         continue;
                     }
                     const BodyData *other = data[side == 0 ? 1 : 0];
-                    const avbd::Rigid *self_rigid = side == 0 ? force->bodyA : force->bodyB;
+                    const avbd::Rigid *self_rigid = side == 0 ? body_a : body_b;
                     for (int c = 0; c < count && static_cast<int32_t>(fill->frame_contacts.size()) < fill->max_contacts_reported; c++) {
+                        const avbd::Manifold::Contact &contact = space.solver.manifoldContact(m, c);
                         const avbd::float3 world = self_rigid->positionLin
                                 + avbd::qrot(self_rigid->positionAng,
-                                        side == 0 ? manifold->contacts[c].rA : manifold->contacts[c].rB);
+                                        side == 0 ? contact.rA : contact.rB);
                         BodyData::FrameContact fc;
                         fc.position = to_godot(world);
                         // The basis's first row points from B to A; each side reports the
                         // normal as pointing out of the other body towards itself.
-                        fc.normal = to_godot(avbd::float3{manifold->basis[0][0], manifold->basis[1][0], manifold->basis[2][0]}
-                                * (side == 0 ? 1.0f : -1.0f));
+                        fc.normal = to_godot(normal * (side == 0 ? 1.0f : -1.0f));
                         fc.collider_body_id = other != nullptr ? id_map[other] : 0;
                         fill->frame_contacts.push_back(fc);
                     }
@@ -2372,7 +2373,7 @@ Array AVBDPhysicsServer3D::get_solver_deepest_contact() const {
 
 // Sleep/wake state of the last step, aggregated over every space. Mirrors the solver's own
 // predicates: a body is asleep when `sleeping` is set, a manifold is frozen when neither side
-// is a movable awake body (Solver::constraintFrozen), and the update set is what the solve
+// is a movable awake body (ManifoldStore::frozen), and the update set is what the solve
 // actually moved.
 Dictionary AVBDPhysicsServer3D::get_solver_sleep_stats() const {
     int body_count = 0;
@@ -2408,15 +2409,12 @@ Dictionary AVBDPhysicsServer3D::get_solver_sleep_stats() const {
                 }
             }
         }
-        for (const avbd::Force *force = solver.forces; force != nullptr; force = force->next) {
-            if (!force->isManifold) {
-                continue;
-            }
-            ++manifolds;
-            const auto awake = [](const avbd::Rigid *b) {
-                return b != nullptr && b->mass > 0.0f && !b->sleeping;
-            };
-            if (!awake(force->bodyA) && !awake(force->bodyB)) {
+        const auto awake = [](const avbd::Rigid *b) {
+            return b != nullptr && b->mass > 0.0f && !b->sleeping;
+        };
+        manifolds += solver.manifoldCount();
+        for (int m = 0; m < solver.manifoldCount(); m++) {
+            if (!awake(solver.manifoldBodyA(m)) && !awake(solver.manifoldBodyB(m))) {
                 ++frozen_manifolds;
             }
         }

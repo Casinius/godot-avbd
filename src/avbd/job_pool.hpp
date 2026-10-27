@@ -153,13 +153,26 @@ public:
     explicit SlotBudget(unsigned capacity) :
             available(capacity) {}
 
+    // The common case (slots are free) is a single atomic CAS, no lock. Only a region that
+    // has to wait touches the mutex/condition variable, and the predicate is re-checked
+    // under that mutex so a release in the check-to-wait window cannot be lost.
     void acquire(unsigned count) {
         if (count == 0) {
             return;
         }
+        unsigned current = available.load(std::memory_order_relaxed);
+        while (current >= count) {
+            if (available.compare_exchange_weak(current, current - count,
+                        std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                return;
+            }
+        }
+
         std::unique_lock<std::mutex> lock(mutex);
-        condition.wait(lock, [this, count] { return available >= count; });
-        available -= count;
+        condition.wait(lock, [this, count] {
+            return available.load(std::memory_order_relaxed) >= count;
+        });
+        available.fetch_sub(count, std::memory_order_relaxed);
     }
 
     void release(unsigned count) {
@@ -167,8 +180,10 @@ public:
             return;
         }
         {
+            // The increment stays under the mutex so a waiter's predicate check and its
+            // transition to sleep cannot interleave with it.
             std::lock_guard<std::mutex> lock(mutex);
-            available += count;
+            available.fetch_add(count, std::memory_order_relaxed);
         }
         condition.notify_all();
     }
@@ -176,7 +191,7 @@ public:
 private:
     std::mutex mutex;
     std::condition_variable condition;
-    unsigned available;
+    std::atomic<unsigned> available;
 };
 
 // The process-wide pool and the region-width budget. Materialised lazily so a serial

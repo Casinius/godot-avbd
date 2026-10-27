@@ -75,7 +75,7 @@ static int count_bodies(const Solver &s) {
 }
 
 static int count_forces(const Solver &s) {
-    int n = 0;
+    int n = s.manifoldCount();
     for (const Force *f = s.forces; f != nullptr; f = f->next) {
         n++;
     }
@@ -83,11 +83,7 @@ static int count_forces(const Solver &s) {
 }
 
 static int count_contact_points(const Solver &s) {
-    int n = 0;
-    for (const Force *f = s.forces; f != nullptr; f = f->next) {
-        n += f->contactPointCount();
-    }
-    return n;
+    return s.manifoldContactPoints();
 }
 
 static bool finite(const Rigid *b) {
@@ -986,13 +982,10 @@ static void test_collide_shapes_equivalence() {
 static int manifold_contacts(const Solver &s, float &r_maxNormalC0) {
     int contacts = 0;
     r_maxNormalC0 = -INFINITY;
-    for (const Force *f = s.forces; f != nullptr; f = f->next) {
-        if (!f->isManifold) {
-            continue;
-        }
-        const auto *m = static_cast<const Manifold *>(f);
-        for (int i = 0; i < m->numContacts; i++) {
-            r_maxNormalC0 = std::fmax(r_maxNormalC0, m->contactC0[i][0]);
+    for (int m = 0; m < s.manifoldCount(); m++) {
+        const int count = s.manifoldContactCount(m);
+        for (int i = 0; i < count; i++) {
+            r_maxNormalC0 = std::fmax(r_maxNormalC0, s.manifoldContactError(m, i)[0]);
             contacts++;
         }
     }
@@ -1282,6 +1275,13 @@ static void test_jacobi_shares() {
     bool covered = true;
     for (const Force *f = s.forces; f != nullptr; f = f->next) {
         const Rigid *sides[2] = {f->bodyA, f->bodyB};
+        for (const Rigid *side : sides) {
+            if (side != nullptr && side->mass > 0 && !side->sleeping && !side->inUpdateSet)
+                covered = false;
+        }
+    }
+    for (int m = 0; m < s.manifoldCount(); m++) {
+        const Rigid *sides[2] = {s.manifoldBodyA(m), s.manifoldBodyB(m)};
         for (const Rigid *side : sides) {
             if (side != nullptr && side->mass > 0 && !side->sleeping && !side->inUpdateSet)
                 covered = false;
