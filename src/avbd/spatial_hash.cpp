@@ -99,7 +99,9 @@ void radixSortKeyed(std::vector<uint64_t> &keys, std::vector<int> &payload)
 } // namespace
 
 void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float baseCell,
-                                        std::vector<uint64_t> &out, std::span<float3> aabbHalfExt,
+                                        std::vector<uint64_t> &out,
+                                        std::span<const float3> aabbHalfExt,
+                                        std::span<const float3> aabbCenter,
                                         detail::JobPool &pool)
 {
     const int count = static_cast<int>(bodies.size());
@@ -109,12 +111,11 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
 
     // Automatic big-block size: the median largest AABB extent, so about half
     // the bodies live in the level-0 big blocks and one level up covers each
-    // further doubling of size. The same pass fills the tight AABB half extents
-    // the solver's exact filter reuses - one bound computation per body per step.
+    // further doubling of size. The extents come from the caller's bounds (swept,
+    // so a fast body's level follows the ground it covers this step).
     extents.resize(count);
     pool.forCount(count, [&](int i) {
-        const float3 h = aabbHalfExtent(*bodies[i]);
-        aabbHalfExt[i] = h;
+        const float3 h = aabbHalfExt[i];
         extents[i] = 2.0f * std::max(h.x, std::max(h.y, h.z));
     }, kMinBodiesPerCheapDispatch);
 
@@ -164,7 +165,7 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
     pool.forCount(count, [&](int i) {
         const int l = levels[i];
         const float invCell = 1.0f / (baseCell * (float)(1 << l));
-        const float3 &p = bodies[i]->positionLin;
+        const float3 &p = aabbCenter[i];
         keyedKeys[i] = cellSortKey(l, cellKey((int)std::floor(p.x * invCell),
                 (int)std::floor(p.y * invCell), (int)std::floor(p.z * invCell)));
         keyedBodies[i] = i;
@@ -212,7 +213,7 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
         std::vector<uint64_t> &buf = pairChunks[chunk];
         buf.clear();
         for (int i = firstBody; i < lastBody; i++) {
-            const float3 &pi = bodies[i]->positionLin;
+            const float3 &pi = aabbCenter[i];
             for (int l = levels[i]; l < levelCount; l++) {
                 const float invCell = 1.0f / (baseCell * (float)(1 << l));
                 const int cx = (int)std::floor(pi.x * invCell);

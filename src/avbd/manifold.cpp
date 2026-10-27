@@ -49,6 +49,22 @@ inline Manifold::BasisHessian basisHessian(const float3x3 &basis, const float3 &
             k.x * b0z2 + k.y * b1z2 + k.z * b2z2};
 }
 
+// The constraint value the primal and dual work against: the step-start error damped by
+// (1-alpha), plus the pose bracket in the contact basis. Penetration is damped so a deep
+// impact does not overshoot; a speculative contact that is still geometrically apart is
+// NOT penetrating yet, and damping its gap to 1% makes any millimetre of jitter look like
+// a violation - the pair starts pushing from up to `speculativeMargin` away, an invisible
+// inflation layer that measurably deepens every jam in a dense pile. Use the full gap for
+// those, so the pair only acts once the bracket predicts a real overlap. With the margin
+// disabled the geometry never reports a separated pair, so the branch is unreachable and
+// the expression is the original one bit for bit.
+inline float3 constraintError(const float3 &c0, const float3 &bracket, const float3x3 &basis,
+        float oneMinusAlpha, bool speculative) noexcept
+{
+    const bool separated = speculative && c0.x > COLLISION_MARGIN + CONTACT_RELEASE_GAP;
+    return c0 * (separated ? 1.0f : oneMinusAlpha) + mul(basis, bracket);
+}
+
 // Manifold pool with simple mutex for correctness
 static std::mutex poolMutex;
 static std::vector<void *> poolFreeList;
@@ -97,6 +113,12 @@ bool Manifold::initialize()
     armsCached = false;
     primalCacheReady = false;
 
+    // Grace revival: a dormant manifold re-enters with the contact set it preserved, so
+    // the feature-key merge below can match the returning contacts against their history.
+    if (numContacts == 0 && dormantSavedCount > 0)
+        numContacts = dormantSavedCount;
+    const int liveCount = numContacts;
+
     // Compute new contacts
     std::array<Contact, 8> newContacts = {};
     int newNumContacts = collide(bodyA, bodyB, std::span<Contact>(newContacts), basis);
@@ -134,9 +156,62 @@ bool Manifold::initialize()
                     newContacts[i].rA = newRA;
                     newContacts[i].rB = newRB;
                 }
+                else
+                {
+                    // Stick heal: a sticky pair's anchors are glued to each other, so their
+                    // separation (what STICK_THRESH checks every dual update) stays ~zero
+                    // no matter how far the pair has slid. Compare the frozen anchors
+                    // against the fresh contact geometry at the current pose instead: past
+                    // STICK_DRIFT_HEAL the "static" contact is really sliding, the old
+                    // anchors no longer sit on the touching surfaces, and C0 measures
+                    // anchor separation - phantom penetration the dual then answers with
+                    // real force. Re-anchor from the current pass and drop the force
+                    // history (the penalty ramp survives, so support rebuilds in-round).
+                    const float3 oldA = bodyA->positionLin + qrot(bodyA->positionAng, contacts[j].rA);
+                    const float3 oldB = bodyB->positionLin + qrot(bodyB->positionAng, contacts[j].rB);
+                    const float3 newA = bodyA->positionLin + qrot(bodyA->positionAng, newRA);
+                    const float3 newB = bodyB->positionLin + qrot(bodyB->positionAng, newRB);
+                    const float drift = std::max(length(oldA - newA), length(oldB - newB));
+#ifdef AVBD_DIAG
+                    if (drift > STICK_DRIFT_HEAL && solver != nullptr)
+                        solver->diag.stickHeals++;
+#endif
+                    if (drift > STICK_DRIFT_HEAL)
+                    {
+                        newContacts[i].rA = newRA;
+                        newContacts[i].rB = newRB;
+                        newStick[i] = 0;
+                        // Keep the normal support impulse: it is a function of how hard the
+                        // pair is pressed together, not of where the anchors sit. Dropping
+                        // it made every sliding contact lose its support each tick - the
+                        // pile never settled, it just kept re-sinking. Only friction is
+                        // tied to the anchors that just moved.
+                        newLambda[i] = float3{newLambda[i].x, 0.0f, 0.0f};
+                        newBetaScale[i] = 1.0f;
+                    }
+                }
                 break;
             }
         }
+    }
+
+#ifdef AVBD_DIAG
+    if (solver != nullptr)
+        for (int i = 0; i < newNumContacts; i++)
+            if (prevErr[i] < 0.0f)
+                solver->diag.newContacts++;
+#endif
+
+    // Fresh-contact seed: a contact that matched no feature key starts its penalty at a
+    // fraction of betaLin instead of the floor, so an impact-time contact does not spend
+    // its first ticks ramping from k=1 while the load runs through it. Gated on the grace
+    // setting (default 0 keeps the historical floor start).
+    if (solver != nullptr && solver->contactGraceTicks > 0)
+    {
+        const float seed = std::max(PENALTY_MIN, 0.05f * solver->betaLin);
+        for (int i = 0; i < newNumContacts; i++)
+            if (prevErr[i] < 0.0f)
+                newPenalty[i] = float3{seed, seed, seed};
     }
 
     // Copy new contacts and their hot state to the manifold
@@ -149,6 +224,36 @@ bool Manifold::initialize()
         contactStick[i] = newStick[i];
         contactBetaScale[i] = newBetaScale[i];
     }
+
+    // Grace dormancy: the pair separated and no contacts came back. Parking the manifold
+    // (instead of reporting it dead for warmstartForces to reap) keeps the hot state of
+    // `liveCount` contacts untouched in the arrays above, so a pair that returns within
+    // Solver::contactGraceTicks re-matches by feature key instead of rebuilding from the
+    // penalty floor. numContacts stays 0, which makes every solve loop over this manifold
+    // a no-op.
+    if (numContacts == 0)
+    {
+        if (solver != nullptr && solver->contactGraceTicks > 0 && dormantTicks < solver->contactGraceTicks)
+        {
+            // Park the stiffness, not the force. What a revived pair needs is the penalty
+            // ramp it earned; the lambda from before the separation is support for a pose
+            // that no longer exists. Kept alive, it is applied in full by the first primal
+            // round after revival - a kick of lambda*dt that a settled box feels as a
+            // several-m/s shove out of the pile. The release rule in the live path exists
+            // for the same reason: a separated pair may carry no force.
+            for (int i = 0; i < liveCount; i++)
+            {
+                contactLambda[i] = float3{};
+                contactStick[i] = 0;
+                contactBetaScale[i] = 1.0f;
+            }
+            dormantTicks++;
+            dormantSavedCount = liveCount;
+            return false;
+        }
+        dormantSavedCount = 0;
+    }
+    dormantTicks = 0;
 
     // Compute error at q- and update penalty and lambdas
     for (int i = 0; i < numContacts; i++)
@@ -166,11 +271,28 @@ bool Manifold::initialize()
         // energy, which showed up as endless bouncing and sink-through on the
         // round-shape scenes. No clamp.
 
+        // Contact release: the anchors say the pair is geometrically apart, so no contact
+        // force can act - whatever impulse the dual still holds came from an earlier pose
+        // and must not be applied across the gap. The warm-start decay alone would keep a
+        // big impact impulse alive for hundreds of ticks, and the penalty term keeps
+        // stamping it into the solve every round; the pile then pops a box out at 10+ m/s
+        // long after it was still. The penalty (stiffness) survives, so the support
+        // rebuilds in one round when the pair closes again.
+        if (contactC0[i][0] > COLLISION_MARGIN + CONTACT_RELEASE_GAP)
+        {
+            contactLambda[i] = float3{};
+            contactStick[i] = 0;
+            contactBetaScale[i] = 1.0f;
+        }
+
         // Adaptive beta (the augmented-Lagrangian kappa update, per contact): a
         // sticking contact whose error did not shrink against last step doubles its
         // personal ramp multiplier; a well-converging one halves it back toward 1.
-        // Unmatched (fresh) contacts start from the neutral multiplier.
-        if (solver->adaptiveBeta && prevErr[i] > 0.0f)
+        // Unmatched (fresh) contacts start from the neutral multiplier. A speculative
+        // contact that has never applied force (positive normal gap, zero normal
+        // lambda) is not an error to converge, so it keeps the neutral multiplier.
+        if (solver->adaptiveBeta && prevErr[i] > 0.0f &&
+                !(contactC0[i][0] > 0.0f && contactLambda[i][0] == 0.0f))
         {
             const float err = length(contactC0[i]);
             float scale = contactBetaScale[i];
@@ -255,7 +377,8 @@ void Manifold::preCompute(float alpha)
         jacobianCache[i].rBWorld = rBWorld;
 
         const float3 bracket = (dqALin - dqBLin) + cross(dqAAng, rAWorld) - cross(dqBAng, rBWorld);
-        const float3 C = contactC0[i] * (1 - alpha) + mul(basis, bracket);
+        const float3 C = constraintError(contactC0[i], bracket, basis, 1 - alpha,
+                solver->speculativeMargin > 0.0f);
 
         // Compute force - the penalty is a diagonal, so K*C is componentwise.
         float3 F = cmul(contactPenalty[i], C) + contactLambda[i];
@@ -308,11 +431,13 @@ void Manifold::stampCached(Rigid *body, Block &block)
     float3 accRhsLin{};
     float3 accRhsAng{};
 
+    // A zero cached force does not make the contact inactive: the normal force is clamped
+    // at zero while the contact can still be compressed within the margin, and its penalty
+    // still belongs in the Hessian. Skipping it removes the support stiffness, which lets
+    // loaded stacks sink through each other and, once deep enough, launch.
     for (int i = 0; i < numContacts; i++)
     {
         const float3 &F = contactForceCache[i];
-        if (F[0] == 0.0f && F[1] == 0.0f && F[2] == 0.0f) continue;
-        
         const float3 r = fromIsA ? jacobianCache[i].rAWorld : jacobianCache[i].rBWorld;
         
         const BasisHessian &s = linHessian[i];
@@ -410,7 +535,10 @@ void Manifold::updateDual(float alpha)
         }
 
         const float3 bracket = (dqALin - dqBLin) + cross(dqAAng, rAWorld) - cross(dqBAng, rBWorld);
-        float3 C = contactC0[i] * (1 - alpha) + mul(basis, bracket);
+        // Same C the primal solved against: the dual must not ramp the penalty on a
+        // different error, or primal and dual disagree about the contact's state.
+        const float3 C = constraintError(contactC0[i], bracket, basis, 1 - alpha,
+                solver->speculativeMargin > 0.0f);
 
         // Compute force - the penalty is a diagonal, so K*C is componentwise.
         float3 F = cmul(contactPenalty[i], C) + contactLambda[i];
@@ -475,11 +603,17 @@ void Manifold::updateDual(float alpha)
 
 // Accumulate this manifold's penetration error for the adaptive iteration estimate.
 // Same loop, comparison and accumulation order as the dynamic_cast block it replaces
-// in solveIterations, so the floating-point sequence is unchanged.
+// in solveIterations, so with speculative contacts off the floating-point sequence is
+// unchanged. With speculative contacts on, a positive normal error is a gap the bodies
+// have not closed yet, not penetration: counting it would pin the adaptive target at
+// its upper bound.
 void Manifold::accumulatePenetration(float &r_total, int &r_count) const
 {
+    const bool speculative = solver->speculativeMargin > 0.0f;
     for (int i = 0; i < numContacts; i++)
     {
+        if (speculative && contactC0[i][0] > 0.0f)
+            continue;
         const float penetration = length(contactC0[i]);
         if (penetration > 0.0f)
         {

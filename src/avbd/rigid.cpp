@@ -114,7 +114,16 @@ bool Rigid::constrainedTo(Rigid* other) const
     // the solver put together.
     for (Force* f = forces; f != 0; f = (f->bodyA == this) ? f->nextA : f->nextB)
         if ((f->bodyA == this && f->bodyB == other) || (f->bodyA == other && f->bodyB == this))
+        {
+            // A dormant manifold (contact grace) does not join the pair: the pair must
+            // still wake on AABB overlap and re-enter the broad phase, or a sleeping body
+            // behind a dormant manifold is invisible to an incoming body and gets tunneled
+            // through. The dormant manifold itself revives in its own initialize().
+            if (f->isManifold && static_cast<const Manifold*>(f)->numContacts == 0
+                    && static_cast<const Manifold*>(f)->dormantTicks > 0)
+                continue;
             return true;
+        }
     return false;
 }
 

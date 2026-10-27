@@ -165,6 +165,8 @@ void Solver::step()
     int newtonRounds = iterations;
     computeIterations(targetIterations, newtonRounds);
     runSubstep(forceCount, targetIterations, newtonRounds, true);
+    projectContacts(forceCount);
+    rebaseContacts(forceCount);
 }
 
 // One substep: body warmstart (independent), the colour-parallel Gauss-Seidel region,
@@ -207,6 +209,9 @@ void Solver::stepInterleaved(int substeps, int roundsPerSubstep)
         return;
     }
 
+#ifdef AVBD_DIAG
+    diag = Diag{}; // warmstartForces fills reaped/soft/new below; reset first
+#endif
     broadPhase();
     const int forceCount = warmstartForces();
     selectUpdateBodies();
@@ -215,12 +220,21 @@ void Solver::stepInterleaved(int substeps, int roundsPerSubstep)
     int newtonTick = iterations;
     computeIterations(targetTick, newtonTick);
 
-    // Explicit budget wins; otherwise split the tick's adaptive target evenly.
+    // The explicit budget is a FLOOR on the per-substep share of the adaptive target,
+    // not a cap: a scene that asks for 2 rounds/substep during a deep impact must still
+    // get the rounds the penetration estimate calls for, or the impact pays for the
+    // budget's optimism with permanent penetration. `roundsPerSubstep == 0` keeps the
+    // pure adaptive split, bit-identical to before this floor existed.
     const int rounds = roundsPerSubstep > 0
-            ? std::min(roundsPerSubstep, adaptiveMaxIterations)
+            ? std::clamp(std::max(roundsPerSubstep, std::max(2, (targetTick + substeps - 1) / substeps)),
+                    2, adaptiveMaxIterations)
             : std::max(2, (targetTick + substeps - 1) / substeps);
     const int newton = std::clamp(
             static_cast<int>(std::ceil(newtonRatio * static_cast<float>(rounds))), 0, rounds);
+#ifdef AVBD_DIAG
+    diag.adaptiveTarget = targetTick;
+    diag.actualRounds = rounds;
+#endif
 
     for (int sub = 0; sub < substeps; ++sub) {
         if (sub > 0) {
@@ -228,6 +242,15 @@ void Solver::stepInterleaved(int substeps, int roundsPerSubstep)
         }
         runSubstep(forceCount, rounds, newton, sub + 1 == substeps);
     }
+    // Once per tick, not per substep: the correction is positional and velocities are
+    // already final, so a second pass inside the same tick would only re-fight the first.
+    projectContacts(forceCount);
+    // The tick's stored error is the one the solver saw when its contacts were initialized;
+    // the bodies have moved since. Rebase it at the final pose so what the host reads back
+    // (the penetration diagnostic) is the geometry the pair actually ended the tick with,
+    // not a one-tick-old pose. The next tick's initialize() replaces it from its own
+    // collision pass either way; this only feeds prevErr (adaptive beta) and the host.
+    rebaseContacts(forceCount);
 }
 
 // Rebase every manifold's constraint error at the current pose. Parallel over forces; a
@@ -242,16 +265,186 @@ void Solver::rebaseContacts(int forceCount)
     }, kMinForcesPerDispatch);
 }
 
-// A broad-phase candidate test: tight world AABBs plus Godot's layer/mask pair
-// rule, minus pairs already joined by a force (IgnoreCollision, joints). The AABB
-// is the tight box of the actual shape, unlike a bounding-sphere test whose radius
-// is the shape's diagonal and therefore admits many far-apart candidates.
-static bool pairOverlaps(Rigid *bodyA, const float3 &aHalf, Rigid *bodyB, const float3 &bHalf)
+// Inverse inertia is diagonal in the body frame (`Rigid::moment` holds the inertia itself,
+// the same convention GenericJoint::penaltyLimit reads), so both halves of a projection come
+// from one rotation into that frame: the quadratic form t.(I^-1 t) is the effective angular
+// compliance along the contact's torque axis, and I^-1 t is the rotation vector that axis's
+// impulse produces.
+namespace {
+
+[[nodiscard]] float angularCompliance(const Rigid &body, const float3 &localAxis) noexcept
 {
-    const float3 aMin = bodyA->positionLin - aHalf;
-    const float3 aMax = bodyA->positionLin + aHalf;
-    const float3 bMin = bodyB->positionLin - bHalf;
-    const float3 bMax = bodyB->positionLin + bHalf;
+    const float3 &I = body.moment;
+    float sum = 0.0f;
+    for (int k = 0; k < 3; k++)
+        if (I[k] > 0.0f)
+            sum += localAxis[k] * localAxis[k] / I[k];
+    return sum;
+}
+
+// World-space rotation vector produced by a unit impulse about `localAxis` (already in the
+// body frame), returned in world space.
+[[nodiscard]] float3 angularResponse(const Rigid &body, const float3 &localAxis) noexcept
+{
+    const float3 &I = body.moment;
+    float3 out{0.0f, 0.0f, 0.0f};
+    for (int k = 0; k < 3; k++)
+        if (I[k] > 0.0f)
+            out[k] = localAxis[k] / I[k];
+    return qrot(body.positionAng, out);
+}
+
+// A locked axis does not move, so the projection drops that component. The effective mass
+// was computed as if it did, which makes the correction slightly soft on locked bodies -
+// the same documented approximation the rest of the solver makes for axis locks.
+void applyLocked(Rigid &body, float3 &dLin, float3 &dAng) noexcept
+{
+    for (int k = 0; k < 3; k++)
+    {
+        if (body.axisLockLinear & (1 << k))
+            dLin[k] = 0.0f;
+        if (body.axisLockAngular & (1 << k))
+            dAng[k] = 0.0f;
+    }
+}
+
+} // namespace
+
+// Position-only contact projection (see Solver::positionProjection). Serial over the
+// manifold list in force order: a body takes part in several manifolds, so sweeps must be
+// Gauss-Seidel to converge, and serial order is what makes the result independent of the
+// thread count. Cheap when nothing is deep - a contact within `projectionSlop` costs one
+// pair of arm rotations and a dot product.
+//
+// Velocity absorption (`projectionVelocityAbsorb`): a body the pass lifts out of a
+// penetration still carries its approach velocity - without absorption it re-enters next
+// tick at full speed and the net becomes a launch-and-fall pump (measured: a 420-box
+// pyramid rattles at 15-30 m/s forever with the net on, and settles to 0.1 m/s with it
+// off - the off case "settles" by freezing the crush). Absorption removes the normal
+// component of the velocity that points back INTO the projected contact, per body, once
+// that body's side of the manifold actually moved. It is strictly dissipative - it can
+// only remove speed, never add it - so the pass behaves like a restitution-0 resolve for
+// impacts the penalty ramp missed, and leaves everything else untouched.
+void Solver::projectContacts(int forceCount)
+{
+    if (!positionProjection || forceCount <= 0 || projectionIterations <= 0)
+        return;
+
+    const float slop = projectionSlop;
+    const float beta = projectionBeta;
+    const float cap = projectionMaxCorrection;
+    const bool absorb = projectionVelocityAbsorb;
+
+    for (int iter = 0; iter < projectionIterations; iter++)
+    {
+        for (int i = 0; i < forceCount; i++)
+        {
+            Force *f = forceOrder[i];
+            if (!f->isManifold)
+                continue;
+            Manifold *m = static_cast<Manifold *>(f);
+            Rigid *A = m->bodyA;
+            Rigid *B = m->bodyB;
+
+            // Only bodies the solve itself was allowed to move may be projected: static
+            // bodies are immovable, and a sleeping one must stay exactly where it was parked
+            // (its manifold is frozen, so its contact state is deliberately stale).
+            const bool moveA = A->mass > 0.0f && A->inUpdateSet;
+            const bool moveB = B->mass > 0.0f && B->inUpdateSet;
+            if (!moveA && !moveB)
+                continue;
+            const float invMassA = moveA ? 1.0f / A->mass : 0.0f;
+            const float invMassB = moveB ? 1.0f / B->mass : 0.0f;
+
+            // Row 0 of the basis is the contact normal pointing from B to A, so pushing A
+            // along +n and B along -n separates the pair.
+            const float3 n = m->basis.x;
+
+            // Accumulate over the manifold's contacts and apply once. Applying each contact
+            // in turn moves the body before the next one is measured, so a symmetric set -
+            // the four corners of a flat box-on-box face - stops cancelling: the first
+            // corner's tilt changes the other three's depths and the manifold walks the body
+            // sideways. Summing first restores the cancellation, and the manifold still
+            // sees its neighbours' latest poses, so sweeps stay Gauss-Seidel across forces.
+            float3 dLinA{0, 0, 0}, dAngA{0, 0, 0}, dLinB{0, 0, 0}, dAngB{0, 0, 0};
+            for (int k = 0; k < m->numContacts; k++)
+            {
+                const float3 rA = qrot(A->positionAng, m->contacts[k].rA);
+                const float3 rB = qrot(B->positionAng, m->contacts[k].rB);
+                const float depth = -dot(n, (A->positionLin + rA) - (B->positionLin + rB)) - slop;
+                if (depth <= 0.0f)
+                    continue;
+
+                const float3 tA = cross(rA, n);
+                const float3 tB = cross(rB, n);
+                // The arms go into the body frame once: I^-1 is diagonal there, and both
+                // the effective mass and the applied rotation vector read the same product.
+                const float3 tALocal = moveA ? qrot(qconj(A->positionAng), tA) : float3{0, 0, 0};
+                const float3 tBLocal = moveB ? qrot(qconj(B->positionAng), tB) : float3{0, 0, 0};
+                const float effectiveMass = invMassA + invMassB
+                        + (moveA ? angularCompliance(*A, tALocal) : 0.0f)
+                        + (moveB ? angularCompliance(*B, tBLocal) : 0.0f);
+                if (!(effectiveMass > 0.0f))
+                    continue;
+
+                float dp = beta * depth / effectiveMass;
+                if (cap > 0.0f)
+                    dp = std::min(dp, cap);
+
+                if (moveA)
+                {
+                    dLinA = dLinA + n * (invMassA * dp);
+                    dAngA = dAngA + angularResponse(*A, tALocal) * dp;
+                }
+                if (moveB)
+                {
+                    dLinB = dLinB + n * (invMassB * dp);
+                    dAngB = dAngB + angularResponse(*B, tBLocal) * dp;
+                }
+            }
+
+            if (moveA)
+            {
+                applyLocked(*A, dLinA, dAngA);
+                A->positionLin = A->positionLin + dLinA;
+                A->positionAng = A->positionAng + dAngA;
+                // Approach along this contact is motion opposite the normal (n points
+                // B -> A); remove exactly that component once A actually moved here.
+                if (absorb && dLinA != float3{0, 0, 0})
+                {
+                    const float vn = dot(A->velocityLin, n);
+                    if (vn < 0.0f)
+                        A->velocityLin = A->velocityLin - n * vn;
+                }
+            }
+            if (moveB)
+            {
+                applyLocked(*B, dLinB, dAngB);
+                B->positionLin = B->positionLin - dLinB;
+                B->positionAng = B->positionAng + (-dAngB);
+                if (absorb && dLinB != float3{0, 0, 0})
+                {
+                    const float vn = dot(B->velocityLin, n);
+                    if (vn > 0.0f)
+                        B->velocityLin = B->velocityLin - n * vn;
+                }
+            }
+        }
+    }
+}
+
+// A broad-phase candidate test: swept world AABBs plus Godot's layer/mask pair
+// rule, minus pairs already joined by a force (IgnoreCollision, joints). The box
+// starts from the tight bounds of the actual shape - unlike a bounding-sphere test
+// whose radius is the shape's diagonal and therefore admits many far-apart
+// candidates - and is grown to cover the body's motion for the step.
+static bool pairOverlaps(Rigid *bodyA, const float3 &aHalf, const float3 &aCenter,
+                         Rigid *bodyB, const float3 &bHalf, const float3 &bCenter)
+{
+    const float3 aMin = aCenter - aHalf;
+    const float3 aMax = aCenter + aHalf;
+    const float3 bMin = bCenter - bHalf;
+    const float3 bMax = bCenter + bHalf;
     const bool boundsOverlap = !(bMin.x > aMax.x || bMin.y > aMax.y || bMin.z > aMax.z ||
             aMin.x > bMax.x || aMin.y > bMax.y || aMin.z > bMax.z);
     // Godot semantics: the pair collides when either side's layer is in the other's
@@ -284,12 +477,34 @@ void Solver::broadPhase()
     if (count < 2)
         return;
 
-    // The hash computes each body's tight AABB half extents in its own per-body pass (the
-    // exact candidate filter below reuses them), rather than paying a second dispatch for
-    // the same rotation matrices. Note the solver's own pool: the broad phase used to
-    // build a fixed 8-worker JobPool on the stack, ignoring `threads` entirely.
+    // Swept bounds: the union of the body's AABB at the step start and at the step end.
+    // For linear motion that union is exact - centred at p + disp/2 with half extent
+    // h + |disp|/2 - and the rotation term conservatively grows it by the arc a point at
+    // the bounding radius sweeps. The speculative margin is the last growth, which is
+    // what lets a pair whose surfaces are about to meet enter the narrow phase.
     bodyAabbHalf.resize(static_cast<size_t>(count));
-    broadHash.buildAndCollectPairs(bodiesInOrder, 0.0f, sweepPairs, bodyAabbHalf, *pool);
+    bodyAabbCenter.resize(static_cast<size_t>(count));
+    pool->forCount(count, [this](int i) {
+        Rigid *body = bodiesInOrder[i];
+        const float3 tight = aabbHalfExtent(*body);
+
+        // Same prediction warmstartBody applies to the pose; the adaptive warm-start's
+        // extra gravity fraction is smaller than the full g*dt^2 term used here.
+        float3 disp = body->velocityLin * dt;
+        if (body->mass > 0)
+            disp += float3{0, 0, body->gravity * dt * dt};
+
+        const float rotSweep = body->radius * length(body->velocityAng) * dt;
+        const float grow = rotSweep + speculativeMargin;
+
+        bodyAabbCenter[i] = body->positionLin + disp * 0.5f;
+        bodyAabbHalf[i] = tight
+                + float3{std::fabs(disp.x), std::fabs(disp.y), std::fabs(disp.z)} * 0.5f
+                + float3{grow, grow, grow};
+    }, kMinBodiesPerCheapDispatch);
+
+    broadHash.buildAndCollectPairs(bodiesInOrder, 0.0f, sweepPairs,
+            bodyAabbHalf, bodyAabbCenter, *pool);
 
     // Pairs are packed (min<<32 | max), so integer order is lexicographic order over the
     // old std::pair and the sort takes the radix path instead of std::sort's comparator.
@@ -303,8 +518,8 @@ void Solver::broadPhase()
     pool->forCount(pairCount, [this, &pairValid](int k) {
         const int i = pairFirst(sweepPairs[k]);
         const int j = pairSecond(sweepPairs[k]);
-        auto overlaps = pairOverlaps(bodiesInOrder[i], bodyAabbHalf[i],
-                                    bodiesInOrder[j], bodyAabbHalf[j]);
+        auto overlaps = pairOverlaps(bodiesInOrder[i], bodyAabbHalf[i], bodyAabbCenter[i],
+                                    bodiesInOrder[j], bodyAabbHalf[j], bodyAabbCenter[j]);
         pairValid[k] = overlaps;
         if (!overlaps) return;
 
@@ -328,6 +543,23 @@ void Solver::broadPhase()
         if (!pairValid[k]) continue;
         const int i = pairFirst(sweepPairs[k]);
         const int j = pairSecond(sweepPairs[k]);
+        // A dormant manifold (contact grace) let this pair back into the candidate set
+        // (constrainedTo skips dormant ones so overlap can wake sleepers); it will revive
+        // in its own initialize(), so creating a second manifold here would double the
+        // pair's constraints.
+        bool exists = false;
+        for (Force *f = bodiesInOrder[i]->forces; f != nullptr;
+                f = (f->bodyA == bodiesInOrder[i]) ? f->nextA : f->nextB)
+        {
+            if ((f->bodyA == bodiesInOrder[i] && f->bodyB == bodiesInOrder[j])
+                    || (f->bodyA == bodiesInOrder[j] && f->bodyB == bodiesInOrder[i]))
+            {
+                exists = true;
+                break;
+            }
+        }
+        if (exists)
+            continue;
         new Manifold(this, bodiesInOrder[i], bodiesInOrder[j]);
     }
 
@@ -368,10 +600,40 @@ int Solver::warmstartForces()
     for (int i = 0; i < forceCount; i++)
     {
         if (!forceActive[i])
+        {
+            // Grace: a manifold that went dormant this tick (initialize parked it) keeps
+            // its hot state for contactGraceTicks ticks instead of being reaped. initialize
+            // only enters dormancy while the grace setting is positive, so with the
+            // default 0 this branch never fires and the delete below is unchanged.
+            if (forceOrder[i]->isManifold && contactGraceTicks > 0
+                    && static_cast<Manifold *>(forceOrder[i])->dormantTicks > 0)
+                continue;
+#ifdef AVBD_DIAG
+            diag.reapedManifolds++;
+#endif
             delete forceOrder[i]; // unlinks itself from the solver and both bodies
+        }
     }
 
     forceCount = collectForces(); // the sweep above invalidated the index
+
+#ifdef AVBD_DIAG
+    {
+        int soft = 0;
+        const float softLimit = 0.1f * betaLin;
+        for (int i = 0; i < forceCount; i++)
+        {
+            Force *f = forceOrder[i];
+            if (!f->isManifold)
+                continue;
+            Manifold *m = static_cast<Manifold *>(f);
+            for (int ci = 0; ci < m->numContacts; ci++)
+                if (m->contactPenalty[ci].x < softLimit)
+                    soft++;
+        }
+        diag.softContacts = soft;
+    }
+#endif
     return forceCount;
 }
 

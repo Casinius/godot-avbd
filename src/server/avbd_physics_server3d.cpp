@@ -16,7 +16,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <array>
 #include <ranges>
+#include <span>
 #include <tuple>
 
 #include <godot_cpp/classes/box_shape3d.hpp>
@@ -377,6 +379,21 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     p_space.internal_ticks_per_second = internal_hz;
     p_space.max_internal_steps = std::max(static_cast<int>(settings->get_setting(
             "physics/avbd/max_internal_steps", 4.0)), 1);
+    p_space.position_projection = settings->get_setting("physics/avbd/position_projection", true);
+    p_space.projection_iterations = static_cast<int>(settings->get_setting(
+            "physics/avbd/projection_iterations", 8.0));
+    p_space.projection_beta = settings->get_setting("physics/avbd/projection_beta", 1.0);
+    p_space.projection_slop = settings->get_setting("physics/avbd/projection_slop", 0.005);
+    p_space.projection_max_correction = settings->get_setting(
+            "physics/avbd/projection_max_correction", 0.0);
+    p_space.sleep_linear_threshold = settings->get_setting(
+            "physics/avbd/sleep_linear_threshold", 0.05);
+    p_space.sleep_angular_threshold = settings->get_setting(
+            "physics/avbd/sleep_angular_threshold", 0.05);
+    p_space.sleep_time = settings->get_setting("physics/avbd/sleep_time", 1.0);
+    p_space.contact_grace_ticks = static_cast<int>(settings->get_setting(
+            "physics/avbd/contact_grace_ticks", 0.0));
+    p_space.speculative_margin = settings->get_setting("physics/avbd/speculative_margin", 0.0);
 }
 
 void AVBDPhysicsServer3D::_space_set_active(const RID &p_space, bool p_active) {
@@ -821,13 +838,18 @@ float AVBDPhysicsServer3D::density_for(const BodyData &p_body) {
     return static_cast<float>(p_body.mass / volume);
 }
 
-void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
+void AVBDPhysicsServer3D::rebuild_space(const RID &p_space, std::source_location where) {
     SpaceData *space = find_space(p_space);
     if (space == nullptr) {
         return;
     }
 
     const uint64_t space_id = id_of(p_space);
+    ++rebuild_total;
+    const std::string reason = std::string(where.function_name()) + ":" + std::to_string(where.line());
+    ++rebuild_reasons[reason];
+    rebuild_last_step = step_total;
+    rebuild_last_reason = String::utf8(reason.c_str());
 
     // Anything this space owned is gone; the solver is about to be refilled.
     for (auto &[id, body] : bodies) {
@@ -1283,6 +1305,10 @@ void AVBDPhysicsServer3D::_step(float p_step) {
     if (!server_active) {
         return;
     }
+    ++step_total;
+    diag_max_penetration = 0.0;
+    diag_deepest_a = 0;
+    diag_deepest_b = 0;
 
     // One state object serves every callback this step; re-aimed per body before each call.
     if (body_state == nullptr) {
@@ -1349,6 +1375,11 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         space.solver.adaptiveBeta = space.adaptive_beta;
         space.solver.adaptiveIterations = space.adaptive_iterations;
         space.solver.maxPenetrationError = static_cast<float>(std::max(space.max_penetration_error, 0.0));
+        space.solver.positionProjection = space.position_projection;
+        space.solver.projectionIterations = std::max(space.projection_iterations, 0);
+        space.solver.projectionBeta = static_cast<float>(std::clamp(space.projection_beta, 0.0, 1.0));
+        space.solver.projectionSlop = static_cast<float>(std::max(space.projection_slop, 0.0));
+        space.solver.projectionMaxCorrection = static_cast<float>(std::max(space.projection_max_correction, 0.0));
 
         // Godot's physics tick is the sampling rate. If an internal rate is configured,
         // accumulate engine time and advance the solver on its own fixed tick; the engine
@@ -1369,9 +1400,17 @@ void AVBDPhysicsServer3D::_step(float p_step) {
             }
         }
         space.solver.dt = static_cast<float>(dt / static_cast<double>(substeps));
-        // Idle-sleep horizon: Godot's 0.5 s default, expressed in internal ticks. A fixed
-        // step count would make a high-tick-rate project fall asleep sooner than intended.
-        space.solver.sleepFrames = std::max(1, static_cast<int>(std::lround(0.5 / dt)));
+        // Idle-sleep horizon: Godot's 0.5 s default scaled by sleep_time, expressed in
+        // internal ticks. A fixed step count would make a high-tick-rate project fall
+        // asleep sooner than intended - the horizon is a TIME, not 60 frames.
+        space.solver.sleepFrames = std::max(1,
+                static_cast<int>(std::lround(0.5 * space.sleep_time / dt)));
+        space.solver.sleepLinearThreshold =
+                static_cast<float>(std::max(space.sleep_linear_threshold, 0.0));
+        space.solver.sleepAngularThreshold =
+                static_cast<float>(std::max(space.sleep_angular_threshold, 0.0));
+        space.solver.contactGraceTicks = std::max(space.contact_grace_ticks, 0);
+        space.solver.speculativeMargin = static_cast<float>(std::max(space.speculative_margin, 0.0));
 
         for (int tick = 0; tick < tickCount; ++tick) {
             const float tickDt = static_cast<float>(dt);
@@ -1420,6 +1459,60 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         }
         if (tickCount > 0) {
             stepped_any = true;
+        }
+
+        // Snapshot the deepest contact on the stepping thread, where the force list is
+        // stable. The getters run on the main thread; walking solver.forces there races
+        // with manifold creation, revival and reaping, and a manifold read after it was
+        // unlinked (or reused from the pool) reports a depth for a pair that is no longer
+        // touching - the "phantom depth" that does not match any geometry.
+        //
+        // The stored error alone is not the answer either: it belongs to the contact set
+        // the tick's collision pass found, and the bodies have moved since (a fast pair can
+        // have separated within the tick, and a contact that rotated makes its stored
+        // normal measure a separation that no longer exists). Report the pair the solver
+        // believes is deepest, but measure it with a real SAT pass at the current pose, so
+        // the number always describes the geometry the host can see. One extra narrow
+        // phase per step, on the stepping thread.
+        const avbd::Manifold *deepest = nullptr;
+        double deepest_stored = 0.0;
+        for (const avbd::Force *force = space.solver.forces; force != nullptr; force = force->next) {
+            if (!force->isManifold) {
+                continue;
+            }
+            const auto *manifold = static_cast<const avbd::Manifold *>(force);
+            for (int i = 0; i < manifold->numContacts; i++) {
+                const double depth = static_cast<double>(avbd::COLLISION_MARGIN - manifold->contactC0[i].x);
+                if (depth > deepest_stored) {
+                    deepest_stored = depth;
+                    deepest = manifold;
+                }
+            }
+        }
+        if (deepest != nullptr) {
+            std::array<avbd::Manifold::Contact, 8> fresh{};
+            avbd::float3x3 freshBasis{};
+            const int freshCount = avbd::Manifold::collide(deepest->bodyA, deepest->bodyB,
+                    std::span<avbd::Manifold::Contact>(fresh), freshBasis);
+            for (int i = 0; i < freshCount; i++) {
+                const avbd::float3 xA = deepest->bodyA->positionLin
+                        + avbd::qrot(deepest->bodyA->positionAng, fresh[i].rA);
+                const avbd::float3 xB = deepest->bodyB->positionLin
+                        + avbd::qrot(deepest->bodyB->positionAng, fresh[i].rB);
+                const avbd::float3 c0 = avbd::mul(freshBasis, xA - xB)
+                        + avbd::float3{avbd::COLLISION_MARGIN, 0, 0};
+                const double depth = static_cast<double>(avbd::COLLISION_MARGIN - c0.x);
+                if (depth <= diag_max_penetration) {
+                    continue;
+                }
+                diag_max_penetration = depth;
+                const auto it_a = space.rigid_ids.find(deepest->bodyA);
+                const auto it_b = space.rigid_ids.find(deepest->bodyB);
+                const auto rec_a = bodies.find(it_a != space.rigid_ids.end() ? it_a->second : 0);
+                const auto rec_b = bodies.find(it_b != space.rigid_ids.end() ? it_b->second : 0);
+                diag_deepest_a = rec_a != bodies.end() ? rec_a->second.instance_id : 0;
+                diag_deepest_b = rec_b != bodies.end() ? rec_b->second.instance_id : 0;
+            }
         }
 
         // Area monitoring runs once per engine step, after the solver's output is in hand
@@ -2259,71 +2352,101 @@ double AVBDPhysicsServer3D::get_solver_finish_time() const {
     return 0.0;
 }
 
-// The deepest normal overlap across every live manifold. A contact's C0 is stamped at the
-// start of the step (Manifold::initialize), so this is the geometric penetration the last
-// solve was working against, not a solver-internal residual.
+// The deepest normal overlap across every live manifold, as snapshotted at the end of the
+// last step. A contact's C0 is stamped at the start of the step (Manifold::initialize), so
+// this is the geometric penetration the last solve was working against, not a
+// solver-internal residual.
 double AVBDPhysicsServer3D::get_solver_max_penetration() const {
-    double worst = 0.0;
-    for (const auto &[id, space] : spaces) {
-        (void)id;
-        for (const avbd::Force *force = space->solver.forces; force != nullptr; force = force->next) {
-            if (!force->isManifold) {
-                continue;
-            }
-            const auto *manifold = static_cast<const avbd::Manifold *>(force);
-            for (int i = 0; i < manifold->numContacts; i++) {
-                const double depth = static_cast<double>(avbd::COLLISION_MARGIN - manifold->contactC0[i].x);
-                if (depth > worst) {
-                    worst = depth;
-                }
-            }
-        }
-    }
-    return worst;
+    return diag_max_penetration;
 }
 
 Array AVBDPhysicsServer3D::get_solver_deepest_contact() const {
-    double worst = 0.0;
-    uint64_t worst_a = 0;
-    uint64_t worst_b = 0;
+    Array out;
+    if (diag_max_penetration > 0.0) {
+        out.push_back(static_cast<int64_t>(diag_deepest_a));
+        out.push_back(static_cast<int64_t>(diag_deepest_b));
+        out.push_back(diag_max_penetration);
+    }
+    return out;
+}
+
+// Sleep/wake state of the last step, aggregated over every space. Mirrors the solver's own
+// predicates: a body is asleep when `sleeping` is set, a manifold is frozen when neither side
+// is a movable awake body (Solver::constraintFrozen), and the update set is what the solve
+// actually moved.
+Dictionary AVBDPhysicsServer3D::get_solver_sleep_stats() const {
+    int body_count = 0;
+    int movable = 0;
+    int sleeping = 0;
+    int sleep_mode_never = 0;
+    int max_still_frames = 0;
+    int update_set = 0;
+    int manifolds = 0;
+    int frozen_manifolds = 0;
+    int sleep_frames = 0;
+
     for (const auto &[id, space] : spaces) {
         (void)id;
-        for (const avbd::Force *force = space->solver.forces; force != nullptr; force = force->next) {
+        if (!space->active) {
+            continue; // an unused Space3D would report its own empty solver as the aggregate
+        }
+        const avbd::Solver &solver = space->solver;
+        sleep_frames = solver.sleepFrames;
+        for (const avbd::Rigid *body = solver.bodies; body != nullptr; body = body->next) {
+            ++body_count;
+            if (body->mass > 0.0f) {
+                ++movable;
+                if (body->sleeping) {
+                    ++sleeping;
+                }
+                if (body->sleep_mode == 0) {
+                    ++sleep_mode_never;
+                }
+                max_still_frames = std::max(max_still_frames, body->stillFrames);
+                if (body->inUpdateSet) {
+                    ++update_set;
+                }
+            }
+        }
+        for (const avbd::Force *force = solver.forces; force != nullptr; force = force->next) {
             if (!force->isManifold) {
                 continue;
             }
-            const auto *manifold = static_cast<const avbd::Manifold *>(force);
-            for (int i = 0; i < manifold->numContacts; i++) {
-                const double depth = static_cast<double>(avbd::COLLISION_MARGIN - manifold->contactC0[i].x);
-                if (depth <= worst) {
-                    continue;
-                }
-                worst = depth;
-                const auto it_a = space->rigid_ids.find(manifold->bodyA);
-                const auto it_b = space->rigid_ids.find(manifold->bodyB);
-                const uint64_t id_a = it_a != space->rigid_ids.end() ? it_a->second : 0;
-                const uint64_t id_b = it_b != space->rigid_ids.end() ? it_b->second : 0;
-                const auto rec_a = bodies.find(id_a);
-                const auto rec_b = bodies.find(id_b);
-                worst_a = rec_a != bodies.end() ? rec_a->second.instance_id : 0;
-                worst_b = rec_b != bodies.end() ? rec_b->second.instance_id : 0;
+            ++manifolds;
+            const auto awake = [](const avbd::Rigid *b) {
+                return b != nullptr && b->mass > 0.0f && !b->sleeping;
+            };
+            if (!awake(force->bodyA) && !awake(force->bodyB)) {
+                ++frozen_manifolds;
             }
         }
     }
-    Array out;
-    if (worst > 0.0) {
-        out.push_back(static_cast<int64_t>(worst_a));
-        out.push_back(static_cast<int64_t>(worst_b));
-        out.push_back(worst);
+
+    Dictionary out;
+    out["bodies"] = body_count;
+    out["movable"] = movable;
+    out["sleeping"] = sleeping;
+    out["sleep_mode_never"] = sleep_mode_never;
+    out["max_still_frames"] = max_still_frames;
+    out["update_set"] = update_set;
+    out["manifolds"] = manifolds;
+    out["frozen_manifolds"] = frozen_manifolds;
+    out["sleep_frames"] = sleep_frames;
+    out["rebuilds"] = static_cast<int64_t>(rebuild_total);
+    out["steps"] = static_cast<int64_t>(step_total);
+    out["rebuild_last_step"] = static_cast<int64_t>(rebuild_last_step);
+    out["rebuild_last_reason"] = rebuild_last_reason;
+    Dictionary reasons;
+    for (const auto &[reason, count] : rebuild_reasons) {
+        reasons[String::utf8(reason.c_str())] = static_cast<int64_t>(count);
     }
+    out["rebuild_reasons"] = reasons;
     return out;
 }
 
 AVBDPhysicsServer3D *AVBDPhysicsServer3D::get_singleton() {
     return SpaceData::singleton;
-}
-
-PhysicsDirectSpaceState3D *AVBDPhysicsServer3D::body_state_space_state(const RID &p_body) {
+}PhysicsDirectSpaceState3D *AVBDPhysicsServer3D::body_state_space_state(const RID &p_body) {
     const BodyData *body = find_body(p_body);
     if (body == nullptr || body->space.is_valid() == false) {
         return nullptr;

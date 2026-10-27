@@ -79,6 +79,16 @@ static void register_avbd_settings() {
             {"physics/avbd/rounds_per_substep", Variant(0)},
             {"physics/avbd/internal_ticks_per_second", Variant(0.0)},
             {"physics/avbd/max_internal_steps", Variant(4)},
+            {"physics/avbd/position_projection", Variant(true)},
+            {"physics/avbd/projection_iterations", Variant(8)},
+            {"physics/avbd/projection_beta", Variant(1.0)},
+            {"physics/avbd/projection_slop", Variant(0.005)},
+            {"physics/avbd/projection_max_correction", Variant(0.0)},
+            {"physics/avbd/sleep_linear_threshold", Variant(0.05)},
+            {"physics/avbd/sleep_angular_threshold", Variant(0.05)},
+            {"physics/avbd/sleep_time", Variant(1.0)},
+            {"physics/avbd/contact_grace_ticks", Variant(0)},
+            {"physics/avbd/speculative_margin", Variant(0.0)},
     };
     for (const auto &entry : entries) {
         if (settings->has_setting(entry.first)) {
@@ -93,6 +103,7 @@ static void register_avbd_settings() {
                         name == StringName("physics/avbd/adaptive_iterations") ||
                         name == StringName("physics/avbd/interleaved_substeps") ||
                         name == StringName("physics/avbd/internal_ticks_per_second") ||
+                        name == StringName("physics/avbd/position_projection") ||
                         name == StringName("physics/avbd/substeps") ||
                         name == StringName("physics/avbd/iterations"));
     }

@@ -11,13 +11,14 @@
  * Hierarchical hashed-grid broad phase ("big-block screen + layered hash").
  *
  * Replaces the Morton LBVH. Bodies are bucketed by the largest full extent of
- * their tight world AABB into dyadic levels: level 0 has cells of `baseCell`
- * (the big blocks), level l has cells of baseCell * 2^l, and a body lives at the
- * smallest level whose cell fits its AABB. Each level is hashed as packed 20-bit
- * integer coordinates; the level index rides in the sort key's top four bits, so
- * one radix sort produces both the per-level CSR ranges and the bucketed cells.
+ * their world AABB (the solver passes swept bounds) into dyadic levels: level 0
+ * has cells of `baseCell` (the big blocks), level l has cells of baseCell * 2^l,
+ * and a body lives at the smallest level whose cell fits its AABB. Each level is
+ * hashed as packed 20-bit integer coordinates; the level index rides in the sort
+ * key's top four bits, so one radix sort produces both the per-level CSR ranges
+ * and the bucketed cells.
  *
- * Pair generation: a body walks the 27-cell neighbourhood of its own centre at
+ * Pair generation: a body walks the 27-cell neighbourhood of its AABB centre at
  * every level from its own up to the coarsest. Two bodies whose AABBs overlap
  * are at most one cell apart (Chebyshev) at any level that fits both AABBs, so
  * every overlapping pair is found from the smaller body's walk; same-level pairs
@@ -72,10 +73,13 @@ public:
     // world AABBs can overlap into `out`, packed by `packPair` (see above).
     // `baseCell` <= 0 selects it automatically: the median largest AABB extent
     // of the scene, so half the bodies land in the level-0 big blocks.
-    // `aabbHalfExt` is filled with each body's tight world AABB half extents (the
-    // exact filter in the solver reuses them), so the per-body bound is computed once.
+    // `aabbHalfExt` / `aabbCenter` are the precomputed world AABB bounds per body
+    // (the solver passes swept bounds, so a fast body is not missed). They are also
+    // the exact filter's inputs, so the bound is computed once per body per step.
     void buildAndCollectPairs(std::span<Rigid *const> bodies, float baseCell,
-                              std::vector<uint64_t> &out, std::span<float3> aabbHalfExt,
+                              std::vector<uint64_t> &out,
+                              std::span<const float3> aabbHalfExt,
+                              std::span<const float3> aabbCenter,
                               detail::JobPool &pool);
 
     // Statistics of the last build (diagnostics only).

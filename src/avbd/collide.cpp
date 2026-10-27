@@ -240,13 +240,14 @@ inline bool addContact(const Shape& shapeA, const Shape& shapeB, std::span<Manif
 // The generic per-axis form (normalise, absDot both boxes' three axes) did ~30
 // multiplies plus a sqrt per axis, 15 axes per pair.
 
-inline bool testFaceAxisA(const OBB& boxA, const OBB& boxB, const float3& dA, const float3x3& m, int i, SatAxis& best)
+inline bool testFaceAxisA(const OBB& boxA, const OBB& boxB, const float3& dA, const float3x3& m, int i,
+        float speculativeMargin, SatAxis& best)
 {
     const float separation = std::abs(dA[i]) -
             (boxA.half[i] +
                     boxB.half.x * std::abs(m[0][i]) + boxB.half.y * std::abs(m[1][i]) +
                     boxB.half.z * std::abs(m[2][i]));
-    if (separation > 0.0f)
+    if (separation > speculativeMargin)
         return false;
 
     if (!best.valid || separation > best.separation)
@@ -261,13 +262,14 @@ inline bool testFaceAxisA(const OBB& boxA, const OBB& boxB, const float3& dA, co
     return true;
 }
 
-inline bool testFaceAxisB(const OBB& boxA, const OBB& boxB, const float3& dB, const float3x3& m, int j, SatAxis& best)
+inline bool testFaceAxisB(const OBB& boxA, const OBB& boxB, const float3& dB, const float3x3& m, int j,
+        float speculativeMargin, SatAxis& best)
 {
     const float separation = std::abs(dB[j]) -
             (boxB.half[j] +
                     boxA.half.x * std::abs(m[j][0]) + boxA.half.y * std::abs(m[j][1]) +
                     boxA.half.z * std::abs(m[j][2]));
-    if (separation > 0.0f)
+    if (separation > speculativeMargin)
         return false;
 
     if (!best.valid || separation > best.separation)
@@ -283,7 +285,7 @@ inline bool testFaceAxisB(const OBB& boxA, const OBB& boxB, const float3& dB, co
 }
 
 inline bool testEdgeAxis(const OBB& boxA, const OBB& boxB, const float3& delta, const float3& axis, const float3x3& m,
-        int i, int j, SatAxis& best)
+        int i, int j, float speculativeMargin, SatAxis& best)
 {
     const float lenSq = length2(axis);
     if (lenSq < SAT_AXIS_EPSILON)
@@ -300,7 +302,7 @@ inline bool testEdgeAxis(const OBB& boxA, const OBB& boxB, const float3& delta, 
 
     const float signedDist = dot(delta, axis) * invLen;
     const float separation = std::abs(signedDist) - (rA + rB);
-    if (separation > 0.0f)
+    if (separation > speculativeMargin)
         return false;
 
     if (!best.valid || separation > best.separation)
@@ -388,7 +390,7 @@ inline void closestPointsOnSegments(const float3& p0, const float3& p1, const fl
     c1 = q0 + d2 * t;
 }
 
-inline int buildFaceManifold(const Shape& shapeA, const Shape& shapeB, const OBB& boxA, const OBB& boxB, bool referenceIsA, int referenceAxis, const float3& normalAB, std::span<Manifold::Contact> contacts)
+inline int buildFaceManifold(const Shape& shapeA, const Shape& shapeB, const OBB& boxA, const OBB& boxB, bool referenceIsA, int referenceAxis, const float3& normalAB, float speculativeMargin, std::span<Manifold::Contact> contacts)
 {
     const OBB& referenceBox = referenceIsA ? boxA : boxB;
     const OBB& incidentBox = referenceIsA ? boxB : boxA;
@@ -434,11 +436,15 @@ inline int buildFaceManifold(const Shape& shapeA, const Shape& shapeB, const OBB
     featurePrefix |= (referenceAxis & 0xFF) << 16;
     featurePrefix |= (incidentAxis & 0xFF) << 8;
 
+    // Keep clipped vertices up to the speculative margin above the reference face;
+    // PLANE_EPSILON is the floor so a zero margin keeps the original behaviour.
+    const float acceptDistance = std::max(speculativeMargin, PLANE_EPSILON);
+
     for (size_t i = 0; i < static_cast<size_t>(count) && contactCount < MAX_CONTACTS; ++i)
     {
         float3 pIncident = clip0[i];
         float distance = dot(pIncident - referenceFace.center, referenceFace.normal);
-        if (distance > PLANE_EPSILON)
+        if (distance > acceptDistance)
             continue;
 
         float3 pReference = pIncident - referenceFace.normal * distance;
@@ -450,8 +456,17 @@ inline int buildFaceManifold(const Shape& shapeA, const Shape& shapeB, const OBB
 
     if (!contactCount)
     {
+        // The clip window caught nothing: the faces only meet at a corner. The support
+        // points are the deepest points along the normal, so their normal separation is
+        // the contact error - but their *tangential* offset is arbitrary (it is the
+        // distance between whichever corners the support direction happens to pick, up to
+        // a full box width). That offset becomes a tangential constraint error, ramps the
+        // friction penalty against a phantom, and after the next rebase rotates into the
+        // normal: box-sized penetration and an explosive impulse. Keep the normal
+        // separation, put both anchors at A's support point.
         float3 xA = supportPoint(boxA, normalAB);
         float3 xB = supportPoint(boxB, -normalAB);
+        xB = xA - normalAB * dot(xA - xB, normalAB);
         addContact(shapeA, shapeB, contacts, contactCount, contactMidpoints.data(), xA, xB, featurePrefix);
     }
 
@@ -695,12 +710,12 @@ inline void cylinderSamples(const Shape& cyl, float3* out, int& count)
 }
 
 inline int collideSphereSphere(const Shape& a, const Shape& b,
-        std::span<Manifold::Contact> contacts, float3x3& basisOut)
+        std::span<Manifold::Contact> contacts, float3x3& basisOut, float speculativeMargin)
 {
     const float3 d = b.center - a.center;
     const float distSq = length2(d);
-    const float sum = a.radius + b.radius;
-    if (distSq >= sum * sum)
+    const float sumPlus = a.radius + b.radius + speculativeMargin;
+    if (distSq >= sumPlus * sumPlus)
         return 0;
 
     const float dist = std::sqrt(distSq);
@@ -716,7 +731,7 @@ inline int collideSphereSphere(const Shape& a, const Shape& b,
 
 // Sphere against box, in either order. Exact.
 inline int collideSphereBox(const Shape& a, const Shape& b, bool sphereIsA,
-        std::span<Manifold::Contact> contacts, float3x3& basisOut)
+        std::span<Manifold::Contact> contacts, float3x3& basisOut, float speculativeMargin)
 {
     const Shape& sphere = sphereIsA ? a : b;
     const Shape& box = sphereIsA ? b : a;
@@ -728,7 +743,8 @@ inline int collideSphereBox(const Shape& a, const Shape& b, bool sphereIsA,
     const float3 d = sphere.center - closestLocal;
     const float distSq = length2(d);
 
-    if (distSq >= sphere.radius * sphere.radius)
+    const float radPlus = sphere.radius + speculativeMargin;
+    if (distSq >= radPlus * radPlus)
         return 0;
 
     const float dist = std::sqrt(distSq);
@@ -768,7 +784,7 @@ inline int collideSphereBox(const Shape& a, const Shape& b, bool sphereIsA,
 
 // Sphere against the closest point on a solid cylinder. Exact for the curved side and both caps.
 inline int collideSphereCylinder(const Shape& a, const Shape& b, bool sphereIsA,
-        std::span<Manifold::Contact> contacts, float3x3& basisOut)
+        std::span<Manifold::Contact> contacts, float3x3& basisOut, float speculativeMargin)
 {
     const Shape& sphere = sphereIsA ? a : b;
     const Shape& cyl = sphereIsA ? b : a;
@@ -776,7 +792,7 @@ inline int collideSphereCylinder(const Shape& a, const Shape& b, bool sphereIsA,
     float3 outward;
     float distance;
     const float3 onCylinder = closestPointOnCylinder(cyl, sphere.center, outward, distance);
-    if (distance >= sphere.radius)
+    if (distance >= sphere.radius + speculativeMargin)
         return 0;
 
 // `outward` points from the cylinder surface towards the sphere centre, so it is the A-to-B
@@ -907,26 +923,30 @@ inline int collideCylinderCylinder(const Shape& a, const Shape& b,
 
 int collideShapes(const Shape& a, const Shape& b,
                   std::span<Manifold::Contact> contacts,
-                  float3x3& basisOut)
+                  float3x3& basisOut,
+                  float speculativeMargin)
 {
     // Shapes other than boxes take their own paths; box-box keeps the SAT implementation below
     // untouched, so its behaviour is bit-for-bit what it was.
     if (a.type != ShapeType::Box || b.type != ShapeType::Box)
     {
         if (a.type == ShapeType::Sphere && b.type == ShapeType::Sphere)
-            return collideSphereSphere(a, b, contacts, basisOut);
+            return collideSphereSphere(a, b, contacts, basisOut, speculativeMargin);
 
         if (a.type == ShapeType::Sphere || b.type == ShapeType::Sphere)
         {
             if (a.type == ShapeType::Cylinder || b.type == ShapeType::Cylinder)
             {
                 const bool sphereIsA = a.type == ShapeType::Sphere;
-                return collideSphereCylinder(a, b, sphereIsA, contacts, basisOut);
+                return collideSphereCylinder(a, b, sphereIsA, contacts, basisOut, speculativeMargin);
             }
             const bool sphereIsA = a.type == ShapeType::Sphere;
-            return collideSphereBox(a, b, sphereIsA, contacts, basisOut);
+            return collideSphereBox(a, b, sphereIsA, contacts, basisOut, speculativeMargin);
         }
 
+        // The sampled cylinder paths stay penetration-only: every sample must be inside
+        // the other shape. The swept broad phase still admits the pair, and a contact
+        // appears the moment the shapes actually touch.
         if (a.type == ShapeType::Cylinder && b.type == ShapeType::Cylinder)
             return collideCylinderCylinder(a, b, contacts, basisOut);
 
@@ -958,13 +978,13 @@ int collideShapes(const Shape& a, const Shape& b,
 
     for (int i = 0; i < 3; ++i)
     {
-        if (!testFaceAxisA(boxA, boxB, dA, m, i, bestFace))
+        if (!testFaceAxisA(boxA, boxB, dA, m, i, speculativeMargin, bestFace))
             return 0;
     }
 
     for (int j = 0; j < 3; ++j)
     {
-        if (!testFaceAxisB(boxA, boxB, dB, m, j, bestFace))
+        if (!testFaceAxisB(boxA, boxB, dB, m, j, speculativeMargin, bestFace))
             return 0;
     }
 
@@ -973,7 +993,7 @@ int collideShapes(const Shape& a, const Shape& b,
         for (int j = 0; j < 3; ++j)
         {
             float3 axis = cross(boxA.axis[i], boxB.axis[j]);
-            if (!testEdgeAxis(boxA, boxB, delta, axis, m, i, j, bestEdge))
+            if (!testEdgeAxis(boxA, boxB, delta, axis, m, i, j, speculativeMargin, bestEdge))
                 return 0;
         }
     }
@@ -996,9 +1016,9 @@ int collideShapes(const Shape& a, const Shape& b,
         return buildEdgeContact(a, b, boxA, boxB, best.indexA, best.indexB, best.normalAB, contacts);
 
     if (best.type == AXIS_FACE_A)
-        return buildFaceManifold(a, b, boxA, boxB, true, best.indexA, best.normalAB, contacts);
+        return buildFaceManifold(a, b, boxA, boxB, true, best.indexA, best.normalAB, speculativeMargin, contacts);
 
-    return buildFaceManifold(a, b, boxA, boxB, false, best.indexB, best.normalAB, contacts);
+    return buildFaceManifold(a, b, boxA, boxB, false, best.indexB, best.normalAB, speculativeMargin, contacts);
 }
 
 int Manifold::collide(Rigid* bodyA, Rigid* bodyB,
@@ -1006,7 +1026,10 @@ int Manifold::collide(Rigid* bodyA, Rigid* bodyB,
                       float3x3& basisOut)
 {
     // Thin wrapper: flatten both bodies into shape queries and reuse the solver-free path.
-    return collideShapes(makeShape(bodyA), makeShape(bodyB), contacts, basisOut);
+    // Only the solver's contacts are speculative; the space-query paths keep margin 0.
+    const Solver *owner = bodyA != nullptr ? bodyA->solver : nullptr;
+    const float speculativeMargin = owner != nullptr ? owner->speculativeMargin : 0.0f;
+    return collideShapes(makeShape(bodyA), makeShape(bodyB), contacts, basisOut, speculativeMargin);
 }
 
 } // namespace avbd

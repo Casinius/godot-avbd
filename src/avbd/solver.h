@@ -50,6 +50,24 @@ inline constexpr float COLLISION_MARGIN_MAX = 0.02f;
 inline constexpr float COLLISION_MARGIN = COLLISION_MARGIN_BASE;
 // Position threshold for sticking contacts (ie static friction)
 inline constexpr float STICK_THRESH = 0.00001f;
+// A sticky contact's anchors are material points frozen when static friction engaged, and
+// because the two anchors stay glued to each other while the pair slides, their separation
+// (what STICK_THRESH measures) never grows - stick never clears on its own, even as the
+// frozen anchors slide metres off the touching surfaces and turn C0 into phantom depth.
+// The merge heals instead: when a sticky pair's anchor world positions drift this far from
+// where the current collision pass puts the contact, the anchors are re-adopted and the
+// force history resets. The threshold sits at the collision-margin scale: below it the
+// "drift" is numerical noise on a genuinely static contact and re-anchoring would churn
+// resting manifolds for nothing.
+inline constexpr float STICK_DRIFT_HEAL = 0.002f;
+// Geometric separation at which a contact's warm-started dual is dropped. The dual is a
+// force, and the alpha*gamma warm-start decay (~0.99/tick) bleeds an impact impulse off
+// over hundreds of ticks; while any of it is left the contact keeps applying it even
+// though the pair has visibly parted - measured as a box popping out of an otherwise
+// still pile at 10+ m/s seconds after the impact that loaded it. Anything above the
+// collision-margin skin plus this tolerance is a real gap, and a real gap carries no
+// contact force. Below it, the skin's own noise must not churn resting contacts.
+inline constexpr float CONTACT_RELEASE_GAP = 2.0e-3f;
 
 struct Rigid;
 struct Force;
@@ -491,6 +509,15 @@ struct Manifold : Force
     // most once per round instead of once per body.
     bool primalCacheReady = false;
 
+    // Contact-grace dormancy (Solver::contactGraceTicks). While the pair's swept AABBs
+    // stay apart, initialize() parks the manifold here instead of letting warmstartForces
+    // reap it: `dormantSavedCount` is the live contact count whose geometry and hot state
+    // (penalty/lambda/betaScale/stick, untouched by a zero-contact merge) survive until
+    // the pair returns, and `dormantTicks` counts dormant ticks toward the grace limit.
+    // numContacts is held at 0 while dormant so every per-contact solve loop no-ops.
+    int dormantTicks = 0;
+    int dormantSavedCount = 0;
+
     Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB);
 
     // Class-specific pooled allocation: manifolds churn with contact formation and
@@ -528,10 +555,13 @@ struct Manifold : Force
 // independent of any solver. `contacts` must hold at least 8 slots (`Manifold`'s
 // capacity) - exported because space queries reuse the exact path `Manifold` walks.
 // `basis` receives an orthonormal frame whose first row is the contact normal (A -> B).
+// `speculativeMargin` lets separated shapes report contacts up to that distance apart
+// (the constraint error is then positive); 0 keeps the query strictly overlap-only.
 // Returns the contact count (0 = separated).
 int collideShapes(const Shape &a, const Shape &b,
                   std::span<Manifold::Contact> contacts,
-                  float3x3 &basis);
+                  float3x3 &basis,
+                  float speculativeMargin = 0.0f);
 
 // Work per item differs by orders of magnitude between the phases below, so each one gets
 // its own break-even batch size. Measured on a 12-core machine: one dispatch into the pool
@@ -593,6 +623,20 @@ struct Solver
     // Penetration error treated as "solved" by the adaptive iteration estimate, in metres.
     float maxPenetrationError = 1e-4f;
 
+#ifdef AVBD_DIAG
+    // Root-cause instrumentation, compiled out of the shipped library. Reset at the top
+    // of every stepInterleaved/step; the driver reads it per tick.
+    struct Diag {
+        int adaptiveTarget = 0;    // computeIterations' tick target (H2: vs actualRounds)
+        int actualRounds = 0;      // rounds each substep actually ran
+        int softContacts = 0;      // contacts with penalty < 0.1*betaLin after warm start (H1)
+        int newContacts = 0;       // contact points that matched no previous feature key (H1 churn)
+        int reapedManifolds = 0;   // manifolds deleted after a one-tick separation (H1 history loss)
+        int stickHeals = 0;        // sticky contacts re-anchored after drifting off the surface (#13)
+    };
+    Diag diag;
+#endif
+
     // Early-exit threshold on the mean penetration residual: when a Newton round
     // improves the average residual by less than this (or worsens it), the iteration set
     // ends early - remaining rounds would polish float noise at full price. 0 disables
@@ -630,6 +674,58 @@ struct Solver
     // Realistic value 1e-4 (0.1 mm): in-iteration arm drift is millimetre-scale.
     float jacobianRebuildDistance = 0.0f;
 
+    // Speculative contact gap (metres). Pairs separated by less than this still produce
+    // contacts, whose positive (separated) normal error generates no force until the
+    // bodies actually close it within the step - so a fast body is stopped at the
+    // surface instead of tunnelling through it. 0 disables speculative contacts and
+    // keeps the previous behaviour; 0.02 is a useful metre-scale default.
+    float speculativeMargin = 0.0f;
+
+    // Position projection: the safety net a pure penalty method does not have. Nothing in
+    // the solve above bounds the overlap directly - the contacts push with whatever
+    // stiffness the penalty ramp reached, so when a load outruns the iteration budget (a
+    // deep stack, an impact) the residual overlap is simply whatever that stiffness
+    // happened to hold, and it can be a large fraction of a body. This pass runs once per
+    // tick after the velocity finish and moves overlapping contacts apart in position
+    // only: the displacement is charged to the bodies' velocities over the tick period
+    // (see projectionVelocityAbsorb), so the net dissipates the approach it rescues
+    // instead of handing it back. Off by default; the core suite pins digests against it.
+    bool positionProjection = false;
+    // Gauss-Seidel sweeps over the manifold list per tick. Serial and in force order, so
+    // the outcome is deterministic and independent of the thread count. A correction at
+    // the top of a stack needs roughly one sweep per layer to reach the bottom.
+    int projectionIterations = 8;
+    // Fraction of each contact's computed correction applied per sweep. Under 1 keeps a
+    // sweep from overshooting when a body is pushed out of one contact and into another.
+    float projectionBeta = 1.0f;
+    // Overlap (metres) the pass leaves alone. Resting contacts sit a few millimetres deep
+    // and belong to the penalty solve: projecting them too rotates a body about its offset
+    // contact anchors every step, and with no velocity behind the move friction cannot
+    // answer it - a box that should hold on a ramp creeps down it. The net is for crush
+    // depths the penalty solve cannot reach, so it stays out of the ordinary case.
+    float projectionSlop = 0.005f;
+    // Per-contact cap on the correction within one tick, in metres. 0 = uncapped: a deep
+    // overlap is then resolved over a few ticks by `projectionBeta` alone.
+    float projectionMaxCorrection = 0.0f;
+    // Remove each projected body's velocity component that points back into the contact
+    // it was just lifted out of. Without this the net is a free teleport: a body the
+    // penalty solve failed to stop keeps its full approach speed after being lifted to the
+    // surface, re-enters next tick, and the net pumps the scene forever instead of
+    // settling it. Strictly dissipative - it can only remove speed along the contact
+    // normal of a contact the pass actually moved.
+    bool projectionVelocityAbsorb = true;
+
+    // Ticks a manifold whose pair slipped out of the swept AABBs stays dormant instead of
+    // being deleted. A reaped manifold loses its whole hot state - penalty ramp, duals,
+    // stick flags - so the impact-time feature churn (contacts flickering in and out as
+    // faces toggle) restarts every returning contact from the penalty floor, and a loaded
+    // stack pays that restart hundreds of times per tick. A dormant manifold keeps its
+    // contacts and hot state (it contributes nothing while separated: every solve loop
+    // walks contacts) and re-matches by feature key when the pair returns. Freshly formed
+    // contacts inside a live manifold also seed their penalty from 5% of betaLin instead
+    // of the floor while this is enabled. 0 = delete on first separation, as before.
+    int contactGraceTicks = 0;
+
     // Worker threads for the per-body phases. 0 = one per hardware thread, 1 = run
     // everything inline on the calling thread. The result does not depend on this value:
     // every body solves its own block system against the same pose snapshot, and applies
@@ -639,7 +735,10 @@ struct Solver
     // Idle detection: a movable body whose BDF1 velocities stay under both thresholds for
     // this many consecutive steps falls asleep (velocity zeroed, Godot semantics).
     // 0 disables automatic sleeping; the core tests rely on the default for bit-identical
-    // digests. Thresholds follow Godot's space-parameter defaults.
+    // digests. The horizon is a TIME (Godot's 0.5 s) converted to steps by the host, not a
+    // fixed 60 frames. The server layer overrides all three from physics/avbd/sleep_*
+    // settings (defaults 0.05 m/s, 0.05 rad/s, 1.0x horizon); the core defaults here stay
+    // as they were so pinned digests are unaffected.
     float sleepLinearThreshold = 0.1f;       // m/s
     float sleepAngularThreshold = 0.139626f; // rad/s (Godot default: 8 deg/s)
     int sleepFrames = 0;                     // steps below thresholds before sleeping
@@ -717,7 +816,11 @@ private:
     // step), the hierarchical spatial hash over those bodies, and the candidate
     // pair list (sorted unique (min index, other), the manifold creation order).
     std::vector<Rigid *> bodiesInOrder;
-    std::vector<float3> bodyAabbHalf; // cached tight AABB half extents, per bodiesInOrder
+    // Swept AABBs per bodiesInOrder: the tight bounds grown by this step's linear
+    // displacement, the rotation sweep and the speculative margin. center is the
+    // current position plus half the displacement; half is the matching extent.
+    std::vector<float3> bodyAabbHalf;
+    std::vector<float3> bodyAabbCenter;
     SpatialHash broadHash;
     std::vector<uint64_t> sweepPairs;
 
@@ -801,6 +904,9 @@ private:
     void runSubstep(int forceCount, int targetIterations, int newtonRounds, bool idleDetection);
     // Rebase every manifold's contact error at the current pose (parallel over forces).
     void rebaseContacts(int forceCount);
+    // Push overlapping contacts apart in position only, after the velocity finish, so the
+    // overlap cannot exceed what the penalty solve happened to hold (see positionProjection).
+    void projectContacts(int forceCount);
 
     // Island-wide sleep bookkeeping (runs when sleeping is enabled): movable bodies are
     // grouped into islands through force connectivity, and an island whose every body

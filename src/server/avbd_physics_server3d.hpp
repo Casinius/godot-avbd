@@ -38,6 +38,8 @@
 #include <cstdint>
 
 #include <memory>
+#include <source_location>
+#include <string>
 #include <vector>
 #include <ankerl/unordered_dense.h>
 
@@ -46,6 +48,7 @@
 #include <godot_cpp/classes/physics_server3d_extension.hpp>
 #include <godot_cpp/classes/physics_server3d_rendering_server_handler.hpp>
 #include <godot_cpp/variant/array.hpp>
+#include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/callable.hpp>
 #include <godot_cpp/variant/rid.hpp>
 #include <godot_cpp/variant/transform3d.hpp>
@@ -245,6 +248,45 @@ protected:
         double internal_ticks_per_second = 0.0;
         int max_internal_steps = 4;
         double internal_accumulator = 0.0;
+        // Positional projection of overlapping contacts, run after the velocity finish
+        // (see Solver::positionProjection). The penalty solve alone leaves deep overlaps
+        // in a large pile, and BDF1 turns any later correction into velocity; this bounds
+        // the overlap in position instead, so under-solving cannot become kinetic energy.
+        // The Solver member defaults to false so the core suite's pinned digests are
+        // unaffected - the engine layer is what turns it on.
+        bool position_projection = true;
+        // Serial Gauss-Seidel sweeps. A correction at the top of a stack needs one sweep
+        // per layer to reach the bottom, so tall piles want more; contacts already
+        // separated cost a single depth test each.
+        int projection_iterations = 8;
+        double projection_beta = 1.0;
+        // Overlap the net ignores. Resting contacts sit a few millimetres deep and the
+        // penalty solve owns them: projecting those too rotates bodies about their offset
+        // contact anchors every step, and friction has no velocity to counter it with -
+        // a box that should hold on a ramp creeps down it. The net is for crush depths
+        // the penalty solve cannot reach, so it stays out of the ordinary case.
+        double projection_slop = 0.005;
+        double projection_max_correction = 0.0;
+
+        // Idle-sleep thresholds. The horizon (how long a body must stay under both
+        // thresholds) is a TIME - Godot's 0.5 s - converted to internal ticks per step
+        // (`sleepFrames = 0.5 s / dt`), NOT a fixed 60 frames: at 120 internal Hz that is
+        // 60 internal ticks, at 240 Hz it is 120. Only the velocity thresholds and a
+        // multiplier on the horizon are project settings; the core Solver defaults stay
+        // as they were so pinned digests are unaffected.
+        double sleep_linear_threshold = 0.05;  // m/s (Godot default 0.1)
+        double sleep_angular_threshold = 0.05; // rad/s (Godot default ~0.1396 = 8 deg/s)
+        double sleep_time = 1.0;               // multiplier on the 0.5 s horizon
+
+        // Ticks a separated manifold keeps its hot state (see Solver::contactGraceTicks).
+        // 0 = reap on first separation, the historical behaviour.
+        int contact_grace_ticks = 0;
+
+        // Contact generation distance, in metres (see Solver::speculativeMargin). A contact
+        // is created while the shapes are still separated by up to this much, so a fast
+        // body is stopped at the surface instead of first penetrating several centimetres
+        // and paying for it with a stiff-penalty impulse. 0 = only real overlaps.
+        double speculative_margin = 0.0;
 
         // Debug contacts collected during the last step (world space, Godot frame).
 
@@ -308,6 +350,14 @@ protected:
     // after that, so the engine never reads a body pose the solver has not produced.
     bool has_stepped = false;
 
+    // Deepest contact of the last completed step, snapshotted on the stepping thread.
+    // The getters run on the main thread, where walking solver.forces races with the
+    // solver's manifold creation/revival/reaping and can report depths for pooled
+    // manifolds that no longer describe a touching pair.
+    double diag_max_penetration = 0.0;
+    uint64_t diag_deepest_a = 0;
+    uint64_t diag_deepest_b = 0;
+
     // Cached state objects handed to the engine's callbacks; re-aimed per body before use.
     AVBDDirectBodyState3D *body_state = nullptr;
 
@@ -331,11 +381,24 @@ protected:
     // Rebuild the solver for one space from the bodies and joints assigned to it. Needed
     // whenever a body, its shapes, its mode or a joint changes, because those decide what the
     // solver holds.
-    void rebuild_space(const RID &p_space);
+    // The source location is the rebuild reason: every call site is a distinct engine
+    // entry point, and knowing which one fired (and when) is what tells a mid-run
+    // rebuild - which destroys every manifold - apart from scene setup.
+    void rebuild_space(const RID &p_space,
+            std::source_location where = std::source_location::current());
 
     // Spaces whose body set changed since the last step; rebuilt at the top of _step so
     // a body joining mid-setup lands with its shapes attached.
     ankerl::unordered_dense::map<uint64_t, bool> space_rebuild_pending;
+    // Lifetime count of rebuild_space() calls; reported by get_solver_sleep_stats().
+    uint64_t rebuild_total = 0;
+    // Why the rebuilds happened, and when the last one landed relative to _step() calls. A
+    // rebuild destroys every manifold, so one arriving mid-run silently discards all
+    // warm-started contact state; these make that visible from a script.
+    ankerl::unordered_dense::map<std::string, uint64_t> rebuild_reasons;
+    uint64_t step_total = 0;
+    uint64_t rebuild_last_step = 0;
+    String rebuild_last_reason;
 
     // Density the solver should see for a body: mass / volume of the first shape, or the house
     // density when no mass was set.
@@ -404,6 +467,13 @@ public:
     // The deepest contact as [body_a_instance_id, body_b_instance_id, depth] (Godot
     // instance ids, so a script can resolve the nodes). Empty when nothing penetrates.
     Array get_solver_deepest_contact() const;
+    // Sleep/wake diagnostics for the stress suites. A sleeping body is skipped by the
+    // velocity update in Solver::finishBody, and a manifold with neither side awake is
+    // frozen (its contact state is deliberately left stale), so both counts say whether a
+    // penetration measurement was taken against a live solve or a parked one. `rebuilds` is
+    // cumulative over the server's lifetime: a rebuild destroys every manifold, so a rising
+    // count during a run means warm-started contact state is being thrown away.
+    Dictionary get_solver_sleep_stats() const;
     // Get the singleton instance of AVBDPhysicsServer3D.
     static AVBDPhysicsServer3D *get_singleton();
 
@@ -416,6 +486,7 @@ protected:
         ClassDB::bind_method(D_METHOD("get_solver_finish_time"), &AVBDPhysicsServer3D::get_solver_finish_time);
         ClassDB::bind_method(D_METHOD("get_solver_max_penetration"), &AVBDPhysicsServer3D::get_solver_max_penetration);
         ClassDB::bind_method(D_METHOD("get_solver_deepest_contact"), &AVBDPhysicsServer3D::get_solver_deepest_contact);
+        ClassDB::bind_method(D_METHOD("get_solver_sleep_stats"), &AVBDPhysicsServer3D::get_solver_sleep_stats);
         // Target of the ProjectSettings::settings_changed connection made in _init. Bound
         // so the StringName callable can reach it; not meant for scripts.
         ClassDB::bind_method(D_METHOD("_on_project_settings_changed"), &AVBDPhysicsServer3D::_on_project_settings_changed);

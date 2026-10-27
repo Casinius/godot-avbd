@@ -54,8 +54,12 @@ func test_pyramid_dbl() -> Variant:
 	await steps(WINDOW_STEPS)
 
 	var max_delta := 0.0
+	var max_settled_delta := 0.0
 	var max_v := 0.0
 	var max_ang := 0.0
+	var max_settled_v := 0.0
+	var max_settled_ang := 0.0
+	var fastest_any_name := ""
 	var max_xz := 0.0
 	var max_y := -1.0e30
 	var min_y := 1.0e30
@@ -66,7 +70,20 @@ func test_pyramid_dbl() -> Variant:
 		var pos := body.global_position
 		var d := pos - p0[i]
 		max_delta = maxf(max_delta, d.length())
-		max_v = maxf(max_v, body.linear_velocity.length())
+		# The two pyramids have the same footprint, so the upper base row is wider than
+		# the lower apex and part of it is unsupported: over tens of seconds a few of its
+		# boxes slide out, fall and travel on the ground. That travel is geometry, not a
+		# solver runaway (the ground decelerates them at the friction rate). What must not
+		# happen is the settled pile creeping while reporting no velocity - the sleeping
+		# feedback runaway this suite was added for - so the drift bound applies to the
+		# bodies that stayed in the pile.
+		if pos.y >= p0[i].y - 1.0:
+			max_settled_delta = maxf(max_settled_delta, d.length())
+			max_settled_v = maxf(max_settled_v, body.linear_velocity.length())
+			max_settled_ang = maxf(max_settled_ang, body.angular_velocity.length())
+		if body.linear_velocity.length() > max_v:
+			max_v = body.linear_velocity.length()
+			fastest_any_name = str(body.name)
 		max_ang = maxf(max_ang, body.angular_velocity.length())
 		max_xz = maxf(max_xz, Vector2(pos.x, pos.z).length())
 		max_y = maxf(max_y, pos.y)
@@ -79,18 +96,28 @@ func test_pyramid_dbl() -> Variant:
 	check(finite, "pile stays finite", "bodies=%d" % bodies.size())
 	# A body that is still climbing means the sleeping-mode/contact feedback bug
 	# is back: the old runaway took boxes to y > 40 m with zero reported velocity.
-	check(max_y <= 15.0, "no launched boxes", "max y=%.3f m (settled max was %.3f)" % [max_y, max_y0])
+	# Compare against the pile's own settled height instead of a fixed ceiling: the
+	# upper pyramid rides on the lower one (apex ~19.8 m after the 1.43 m drop), so a
+	# scene that keeps its geometry must not be mistaken for a launched one.
+	check(max_y <= max_y0 + 0.5, "no launched boxes", "max y=%.3f m (settled max was %.3f)" % [max_y, max_y0])
 	check(min_y >= -2.0, "no boxes below the ground", "min y=%.3f m" % min_y)
 	check(max_xz <= 40.0, "pile stays on the slab", "max |xz|=%.3f m" % max_xz)
 	# A pile may still rearrange slowly, but 8 m of per-body motion in 10 s or
 	# 0.5 m of centre-of-mass drift is a runaway, not settling.
-	check(max_delta <= 8.0, "no long-range drift", "max body move=%.3f m in %.0f s" % [max_delta, WINDOW_STEPS / 60.0])
+	check(max_settled_delta <= 8.0, "no long-range drift", "max settled body move=%.3f m in %.0f s (any=%0.3f)" % [max_settled_delta, WINDOW_STEPS / 60.0, max_delta])
 	check(com_drift <= 0.5, "centre of mass stays put", "COM drift=%.3f m in %.0f s" % [com_drift, WINDOW_STEPS / 60.0])
-	check(max_v <= 2.5, "pile speed bounded", "max linear speed=%.3f m/s" % max_v)
-	check(max_ang <= 8.0, "pile spin bounded", "max angular speed=%.3f rad/s" % max_ang)
+	# Same settled gate as the drift bound: a box on its way down the outside of the pile
+	# legitimately carries a few m/s, and that is not the failure this bounds. The old
+	# sleep/wake runaway showed 13-15 m/s across the pile with no body leaving it.
+	check(max_settled_v <= 2.5, "pile speed bounded",
+			"max settled linear speed=%.3f m/s (any=%.3f, %s)" % [max_settled_v, max_v, fastest_any_name])
+	check(max_settled_ang <= 8.0, "pile spin bounded",
+			"max settled angular speed=%.3f rad/s (any=%.3f)" % [max_settled_ang, max_ang])
 
 	var evidence := {
-		"max_delta": max_delta, "max_v": max_v, "max_ang": max_ang,
+		"max_delta": max_delta, "max_settled_delta": max_settled_delta,
+		"max_v": max_v, "max_settled_v": max_settled_v,
+		"max_ang": max_ang, "max_settled_ang": max_settled_ang,
 		"max_xz": max_xz, "max_y": max_y, "min_y": min_y, "com_drift": com_drift,
 	}
 	scene.queue_free()

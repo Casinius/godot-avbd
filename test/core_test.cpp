@@ -981,6 +981,77 @@ static void test_collide_shapes_equivalence() {
     check_pair_equivalent(sphere, boxA, "collideShapes matches (sphere-box, swapped)");
 }
 
+// Number of contact points across every manifold, and the largest normal error
+// (positive = the surfaces are still apart).
+static int manifold_contacts(const Solver &s, float &r_maxNormalC0) {
+    int contacts = 0;
+    r_maxNormalC0 = -INFINITY;
+    for (const Force *f = s.forces; f != nullptr; f = f->next) {
+        if (!f->isManifold) {
+            continue;
+        }
+        const auto *m = static_cast<const Manifold *>(f);
+        for (int i = 0; i < m->numContacts; i++) {
+            r_maxNormalC0 = std::fmax(r_maxNormalC0, m->contactC0[i][0]);
+            contacts++;
+        }
+    }
+    return contacts;
+}
+
+// ---------------------------------------------------------------------------
+// Speculative contacts: with a margin, surfaces that are still apart report a
+// contact whose positive normal error generates no force - until the body would
+// close the gap within the step, when the implicit constraint stops it at the
+// surface. Margin 0 keeps the previous overlap-only behaviour.
+// ---------------------------------------------------------------------------
+static void test_speculative_contacts() {
+    Shape boxA{};
+    boxA.type = ShapeType::Box;
+    boxA.half = {0.5f, 0.5f, 0.5f};
+    boxA.rotation = quatIdentity;
+    Shape boxB = boxA;
+    boxB.center = {0, 0, 1.03f}; // 3 cm air gap between the faces
+
+    std::array<Manifold::Contact, 8> contacts;
+    float3x3 basis{};
+    const int overlapOnly = collideShapes(boxA, boxB, contacts, basis);
+    const int speculative = collideShapes(boxA, boxB, contacts, basis, 0.05f);
+    report(overlapOnly == 0 && speculative > 0, "speculative narrow phase",
+            "3 cm gap: margin 0 -> %d contacts, margin 0.05 -> %d", overlapOnly, speculative);
+
+    // At rest inside the margin: the manifold exists, its normal error is the gap,
+    // and no force is applied while the gap is not closing.
+    {
+        Solver s;
+        s.speculativeMargin = 0.05f;
+        new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
+        Rigid *box = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 1.03f});
+        box->gravity = 0.0f;
+        s.step();
+
+        float maxNormalC0 = 0.0f;
+        const int count = manifold_contacts(s, maxNormalC0);
+        report(count > 0 && maxNormalC0 > 0.02f, "speculative gap contact",
+                "contacts=%d max normal C0=%.4f (gap 0.03)", count, maxNormalC0);
+        report(std::fabs(box->positionLin.z - 1.03f) < 1.0e-4f, "speculative gap does not push",
+                "rest z=%.5f from spawn 1.03", box->positionLin.z);
+    }
+
+    // Closing the same 3 cm gap at 10 m/s: without speculation the body sinks 0.14 m
+    // into the slab in one step; the speculative constraint stops it at the surface.
+    {
+        Solver s;
+        s.speculativeMargin = 0.05f;
+        new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
+        Rigid *box = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 1.03f}, {0, 0, -10.0f});
+        box->gravity = 0.0f;
+        s.step();
+        report(box->positionLin.z > 0.95f, "speculative catches a closing body",
+                "z=%.4f after one 10 m/s step (surface at 1.0)", box->positionLin.z);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Layer/mask filtering: Godot semantics - a pair collides when either side's
 // layer is in the other's mask. Defaults (1/1) keep everything colliding.
@@ -1313,6 +1384,7 @@ int main(int argc, char **argv) {
     test_round_shapes_rest();
     test_round_shape_rolls();
     test_collide_shapes_equivalence();
+    test_speculative_contacts();
     test_layer_mask();
     test_axis_lock();
     test_pick_mask();

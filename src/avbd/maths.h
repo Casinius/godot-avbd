@@ -26,6 +26,7 @@
 
 #include "linalg.h"
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -355,6 +356,12 @@ inline bool ldlt6_pivoted_solve(const std::array<std::array<float, 6>, 6> &a_in,
   return std::isfinite(worst) && worst < 1.0e1f;
 }
 
+#ifdef AVBD_DIAG
+// Root-cause instrumentation: both 6x6 kernels failed sanity and the whole DOF update
+// was zeroed. Reset by the driver between ticks.
+inline std::atomic<long> diagUnsane{0};
+#endif
+
 inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross, float3 bLin,
                   float3 bAng, float3 &xLin, float3 &xAng) noexcept {
   std::array<std::array<float, 6>, 6> a{};
@@ -376,6 +383,9 @@ inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross, float3 bLin,
   }
 
   // Degenerate block: freeze this DOF for one iteration instead of teleporting.
+#ifdef AVBD_DIAG
+  diagUnsane.fetch_add(1, std::memory_order_relaxed);
+#endif
   xLin = float3{0, 0, 0};
   xAng = float3{0, 0, 0};
 }
