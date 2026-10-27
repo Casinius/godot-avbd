@@ -378,6 +378,10 @@ RID AVBDPhysicsServer3D::_space_create() {
                                .first->second;
     read_project_gravity(space);
     read_project_params(space);
+    // Godot's own space default for how long a body must idle before sleeping. It is set here and
+    // not in read_project_params because that function runs again whenever a project setting
+    // changes, and this value is a per-space one: it belongs to _space_set_param, not to settings.
+    space.params.sleep.timeToSleep = 1.0f;
     return make_rid(id);
 }
 
@@ -478,13 +482,32 @@ bool AVBDPhysicsServer3D::_space_is_active(const RID &p_space) const {
 }
 
 void AVBDPhysicsServer3D::_space_set_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param, float p_value) {
-    // The space parameters are contact tolerances and sleep thresholds, none of which map onto
-    // AVBD's model. They are accepted and ignored rather than rejected, so a project's settings do
-    // not error out on load. Gravity does not come through here at all: Godot keeps it in the
-    // project settings, and a server is expected to read it (see read_project_gravity).
-    (void)p_space;
-    (void)p_param;
-    (void)p_value;
+    SpaceData *space = find_space(p_space);
+    if (space == nullptr) {
+        return;
+    }
+
+    // The three sleep parameters land on the solver's idle detection as-is. The budget is in
+    // seconds there rather than in steps because the clock it is spent on is itself a setting
+    // (avbd/tick_rate), and a step budget would sleep a scene twice as early at 120 Hz.
+    // The contact tolerances and SPACE_PARAM_SOLVER_ITERATIONS have no AVBD counterpart - the
+    // solver's own collision margin and its adaptive round budget are the equivalents - so those
+    // stay accepted and ignored rather than rejected. Gravity does not come through here at all:
+    // Godot keeps it in the project settings, and a server is expected to read it
+    // (see read_project_gravity).
+    switch (p_param) {
+        case SPACE_PARAM_BODY_LINEAR_VELOCITY_SLEEP_THRESHOLD:
+            space->params.sleep.linearThreshold = p_value;
+            break;
+        case SPACE_PARAM_BODY_ANGULAR_VELOCITY_SLEEP_THRESHOLD:
+            space->params.sleep.angularThreshold = p_value;
+            break;
+        case SPACE_PARAM_BODY_TIME_TO_SLEEP:
+            space->params.sleep.timeToSleep = p_value;
+            break;
+        default:
+            break;
+    }
 }
 
 // Godot stores gravity in the project settings rather than passing it to the server, so the server
@@ -505,9 +528,23 @@ void AVBDPhysicsServer3D::read_project_gravity(SpaceData &p_space) {
 }
 
 float AVBDPhysicsServer3D::_space_get_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param) const {
-    (void)p_space;
-    (void)p_param;
-    return 0.0;
+    const SpaceData *space = find_space(p_space);
+    if (space == nullptr) {
+        return 0.0f;
+    }
+
+    // The three the server actually keeps; the rest read back as 0.0 rather than a number the
+    // solver never used.
+    switch (p_param) {
+        case SPACE_PARAM_BODY_LINEAR_VELOCITY_SLEEP_THRESHOLD:
+            return space->params.sleep.linearThreshold;
+        case SPACE_PARAM_BODY_ANGULAR_VELOCITY_SLEEP_THRESHOLD:
+            return space->params.sleep.angularThreshold;
+        case SPACE_PARAM_BODY_TIME_TO_SLEEP:
+            return space->params.sleep.timeToSleep;
+        default:
+            return 0.0f;
+    }
 }
 
 // One state object per space, created on first ask. PhysicsDirectSpaceState3D is
@@ -1488,11 +1525,7 @@ void AVBDPhysicsServer3D::_step(float p_step) {
 
         space.solver.iterations = space.iterations > 0 ? space.iterations : space.solver.iterations;
         space.solver.threads = space.threads;
-        avbd::SolverParams params = space.params;
-        // Idle-sleep horizon: 30 steps at the usual 60 Hz tick = Godot's 0.5 s default.
-        // Stamped per step rather than read from settings, because it counts solver steps.
-        params.sleep.frames = 30;
-        space.solver.setParams(params);
+        space.solver.setParams(space.params);
 
         const ProfClock::time_point prof_t_solver = ProfClock::now();
         for (int tick = 0; tick < ticks; tick++) {
