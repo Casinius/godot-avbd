@@ -62,8 +62,7 @@ struct StepProfile {
     double forces_ns = 0.0;
     // Spike attribution: per-phase maxima within the reporting window. The average
     // hides exactly what a player feels - the one tick in a hundred that stalls the
-    // frame (an impact running max adaptive rounds, a broad-phase pair storm, a
-    // rebuild).
+    // frame (a deep-impact tick, a broad-phase pair storm, a rebuild).
     double max_total_ns = 0.0;
     double max_solver_ns = 0.0;
     double max_sync_ns = 0.0;
@@ -354,20 +353,13 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     }
 
     p_space.threads = static_cast<int>(settings->get_setting("physics/avbd/threads", 0));
-    p_space.iterations = static_cast<int>(settings->get_setting("physics/avbd/iterations", 4));
+    p_space.iterations = static_cast<int>(settings->get_setting("physics/avbd/iterations", 8));
     p_space.alpha = settings->get_setting("physics/avbd/alpha", 0.99);
     p_space.beta_linear = settings->get_setting("physics/avbd/beta_linear", 1e4);
     p_space.beta_angular = settings->get_setting("physics/avbd/beta_angular", 1e2);
     p_space.gamma = settings->get_setting("physics/avbd/gamma", 0.999);
     p_space.substeps = static_cast<int>(settings->get_setting("physics/avbd/substeps", 2));
-    p_space.newton_ratio = settings->get_setting("physics/avbd/newton_ratio", 0.5);
-    p_space.stiffness_decay = settings->get_setting("physics/avbd/stiffness_decay", 0.8);
     p_space.jacobian_rebuild_distance = settings->get_setting("physics/avbd/jacobian_rebuild_distance", 0.0);
-    p_space.chebyshev_rho = settings->get_setting("physics/avbd/chebyshev_rho", 0.0);
-    p_space.adaptive_max_iterations = settings->get_setting("physics/avbd/adaptive_max_iterations", 16.0);
-    p_space.adaptive_beta = settings->get_setting("physics/avbd/adaptive_beta", false);
-    p_space.adaptive_iterations = settings->get_setting("physics/avbd/adaptive_iterations", true);
-    p_space.max_penetration_error = settings->get_setting("physics/avbd/max_penetration_error", 1e-4);
     p_space.interleaved_substeps = settings->get_setting("physics/avbd/interleaved_substeps", false);
     p_space.rounds_per_substep = static_cast<int>(settings->get_setting("physics/avbd/rounds_per_substep", 0.0));
     const double internal_hz = std::max(static_cast<double>(settings->get_setting(
@@ -1365,15 +1357,7 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         space.solver.betaAng = static_cast<float>(space.beta_angular);
         space.solver.gamma = static_cast<float>(space.gamma);
         space.solver.threads = space.threads;
-        // Newton/impulse phase split and tail-stiffness decay (real-time trade-off knobs).
-        space.solver.newtonRatio = static_cast<float>(std::clamp(space.newton_ratio, 0.0, 1.0));
-        space.solver.stiffnessDecay = static_cast<float>(std::clamp(space.stiffness_decay, 0.0, 1.0));
         space.solver.jacobianRebuildDistance = static_cast<float>(std::max(space.jacobian_rebuild_distance, 0.0));
-        space.solver.chebyshevRho = static_cast<float>(std::max(space.chebyshev_rho, 0.0));
-        space.solver.adaptiveMaxIterations = std::max(static_cast<int>(space.adaptive_max_iterations), 2);
-        space.solver.adaptiveBeta = space.adaptive_beta;
-        space.solver.adaptiveIterations = space.adaptive_iterations;
-        space.solver.maxPenetrationError = static_cast<float>(std::max(space.max_penetration_error, 0.0));
         space.solver.positionProjection = space.position_projection;
         space.solver.projectionIterations = std::max(space.projection_iterations, 0);
         space.solver.projectionBeta = static_cast<float>(std::clamp(space.projection_beta, 0.0, 1.0));

@@ -207,37 +207,16 @@ protected:
         // Solver parameters, read from project settings at space creation and stamped
         // into the solver every step (so a changed setting shows up without a restart).
         int threads = 0;
-        int iterations = 10;
+        int iterations = 8;
         double alpha = 0.99;
         double beta_linear = 10000.0;
         double beta_angular = 100.0;
         double gamma = 0.999;
         int substeps = 1;
-        // Fraction of solver iterations that run the full Newton primal (6x6 dense
-        // solve); the rest run as cheap sequential-impulse-style dual-only passes.
-        // 1.0 = original AVBD behaviour. Real-time scenes trade accuracy for speed here.
-        double newton_ratio = 1.0;
-        // Per-iteration multiplicative decay applied to contact penalties once the
-        // Newton phase ends: stiff-penalty tails converge slowly, softening them lets the
-        // cheaper iterations finish the job. 1.0 = no decay (original behaviour).
-        double stiffness_decay = 1.0;
         // Rotation drift (unit-column distance, ~2 sin(angle/2)) above which a manifold's
         // cached angular jacobians are rebuilt. 0 disables the cache and reassembles them
         // for every contact on every iteration (original behaviour).
         double jacobian_rebuild_distance = 0.0;
-        // Chebyshev semi-iteration spectral-radius bound over the Jacobi primal.
-        // 0 = off (constant relaxation); 0.9-0.99 is the useful range.
-        double chebyshev_rho = 0.0;
-        // Upper bound of the adaptive iteration boost. 16 keeps the reference quality;
-        // 8 trades deep-impact penetration for flat frame cost (see the load sweep).
-        double adaptive_max_iterations = 16;
-        // Per-contact adaptive penalty ramp (augmented-Lagrangian kappa update).
-        bool adaptive_beta = false;
-        // Adaptive round count (see Solver::adaptiveIterations); off keeps `iterations`
-        // authoritative, which is what a real-time frame budget usually wants.
-        bool adaptive_iterations = true;
-        // Penetration treated as solved by the adaptive estimate, in metres.
-        double max_penetration_error = 1e-4;
         // Interleaved substepping: one collision/update-set pass per tick, then a small
         // fixed round budget per substep (see Solver::stepInterleaved).
         bool interleaved_substeps = false;
@@ -252,8 +231,6 @@ protected:
         // (see Solver::positionProjection). The penalty solve alone leaves deep overlaps
         // in a large pile, and BDF1 turns any later correction into velocity; this bounds
         // the overlap in position instead, so under-solving cannot become kinetic energy.
-        // The Solver member defaults to false so the core suite's pinned digests are
-        // unaffected - the engine layer is what turns it on.
         bool position_projection = true;
         // Serial Gauss-Seidel sweeps. A correction at the top of a stack needs one sweep
         // per layer to reach the bottom, so tall piles want more; contacts already

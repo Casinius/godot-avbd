@@ -29,17 +29,12 @@ avbd/beta_linear=100000.0
 avbd/beta_angular=10.0
 avbd/threads=8
 avbd/interleaved_substeps=true
-avbd/adaptive_max_iterations=12
-#avbd/adaptive_beta=true
 avbd/speculative_margin=0.02
 avbd/iterations=12
 avbd/max_internal_steps=12
 avbd/rounds_per_substep=2
 avbd/substeps=4
-avbd/newton_ratio=0.5
 avbd/jacobian_rebuild_distance=0.02
-avbd/adaptive_beta=true
-avbd/adaptive_iterations=false
 avbd/internal_ticks_per_second=60
 
 [rendering]

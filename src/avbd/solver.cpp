@@ -162,9 +162,7 @@ void Solver::step()
     selectUpdateBodies();
 
     int targetIterations = iterations;
-    int newtonRounds = iterations;
-    computeIterations(targetIterations, newtonRounds);
-    runSubstep(forceCount, targetIterations, newtonRounds, true);
+    runSubstep(forceCount, targetIterations, true);
     projectContacts();
     rebaseContacts();
 }
@@ -176,7 +174,6 @@ struct Solver::SubstepCtx {
     Solver *solver = nullptr;
     int forceCount = 0;
     int targetIterations = 0;
-    int newtonRounds = 0;
     bool idleDetection = false;
     float prevResidual = 0.0f;
     std::atomic<bool> converged{false};
@@ -203,7 +200,7 @@ void Solver::flowIterateInline(void *ctx) noexcept
 {
     SubstepCtx &c = *static_cast<SubstepCtx *>(ctx);
     c.solver->pool->runRegionInline([&c](int workerIndex, auto &sync) {
-        c.solver->iterateBody(workerIndex, sync, c.targetIterations, c.forceCount, c.newtonRounds,
+        c.solver->iterateBody(workerIndex, sync, c.targetIterations, c.forceCount,
                 c.prevResidual, c.converged);
     });
 }
@@ -212,7 +209,7 @@ void Solver::flowIterateParallel(void *ctx) noexcept
 {
     SubstepCtx &c = *static_cast<SubstepCtx *>(ctx);
     c.solver->pool->runRegion([&c](int workerIndex, auto &sync) {
-        c.solver->iterateBody(workerIndex, sync, c.targetIterations, c.forceCount, c.newtonRounds,
+        c.solver->iterateBody(workerIndex, sync, c.targetIterations, c.forceCount,
                 c.prevResidual, c.converged);
     });
 }
@@ -226,13 +223,12 @@ void Solver::flowFinishItem(void *ctx, int i) noexcept
 // One substep: body warmstart (independent), the colour-parallel Gauss-Seidel region,
 // then the BDF1 velocity finish (independent). Idle detection only runs on the tick's
 // final substep, so substeps cannot sleep bodies faster than ticks.
-void Solver::runSubstep(int forceCount, int targetIterations, int newtonRounds, bool idleDetection)
+void Solver::runSubstep(int forceCount, int targetIterations, bool idleDetection)
 {
     SubstepCtx ctx;
     ctx.solver = this;
     ctx.forceCount = forceCount;
     ctx.targetIterations = targetIterations;
-    ctx.newtonRounds = newtonRounds;
     ctx.idleDetection = idleDetection;
 
     flow->clear();
@@ -266,23 +262,13 @@ void Solver::stepInterleaved(int substeps, int roundsPerSubstep)
     const int forceCount = warmstartForces();
     selectUpdateBodies();
 
-    int targetTick = iterations;
-    int newtonTick = iterations;
-    computeIterations(targetTick, newtonTick);
-
-    // The explicit budget is a FLOOR on the per-substep share of the adaptive target,
-    // not a cap: a scene that asks for 2 rounds/substep during a deep impact must still
-    // get the rounds the penetration estimate calls for, or the impact pays for the
-    // budget's optimism with permanent penetration. `roundsPerSubstep == 0` keeps the
-    // pure adaptive split, bit-identical to before this floor existed.
+    // The explicit budget is a FLOOR on the per-substep share of `iterations`,
+    // not a cap: a scene that asks for 2 rounds/substep must still get the share
+    // the tick's round count calls for.
     const int rounds = roundsPerSubstep > 0
-            ? std::clamp(std::max(roundsPerSubstep, std::max(2, (targetTick + substeps - 1) / substeps)),
-                    2, adaptiveMaxIterations)
-            : std::max(2, (targetTick + substeps - 1) / substeps);
-    const int newton = std::clamp(
-            static_cast<int>(std::ceil(newtonRatio * static_cast<float>(rounds))), 0, rounds);
+            ? std::max(roundsPerSubstep, std::max(2, (iterations + substeps - 1) / substeps))
+            : std::max(2, (iterations + substeps - 1) / substeps);
 #ifdef AVBD_DIAG
-    diag.adaptiveTarget = targetTick;
     diag.actualRounds = rounds;
 #endif
 
@@ -290,7 +276,7 @@ void Solver::stepInterleaved(int substeps, int roundsPerSubstep)
         if (sub > 0) {
             rebaseContacts();
         }
-        runSubstep(forceCount, rounds, newton, sub + 1 == substeps);
+        runSubstep(forceCount, rounds, sub + 1 == substeps);
     }
     // Once per tick, not per substep: the correction is positional and velocities are
     // already final, so a second pass inside the same tick would only re-fight the first.
@@ -299,7 +285,7 @@ void Solver::stepInterleaved(int substeps, int roundsPerSubstep)
     // the bodies have moved since. Rebase it at the final pose so what the host reads back
     // (the penetration diagnostic) is the geometry the pair actually ended the tick with,
     // not a one-tick-old pose. The next tick's initialize() replaces it from its own
-    // collision pass either way; this only feeds prevErr (adaptive beta) and the host.
+    // collision pass either way; this only feeds the diagnostics and the host.
     rebaseContacts();
 }
 
@@ -809,37 +795,6 @@ void Solver::warmstartBody(int i)
     }
 }
 
-// Decide this step's round count once, on the caller, after warm-starting and before the
-// region starts; every participant then reads the same values.
-void Solver::computeIterations(int &r_targetIterations, int &r_newtonRounds)
-{
-    int targetIterations = iterations;
-
-    if (adaptiveIterations)
-    {
-        // Estimate total penetration error from current manifolds
-        float totalPenetration = 0.0f;
-        int penetrationCount = 0;
-        for (uint32_t slot : manifolds.live)
-            manifolds.accumulatePenetration(slot, *this, totalPenetration, penetrationCount);
-
-        // Adaptive iteration count: more iterations needed if penetration is large
-        if (penetrationCount > 0)
-        {
-            float avgPenetration = totalPenetration / penetrationCount;
-            targetIterations = static_cast<int>(std::round(iterations * avgPenetration / maxPenetrationError));
-        }
-        targetIterations = std::max(2, targetIterations);  // Minimum 2 iterations
-        targetIterations = std::min(targetIterations, adaptiveMaxIterations); // Impact-moment cost bound; see the member comment.
-    }
-
-    r_targetIterations = targetIterations;
-    // newtonRatio splits the set: the leading rounds run primal + dual, the tail runs
-    // dual-only relaxation (optionally with penalty decay via stiffnessDecay).
-    r_newtonRounds = std::clamp(
-            static_cast<int>(std::ceil(newtonRatio * static_cast<float>(targetIterations))), 0, targetIterations);
-}
-
 // One region body for the whole iteration set: `iterations` rounds of the
 // colour-parallel Gauss-Seidel primal followed by a dual pass, with a barrier
 // fence at every phase boundary.
@@ -856,163 +811,109 @@ void Solver::computeIterations(int &r_targetIterations, int &r_newtonRounds)
 // The colouring is capped at kMaxColours so the barrier count per round is
 // bounded; bodies the greedy colouring could not fit run one block-Jacobi round
 // after the colours (precompute, solve against the post-colour snapshot,
-// combine), using jacobiRelaxation/Chebyshev as the combine controls.
+// combine), using jacobiRelaxation as the combine control.
 //
 // NullSync (small scenes) runs the identical body inline in list order, which is
 // exactly the threads=1 reference the digest tests compare against.
 template <typename Sync>
 void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int forceCount,
-        int newtonRounds, float &r_prevResidual, std::atomic<bool> &r_converged)
+        float &r_prevResidual, std::atomic<bool> &r_converged)
 {
-    // Convergence early exit: measure the residual at the end of a Newton round; when it
+    // Convergence early exit: measure the residual at the end of a round; when it
     // stops improving (delta below the threshold or rising), the remaining rounds would
-    // burn cycles on float noise. Measured only at the Newton boundary - the impulse tail
-    // converges slowly by design, so its delta is checked against its own, much looser
-    // scale. 0 disables the check.
-    // Per-worker Chebyshev schedule state for the overflow bucket's combine:
-    // the recurrence is deterministic, so every worker derives the same
-    // weights without sharing anything.
-    int chebRound = 0;
-    float chebGammaPrev = 1.0f;
-    
+    // burn cycles on float noise. 0 disables the check.
     for (int it = 0; it < targetIterations; it++)
     {
-        const bool newton = it < newtonRounds;
-        if (newton)
+        // Colour-parallel Gauss-Seidel. One pass per colour: assemble
+        // (manifolds stamp self-contained against the live poses, other
+        // forces stamp directly), solve, apply. Bodies of one colour
+        // share no force, so the pass is race-free without a snapshot.
+
+        for (int c = 0; c < colourCount; c++)
         {
-            // Colour-parallel Gauss-Seidel. One pass per colour: assemble
-            // (manifolds stamp self-contained against the live poses, other
-            // forces stamp directly), solve, apply. Bodies of one colour
-            // share no force, so the pass is race-free without a snapshot.
-            
-            for (int c = 0; c < colourCount; c++)
-            {
-                const int first = colourBegins[c];
-                const int last = colourBegins[c + 1];
-                if (last == first)
-                    continue; // empty colour: every worker skips the barrier alike
-                sync.forItems(last - first, [this, first, it](int k) {
-                    Rigid *body = updateOrder[colourOrder[first + k]];
-                    Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
-                            body->positionAng, body->inertialAng);
-                    for (const ForceRef &ref : forceAdjacency.of(body->broadIndex))
-                    {
-                        if (ref.isManifold())
-                            manifolds.updatePrimal(ref.slot(), *this, body, alpha, block);
-                        else
-                            ref.asForce()->updatePrimal(body, alpha, block);
-                    }
-                    block.apply(*body);
-                });
-                sync.arriveAndWait();
-            }
-
-            // Overflow bucket (> kMaxColours cliques): block Jacobi against
-            // the post-colour snapshot, in three phases. Phase A precomputes
-            // each manifold's shared per-contact assembly (world arms,
-            // angular jacobians, clamped forces) once - work the two body
-            // stamps used to duplicate. Nobody writes a pose until the
-            // combine pass, so every phase reads the same frozen snapshot.
-            const int overflowCount = static_cast<int>(overflowOrder.size());
-            if (overflowCount > 0)
-            {
-                sync.forItems(manifolds.count(), [this](int i) {
-                    const uint32_t slot = manifolds.live[i];
-                    const bool aIn = manifolds.bodyA[slot]->inUpdateSet &&
-                            bodyColour[manifolds.bodyA[slot]->updateIndex] == kOverflowColour;
-                    const bool bIn = manifolds.bodyB[slot]->inUpdateSet &&
-                            bodyColour[manifolds.bodyB[slot]->updateIndex] == kOverflowColour;
-                    if (!aIn && !bIn)
-                        return; // both sides solved in a colour, or frozen
-                    manifolds.preCompute(slot, *this, alpha);
-                });
-                sync.arriveAndWait();
-
-                // Phase B: each bucket body assembles its full block system
-                // (own inertia plus every incident constraint - manifolds
-                // stamped from the phase-A cache, other forces stamping
-                // directly) and solves for its delta.
-                sync.forItems(overflowCount, [this](int k) {
-                    const int i = overflowOrder[k];
-                    Rigid *body = updateOrder[i];
-                    Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
-                            body->positionAng, body->inertialAng);
-                    for (const ForceRef &ref : forceAdjacency.of(body->broadIndex))
-                    {
-                        if (ref.isManifold())
-                            manifolds.stampCached(ref.slot(), body, block);
-                        else
-                            ref.asForce()->updatePrimal(body, alpha, block);
-                    }
-                    block.solveDelta(bodyDeltaLin[i], bodyDeltaAng[i]);
-                });
-                sync.arriveAndWait();
-
-                // Combine: each bucket body applies its own delta. With
-                // chebyshevRho > 0 the plain Jacobi estimate x + delta is
-                // convex-combined with the previous iterate through the
-                // Chebyshev weights (semi-iteration); otherwise the constant
-                // jacobiRelaxation scales it. The angular delta gets the same
-                // gamma but no prev-mixing: positions are a vector space,
-                // rotations are not, and the first-order quat integration
-                // stays exact as written.
-                float relaxGamma = jacobiRelaxation;
-                if (chebyshevRho > 0.0f)
+            const int first = colourBegins[c];
+            const int last = colourBegins[c + 1];
+            if (last == first)
+                continue; // empty colour: every worker skips the barrier alike
+            sync.forItems(last - first, [this, first, it](int k) {
+                Rigid *body = updateOrder[colourOrder[first + k]];
+                Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
+                        body->positionAng, body->inertialAng);
+                for (const ForceRef &ref : forceAdjacency.of(body->broadIndex))
                 {
-                    const float rho2 = chebyshevRho * chebyshevRho;
-                    if (chebRound == 0)
-                        relaxGamma = 1.0f;
-                    else if (chebRound == 1)
-                        relaxGamma = 1.0f / (1.0f - 0.5f * rho2);
+                    if (ref.isManifold())
+                        manifolds.updatePrimal(ref.slot(), *this, body, alpha, block);
                     else
-                        relaxGamma = 1.0f / (1.0f - 0.25f * rho2 * chebGammaPrev);
-                    chebGammaPrev = relaxGamma;
+                        ref.asForce()->updatePrimal(body, alpha, block);
                 }
-                chebRound++;
-                sync.forItems(overflowCount, [this, relaxGamma](int k) {
-                    const int i = overflowOrder[k];
-                    Rigid *body = updateOrder[i];
-                    if (chebyshevRho <= 0.0f || !body->contactOnly)
-                    {
-                        // Plain relaxed Jacobi - the constant, or the safe fallback for
-                        // bodies coupled by joints (extrapolation diverges those).
-                        body->positionLin = body->positionLin + bodyDeltaLin[i] * jacobiRelaxation;
-                        body->positionAng = body->positionAng + bodyDeltaAng[i] * jacobiRelaxation;
-                        return;
-                    }
-                    // x_{k+1} = gamma * (x_k + delta_k) + (1 - gamma) * x_{k-1}
-                    const float3 xLin = body->positionLin;
-                    body->positionLin = relaxGamma * (xLin + bodyDeltaLin[i]) + (1.0f - relaxGamma) * bodyPrevLin[i];
-                    bodyPrevLin[i] = xLin;
-                    body->positionAng = body->positionAng + bodyDeltaAng[i] * relaxGamma;
-                });
-                sync.arriveAndWait();
-            }
-            else
-            {
-                chebRound++;
-            }
+                block.apply(*body);
+            });
+            sync.arriveAndWait();
+        }
+
+        // Overflow bucket (> kMaxColours cliques): block Jacobi against
+        // the post-colour snapshot, in three phases. Phase A precomputes
+        // each manifold's shared per-contact assembly (world arms,
+        // angular jacobians, clamped forces) once - work the two body
+        // stamps used to duplicate. Nobody writes a pose until the
+        // combine pass, so every phase reads the same frozen snapshot.
+        const int overflowCount = static_cast<int>(overflowOrder.size());
+        if (overflowCount > 0)
+        {
+            sync.forItems(manifolds.count(), [this](int i) {
+                const uint32_t slot = manifolds.live[i];
+                const bool aIn = manifolds.bodyA[slot]->inUpdateSet &&
+                        bodyColour[manifolds.bodyA[slot]->updateIndex] == kOverflowColour;
+                const bool bIn = manifolds.bodyB[slot]->inUpdateSet &&
+                        bodyColour[manifolds.bodyB[slot]->updateIndex] == kOverflowColour;
+                if (!aIn && !bIn)
+                    return; // both sides solved in a colour, or frozen
+                manifolds.preCompute(slot, *this, alpha);
+            });
+            sync.arriveAndWait();
+
+            // Phase B: each bucket body assembles its full block system
+            // (own inertia plus every incident constraint - manifolds
+            // stamped from the phase-A cache, other forces stamping
+            // directly) and solves for its delta.
+            sync.forItems(overflowCount, [this](int k) {
+                const int i = overflowOrder[k];
+                Rigid *body = updateOrder[i];
+                Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
+                        body->positionAng, body->inertialAng);
+                for (const ForceRef &ref : forceAdjacency.of(body->broadIndex))
+                {
+                    if (ref.isManifold())
+                        manifolds.stampCached(ref.slot(), body, block);
+                    else
+                        ref.asForce()->updatePrimal(body, alpha, block);
+                }
+                block.solveDelta(bodyDeltaLin[i], bodyDeltaAng[i]);
+            });
+            sync.arriveAndWait();
+
+            // Combine: each bucket body applies its own delta, scaled by
+            // jacobiRelaxation. A snapshot solve can overshoot where the
+            // coloured Gauss-Seidel updates do not; omega < 1 trades
+            // per-iteration progress for stability.
+            sync.forItems(overflowCount, [this](int k) {
+                const int i = overflowOrder[k];
+                Rigid *body = updateOrder[i];
+                body->positionLin = body->positionLin + bodyDeltaLin[i] * jacobiRelaxation;
+                body->positionAng = body->positionAng + bodyDeltaAng[i] * jacobiRelaxation;
+            });
+            sync.arriveAndWait();
         }
 
         // Dual update: one item per force, and each force only reads the (frozen)
         // body poses and writes its own dual state, so the whole pass is independent.
         // Frozen constraints have nothing to update: every input they read is parked.
-        // In the impulse tail the contact penalties decay first (stiffnessDecay < 1):
-        // relaxation converges poorly against a stiff ramp, softening lets the cheap
-        // rounds finish the job the Newton rounds started - fused into the same pass,
-        // same force, same order, so the decay lands before the dual reads the
-        // penalty without paying an extra pass and barrier per tail round.
-        const float decay = stiffnessDecay;
         const int manifoldCount = manifolds.count();
         sync.forItems(manifoldCount + forceCount,
-                [this, newton, decay, manifoldCount](int k) {
+                [this, manifoldCount](int k) {
             if (k < manifoldCount)
             {
-                // Contacts first: decay (tail only) then the dual, same item as before so
-                // the decay lands before the dual reads the penalty.
                 const uint32_t slot = manifolds.live[k];
-                if (!newton && decay < 1.0f)
-                    manifolds.decayPenalties(slot, decay);
                 if (!manifolds.frozen(slot))
                     manifolds.updateDual(slot, *this, alpha);
                 return;
@@ -1302,15 +1203,14 @@ void Solver::selectUpdateBodies()
         }
     }
 
-    // Per-body delta buffers for the Jacobi primal's split-solve / combine pair, plus
-    // the previous-iterate buffer the Chebyshev combination reads.
+    // Per-body delta buffers for the Jacobi primal's split-solve / combine pair.
     bodyDeltaLin.resize(updateOrder.size());
     bodyDeltaAng.resize(updateOrder.size());
-    bodyPrevLin.resize(updateOrder.size());
 
-    // Chebyshev eligibility: a body carrying any non-manifold force (joint, spring, world
-    // anchor) extrapolates unsafely - its gamma falls back to the constant relaxation in
-    // the combine pass. Every force in the list is non-manifold; contacts do not count.
+    // Overflow-bucket eligibility: a body carrying any non-manifold force (joint, spring,
+    // world anchor) is routed into the overflow bucket by colourGraph - the contact map
+    // is clamped, hard joints do not tolerate the snapshot solve. Every force in the
+    // list is non-manifold; contacts do not count.
     for (Force *f = forces; f != 0; f = f->next)
     {
         if (f->bodyA != 0)
@@ -1366,18 +1266,14 @@ void Solver::colourGraph()
 
     // Counting sort into per-colour runs (stable in updateOrder order).
     colourBegins.assign(kMaxColours + 1, 0);
-    for (int i = 0; i < n; i++){
-        if(updateOrder[i]->contactOnly){
+    for (int i = 0; i < n; i++) {
+        if (updateOrder[i]->contactOnly) {
             bodyColour[i] = kOverflowColour;
             overflowOrder.push_back(i);
         }
-        if(bodyColour[i] != kOverflowColour){
-            colourBegins[bodyColour[i]+1]++;
+        if (bodyColour[i] != kOverflowColour) {
+            colourBegins[bodyColour[i] + 1]++;
         }
-        // if (bodyColour[i] < kMaxColours)
-            // colourBegins[bodyColour[i] + 1]++;
-        // else
-            // overflowOrder.push_back(i);
     }
     for (int c = 0; c < kMaxColours; c++)
         colourBegins[c + 1] += colourBegins[c];
@@ -1397,7 +1293,6 @@ void Solver::colourGraph()
     // The overflow bucket's Jacobi round needs the delta buffers.
     bodyDeltaLin.resize(updateOrder.size());
     bodyDeltaAng.resize(updateOrder.size());
-    bodyPrevLin.resize(updateOrder.size());
 }
 
 // Fill `forceOrder` with the solver's non-manifold forces, so the phases can address them

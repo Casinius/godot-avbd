@@ -10,7 +10,6 @@ numerics change - re-record with --update and read the diff first).
 Usage:
   python3 tools/bridge_regression.py                    # gate against the baseline
   python3 tools/bridge_regression.py --update           # record a new baseline
-  python3 tools/bridge_regression.py --adaptive-beta    # gate with adaptive beta on
   python3 tools/bridge_regression.py --frames 600       # longer settle
 """
 
@@ -30,14 +29,12 @@ def demo_dir():
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "demo"))
 
 
-def write_override(adaptive_beta):
+def write_override():
     # Project settings are read per run; the file wins over project.godot without
     # touching it (the repo's project.godot may deliberately point at Jolt).
     path = os.path.join(demo_dir(), "override.cfg")
     with open(path, "w") as f:
         f.write('[physics]\n\n3d/physics_engine="AVBD"\n')
-        if adaptive_beta:
-            f.write("avbd/adaptive_beta=true\n")
     return path
 
 
@@ -60,7 +57,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--godot", default=shutil.which("godot") or "godot")
     parser.add_argument("--frames", type=int, default=300, help="physics steps per scene")
-    parser.add_argument("--adaptive-beta", action="store_true", help="run with physics/avbd/adaptive_beta on")
     parser.add_argument("--update", action="store_true", help="record the digests as the new baseline")
     parser.add_argument("--baseline", default=os.path.join(os.path.dirname(__file__), "bridge_baseline.json"))
     args = parser.parse_args()
@@ -70,28 +66,26 @@ def main():
         with open(args.baseline) as f:
             baseline = json.load(f)
 
-    override = write_override(args.adaptive_beta)
+    override = write_override()
     digests = {}
     failures = []
     try:
         for scene in SCENES:
             digest, tail = run_scene(args.godot, scene, args.frames)
-            key = scene + ("@adaptive-beta" if args.adaptive_beta else "")
-            digests[key] = digest
-            label = f"{scene} ({args.frames} steps{' +adaptive-beta' if args.adaptive_beta else ''})"
+            digests[scene] = digest
+            label = f"{scene} ({args.frames} steps)"
             if digest is None:
                 failures.append(scene)
                 print(f"FAIL {label}: no digest emitted\n{tail}")
-            elif key in baseline and not args.update and baseline[key] != digest:
+            elif scene in baseline and not args.update and baseline[scene] != digest:
                 failures.append(scene)
-                print(f"FAIL {label}: {digest} != baseline {baseline[key]}")
+                print(f"FAIL {label}: {digest} != baseline {baseline[scene]}")
             else:
                 print(f"ok  {label}: {digest}")
     finally:
         os.remove(override)
 
     if args.update:
-        # Merge: a plain run must not wipe the @adaptive-beta keys and vice versa.
         merged = dict(baseline)
         merged.update(digests)
         with open(args.baseline, "w") as f:

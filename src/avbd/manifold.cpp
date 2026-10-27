@@ -45,7 +45,6 @@ uint32_t ManifoldStore::acquire(Rigid *p_bodyA, Rigid *p_bodyB)
         rAWorld.resize(rAWorld.size() + kMaxManifoldContacts);
         rBWorld.resize(rBWorld.size() + kMaxManifoldContacts);
         contactStick.resize(contactStick.size() + kMaxManifoldContacts);
-        contactBetaScale.resize(contactBetaScale.size() + kMaxManifoldContacts);
         linHessian.resize(linHessian.size() + kMaxManifoldContacts);
     }
 
@@ -73,7 +72,6 @@ uint32_t ManifoldStore::acquire(Rigid *p_bodyA, Rigid *p_bodyB)
         rAWorld[first + k] = float3{};
         rBWorld[first + k] = float3{};
         contactStick[first + k] = 0;
-        contactBetaScale[first + k] = 1.0f;
         linHessian[first + k] = Manifold::BasisHessian{};
     }
 
@@ -106,7 +104,6 @@ void ManifoldStore::clear()
     rAWorld.clear();
     rBWorld.clear();
     contactStick.clear();
-    contactBetaScale.clear();
     linHessian.clear();
     live.clear();
     freeList.clear();
@@ -238,12 +235,9 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
     std::array<float3, kMaxManifoldContacts> newPenalty{};
     std::array<float3, kMaxManifoldContacts> newLambda{};
     std::array<uint8_t, kMaxManifoldContacts> newStick{};
-    std::array<float, kMaxManifoldContacts> newBetaScale{};
-    newBetaScale.fill(1.0f);
 
     // Merge old contact data with new contacts. prevErr[i] carries the matched contact's
-    // error from the previous step so the adaptive-beta update below can compare it
-    // against the fresh error.
+    // error from the previous step so the diagnostics below can count fresh contacts.
     std::array<float, kMaxManifoldContacts> prevErr{};
     prevErr.fill(-1.0f);
     for (int i = 0; i < newNumContacts; i++)
@@ -259,7 +253,6 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
                 newPenalty[i] = contactPenalty[first + j];
                 newLambda[i] = contactLambda[first + j];
                 newStick[i] = contactStick[first + j];
-                newBetaScale[i] = contactBetaScale[first + j];
 
                 // If no static friction in last frame, use the new contact point locations
                 if (!contactStick[first + j])
@@ -300,7 +293,6 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
                         // never settled, it just kept re-sinking. Only friction is tied to the
                         // anchors that just moved.
                         newLambda[i] = float3{newLambda[i].x, 0.0f, 0.0f};
-                        newBetaScale[i] = 1.0f;
                     }
                 }
                 break;
@@ -334,7 +326,6 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
         contactPenalty[first + i] = newPenalty[i];
         contactLambda[first + i] = newLambda[i];
         contactStick[first + i] = newStick[i];
-        contactBetaScale[first + i] = newBetaScale[i];
     }
 
     // Grace dormancy: the pair separated and no contacts came back. Parking the manifold
@@ -357,7 +348,6 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
             {
                 contactLambda[first + i] = float3{};
                 contactStick[first + i] = 0;
-                contactBetaScale[first + i] = 1.0f;
             }
             dormantTicks[slot]++;
             dormantSavedCount[slot] = liveCount;
@@ -394,29 +384,6 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
         {
             contactLambda[first + i] = float3{};
             contactStick[first + i] = 0;
-            contactBetaScale[first + i] = 1.0f;
-        }
-
-        // Adaptive beta (the augmented-Lagrangian kappa update, per contact): a
-        // sticking contact whose error did not shrink against last step doubles its
-        // personal ramp multiplier; a well-converging one halves it back toward 1.
-        // Unmatched (fresh) contacts start from the neutral multiplier. A speculative
-        // contact that has never applied force (positive normal gap, zero normal
-        // lambda) is not an error to converge, so it keeps the neutral multiplier.
-        if (solver.adaptiveBeta && prevErr[i] > 0.0f &&
-                !(contactC0[first + i][0] > 0.0f && contactLambda[first + i][0] == 0.0f))
-        {
-            const float err = length(contactC0[first + i]);
-            float scale = contactBetaScale[first + i];
-            if (err > 0.5f * prevErr[i])
-                scale = std::min(scale * 2.0f, ADAPTIVE_BETA_MAX);
-            else if (err < 0.1f * prevErr[i])
-                scale = std::max(scale * 0.5f, 1.0f);
-            contactBetaScale[first + i] = scale;
-        }
-        else
-        {
-            contactBetaScale[first + i] = 1.0f;
         }
 
         // Initial penalty (Eq. 19): the original computed base * 10^(2*log10(pen)) —
@@ -689,7 +656,7 @@ void ManifoldStore::updateDual(uint32_t slot, const Solver &solver, float alpha)
         contactLambda[first + i] = F;
 
         // Update the penalty parameter and clamp to material stiffness if we are within the force bounds (Eq. 16)
-        const float beta = solver.betaLin * contactBetaScale[first + i];
+        const float beta = solver.betaLin;
         if (F[0] < 0)
             contactPenalty[first + i][0] = std::min(contactPenalty[first + i][0] + beta * std::fabs(C[0]), PENALTY_MAX);
         if (frictionScale <= bounds)
@@ -731,20 +698,9 @@ void ManifoldStore::updateDual(uint32_t slot, const Solver &solver, float alpha)
     flags[slot] = static_cast<uint8_t>(flags[slot] | kPrimalCacheReady);
 }
 
-void ManifoldStore::decayPenalties(uint32_t slot, float decay) noexcept
-{
-    const int first = base(slot);
-    for (int i = 0; i < numContacts[slot]; i++)
-        contactPenalty[first + i] = min(contactPenalty[first + i] * decay,
-                float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX});
-}
-
-// Accumulate this manifold's penetration error for the adaptive iteration estimate.
-// Same loop, comparison and accumulation order as the dynamic_cast block it replaces
-// in solveIterations, so with speculative contacts off the floating-point sequence is
-// unchanged. With speculative contacts on, a positive normal error is a gap the bodies
-// have not closed yet, not penetration: counting it would pin the adaptive target at
-// its upper bound.
+// Accumulate this manifold's penetration error for the convergence probe. With
+// speculative contacts on, a positive normal error is a gap the bodies have not closed
+// yet, not penetration: counting it would skew the residual probe.
 void ManifoldStore::accumulatePenetration(uint32_t slot, const Solver &solver, float &r_total,
         int &r_count) const noexcept
 {

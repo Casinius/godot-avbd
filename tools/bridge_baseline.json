@@ -1,8 +1,5 @@
 {
- "bridge": "0x4e3234dc",
- "bridge2": "0x53836a20",
- "bridge2@adaptive-beta": "0xc445852d",
- "bridge3": "0xa464f12d",
- "bridge3@adaptive-beta": "0xeaccd8c",
- "bridge@adaptive-beta": "0xc663c1a1"
+ "bridge": "0xb18cd2cc",
+ "bridge2": "0xda026c24",
+ "bridge3": "0xae5a3d6f"
 }

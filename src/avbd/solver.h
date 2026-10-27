@@ -36,8 +36,6 @@ class TaskFlow;
 inline constexpr float PENALTY_MIN = 1.0f;
 // Maximum penalty parameter
 inline constexpr float PENALTY_MAX = 10000000000.0f;
-// Cap of the adaptive per-contact betaScale multiplier (see Solver::adaptiveBeta).
-inline constexpr float ADAPTIVE_BETA_MAX = 64.0f;
 // Base collision margin: a 1 mm skin keeps contacts from flickering on/off at the
 // exact surface. It is deliberately small - the margin is added to the contact
 // error, so a large value is a resting penetration floor.
@@ -177,9 +175,9 @@ struct Rigid
     // step. The constraint adjacency and the pair-existence check address bodies through
     // it, so a rebuild never has to hash pointers.
     int broadIndex = -1;
-    // True when every force on the body is a contact manifold. Only such bodies take the
-    // Chebyshev extrapolation: the contact map is clamped and tolerates gamma > 1, hard
-    // joints do not.
+    // True when every force on the body is a contact manifold. Only such bodies are
+    // routed into the overflow bucket's block-Jacobi round by colourGraph: the contact
+    // map is clamped, hard joints do not tolerate the snapshot solve.
     bool contactOnly = true;
     int sleep_mode = 0; // 0=NEVER, 1=SLEEP, 2=START_IN_SLEEP
 };
@@ -276,7 +274,7 @@ struct Force
     virtual int contactPointCount() const { return 0; }
 
     // Accumulate penetration error (total) and positive-penetration contact count, in
-    // contact order, for the adaptive iteration estimate. No-op for non-contact forces.
+    // contact order, for the convergence probe. No-op for non-contact forces.
     virtual void accumulatePenetration(float &r_total, int &r_count) const { (void)r_total; (void)r_count; }
 
     // Whether this constraint has broken and stopped acting on its bodies. Only
@@ -501,10 +499,6 @@ struct ManifoldStore
     std::vector<float3> contactForceCache;
     std::vector<float3> rAWorld, rBWorld; // cached world arms
     std::vector<uint8_t> contactStick;
-    // Personal multiplier on the betaLin penalty ramp, carried across steps with the
-    // warmstart. Adaptive beta (Solver::adaptiveBeta) raises it for contacts whose error
-    // stopped shrinking and lets it fall back for converging ones.
-    std::vector<float> contactBetaScale;
     std::vector<Manifold::BasisHessian> linHessian;
 
     std::vector<uint32_t> live;     // slots owning a manifold, walk order
@@ -547,8 +541,6 @@ struct ManifoldStore
     void stampCached(uint32_t slot, Rigid *body, Block &block) const noexcept;
     void updatePrimal(uint32_t slot, const Solver &solver, Rigid *body, float alpha, Block &block);
     void updateDual(uint32_t slot, const Solver &solver, float alpha) noexcept;
-    // Impulse-tail penalty decay (Solver::stiffnessDecay), fused ahead of the dual.
-    void decayPenalties(uint32_t slot, float decay) noexcept;
     void accumulatePenetration(uint32_t slot, const Solver &solver, float &r_total,
             int &r_count) const noexcept;
 };
@@ -632,51 +624,17 @@ struct Solver
     // unit dependent, which is why they are exposed rather than fixed.
     float dt = 1.0f / 60.0f; // Timestep
     float gravity = -10.0f;  // Gravity, along -Z
-    int iterations = 10;     // Solver iterations per step
+    int iterations = 8;      // Solver iterations per step
 
     float alpha = 0.99f;    // Stabilization parameter, in (0, 1]
     float betaLin = 10000.0f;  // Penalty ramping for linear constraints
     float betaAng = 100.0f;    // Penalty ramping for angular constraints
     float gamma = 0.999f;      // Warmstarting decay, < 1
 
-    // Real-time phase split: the first ceil(newtonRatio * iterations) rounds run the full
-    // Newton primal (dense 6x6 solve); the remaining rounds skip the primal entirely and
-    // run dual-only relaxation on the existing jacobians. 1.0 = original AVBD behaviour.
-    // Newton carries the stiff corrections; the dual-only tail is where the convergence
-    // is cheapest to give up.
-    float newtonRatio = 1.0f;
-    // Per-iteration multiplicative decay applied to contact penalties during the
-    // dual-only tail: a stiff penalty converges slowly under relaxation, softening it
-    // lets the cheap rounds actually converge instead of spinning. 1.0 = no decay.
-    float stiffnessDecay = 1.0f;
-
-    // Adaptive beta: per-contact penalty-ramp multipliers carried across steps,
-    // raised (x2, capped) for contacts whose error did not shrink against last step
-    // and decayed (x0.5, floored at 1) for converging ones - the classic augmented
-    // Lagrangian kappa update, per constraint instead of a global betaLin.
-    bool adaptiveBeta = false;
-
-    // Upper bound of the adaptive iteration boost. The boost multiplies the round count
-    // by the penetration ratio, so at impact moments a scene pays this many dense rounds
-    // per substep - the frame spike the profiler blames. Lower it for smoother frames;
-    // the healing those rounds did is recovered by substeps at high tick rates instead.
-    int adaptiveMaxIterations = 16;
-
-    // Adaptive iteration count: target = round(iterations * mean penetration /
-    // maxPenetrationError), clamped to [2, adaptiveMaxIterations]. With the default
-    // 1e-4 m tolerance a settled stack always hits the upper bound, so `iterations` alone
-    // is not the real round count - disable this (or raise the tolerance) to make the
-    // base count authoritative. A real-time frame budget usually wants it off, or a
-    // smaller `adaptiveMaxIterations`.
-    bool adaptiveIterations = true;
-    // Penetration error treated as "solved" by the adaptive iteration estimate, in metres.
-    float maxPenetrationError = 1e-4f;
-
 #ifdef AVBD_DIAG
     // Root-cause instrumentation, compiled out of the shipped library. Reset at the top
     // of every stepInterleaved/step; the driver reads it per tick.
     struct Diag {
-        int adaptiveTarget = 0;    // computeIterations' tick target (H2: vs actualRounds)
         int actualRounds = 0;      // rounds each substep actually ran
         int softContacts = 0;      // contacts with penalty < 0.1*betaLin after warm start (H1)
         int newContacts = 0;       // contact points that matched no previous feature key (H1 churn)
@@ -689,33 +647,18 @@ struct Solver
     // Early-exit threshold on the mean penetration residual: when a Newton round
     // improves the average residual by less than this (or worsens it), the iteration set
     // ends early - remaining rounds would polish float noise at full price. 0 disables
-    // the check (default: bit-identical iteration counts). Realistic value ~1e-5.
+    // the check. Realistic value ~1e-5.
     float convergenceThreshold = 0.0f;
 
     // Combine-pass relaxation for the overflow bucket of the coloured primal - the
     // bodies the greedy colouring could not fit inside kMaxColours, which run as one
     // block-Jacobi round against a pose snapshot. Such a snapshot solve can overshoot
     // where the coloured Gauss-Seidel updates do not; scaling the applied delta by
-    // omega < 1 trades per-iteration progress for stability. 1.0 = unrelaxed. The
-    // Chebyshev variant replaces this constant with a per-iteration schedule. The
+    // omega < 1 trades per-iteration progress for stability. The
     // bucket is empty in ordinary scenes, so these are tuning knobs for pathological
     // constraint cliques. Suite sweep: 0.5-0.7 hold every rigid bucket scene; 1.0
     // drifts a fully-cliqued stack.
     float jacobiRelaxation = 0.7f;
-
-    // Chebyshev semi-iteration over the overflow bucket's block-Jacobi round
-    // (0 = off, the default). The
-    // plain Jacobi estimate x + delta is convex-combined with the previous iterate
-    // through the Chebyshev weights for a symmetric iteration matrix with spectral
-    // radius <= rho: gamma_0 = 1, gamma_1 = 1/(1 - rho^2/2), then
-    // gamma_{k+1} = 1/(1 - rho^2 * gamma_k / 4). Only pure-contact bodies take it
-    // (Rigid::contactOnly): extrapolation diverges joint chains. Suite sweeps: rho=0.9
-    // recovers deep-stack penetration (0.058 -> 0.027 m on the 10-box stack) but
-    // diverges the 32-layer stack's interfaces; rho=0.7 is safe but the prev-mixing
-    // smoothing gives back what the extrapolation gains. The textbook schedule assumes
-    // a linear map; this one is clamped with ramping penalties, so it ships default-off
-    // as a per-scene experiment rather than a win.
-    float chebyshevRho = 0.0f;
 
     // Incremental arm-rebuild distance (metres): later rounds reuse a contact's cached
     // world moment arms while the body rotations have drifted less than this from the
@@ -738,8 +681,9 @@ struct Solver
     // tick after the velocity finish and moves overlapping contacts apart in position
     // only: the displacement is charged to the bodies' velocities over the tick period
     // (see projectionVelocityAbsorb), so the net dissipates the approach it rescues
-    // instead of handing it back. Off by default; the core suite pins digests against it.
-    bool positionProjection = false;
+    // instead of handing it back. On by default: with a fixed round budget it is the
+    // safety net that bounds resting penetration for round shapes and deep stacks.
+    bool positionProjection = true;
     // Gauss-Seidel sweeps over the manifold list per tick. Serial and in force order, so
     // the outcome is deterministic and independent of the thread count. A correction at
     // the top of a stack needs roughly one sweep per layer to reach the bottom.
@@ -868,7 +812,7 @@ struct Solver
     // Interleaved substeps: one broad phase / force warmstart / update-set selection per
     // tick, then `substeps` rounds of (body warmstart, primal+dual, velocity finish) with
     // the contact error rebased between them. `roundsPerSubstep` 0 splits the tick's
-    // adaptive target evenly. `dt` must already be the substep dt.
+    // `iterations` evenly. `dt` must already be the substep dt.
     void stepInterleaved(int substeps, int roundsPerSubstep);
     // Greedy kMaxColours-bounded colouring of the update set's constraint graph;
     // bodies that do not fit join the block-Jacobi overflow bucket.
@@ -877,21 +821,12 @@ struct Solver
     // Number of worker threads actually in use (1 when running inline).
     [[nodiscard]] int threadCount() const;
 
-    // Performance timing counters (ms).
-    static double _time_broadPhase;
-    static double _time_colourGraph;
-    static double _time_solve;
-    static double _time_finish;
-
-    // Performance timing getters (ms). Returns 0 if timing is not active.
+    // Performance timing getters (ms). Timing is not wired up; the server exposes
+    // these as engine properties and they always report 0.
     [[nodiscard]] static double get_broadPhase_time() { return 0.0; }
     [[nodiscard]] static double get_colourGraph_time() { return 0.0; }
     [[nodiscard]] static double get_solve_time() { return 0.0; }
     [[nodiscard]] static double get_finish_time() { return 0.0; }
-    // Reset all timing counters to zero.
-    static void reset_timing();
-    // Get current CPU time in microseconds.
-    static double get_time();
 
 private:
     // Every body in list order. The inertial/warmstart and BDF1 phases run over this,
@@ -925,10 +860,6 @@ private:
     std::vector<Rigid *> updateOrder;
     std::vector<float3> bodyDeltaLin;
     std::vector<float3> bodyDeltaAng;
-    // Previous linear iterate per overflow-bucket body (the Chebyshev combination's
-    // x_{k-1}; only read when chebyshevRho > 0). Angular iterates are not mixed:
-    // quats are not a vector space, so the angular delta only takes the gamma.
-    std::vector<float3> bodyPrevLin;
 
     // Constraint-graph colouring, rebuilt by colourGraph() every step. Bodies of
     // one colour share no force, so a colour's whole set can solve and apply in
@@ -990,20 +921,18 @@ private:
     int warmstartForces();
     // One body's inertial/warm-start update (independent across the list).
     void warmstartBody(int i);
-    // Decide this step's round count once, before the region starts.
-    void computeIterations(int &r_targetIterations, int &r_newtonRounds);
     // The whole iteration set as one persistent-worker region: `targetIterations` rounds of
     // the block-Jacobi primal (one full block solve per body against the iteration-start
     // pose, then a combine pass) plus dual passes, fenced by LoopSync barriers. Both sync
     // types run the identical body; NullSync is the inline/reference path.
     template <typename Sync>
     void iterateBody(int workerIndex, Sync &sync, int targetIterations, int forceCount,
-            int newtonRounds, float &r_prevResidual, std::atomic<bool> &r_converged);
+            float &r_prevResidual, std::atomic<bool> &r_converged);
     // One body's BDF1 velocity update (independent across the list). Idle detection only
     // runs on the final substep, so substeps do not sleep bodies faster than ticks.
     void finishBody(int i, bool idleDetection);
     // One substep's body warmstart, iteration region, and velocity finish, as a flow.
-    void runSubstep(int forceCount, int targetIterations, int newtonRounds, bool idleDetection);
+    void runSubstep(int forceCount, int targetIterations, bool idleDetection);
 
     // Flow stage context. Lives on runSubstep's stack for the duration of flow->run(), so
     // stage thunks take it as an opaque pointer with no allocation and no type erasure.

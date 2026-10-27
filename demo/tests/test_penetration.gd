@@ -104,21 +104,15 @@ func _apply_sweep_config() -> void:
 			return
 		"old-budget":
 			# The schedule the pyramid regression was authored under: one solver step per
-			# 240 Hz engine tick, 12 adaptive iterations (6 Newton rounds).
+			# 240 Hz engine tick, 12 iterations.
 			ProjectSettings.set_setting("physics/avbd/interleaved_substeps", false)
 			ProjectSettings.set_setting("physics/avbd/substeps", 1)
 			ProjectSettings.set_setting("physics/avbd/iterations", 12)
 			ProjectSettings.set_setting("physics/avbd/internal_ticks_per_second", 0.0)
-		"newton-1.0":
-			# Current 120 Hz x 2 substeps x 2 rounds, but both rounds are Newton.
-			ProjectSettings.set_setting("physics/avbd/newton_ratio", 1.0)
-			ProjectSettings.set_setting("physics/avbd/stiffness_decay", 1.0)
 		"rounds-8":
 			ProjectSettings.set_setting("physics/avbd/rounds_per_substep", 8)
-			ProjectSettings.set_setting("physics/avbd/newton_ratio", 1.0)
-			ProjectSettings.set_setting("physics/avbd/stiffness_decay", 1.0)
 		"adaptive":
-			# Explicit budget 0: stepInterleaved falls back to the adaptive target.
+			# Explicit budget 0: stepInterleaved falls back to splitting `iterations`.
 			ProjectSettings.set_setting("physics/avbd/rounds_per_substep", 0)
 		"sleep-on":
 			# Same solver settings as `current`; the only difference is that the boxes keep
@@ -131,8 +125,6 @@ func _apply_sweep_config() -> void:
 			ProjectSettings.set_setting("physics/avbd/speculative_margin", 0.0)
 		"no-proj":
 			ProjectSettings.set_setting("physics/avbd/position_projection", false)
-		"no-adaptive-beta":
-			ProjectSettings.set_setting("physics/avbd/adaptive_beta", false)
 		"proj-32":
 			ProjectSettings.set_setting("physics/avbd/projection_iterations", 32)
 		"proj-64":

@@ -61,20 +61,13 @@ static void register_avbd_settings() {
 
     const std::pair<const char *, Variant> entries[] = {
             {"physics/avbd/threads", Variant(0)},
-            {"physics/avbd/iterations", Variant(4)},
+            {"physics/avbd/iterations", Variant(8)},
             {"physics/avbd/alpha", Variant(0.99)},
             {"physics/avbd/beta_linear", Variant(10000.0)},
             {"physics/avbd/beta_angular", Variant(100.0)},
             {"physics/avbd/gamma", Variant(0.999)},
             {"physics/avbd/substeps", Variant(2)},
-            {"physics/avbd/newton_ratio", Variant(1.0)},
-            {"physics/avbd/stiffness_decay", Variant(0.8)},
             {"physics/avbd/jacobian_rebuild_distance", Variant(0.0)},
-            {"physics/avbd/chebyshev_rho", Variant(0.0)},
-            {"physics/avbd/adaptive_max_iterations", Variant(16)},
-            {"physics/avbd/adaptive_beta", Variant(false)},
-            {"physics/avbd/adaptive_iterations", Variant(true)},
-            {"physics/avbd/max_penetration_error", Variant(1e-4)},
             {"physics/avbd/interleaved_substeps", Variant(false)},
             {"physics/avbd/rounds_per_substep", Variant(0)},
             {"physics/avbd/internal_ticks_per_second", Variant(0.0)},
@@ -99,9 +92,7 @@ static void register_avbd_settings() {
         // The knobs people reach for first are basic; the rest live under "Advanced".
         const StringName name(entry.first);
         settings->set_as_basic(name,
-                name == StringName("physics/avbd/adaptive_beta") ||
-                        name == StringName("physics/avbd/adaptive_iterations") ||
-                        name == StringName("physics/avbd/interleaved_substeps") ||
+                name == StringName("physics/avbd/interleaved_substeps") ||
                         name == StringName("physics/avbd/internal_ticks_per_second") ||
                         name == StringName("physics/avbd/position_projection") ||
                         name == StringName("physics/avbd/substeps") ||
