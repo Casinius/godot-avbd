@@ -26,7 +26,7 @@ common/physics_ticks_per_second=240
 3d/solver/solver_iterations=4
 common/physics_interpolation=true
 avbd/beta_linear=100000.0
-avbd/beta_angular=10.0
+avbd/beta_angular=100.0
 avbd/threads=8
 avbd/interleaved_substeps=true
 avbd/speculative_margin=0.02
@@ -35,6 +35,10 @@ avbd/max_internal_steps=12
 avbd/rounds_per_substep=2
 avbd/substeps=4
 avbd/jacobian_rebuild_distance=0.02
+avbd/position_projection=false
+avbd/projection_iterations=1
+avbd/projection_beta=0.5
+avbd/projection_max_correction=0.1
 avbd/internal_ticks_per_second=60
 
 [rendering]

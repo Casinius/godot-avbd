@@ -344,21 +344,7 @@ void applyLocked(Rigid &body, float3 &dLin, float3 &dAng) noexcept
 
 } // namespace
 
-// Position-only contact projection (see Solver::positionProjection). Serial over the
-// manifold list in force order: a body takes part in several manifolds, so sweeps must be
-// Gauss-Seidel to converge, and serial order is what makes the result independent of the
-// thread count. Cheap when nothing is deep - a contact within `projectionSlop` costs one
-// pair of arm rotations and a dot product.
-//
-// Velocity absorption (`projectionVelocityAbsorb`): a body the pass lifts out of a
-// penetration still carries its approach velocity - without absorption it re-enters next
-// tick at full speed and the net becomes a launch-and-fall pump (measured: a 420-box
-// pyramid rattles at 15-30 m/s forever with the net on, and settles to 0.1 m/s with it
-// off - the off case "settles" by freezing the crush). Absorption removes the normal
-// component of the velocity that points back INTO the projected contact, per body, once
-// that body's side of the manifold actually moved. It is strictly dissipative - it can
-// only remove speed, never add it - so the pass behaves like a restitution-0 resolve for
-// impacts the penalty ramp missed, and leaves everything else untouched.
+
 void Solver::projectContacts()
 {
     const int manifoldCount = manifolds.count();
@@ -367,8 +353,11 @@ void Solver::projectContacts()
 
     const float slop = projectionSlop;
     const float beta = projectionBeta;
-    const float cap = projectionMaxCorrection;
-    const bool absorb = projectionVelocityAbsorb;
+    const float invDt = 1.0f / dt;
+    // A per-tick length cap maps to a speed cap.
+    const float maxBiasSpeed = projectionMaxCorrection > 0.0f
+            ? projectionMaxCorrection * invDt
+            : INFINITY;
 
     for (int iter = 0; iter < projectionIterations; iter++)
     {
@@ -381,9 +370,6 @@ void Solver::projectContacts()
             if (contactCount == 0)
                 continue;
 
-            // Only bodies the solve itself was allowed to move may be projected: static
-            // bodies are immovable, and a sleeping one must stay exactly where it was parked
-            // (its manifold is frozen, so its contact state is deliberately stale).
             const bool moveA = A->mass > 0.0f && A->inUpdateSet;
             const bool moveB = B->mass > 0.0f && B->inUpdateSet;
             if (!moveA && !moveB)
@@ -391,17 +377,9 @@ void Solver::projectContacts()
             const float invMassA = moveA ? 1.0f / A->mass : 0.0f;
             const float invMassB = moveB ? 1.0f / B->mass : 0.0f;
 
-            // Row 0 of the basis is the contact normal pointing from B to A, so pushing A
-            // along +n and B along -n separates the pair.
+            // Row 0 of the basis is the contact normal, pointing from B to A.
             const float3 n = manifolds.basis[slot].x;
 
-            // Accumulate over the manifold's contacts and apply once. Applying each contact
-            // in turn moves the body before the next one is measured, so a symmetric set -
-            // the four corners of a flat box-on-box face - stops cancelling: the first
-            // corner's tilt changes the other three's depths and the manifold walks the body
-            // sideways. Summing first restores the cancellation, and the manifold still
-            // sees its neighbours' latest poses, so sweeps stay Gauss-Seidel across forces.
-            float3 dLinA{0, 0, 0}, dAngA{0, 0, 0}, dLinB{0, 0, 0}, dAngB{0, 0, 0};
             for (int k = 0; k < contactCount; k++)
             {
                 const float3 rA = qrot(A->positionAng, manifolds.contacts[first + k].rA);
@@ -410,10 +388,24 @@ void Solver::projectContacts()
                 if (depth <= 0.0f)
                     continue;
 
+                // Relative normal velocity of the two contact points: A against B
+                // along n. Includes each body's angular contribution at the arm.
+                const float3 vAp = A->velocityLin + cross(A->velocityAng, rA);
+                const float3 vBp = B->velocityLin + cross(B->velocityAng, rB);
+                const float vn = dot(vAp - vBp, n);
+
+                // Target: resolve `beta * depth` of penetration per tick, i.e. a
+                // separation speed of beta * depth / dt.
+                float bias = beta * depth * invDt;
+                bias = std::min(bias, maxBiasSpeed);
+
+                // A contact pushes only; if the pair is already separating fast
+                // enough, there is nothing to add.
+                if (vn >= bias)
+                    continue;
+
                 const float3 tA = cross(rA, n);
                 const float3 tB = cross(rB, n);
-                // The arms go into the body frame once: I^-1 is diagonal there, and both
-                // the effective mass and the applied rotation vector read the same product.
                 const float3 tALocal = moveA ? qrot(qconj(A->positionAng), tA) : float3{0, 0, 0};
                 const float3 tBLocal = moveB ? qrot(qconj(B->positionAng), tB) : float3{0, 0, 0};
                 const float effectiveMass = invMassA + invMassB
@@ -422,46 +414,25 @@ void Solver::projectContacts()
                 if (!(effectiveMass > 0.0f))
                     continue;
 
-                float dp = beta * depth / effectiveMass;
-                if (cap > 0.0f)
-                    dp = std::min(dp, cap);
+                const float j = (bias - vn) / effectiveMass;
+                if (!(j > 0.0f))
+                    continue;
 
                 if (moveA)
                 {
-                    dLinA = dLinA + n * (invMassA * dp);
-                    dAngA = dAngA + angularResponse(*A, tALocal) * dp;
+                    float3 dvLin = n * (j * invMassA);
+                    float3 dvAng = angularResponse(*A, tALocal) * j;
+                    applyLocked(*A, dvLin, dvAng);
+                    A->velocityLin = A->velocityLin + dvLin;
+                    A->velocityAng = A->velocityAng + dvAng;
                 }
                 if (moveB)
                 {
-                    dLinB = dLinB + n * (invMassB * dp);
-                    dAngB = dAngB + angularResponse(*B, tBLocal) * dp;
-                }
-            }
-
-            if (moveA)
-            {
-                applyLocked(*A, dLinA, dAngA);
-                A->positionLin = A->positionLin + dLinA;
-                A->positionAng = A->positionAng + dAngA;
-                // Approach along this contact is motion opposite the normal (n points
-                // B -> A); remove exactly that component once A actually moved here.
-                if (absorb && dLinA != float3{0, 0, 0})
-                {
-                    const float vn = dot(A->velocityLin, n);
-                    if (vn < 0.0f)
-                        A->velocityLin = A->velocityLin - n * vn;
-                }
-            }
-            if (moveB)
-            {
-                applyLocked(*B, dLinB, dAngB);
-                B->positionLin = B->positionLin - dLinB;
-                B->positionAng = B->positionAng + (-dAngB);
-                if (absorb && dLinB != float3{0, 0, 0})
-                {
-                    const float vn = dot(B->velocityLin, n);
-                    if (vn > 0.0f)
-                        B->velocityLin = B->velocityLin - n * vn;
+                    float3 dvLin = n * (j * invMassB);
+                    float3 dvAng = angularResponse(*B, tBLocal) * j;
+                    applyLocked(*B, dvLin, dvAng);
+                    B->velocityLin = B->velocityLin - dvLin;
+                    B->velocityAng = B->velocityAng - dvAng;
                 }
             }
         }
