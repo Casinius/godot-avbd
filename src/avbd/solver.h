@@ -801,15 +801,19 @@ struct SolverParams
         bool contacts = true;
     } projection;
 
-    // Idle detection: a movable body whose BDF1 velocities stay under both thresholds for
-    // `frames` consecutive steps falls asleep (velocity zeroed, Godot semantics).
-    // 0 disables automatic sleeping; the core tests rely on the default for bit-identical
-    // digests. Thresholds follow Godot's space-parameter defaults.
+    // Idle detection: a movable body whose BDF1 velocities stay under both thresholds falls asleep
+    // (velocity zeroed, Godot semantics) once that has held for `timeToSleep` seconds.
+    // 0 disables automatic sleeping, which is the default the core tests measure against; the
+    // Godot server opens it at Godot's own space default. Thresholds are Godot's too.
     struct Sleep
     {
         float linearThreshold = 0.1f;       // m/s
         float angularThreshold = 0.139626f; // rad/s (Godot default: 8 deg/s)
-        int frames = 0;                     // steps below thresholds before sleeping
+        // Seconds of uninterrupted idle before a body sleeps. Seconds, not steps, because the
+        // clock the scene runs on is a setting: at tick_rate 120 a step is half as long, and a
+        // budget counted in steps would sleep everything twice as early. Solver::sleepFrames is
+        // the same budget converted for the dt of the tick being run.
+        float timeToSleep = 0.0f;
     } sleep;
 };
 
@@ -844,7 +848,7 @@ struct Solver
         p.projection.velocityTransfer = std::clamp(p.projection.velocityTransfer, 0.0f, 1.0f);
         p.sleep.linearThreshold = std::max(p.sleep.linearThreshold, 0.0f);
         p.sleep.angularThreshold = std::max(p.sleep.angularThreshold, 0.0f);
-        p.sleep.frames = std::max(p.sleep.frames, 0);
+        p.sleep.timeToSleep = std::max(p.sleep.timeToSleep, 0.0f);
         params = p;
     }
 
@@ -916,9 +920,10 @@ private:
         // the angular delta only takes the schedule's gamma.
         std::vector<float3> prevLin;
         // What the position projection has moved this body so far this step, summed over every
-        // pass (SolverParams::Projection). `finishBody` subtracts all of it back out of the BDF1
-        // velocity unless projection_velocity_transfer says otherwise, so a purely positional
-        // correction injects no energy. Zeroed once per step in warmstartBody, not per pass.
+        // pass (SolverParams::Projection). `finishBody` gives this back out of the BDF1 velocity
+        // only when projection_velocity_transfer asks for a purely positional layer; at the
+        // default the move stays in the velocity, as standard PBD. Zeroed once per step in
+        // warmstartBody, not per pass.
         std::vector<float3> projLin;
         std::vector<float3> projAng;
 
@@ -943,6 +948,12 @@ private:
     // the deal, which is why the per-force index pairs no longer need storing.
     std::vector<Rigid *> islandBodies;
 
+    // The idle window expressed in steps, derived from Sleep::timeToSleep and `dt` at the top of
+    // every tick (computeSleepFrames). Idle detection counts steps because the state it compares
+    // against, Rigid::stillFrames, is a step counter; the budget is seconds because the tick is a
+    // setting. 0 means idle detection is off.
+    int sleepFrames = 0;
+
     std::unique_ptr<detail::JobPool> pool;
     // Sequence of classified stages for one step, rebuilt each time `runSubstep` runs.
     std::unique_ptr<detail::TaskFlow> flow;
@@ -963,6 +974,8 @@ private:
     void warmstartBody(int i);
     // Decide this step's round count once, before the region starts.
     void computeIterations(int &r_targetIterations, int &r_newtonRounds);
+    // Convert the seconds-based idle window into steps for the dt of this tick.
+    void computeSleepFrames();
     // The whole iteration set as one persistent-worker region: `targetIterations` rounds of
     // the block-Jacobi primal (one full block solve per body against the iteration-start
     // pose, then a combine pass) plus dual passes, fenced by LoopSync barriers. Both sync

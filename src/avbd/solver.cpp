@@ -273,6 +273,7 @@ void Solver::step()
 {
     ensurePool();
 
+    computeSleepFrames();
     broadPhase();
     const int forceCount = warmstartForces();
     selectUpdateBodies();
@@ -510,6 +511,17 @@ void Solver::warmstartBody(int i)
         scratch.projLin[body->updateSlot] = float3{0, 0, 0};
         scratch.projAng[body->updateSlot] = float3{0, 0, 0};
     }
+}
+
+// The idle window the scene declared in seconds, in steps of the clock this tick runs on. Rounded
+// rather than floored so that a window shorter than one step still means "one step", and a
+// tick_rate change re-derives it on the next tick instead of sleeping on a stale count.
+void Solver::computeSleepFrames()
+{
+    const float seconds = params.sleep.timeToSleep;
+    sleepFrames = seconds > 0.0f && dt > 0.0f
+            ? std::max(1, static_cast<int>(std::lround(seconds / dt)))
+            : 0;
 }
 
 // Decide this step's round count once, on the caller, after warm-starting and before the
@@ -855,17 +867,17 @@ void Solver::finishBody(int i)
         }
     }
     // Idle detection: a movable, non-sleeping body whose velocities stayed under both
-    // thresholds for SolverParams::Sleep::frames consecutive steps falls asleep (velocity zeroed,
+    // thresholds for Solver::sleepFrames consecutive steps falls asleep (velocity zeroed,
     // Godot semantics). Only touches this body's fields, so it is safe inside the
     // parallel dispatch and deterministic regardless of thread count.
-    if (sleepParams.frames > 0 && body->mass > 0 && !body->sleeping)
+    if (sleepFrames > 0 && body->mass > 0 && !body->sleeping)
     {
         if (body->velocityLin.squaredNorm() < sleepParams.linearThreshold * sleepParams.linearThreshold &&
                 body->velocityAng.squaredNorm() < sleepParams.angularThreshold * sleepParams.angularThreshold)
             ++body->stillFrames;
         else
             body->stillFrames = 0;
-        if (body->stillFrames >= sleepParams.frames)
+        if (body->stillFrames >= sleepFrames)
         {
             body->sleeping = true;
             body->velocityLin = float3{0, 0, 0};
@@ -877,15 +889,14 @@ void Solver::finishBody(int i)
 // Island-wide sleep bookkeeping. Movable, sleep-enabled bodies are grouped into islands
 // through force connectivity (union-find over the flattened body list; static bodies and
 // sleep_mode == NEVER bodies join nothing and never propagate). An island where every
-// member cleared idle detection this step (stillFrames >= Sleep::frames or already
+// member cleared idle detection this step (stillFrames >= Solver::sleepFrames or already
 // sleeping) is put to sleep as a unit: Godot semantics, and it removes the
 // partially-assembled-chain edge case where the bottom box qualifies a step before the
 // boxes above it. Deterministic: the union-find walks the force list in list order and
 // the minimum-body-index island representative is independent of visit order.
 void Solver::islandSleep()
 {
-    const int sleepFrames = params.sleep.frames;
-    // Only bodies that can sleep join an island. With the default sleep.frames = 0 this
+    // Only bodies that can sleep join an island. With the default timeToSleep = 0 this
     // whole pass is skipped by the caller, so the core suite (which never sets
     // sleep_mode) is unaffected.
     islandBodies.clear();
@@ -987,7 +998,7 @@ void Solver::selectUpdateBodies()
     // must be allowed to fall asleep together, one body at a time. Serial and read-only
     // over the force adjacency apart from the examined body itself, so the outcome is
     // fixed regardless of thread count.
-    if (params.sleep.frames > 0)
+    if (sleepFrames > 0)
     {
         const float lin2 = params.sleep.linearThreshold * params.sleep.linearThreshold;
         const float ang2 = params.sleep.angularThreshold * params.sleep.angularThreshold;

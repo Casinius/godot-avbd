@@ -1107,12 +1107,13 @@ static void test_pick_mask() {
 
 // ---------------------------------------------------------------------------
 // Idle sleep: a settled stack of sleep-enabled boxes must fall asleep on its own
-// (SolverParams::Sleep::frames idle detection), and sleeping must not corrupt state. The core
-// suite default keeps Sleep::frames = 0, so this is opt-in behaviour.
+// (SolverParams::Sleep::timeToSleep idle detection), and sleeping must not corrupt state. The
+// core suite default keeps timeToSleep = 0, so this is opt-in behaviour. The window is five
+// steps of the default 60 Hz dt, which is what the seconds budget converts back to.
 // ---------------------------------------------------------------------------
 static void test_idle_sleep() {
     Solver s;
-    s.params.sleep.frames = 5;
+    s.params.sleep.timeToSleep = 5.0f / 60.0f;
     new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
     Rigid *a = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f});
     Rigid *b = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 1.5f});
