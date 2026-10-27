@@ -376,6 +376,12 @@ inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross, float3 bLin,
 
   const std::array<float, 6> b{bLin[0], bLin[1], bLin[2], bAng[0], bAng[1], bAng[2]};
   std::array<float, 6> x{};
+    
+    float scale = 0.0f;
+    for (int i = 0; i < 6; i++) scale = std::max(scale, std::abs(a[i][i]));
+    const float damping = 1.0e-3f * scale;
+    for (int i = 0; i < 6; i++) a[i][i] += damping;
+  
   if (ldlt6_solve(a, b, x) || ldlt6_pivoted_solve(a, b, x)) {
     xLin = float3{x[0], x[1], x[2]};
     xAng = float3{x[3], x[4], x[5]};

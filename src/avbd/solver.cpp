@@ -1366,11 +1366,19 @@ void Solver::colourGraph()
 
     // Counting sort into per-colour runs (stable in updateOrder order).
     colourBegins.assign(kMaxColours + 1, 0);
-    for (int i = 0; i < n; i++)
-        if (bodyColour[i] < kMaxColours)
-            colourBegins[bodyColour[i] + 1]++;
-        else
+    for (int i = 0; i < n; i++){
+        if(updateOrder[i]->contactOnly){
+            bodyColour[i] = kOverflowColour;
             overflowOrder.push_back(i);
+        }
+        if(bodyColour[i] != kOverflowColour){
+            colourBegins[bodyColour[i]+1]++;
+        }
+        // if (bodyColour[i] < kMaxColours)
+            // colourBegins[bodyColour[i] + 1]++;
+        // else
+            // overflowOrder.push_back(i);
+    }
     for (int c = 0; c < kMaxColours; c++)
         colourBegins[c + 1] += colourBegins[c];
     colourOrder.resize(n - static_cast<int>(overflowOrder.size()));

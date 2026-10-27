@@ -1,6 +1,6 @@
 [gd_scene format=3 uid="uid://c46janufjnosd"]
 
-[ext_resource type="Script" uid="uid://dqjm6ud8kqiwg" path="res://scenes/demo.gd" id="1_uhcuh"]
+[ext_resource type="Script" uid="uid://ckg0ecqiri7sc" path="res://scenes/demo.gd" id="1_uhcuh"]
 
 [sub_resource type="Environment" id="Environment_1"]
 background_mode = 1
@@ -2142,7 +2142,7 @@ shape = SubResource("BoxShape_box")
 mesh = SubResource("BoxMesh_box")
 
 [node name="Camera3D" type="Camera3D" parent="." unique_id=1720599791]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.49371338, 5.0879, 10.171942)
+transform = Transform3D(1, 0, 0, 0, 0.8567594, -0.51571625, 0, 0.51571625, 0.8567594, 0.49371338, 5.0879, 10.171942)
 
 [node name="Box210" type="RigidBody3D" parent="." unique_id=1624202241]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -9.595, 12.063272, 0)
@@ -6344,9 +6344,6 @@ shape = SubResource("BoxShape_box")
 [node name="Mesh" type="MeshInstance3D" parent="Box629" unique_id=974398089]
 mesh = SubResource("BoxMesh_box")
 
-[node name="Camera3D2" type="Camera3D" parent="." unique_id=6531340]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 15.459579, 10.976112, 10.171942)
-
 [node name="Box630" type="RigidBody3D" parent="." unique_id=2045778325]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 5.370866, 17.951485, 0)
 physics_material_override = SubResource("Mat_box")
@@ -10547,9 +10544,6 @@ shape = SubResource("BoxShape_box")
 [node name="Mesh" type="MeshInstance3D" parent="Box1049" unique_id=999569132]
 mesh = SubResource("BoxMesh_box")
 
-[node name="Camera3D3" type="Camera3D" parent="." unique_id=1967446126]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.49371338, 30.526175, 10.171942)
-
 [node name="Box1050" type="RigidBody3D" parent="." unique_id=652647244]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -9.595, 37.50155, 0)
 physics_material_override = SubResource("Mat_box")
@@ -14749,9 +14743,6 @@ shape = SubResource("BoxShape_box")
 
 [node name="Mesh" type="MeshInstance3D" parent="Box1469" unique_id=429660540]
 mesh = SubResource("BoxMesh_box")
-
-[node name="Camera3D4" type="Camera3D" parent="." unique_id=1081216761]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 15.459579, 36.414387, 10.171942)
 
 [node name="DirectionalLight3D4" type="DirectionalLight3D" parent="." unique_id=58648268]
 transform = Transform3D(0.77399296, -0.51613694, 0.36679366, 0, 0.5792752, 0.8151321, -0.63319427, -0.6309065, 0.44835484, 15.415867, 32.326485, 0.55)
