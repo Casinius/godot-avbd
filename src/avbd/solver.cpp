@@ -501,6 +501,15 @@ void Solver::warmstartBody(int i)
         body->positionLin = body->positionLin + body->velocityLin * dt + float3{0, 0, g} * (accelWeight * dt * dt);
         body->positionAng = body->positionAng + body->velocityAng * dt;
     }
+
+    // The projection's running total starts the step empty. It is summed over every pass of the
+    // step rather than reset per pass, because what `finishBody` has to take back out of the BDF1
+    // velocity is the whole distance the layer moved this body, not the last pass's share.
+    if (body->updateSlot >= 0)
+    {
+        scratch.projLin[body->updateSlot] = float3{0, 0, 0};
+        scratch.projAng[body->updateSlot] = float3{0, 0, 0};
+    }
 }
 
 // Decide this step's round count once, on the caller, after warm-starting and before the
@@ -557,6 +566,19 @@ void Solver::runSubstep(int forceCount, int targetIterations, int newtonRounds)
                         && forceCount < kMinForcesPerDispatch;
             });
 
+    // The closing projection, as two stages: the fence between them is what the flow's stage
+    // boundary gives for free. It runs whether or not the iteration set finished, finished early
+    // on convergence or never projected at all, and it is the pass that makes the promise of the
+    // layer true of the pose actually handed to the host: what `finishBody` then measures the
+    // velocity from is feasible.
+    if (params.projection.rounds > 0)
+    {
+        flow->independent([forceCount] { return forceCount; }, kMinForcesPerDispatch,
+                [this](int i) { projectForce(i); });
+        flow->independent([this] { return static_cast<int>(updateOrder.size()); },
+                kMinBodiesPerDispatch, [this](int i) { projectBody(i); });
+    }
+
     flow->independent([this] { return static_cast<int>(warmstartOrder.size()); },
             kMinBodiesPerDispatch, [this](int i) { finishBody(i); });
 
@@ -584,6 +606,9 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
     // worker derives the same weights without sharing anything.
     int chebRound = 0;
     float chebGammaPrev = 1.0f;
+    // Read once: every participant must agree on which rounds project, or the barriers inside
+    // the pass stop being paired.
+    const int projectionRounds = params.projection.rounds;
     for (int it = 0; it < targetIterations; it++)
     {
         const bool newton = it < newtonRounds;
@@ -695,6 +720,14 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
         });
         sync.arriveAndWait();
 
+        // The trailing rounds of the set project. Leading rounds leave it to the Lagrangian,
+        // which reaches the same target faster where it can - a projection has no force behind
+        // it, so a stack held up by projections would separate the moment one contact breaks.
+        // The last rounds are where the projection earns its keep: those are the ones whose
+        // residual the set runs out of budget to pay.
+        if (projectionRounds > 0 && it >= targetIterations - projectionRounds)
+            projectPass(sync, forceCount);
+
         // Convergence probe after a Newton round: a full primal pass is expensive, so
         // skip further rounds when the residual stops shrinking. Only the calling
         // thread (worker 0) evaluates the reduction, and the verdict is stored in a
@@ -719,6 +752,65 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
     }
 }
 
+// The position projection's measure half: one constraint, reading the poses every other pass has
+// left and writing only its own step-scoped state. Frozen constraints are skipped for the same
+// reason the dual pass skips them - nothing they read can have moved.
+void Solver::projectForce(int i)
+{
+    Force *f = forceOrder[i];
+    if (constraintFrozen(f))
+        return;
+    f->projectMeasure(params.projection.scale, params.projection.maxCorrection);
+}
+
+// The projection's apply half: one body, summing the share of every constraint it is in and
+// moving itself. Exactly the shape of the primal's phase B, which is what makes it a Jacobi step:
+// no body is written by two items, so the result does not depend on how the work was split.
+void Solver::projectBody(int i)
+{
+    Rigid *body = updateOrder[i];
+    float3 deltaLin = float3{0, 0, 0};
+    float3 deltaAng = float3{0, 0, 0};
+    for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
+        f->projectShare(body, deltaLin, deltaAng);
+
+    // One ceiling per body per pass, on the sum: a body pinned by eight deep contacts is pulled
+    // out of the worst of them, not teleported out of all of them at once. The angular half is
+    // capped by the same number read as radians - the rotation is applied through the same
+    // first-order integration the primal's delta uses, so its magnitude is an angle.
+    const float ceiling = params.projection.maxCorrection;
+    const float moved = deltaLin.norm();
+    if (moved > ceiling && moved > 0.0f)
+        deltaLin = deltaLin * (ceiling / moved);
+    const float turned = deltaAng.norm();
+    if (turned > ceiling && turned > 0.0f)
+        deltaAng = deltaAng * (ceiling / turned);
+    if (moved == 0.0f && turned == 0.0f)
+        return;
+
+    body->positionLin = body->positionLin + deltaLin;
+    body->positionAng = body->positionAng + deltaAng;
+    scratch.projLin[i] = scratch.projLin[i] + deltaLin;
+    scratch.projAng[i] = scratch.projAng[i] + deltaAng;
+}
+
+// One projection: measure over the forces, fence, share and apply over the update set. The fence
+// is the whole design - without it the share pass would read a constraint whose error was
+// computed against a pose another thread had already corrected, and the layer would inherit the
+// colour-parallel Gauss-Seidel's thread-count dependence, which is why that was removed.
+//
+// Both halves run through the same `Sync` the iteration rounds use, so a small scene or a solver
+// that does not hold the region executes the identical body inline, in list order - the threads=1
+// reference the digest tests compare against.
+template <typename Sync>
+void Solver::projectPass(Sync &sync, int forceCount)
+{
+    sync.forItems(forceCount, [this](int i) { projectForce(i); });
+    sync.arriveAndWait();
+    sync.forItems(static_cast<int>(updateOrder.size()), [this](int i) { projectBody(i); });
+    sync.arriveAndWait();
+}
+
 // BDF1 velocities after the final iteration. Per-body and independent; it covers static
 // bodies too, so their bookkeeping matches, though only movable ones get a new velocity.
 void Solver::finishBody(int i)
@@ -731,6 +823,18 @@ void Solver::finishBody(int i)
     {
         body->velocityLin = (body->positionLin - body->initialLin) / dt;
         body->velocityAng = (body->positionAng - body->initialAng) / dt;
+        // BDF1 cannot tell a projection's move from a body's own: both are a change of pose
+        // inside the step. projection_velocity_transfer says which of them the scene keeps. At
+        // 0 (the default) the layer is purely positional - the pose is legal and the velocity is
+        // what it would have been without the correction, so nothing is injected. At 1 the
+        // correction is indistinguishable from motion, which is standard PBD.
+        if (params.projection.rounds > 0 && params.projection.velocityTransfer < 1.0f
+                && body->updateSlot >= 0)
+        {
+            const float giveBack = (1.0f - params.projection.velocityTransfer) / dt;
+            body->velocityLin = body->velocityLin - scratch.projLin[body->updateSlot] * giveBack;
+            body->velocityAng = body->velocityAng - scratch.projAng[body->updateSlot] * giveBack;
+        }
     }
     // A locked axis reports no velocity even if constraint coupling nudged it: the
     // lock's promise is "this axis does not move" to whoever reads state back.

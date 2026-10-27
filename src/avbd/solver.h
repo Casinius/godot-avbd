@@ -187,6 +187,58 @@ struct Rigid
     bool constrainedTo(Rigid *other) const;
 };
 
+// How much a body gives way along a constraint direction, for the position projection. The
+// projection splits one correction between a constraint's two sides in proportion to these, so
+// a side that cannot move this step (static, or sleeping and therefore out of the update set)
+// takes none of it and the other side takes all of it.
+//
+// A body's inertia is diagonal (`Rigid::moment`), which is what makes the split arithmetic a
+// componentwise product rather than a 3x3 solve.
+struct Compliance
+{
+    float invMass = 0.0f;
+    float3 invInertia = float3{0, 0, 0};
+
+    [[nodiscard]] bool immobile() const noexcept { return invMass == 0.0f && invInertia.isZero(0.0f); }
+
+    // The body's inverse inertia applied to a world-frame vector. Componentwise by definition:
+    // `Rigid::moment` is diagonal, which is what makes the projection's split arithmetic a
+    // multiply instead of a 3x3 solve. The inertia is stored in the body's own frame and the
+    // solver's angular block treats the rotation vector as if it were in the world one (the
+    // first-order approximation the primal stamps are built on), so the projection follows the
+    // same convention rather than inventing a rotation of its own.
+    [[nodiscard]] float3 invInertiaTimes(float3 v) const noexcept
+    {
+        return float3{invInertia.x() * v.x(), invInertia.y() * v.y(), invInertia.z() * v.z()};
+    }
+
+    // w = J M^-1 J^T for a row whose linear half is `n` and whose angular half is `arm x n`.
+    // Invariant under flipping `n`, which is why one call serves both sides of a constraint.
+    [[nodiscard]] float row(float3 n, float3 arm) const noexcept
+    {
+        const float3 jAng = arm.cross(n);
+        return invMass + jAng.dot(invInertiaTimes(jAng));
+    }
+};
+
+// Defined after Rigid, which is what it reads. `updateSlot >= 0` is the primal's own answer to
+// "may this body be moved this step": the same test the iteration phases use, so a projection
+// can never move a body the rest of the step has left frozen - that would break both the sleep
+// bookkeeping and the thread-count independence the update set is there to protect.
+inline Compliance complianceOf(const Rigid *body)
+{
+    Compliance c;
+    if (body == nullptr || body->mass <= 0.0f || body->updateSlot < 0)
+        return c;
+    c.invMass = 1.0f / body->mass;
+    // A zero or negative principal inertia means the body cannot rotate about that axis
+    // (a cylinder's own axis, for instance); the projection leaves those alone.
+    c.invInertia = float3{body->moment.x() > 0.0f ? 1.0f / body->moment.x() : 0.0f,
+            body->moment.y() > 0.0f ? 1.0f / body->moment.y() : 0.0f,
+            body->moment.z() > 0.0f ? 1.0f / body->moment.z() : 0.0f};
+    return c;
+}
+
 // The 6x6 Newton system a single body solves each iteration, split into its two 3x3
 // diagonal blocks plus the coupling block, and the matching right-hand side.
 //
@@ -267,6 +319,34 @@ struct Force
     virtual void updatePrimal(Rigid *body, float alpha, Block &block) = 0;
     virtual void updateDual(float alpha) = 0;
 
+    // --- position projection (see SolverParams::Projection) -------------------
+    //
+    // The projection runs as two passes, and the split is the whole point: pass one is
+    // dispatched over forces, so a constraint may write only its own step-scoped state; pass two
+    // is dispatched over bodies, so a body may write only itself. That is what makes the layer
+    // thread-count independent, and it is why the measured correction is stored here rather than
+    // applied on the spot - applying it would be a second body writing this one's pose.
+    //
+    // Both default to doing nothing: a constraint that models a soft pull (a spring) or no pull
+    // at all (an ignore pair) has no feasibility to guarantee.
+    //
+    // `scale` is the fraction of the error to remove, `maxCorrection` the per-body distance
+    // ceiling in metres.
+    virtual void projectMeasure(float scale, float maxCorrection)
+    {
+        (void)scale;
+        (void)maxCorrection;
+    }
+    // This body's own share of what projectMeasure stored, summed into the two accumulators by
+    // the caller. Zero for a body that is not one of this constraint's, and for one the pass may
+    // not move.
+    virtual void projectShare(const Rigid *body, float3 &r_deltaLin, float3 &r_deltaAng) const
+    {
+        (void)body;
+        (void)r_deltaLin;
+        (void)r_deltaAng;
+    }
+
     // How many contact points this force currently holds (0 for every non-contact force).
     // A reporting query - penetration statistics, the host's contact list. Dispatch uses
     // `kind`, which is also not a virtual call.
@@ -292,11 +372,19 @@ struct Joint : Force
     float torqueArm;
     bool broken;
 
+    // Position projection state: the multiplier of each of the three anchor-error rows, in world
+    // axes. Step-scoped for the same reason a manifold's cache is - it describes the correction
+    // being applied right now. The share pass recomputes the arms and rows from the poses, which
+    // have not moved between the two passes, so nothing else has to be stored.
+    float3 projLin = float3{0, 0, 0};
+
     Joint(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, float3 p_rB, float p_stiffnessLin = INFINITY, float p_stiffnessAng = 0.0f, float p_fracture = INFINITY);
 
     bool initialize() override;
     void updatePrimal(Rigid *body, float alpha, Block &block) override;
     void updateDual(float alpha) override;
+    void projectMeasure(float scale, float maxCorrection) override;
+    void projectShare(const Rigid *body, float3 &r_deltaLin, float3 &r_deltaAng) const override;
 
     // Break the joint immediately, discarding its dual state. Used when a host
     // application wants the fracture decision to survive being re-created (the
@@ -377,11 +465,20 @@ struct GenericJoint : Force
     JointAxis linear[3];
     JointAxis angular[3];
 
+    // Position projection state: the multiplier of each linear axis's row, along that axis in
+    // world space. Step-scoped, like Joint::projLin and the manifold's cache.
+    std::array<float, 3> projLinear = {};
+
     GenericJoint(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, float3 p_rB);
 
     bool initialize() override;
     void updatePrimal(Rigid *body, float alpha, Block &block) override;
     void updateDual(float alpha) override;
+
+    // Position projection of the three linear axes only; see projectMeasure for why the angular
+    // degrees of freedom are left to the Lagrangian.
+    void projectMeasure(float scale, float maxCorrection) override;
+    void projectShare(const Rigid *body, float3 &r_deltaLin, float3 &r_deltaAng) const override;
 
     // Anchor of each body in world space.
     [[nodiscard]] float3 anchorA() const;
@@ -486,6 +583,13 @@ struct Manifold : Force
         float3 rBWorld;
         float3x3 jAAng;
         float3x3 jBAng;
+        // Position projection (SolverParams::Projection): the correction the measure pass worked
+        // out for each row of this contact, as a multiplier in the contact basis, and which rows
+        // it actually corrected. Step-scoped for the same reason the arms are - it describes the
+        // correction being applied right now, and nothing about it survives to the next step. The
+        // row mask is what the dual ramp reads to avoid ramping against an error already gone.
+        float3 projLambda = float3{0, 0, 0};
+        uint8_t projectedRows = 0;
     };
     std::array<JacobianCache, 8> jacobianCache;
     float3x3 rotACaptured = float3x3::Identity(); // body rotations at capture
@@ -516,6 +620,14 @@ struct Manifold : Force
     void preCompute(float alpha);
     void stampCached(Rigid *body, Block &block);
     void updateDual(float alpha) override;
+    // Position projection. The measure pass reads the contact's error at the poses the rest of
+    // the step has left, unstabilised, works out the multiplier that would take each violating row
+    // to zero - shared between the two bodies in proportion to their compliance, the row's total
+    // being the sum of theirs - and keeps it in the cache for the share pass. With dual feedback
+    // it also charges that correction to the contact's multiplier, which is what stops the next
+    // round re-fighting an error the projection has already paid for.
+    void projectMeasure(float scale, float maxCorrection) override;
+    void projectShare(const Rigid *body, float3 &r_deltaLin, float3 &r_deltaAng) const override;
     int contactPointCount() const override { return numContacts; }
     void accumulatePenetration(float &r_total, int &r_count) const override;
 
@@ -633,6 +745,43 @@ struct SolverParams
         float jacobianRebuildDistance = 0.0f;
     } primal;
 
+    // The position projection layer (PBD-style), which sits on top of the augmented Lagrangian
+    // and does what a penalty method structurally cannot: make the delivered pose feasible.
+    // The Lagrangian converges towards zero error over rounds, its penalty is capped and its
+    // residual is clamped, so whatever the round budget did not pay for stays as penetration.
+    // Projection takes the error that is left and moves the bodies out of it directly, split
+    // between the two sides by their own compliance so it stays a Jacobi step and therefore
+    // thread-count independent.
+    //
+    // `rounds` is the whole switch: 0 runs none of the passes, and every digest in the suite is
+    // the one measured before this layer existed.
+    struct Projection
+    {
+        // Trailing rounds of the iteration set that end in a projection pass, and the closing
+        // pass after the set. 0 = off, 8 = every round.
+        int rounds = 0;
+        // How much of the measured error one pass removes. 1.0 would be exact projection;
+        // below 1 it is a damped step, which is what keeps a stack of projections from
+        // oscillating when several constraints fight over the same body.
+        float scale = 0.9f;
+        // Ceiling, in metres, on the correction one pass applies to one body. A contact deeper
+        // than the solver's own residual clamp (PENETRATION_MAX) is a body that has fallen
+        // through its partner, and yanking it out in one step is a discontinuity the scene sees
+        // as a teleport.
+        float maxCorrection = 0.01f;
+        // Fraction of the projected displacement that shows up as velocity. 0 - the default -
+        // means the projection is purely positional: the bodies end up feasible, and BDF1
+        // subtracts the displacement back out so no energy is injected. 1 is standard PBD, where
+        // the correction is indistinguishable from motion and does carry velocity.
+        float velocityTransfer = 0.0f;
+        // Charge the projected correction to the constraint's dual variable (the multiplier)
+        // instead of leaving it as a purely geometric move, and let the penalty ramp skip the
+        // rows the projection already resolved. On, the correction survives the next round
+        // instead of being re-fought by the Lagrangian from scratch, which is what lets a
+        // smaller iteration budget reach the same residual.
+        bool dualFeedback = true;
+    } projection;
+
     // Idle detection: a movable body whose BDF1 velocities stay under both thresholds for
     // `frames` consecutive steps falls asleep (velocity zeroed, Godot semantics).
     // 0 disables automatic sleeping; the core tests rely on the default for bit-identical
@@ -670,6 +819,10 @@ struct Solver
         p.primal.jacobianRebuildDistance = std::max(p.primal.jacobianRebuildDistance, 0.0f);
         p.primal.chebyshevRho = std::max(p.primal.chebyshevRho, 0.0f);
         p.primal.adaptiveMaxIterations = std::max(p.primal.adaptiveMaxIterations, 2);
+        p.projection.rounds = std::clamp(p.projection.rounds, 0, 8);
+        p.projection.scale = std::clamp(p.projection.scale, 0.0f, 1.0f);
+        p.projection.maxCorrection = std::max(p.projection.maxCorrection, 0.0f);
+        p.projection.velocityTransfer = std::clamp(p.projection.velocityTransfer, 0.0f, 1.0f);
         p.sleep.linearThreshold = std::max(p.sleep.linearThreshold, 0.0f);
         p.sleep.angularThreshold = std::max(p.sleep.angularThreshold, 0.0f);
         p.sleep.frames = std::max(p.sleep.frames, 0);
@@ -743,12 +896,20 @@ private:
         // chebyshevRho > 0. Angular iterates are not mixed: quats are not a vector space, so
         // the angular delta only takes the schedule's gamma.
         std::vector<float3> prevLin;
+        // What the position projection has moved this body so far this step, summed over every
+        // pass (SolverParams::Projection). `finishBody` subtracts all of it back out of the BDF1
+        // velocity unless projection_velocity_transfer says otherwise, so a purely positional
+        // correction injects no energy. Zeroed once per step in warmstartBody, not per pass.
+        std::vector<float3> projLin;
+        std::vector<float3> projAng;
 
         void resize(size_t bodyCount)
         {
             deltaLin.resize(bodyCount);
             deltaAng.resize(bodyCount);
             prevLin.resize(bodyCount);
+            projLin.resize(bodyCount);
+            projAng.resize(bodyCount);
         }
     } scratch;
 
@@ -792,6 +953,15 @@ private:
             int newtonRounds, float &r_prevResidual, std::atomic<bool> &r_converged);
     // One body's BDF1 velocity update and idle detection (independent across the list).
     void finishBody(int i);
+    // The position projection layer: two fenced passes, measure over forces then share and apply
+    // over the update set. Runs as part of the iteration region (the trailing rounds) and again
+    // as the closing stage of a step, so both call sites drive it through the same `Sync`.
+    // Does nothing when projection_rounds is 0, and issues no barriers in that case.
+    template <typename Sync>
+    void projectPass(Sync &sync, int forceCount);
+    // The projection's two per-item halves: one constraint's measure, one body's share and apply.
+    void projectForce(int i);
+    void projectBody(int i);
     // One step's body warmstart, iteration region, and velocity finish, as a flow.
     void runSubstep(int forceCount, int targetIterations, int newtonRounds);
 
