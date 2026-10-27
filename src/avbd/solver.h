@@ -764,22 +764,41 @@ struct SolverParams
         // below 1 it is a damped step, which is what keeps a stack of projections from
         // oscillating when several constraints fight over the same body.
         float scale = 0.9f;
-        // Ceiling, in metres, on the correction one pass applies to one body. A contact deeper
-        // than the solver's own residual clamp (PENETRATION_MAX) is a body that has fallen
-        // through its partner, and yanking it out in one step is a discontinuity the scene sees
-        // as a teleport.
-        float maxCorrection = 0.01f;
-        // Fraction of the projected displacement that shows up as velocity. 0 - the default -
-        // means the projection is purely positional: the bodies end up feasible, and BDF1
-        // subtracts the displacement back out so no energy is injected. 1 is standard PBD, where
-        // the correction is indistinguishable from motion and does carry velocity.
-        float velocityTransfer = 0.0f;
+        // Ceiling, in metres, on the correction one pass applies to one body. Measured down from
+        // the 0.01 first shipped: a ceiling-sized move is a teleport, and the jointed Bridge
+        // absorbs it at 3 mm (|x| stays 20 at every round count) but throws itself apart at 10 mm
+        // with only the trailing two rounds projected (|x| 1382).
+        float maxCorrection = 0.003f;
+        // Fraction of the projected displacement that shows up as velocity. 1 - standard PBD -
+        // because 0 is measured to be the unstable half: subtracting the move back out of BDF1
+        // leaves the pose saying one thing and its velocity another, and the jointed scenes diverge
+        // at every ceiling tried (Bridge 1141 - 2152 at transfer 0, held at 20 at transfer 1).
+        float velocityTransfer = 1.0f;
         // Charge the projected correction to the constraint's dual variable (the multiplier)
         // instead of leaving it as a purely geometric move, and let the penalty ramp skip the
         // rows the projection already resolved. On, the correction survives the next round
         // instead of being re-fought by the Lagrangian from scratch, which is what lets a
         // smaller iteration budget reach the same residual.
         bool dualFeedback = true;
+        // Which half of the constraint set the passes may touch. Separate switches, because the two
+        // halves measured nothing alike (run_scene over the core scenes, 300 steps, threads=8, with
+        // AVBD_PROJECTION_ROUNDS and the two scope knobs below):
+        //   joints: the baseline loses its jointed chains - by step 300 the Bridge reaches
+        //     |x|=617 and the Rope 1075 - and projection holds the Bridge at 20 with either scope
+        //     and the Rope at 20 with both. Nothing else in the suite moves at all, because nothing
+        //     else has joints. A hard anchor the Lagrangian leaves 2.7 cm open closes to zero
+        //     (avbd_core_test, "projection closes a hard anchor").
+        //   contacts: pays for the residual in scene motion. The stack's worst box-box interface
+        //     goes 0.1145 -> 0.0020 m and the 512-box Pyramid XL improves too (314 -> 152), but the
+        //     16-layer Pyramid, which the baseline holds at |x|=8.008 for 1000 steps, loses a box
+        //     at every scale (0.25 - 1), ceiling (0.001 - 0.01), depth gate, round count and
+        //     transfer tried, the most conservative configuration included (|x| 17 - 184). The
+        //     mass-ratio stack (6.97 -> 250) and the breakable beam (5.24 -> 18.05) go the same way.
+        // That asymmetry is why `rounds` stays 0 by default: the joint half has no measured cost,
+        // the contact half trades residual for stability, and a project has to decide which of the
+        // two it is buying.
+        bool joints = true;
+        bool contacts = true;
     } projection;
 
     // Idle detection: a movable body whose BDF1 velocities stay under both thresholds for

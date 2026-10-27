@@ -87,19 +87,26 @@ static void register_avbd_settings() {
             // The position projection layer: a positional pass over the constraints that declares
             // itself hard (contacts, locked and limited joint axes), so a delivered pose is legal
             // even where a penalty method can only approach one. Rounds is the switch and 0 keeps
-            // a project exactly as it was; 2-4 is where the measurement starts to pay.
+            // a project exactly as it was. What it is worth turning it on for is split by scope,
+            // hence projection_joints and projection_contacts: the joint half holds up chains that
+            // the plain solver loses (Bridge, Rope), the contact half buys a lower residual at the
+            // cost of squirrelling deep piles. See SolverParams::Projection for the numbers.
             {"physics/avbd/projection_rounds", Variant(0)},
             {"physics/avbd/projection_scale", Variant(0.9)},
             // Ceiling on how far one body may be moved by one pass, metres. It is a per-body
             // ceiling rather than a per-contact one, so a body pinched between many contacts is
-            // moved once per pass and not once per pinch.
-            {"physics/avbd/projection_max_correction", Variant(0.01)},
+            // moved once per pass and not once per pinch. Keep it small: a pass that hits the
+            // ceiling is a teleport, and a teleport is what breaks a jointed chain.
+            {"physics/avbd/projection_max_correction", Variant(0.003)},
             // 0 = the projected move is given back out of the step's velocity, so the layer costs
-            // no momentum; 1 = standard PBD, where the move *is* the velocity.
-            {"physics/avbd/projection_velocity_transfer", Variant(0.0)},
+            // no momentum; 1 = standard PBD, where the move *is* the velocity. Measured: 0 leaves
+            // the pose and the velocity disagreeing and the jointed scenes diverge.
+            {"physics/avbd/projection_velocity_transfer", Variant(1.0)},
             // Charge the correction to the constraint's force multiplier so the next round's
             // penalty ramp does not buy the same lift twice.
             {"physics/avbd/projection_dual_feedback", Variant(true)},
+            {"physics/avbd/projection_joints", Variant(true)},
+            {"physics/avbd/projection_contacts", Variant(true)},
     };
     for (const auto &entry : entries) {
         if (settings->has_setting(entry.first)) {

@@ -405,6 +405,10 @@ void GenericJoint::projectMeasure(float scale, float maxCorrection)
     // share pass reads.
     projLinear = {};
 
+    // Out of scope, after the clear - see Joint::projectMeasure for why the order matters.
+    if (!solver->params.projection.joints)
+        return;
+
     const Compliance cA = complianceOf(bodyA);
     const Compliance cB = complianceOf(bodyB);
     if (cA.immobile() && cB.immobile())

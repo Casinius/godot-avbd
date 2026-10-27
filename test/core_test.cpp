@@ -11,6 +11,9 @@
  *   xmake run avbd_core_test --scene Stack --steps 300
  *   xmake run avbd_core_test --bench         # 512-box pyramid timing
  *   xmake run avbd_core_test --bench-ratio --threads 8   # serial vs parallel speedup
+ *
+ * A --scene run also reads the AVBD_* tuning overrides listed in step_n(), which is how the
+ * measurements quoted next to a knob are reproduced without editing the solver defaults.
  */
 
 #include <algorithm>
@@ -60,10 +63,73 @@ static void step_n(Solver &s, int n) {
         const char *env = std::getenv("AVBD_CHEBYSHEV_RHO");
         return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0f;
     }();
+    // The projection layer and the round budget it is meant to substitute for, for the same
+    // reason and with the same 0-means-leave-alone convention.
+    static const int projection = []() {
+        const char *env = std::getenv("AVBD_PROJECTION_ROUNDS");
+        return env != nullptr ? std::atoi(env) : 0;
+    }();
+    static const int iterations = []() {
+        const char *env = std::getenv("AVBD_ITERATIONS");
+        return env != nullptr ? std::atoi(env) : 0;
+    }();
+    static const float newtonRatio = []() {
+        const char *env = std::getenv("AVBD_NEWTON_RATIO");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0f;
+    }();
+    // "0" is the only meaningful override here (the default is on), so the convention is inverted:
+    // set it to zero to take the dual feedback away from the projection.
+    static const int feedback = []() {
+        const char *env = std::getenv("AVBD_PROJECTION_FEEDBACK");
+        return env != nullptr ? std::atoi(env) : -1;
+    }();
+    static const float projScale = []() {
+        const char *env = std::getenv("AVBD_PROJECTION_SCALE");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0f;
+    }();
+    static const float projMax = []() {
+        const char *env = std::getenv("AVBD_PROJECTION_MAX");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : -1.0f;
+    }();
+    // Read as a raw value, including 0: the default is 0, and a sweep needs to be able to ask for
+    // the other end of the range without a second convention.
+    static const float projTransfer = []() {
+        const char *env = std::getenv("AVBD_PROJECTION_TRANSFER");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : -1.0f;
+    }();
+    // The two scopes, with the same inverted convention as feedback: only the off side is worth
+    // asking for from the shell, because the numbers documented in SolverParams::Projection are
+    // on/off pairs.
+    static const int projJoints = []() {
+        const char *env = std::getenv("AVBD_PROJECTION_JOINTS");
+        return env != nullptr ? std::atoi(env) : -1;
+    }();
+    static const int projContacts = []() {
+        const char *env = std::getenv("AVBD_PROJECTION_CONTACTS");
+        return env != nullptr ? std::atoi(env) : -1;
+    }();
     if (relax > 0.0f)
         s.params.primal.jacobiRelaxation = relax;
     if (rho > 0.0f)
         s.params.primal.chebyshevRho = rho;
+    if (projection > 0)
+        s.params.projection.rounds = projection;
+    if (iterations > 0)
+        s.iterations = iterations;
+    if (newtonRatio > 0.0f)
+        s.params.primal.newtonRatio = newtonRatio;
+    if (feedback >= 0)
+        s.params.projection.dualFeedback = feedback != 0;
+    if (projScale > 0.0f)
+        s.params.projection.scale = projScale;
+    if (projMax >= 0.0f)
+        s.params.projection.maxCorrection = projMax;
+    if (projTransfer >= 0.0f)
+        s.params.projection.velocityTransfer = projTransfer;
+    if (projJoints >= 0)
+        s.params.projection.joints = projJoints != 0;
+    if (projContacts >= 0)
+        s.params.projection.contacts = projContacts != 0;
     for (int i = 0; i < n; i++) {
         s.step();
     }
@@ -1067,6 +1133,31 @@ static void list_scenes() {
     }
 }
 
+// Scene-generic quality: the contact residual over the whole solver, mean and worst, in metres.
+// `C0.norm()` is the number the solver ramps its own penalty against, collision margin included,
+// so a well-settled contact reads about COLLISION_MARGIN (5 mm) rather than zero. Comparing two
+// configurations of the same scene is what it is for; the absolute value carries the margin bias.
+static void scene_penetration(const Solver &s, float &r_mean, float &r_worst) {
+    double total = 0.0;
+    int count = 0;
+    r_mean = 0.0f;
+    r_worst = 0.0f;
+    for (const Force *f = s.forces; f != nullptr; f = f->next) {
+        if (f->kind != ForceKind::Contact)
+            continue;
+        const Manifold *manifold = f->asManifold();
+        for (int i = 0; i < manifold->numContacts; i++) {
+            const float depth = manifold->contacts[i].C0.norm();
+            total += depth;
+            count++;
+            if (depth > r_worst)
+                r_worst = depth;
+        }
+    }
+    if (count > 0)
+        r_mean = static_cast<float>(total / static_cast<double>(count));
+}
+
 static int run_scene(const std::string &name, int steps, int threads, bool adaptiveBeta) {
     const CoreScene *scene = find_scene(name);
     if (scene == nullptr) {
@@ -1078,10 +1169,16 @@ static int run_scene(const std::string &name, int steps, int threads, bool adapt
     s.params.dual.adaptiveBeta = adaptiveBeta;
     scene->build(&s);
     std::printf("scene '%s': %d bodies, %d forces\n", scene->name, count_bodies(s), count_forces(s));
+    const auto t0 = std::chrono::steady_clock::now();
     step_n(s, steps);
-    std::printf("after %d steps: threads=%d bodies=%d contacts=%d max|x|=%.4f finite=%s digest=0x%016llx\n",
+    const auto t1 = std::chrono::steady_clock::now();
+    float mean = 0.0f, worst = 0.0f;
+    scene_penetration(s, mean, worst);
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / static_cast<double>(steps);
+    std::printf("after %d steps: threads=%d bodies=%d contacts=%d max|x|=%.4f finite=%s"
+                " penetration mean=%.5f worst=%.5f  %.3f ms/step digest=0x%016llx\n",
             steps, s.threadCount(), count_bodies(s), count_contact_points(s), max_abs_position(s),
-            all_finite(s) ? "yes" : "NO", (unsigned long long)state_digest(s));
+            all_finite(s) ? "yes" : "NO", mean, worst, ms, (unsigned long long)state_digest(s));
     return all_finite(s) ? 0 : 1;
 }
 
@@ -1287,6 +1384,25 @@ static void projection_probe(int steps, float transfer, float &r_z, float &r_vz)
     r_vz = ball->velocityLin.z();
 }
 
+// A hard joint with nothing else near it: the bodies stay five metres apart, so no manifold ever
+// joins and the only thing acting on the body is the 5 cm anchor error it starts with. That makes
+// it the read of the joint half of the projection scope, the way projection_stack is the read of
+// the contact half.
+static uint64_t joint_rig(const SolverParams &p, int steps, float &r_error) {
+    Solver s;
+    s.threads = 1;
+    s.gravity = 0.0f;
+    s.setParams(p);
+    Rigid *anchor = new Rigid(&s, {1, 1, 1}, 0.0f, 0.5f, {0, 0, 0});
+    Rigid *body = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0.05f, 0, 5});
+    new Joint(&s, anchor, body, {0, 0, 0}, {0, 0, -5});
+    step_n(s, steps);
+    const float3 a = anchor->positionLin + anchor->positionAng * float3{0, 0, 0};
+    const float3 b = body->positionLin + body->positionAng * float3{0, 0, -5};
+    r_error = (a - b).norm();
+    return state_digest(s);
+}
+
 static void test_projection() {
     // 1. Off, through the clamp site the host uses. Every digest printed by this binary was
     //    measured before the layer existed, so this is the one that has to keep matching.
@@ -1341,6 +1457,40 @@ static void test_projection() {
         report(std::fabs(lift0) < 1e-3f, "transfer 0 gives the move back", "vz=%.6f", lift0);
         report(std::fabs(lift1 - (one1 - 0.9f) / dt) < 1e-2f, "transfer 1 keeps it as velocity",
                 "vz=%.4f (lift %.4f m over one dt)", lift1, one1 - 0.9f);
+    }
+
+    // 4. Scope. Each half of the constraint set is switched separately, so each half has to answer
+    //    for its switch: off in a scene that has none of it changes nothing at all, and off in a
+    //    scene that has all of it takes the layer away. The second pair is the one that catches a
+    //    bug the clearing order would otherwise leave - a projection that stops measuring but still
+    //    hands the share pass last pass's correction.
+    {
+        SolverParams on;
+        on.projection.rounds = 4;
+        SolverParams jointsOff = on;
+        jointsOff.projection.joints = false;
+        SolverParams contactsOff = on;
+        contactsOff.projection.contacts = false;
+
+        float stackOn = 0.0f, stackJointsOff = 0.0f, stackContactsOff = 0.0f, stackNone = 0.0f;
+        const uint64_t dOn = projection_stack(on, 1, stackOn);
+        const uint64_t dJointsOff = projection_stack(jointsOff, 1, stackJointsOff);
+        const uint64_t dContactsOff = projection_stack(contactsOff, 1, stackContactsOff);
+        const uint64_t dNone = projection_stack(SolverParams{}, 1, stackNone);
+        report(dJointsOff == dOn, "joint scope is inert without joints", "0x%016llx vs 0x%016llx",
+                (unsigned long long)dJointsOff, (unsigned long long)dOn);
+        report(dContactsOff == dNone, "contact scope off is the whole layer off", "0x%016llx vs 0x%016llx",
+                (unsigned long long)dContactsOff, (unsigned long long)dNone);
+
+        float errOn = 0.0f, errJointsOff = 0.0f, errContactsOff = 0.0f, errNone = 0.0f;
+        const uint64_t rNone = joint_rig(SolverParams{}, 60, errNone);
+        joint_rig(on, 60, errOn);
+        const uint64_t rJointsOff = joint_rig(jointsOff, 60, errJointsOff);
+        joint_rig(contactsOff, 60, errContactsOff);
+        report(rJointsOff == rNone, "joint scope off is the whole layer off for joints",
+                "0x%016llx vs 0x%016llx", (unsigned long long)rJointsOff, (unsigned long long)rNone);
+        report(errOn < errNone && errContactsOff < errNone, "projection closes a hard anchor",
+                "anchor error on=%.5f contacts-off=%.5f off=%.5f m", errOn, errContactsOff, errNone);
     }
 }
 
