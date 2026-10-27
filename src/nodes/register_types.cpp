@@ -107,6 +107,22 @@ static void register_avbd_settings() {
             {"physics/avbd/projection_dual_feedback", Variant(true)},
             {"physics/avbd/projection_joints", Variant(true)},
             {"physics/avbd/projection_contacts", Variant(true)},
+            // Sleeping. Godot's own space parameters (3d/sleep_linear_threshold,
+            // 3d/sleep_angular_threshold, 3d/time_before_sleep) reach the solver through
+            // _space_set_param; these four are the parts of the rest test Godot has no knob for.
+            // How far a body may have travelled over its rest window (about ten steps) and still
+            // count as idle. The velocity thresholds say the same thing in m/s, but a BDF1 velocity
+            // divides that travel by the tick, so at a fast clock a settled stack's jitter clears
+            // Godot's threshold on its own - which is what this gate is here to outvote.
+            {"physics/avbd/sleep_position_tolerance", Variant(0.005)},
+            {"physics/avbd/sleep_rotation_tolerance", Variant(0.02)},
+            // A body between the tolerances and this many times them leaks idle credit instead of
+            // losing all of it. 1 disables the band, which brings back the restart-on-any-twitch
+            // behaviour the sleep/wake thrash came from.
+            {"physics/avbd/sleep_hysteresis_ratio", Variant(3.0)},
+            // Steps a neighbour's disturbance has to hold for before it wakes a sleeping island.
+            // A hit harder than the hysteresis ratio wakes immediately.
+            {"physics/avbd/sleep_wake_debounce", Variant(2)},
     };
     for (const auto &entry : entries) {
         if (settings->has_setting(entry.first)) {

@@ -11,6 +11,7 @@
  *   xmake run avbd_core_test --scene Stack --steps 300
  *   xmake run avbd_core_test --bench         # 512-box pyramid timing
  *   xmake run avbd_core_test --bench-ratio --threads 8   # serial vs parallel speedup
+ *   xmake run avbd_core_test --sleep         # sleep/wake audit across tick rates
  *
  * A --scene run also reads the AVBD_* tuning overrides listed in step_n(), which is how the
  * measurements quoted next to a knob are reproduced without editing the solver defaults.
@@ -1126,6 +1127,182 @@ static void test_idle_sleep() {
 }
 
 // ---------------------------------------------------------------------------
+// Sleep audit (--sleep)
+//
+// Three measurements behind the wake/sleep review, in the order their claims get stronger:
+//
+//  1. Jitter rows - a body disturbed by a fixed DISTANCE every step, which is what a solver's
+//     residual actually is, at three tick rates. The distance is the same at every rate; the BDF1
+//     velocity it implies is not. Half a millimetre per step is 0.03 m/s at 60 Hz and 0.24 m/s at
+//     480 Hz, past Godot's 0.1 m/s threshold, so a rest test that reads that velocity sleeps at one
+//     rate and never at the other, and a rest test that reads travel over a window sleeps at the
+//     same second on both. The seconds are asserted. (The window gate is dt-independent by
+//     construction - this row is the guard that keeps it that way if a rate gate creeps back into
+//     the quiet test.)
+//  2. Stack rows - a real three-box stack on the ground, which is where the thrash used to live:
+//     how many times it wakes itself after its first sleep. Asserted at zero. The seconds are only
+//     printed, because this scene is still creeping when it sleeps (its boxes sink 20-60 mm over
+//     the run, and about half as fast again per second at 240 Hz as at 60): its onset measures the
+//     solver's own settling, not the sleep logic, and no threshold on it would be a fair test.
+//  3. Wake row - a box dropped on the sleeping island. It has to wake, once, as a unit, and the
+//     island has to be parked again afterwards. Asserted.
+// ---------------------------------------------------------------------------
+struct SleepRow {
+    float dt = 0.0f;
+    float secondsToSleep = -1.0f; // simulated seconds until the watched bodies are all asleep
+    int wakeEvents = 0;           // all-asleep -> any-awake flips after that first sleep
+    bool asleepAtEnd = false;
+};
+
+// The island's transitions are counted, not each body's: a chain that wakes one box at a time is
+// the behaviour under audit, so the unit of the count has to be the chain.
+static void audit_note_tick(SleepRow &row, int tick, int asleep, int total) {
+    const bool allAsleep = asleep == total;
+    if (row.secondsToSleep < 0.0f) {
+        if (allAsleep) {
+            row.secondsToSleep = static_cast<float>(tick + 1) * row.dt;
+        }
+    } else if (row.asleepAtEnd && !allAsleep) {
+        row.wakeEvents++;
+    }
+    if (row.secondsToSleep >= 0.0f) {
+        row.asleepAtEnd = allAsleep;
+    }
+}
+
+static SleepRow audit_jitter_row(float dt, float budget, float amplitude) {
+    Solver s;
+    s.threads = 1;
+    s.dt = dt;
+    s.gravity = 0.0f; // nothing but the disturbance may move this body
+    s.params.sleep.timeToSleep = budget;
+    Rigid *body = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0});
+    body->sleep_mode = 1;
+
+    SleepRow row;
+    row.dt = dt;
+    const int maxTicks = static_cast<int>(10.0f / dt);
+    for (int t = 0; t < maxTicks && row.secondsToSleep < 0.0f; t++) {
+        // Injected as the velocity the integrator turns into exactly `amplitude` of travel, so the
+        // distance per step is the same at every tick rate and its velocity is not.
+        body->velocityLin = float3{((t & 1) ? -amplitude : amplitude) / dt, 0, 0};
+        s.step();
+        audit_note_tick(row, t, body->sleeping ? 1 : 0, 1);
+    }
+    return row;
+}
+
+// `dropAfterSeconds` < 0 runs the plain settle; otherwise the stack is watched until it has parked,
+// a box is dropped on it from 8 m at that second, and the run continues. The watched set stays the
+// three boxes either way: a striker born awake is not a wake-up, and counting it as one would let
+// the row assert its own bookkeeping instead of the island's.
+static SleepRow audit_stack_row(float dt, float budget, float dropAfterSeconds) {
+    Solver s;
+    s.threads = 1;
+    s.dt = dt;
+    s.params.sleep.timeToSleep = budget;
+    new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, -0.5f}); // static ground
+    std::vector<Rigid *> island;
+    for (int i = 0; i < 3; i++) {
+        Rigid *b = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f + static_cast<float>(i)});
+        b->sleep_mode = 1;
+        island.push_back(b);
+    }
+
+    SleepRow row;
+    row.dt = dt;
+    const int maxTicks = static_cast<int>(20.0f / dt);
+    const int strikeTick = dropAfterSeconds < 0.0f ? -1 : static_cast<int>(dropAfterSeconds / dt);
+    // How long, after the last transition, the island has to hold still for the row to have answered
+    // its question: six seconds of parked stack is the thrash watch, one is the re-park proof.
+    const float parkSeconds = strikeTick < 0 ? 6.0f : 1.0f;
+    int parked = 0;
+
+    for (int t = 0; t < maxTicks; t++) {
+        if (t == strikeTick) {
+            Rigid *striker = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 8.0f});
+            striker->sleep_mode = 1;
+        }
+        s.step();
+        int asleep = 0;
+        for (Rigid *b : island) {
+            asleep += b->sleeping ? 1 : 0;
+        }
+        audit_note_tick(row, t, asleep, static_cast<int>(island.size()));
+        if (asleep == static_cast<int>(island.size())) {
+            parked++;
+        } else {
+            parked = 0;
+        }
+        // The plain rows answer with six parked seconds; the strike row may only end once the
+        // island has actually woken - a parked count from before the drop proves nothing.
+        if (parked > static_cast<int>(parkSeconds / dt) && (strikeTick < 0 || row.wakeEvents > 0)) {
+            break;
+        }
+    }
+    int asleep = 0;
+    for (Rigid *b : island) {
+        asleep += b->sleeping ? 1 : 0;
+    }
+    row.asleepAtEnd = asleep == static_cast<int>(island.size());
+    return row;
+}
+
+static float spread_of(const SleepRow rows[], int n) {
+    float spread = 0.0f;
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            if (rows[i].secondsToSleep >= 0.0f && rows[j].secondsToSleep >= 0.0f) {
+                spread = std::max(spread, std::fabs(rows[i].secondsToSleep - rows[j].secondsToSleep));
+            }
+        }
+    }
+    return spread;
+}
+
+static void print_rows(const char *title, const SleepRow rows[], int n) {
+    std::printf("%s\n%-10s %-18s %-12s %s\n", title, "dt", "seconds to sleep", "wake events",
+            "asleep at end");
+    for (int i = 0; i < n; i++) {
+        std::printf("%-10.6f %-18.3f %-12d %s\n", rows[i].dt, rows[i].secondsToSleep,
+                rows[i].wakeEvents, rows[i].asleepAtEnd ? "yes" : "NO");
+    }
+}
+
+static int run_sleep_audit() {
+    std::printf("sleep audit: threads=1, 0.5 s budget\n");
+
+    // 0.5 mm of travel per step: 0.03 m/s at 60 Hz, 0.24 m/s at 480 Hz.
+    SleepRow jitter[3] = {audit_jitter_row(1.0f / 60.0f, 0.5f, 0.0005f),
+            audit_jitter_row(1.0f / 240.0f, 0.5f, 0.0005f), audit_jitter_row(1.0f / 480.0f, 0.5f, 0.0005f)};
+    print_rows("jitter: one body, 0.5 mm of position noise per step", jitter, 3);
+    const float jitterSpread = spread_of(jitter, 3);
+    // Two ticks of the slowest clock is the slack: the budget conversion rounds, and that is all
+    // this scene has to disagree about.
+    report(jitter[0].secondsToSleep > 0.0f && jitterSpread < 0.05f, "sleep onset in seconds",
+            "spread across dt = %.4f s (limit 0.05)", jitterSpread);
+
+    SleepRow stack[3] = {audit_stack_row(1.0f / 60.0f, 0.5f, -1.0f),
+            audit_stack_row(1.0f / 240.0f, 0.5f, -1.0f), audit_stack_row(1.0f / 480.0f, 0.5f, -1.0f)};
+    print_rows("stack: three boxes on ground, settling", stack, 3);
+    int wakeEvents = 0;
+    for (const SleepRow &row : stack) {
+        wakeEvents += row.wakeEvents;
+    }
+    report(wakeEvents == 0, "settled stack stays asleep", "wake events = %d", wakeEvents);
+    report(stack[0].asleepAtEnd && stack[1].asleepAtEnd && stack[2].asleepAtEnd,
+            "every rate ends asleep", "60=%d 240=%d 480=%d", stack[0].asleepAtEnd, stack[1].asleepAtEnd,
+            stack[2].asleepAtEnd);
+
+    SleepRow hit = audit_stack_row(1.0f / 120.0f, 0.5f, 5.0f);
+    print_rows("wake: same stack, a fourth box dropped on it at 5 s", &hit, 1);
+    report(hit.wakeEvents == 1, "impact wakes the island", "slept at %.2f s, wake events = %d",
+            hit.secondsToSleep, hit.wakeEvents);
+    report(hit.asleepAtEnd, "and it parks again", "after wake events = %d", hit.wakeEvents);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // CLI helpers
 // ---------------------------------------------------------------------------
 static void list_scenes() {
@@ -1632,6 +1809,8 @@ int main(int argc, char **argv) {
         } else if (arg == "--bench-ratio") {
             // Deferred so --threads/--adaptive-beta may follow it on the command line.
             benchRatio = true;
+        } else if (arg == "--sleep") {
+            return run_sleep_audit();
         } else if (arg == "--shape") {
             report_parallel_shape();
             return 0;
@@ -1642,8 +1821,9 @@ int main(int argc, char **argv) {
         } else if (arg == "--threads" && i + 1 < argc) {
             threads = std::atoi(argv[++i]);
         } else {
-            std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --bench-ratio | --shape |"
-                                 " --scene NAME [--steps N]] [--threads N] [--adaptive-beta]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --bench-ratio | --sleep |"
+                                 " --shape | --scene NAME [--steps N]] [--threads N] [--adaptive-beta]\n",
+                    argv[0]);
             return 2;
         }
     }

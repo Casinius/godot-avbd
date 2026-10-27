@@ -468,6 +468,18 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
             static_cast<bool>(settings->get_setting("physics/avbd/projection_joints", true));
     params.projection.contacts =
             static_cast<bool>(settings->get_setting("physics/avbd/projection_contacts", true));
+
+    // The parts of the rest test Godot has no space parameter for. The defaults are the solver's,
+    // and they are the ones the core suite's --sleep audit measures: see SolverParams::Sleep for
+    // what each of them is for and what the tick-rate arithmetic that motivated them looks like.
+    params.sleep.positionTolerance =
+            static_cast<float>(settings->get_setting("physics/avbd/sleep_position_tolerance", 0.005));
+    params.sleep.rotationTolerance =
+            static_cast<float>(settings->get_setting("physics/avbd/sleep_rotation_tolerance", 0.02));
+    params.sleep.hysteresisRatio =
+            static_cast<float>(settings->get_setting("physics/avbd/sleep_hysteresis_ratio", 3.0));
+    params.sleep.wakeDebounce =
+            static_cast<int>(settings->get_setting("physics/avbd/sleep_wake_debounce", 2.0));
 }
 
 void AVBDPhysicsServer3D::_space_set_active(const RID &p_space, bool p_active) {
@@ -1062,8 +1074,12 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
         // parked comes back parked.
         body.rigid->sleeping = body.sleep_requested.value_or(body.sleep_reported);
         // Solver sleep modes: 0 = never sleeps, 1 = may sleep. Idle detection lives in the
-        // solver (SolverParams::Sleep::frames); can_sleep only opens the gate.
+        // solver (SolverParams::Sleep), on this body's rest window - can_sleep only opens the gate.
         body.rigid->sleep_mode = body.can_sleep ? 1 : 0;
+        // The Rigid was built at the node's position with an identity orientation and had its real
+        // rotation stamped afterwards, so its rest window is looking at a pose the body never had.
+        // A rebuild is also, by definition, a change to the body - its credit is void either way.
+        body.rigid->resetRestWindow();
         body.rigid->gravity = space->solver.gravity * static_cast<float>(body.gravity_scale);
     }
 
@@ -2160,9 +2176,9 @@ void AVBDPhysicsServer3D::_body_set_state(const RID &p_body, PhysicsServer3D::Bo
                 body->rigid->positionLin = avbd::float3{static_cast<float>(t.origin.x),
                         static_cast<float>(-t.origin.z), static_cast<float>(t.origin.y)};
                 body->rigid->positionAng = to_sim(t.basis.get_rotation_quaternion());
-                // External teleports wake a sleeping body (Godot semantics).
-                body->rigid->sleeping = false;
-                body->rigid->stillFrames = 0;
+                // External teleports wake a sleeping body (Godot semantics) - and reset its rest
+                // window with it, since the pose the credit was measured against is gone.
+                body->rigid->wake();
             }
             break;
         }
@@ -2173,9 +2189,9 @@ void AVBDPhysicsServer3D::_body_set_state(const RID &p_body, PhysicsServer3D::Bo
                 const Vector3 &v = body->linear_velocity;
                 body->rigid->velocityLin = avbd::float3{static_cast<float>(v.x), static_cast<float>(-v.z),
                         static_cast<float>(v.y)};
-                // An explicit velocity assignment wakes a sleeping body (Godot semantics).
-                body->rigid->sleeping = false;
-                body->rigid->stillFrames = 0;
+                // An explicit velocity assignment wakes a sleeping body (Godot semantics), with the
+                // same rest-window reset a teleport gets.
+                body->rigid->wake();
             }
             break;
 
@@ -2185,8 +2201,7 @@ void AVBDPhysicsServer3D::_body_set_state(const RID &p_body, PhysicsServer3D::Bo
                 const Vector3 &w = body->angular_velocity;
                 body->rigid->velocityAng = avbd::float3{static_cast<float>(w.x), static_cast<float>(-w.z),
                         static_cast<float>(w.y)};
-                body->rigid->sleeping = false;
-                body->rigid->stillFrames = 0;
+                body->rigid->wake();
             }
             break;
 
@@ -2195,13 +2210,15 @@ void AVBDPhysicsServer3D::_body_set_state(const RID &p_body, PhysicsServer3D::Bo
             // reports a state of its own.
             body->sleep_requested = p_value;
             if (body->rigid != nullptr) {
-                body->rigid->sleeping = p_value;
                 if (p_value) {
+                    body->rigid->sleeping = true;
                     // Godot zeroes velocity when a body is put to sleep explicitly.
                     body->rigid->velocityLin = avbd::float3{0, 0, 0};
                     body->rigid->velocityAng = avbd::float3{0, 0, 0};
                     body->linear_velocity = Vector3();
                     body->angular_velocity = Vector3();
+                } else {
+                    body->rigid->wake();
                 }
             }
             break;

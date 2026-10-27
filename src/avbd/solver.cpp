@@ -823,11 +823,16 @@ void Solver::projectPass(Sync &sync, int forceCount)
     sync.arriveAndWait();
 }
 
+// The rest window's follow-up rate, and the credit a body in the hysteresis band loses per step.
+// One tenth per step is a window of roughly ten steps, which is what makes the travel gate read as
+// "where has this body been over the last sixth of a second" at any tick rate.
+constexpr float kRestWindowDecay = 0.1f;
+constexpr int kHysteresisLeak = 2;
+
 // BDF1 velocities after the final iteration. Per-body and independent; it covers static
 // bodies too, so their bookkeeping matches, though only movable ones get a new velocity.
 void Solver::finishBody(int i)
 {
-    const SolverParams::Sleep &sleepParams = params.sleep;
     Rigid *body = warmstartOrder[i];
     body->prevVelocityLin = body->velocityLin;
     // Don't update velocity if sleeping (Godot 4.7 API)
@@ -866,39 +871,92 @@ void Solver::finishBody(int i)
                 body->velocityAng[k] = 0.0f;
         }
     }
-    // Idle detection: a movable, non-sleeping body whose velocities stayed under both
-    // thresholds for Solver::sleepFrames consecutive steps falls asleep (velocity zeroed,
-    // Godot semantics). Only touches this body's fields, so it is safe inside the
-    // parallel dispatch and deterministic regardless of thread count.
-    if (sleepFrames > 0 && body->mass > 0 && !body->sleeping)
+    // Idle detection - a travel-only rest test, a loud band around it, and a leaky counter; the
+    // counter is the point.
+    //
+    // The quantitative fact the whole of C was written against: a BDF1 velocity is a displacement
+    // divided by the tick, so the same 0.4 mm of solver jitter reads 0.024 m/s at 60 Hz and
+    // 0.096 m/s at 240 Hz - Godot's 0.1 m/s threshold, reached by pure noise. Judged on velocity
+    // alone, and with a budget counted in steps (the old 30, which is 0.5 s at 60 Hz but 0.125 s at
+    // 240), a faster clock made sleeping both harder to earn and shorter-lived. So the window is
+    // seconds (computeSleepFrames), and the travel gate below is in metres: it asks "has this body
+    // moved more than 5 mm over the last few ticks", which is the same question at any tick rate.
+    //
+    // Measured only for sleep_mode == SLEEP bodies. This used to run for every movable body, which
+    // marked a can_sleep == false one `sleeping` as well - and the velocity update above is gated
+    // on `!sleeping`, while the update-set gate keeps solving for it. The result was a body that
+    // went on moving but stopped accelerating, forever, since nothing but the island pass clears
+    // that flag for a body that never sleeps. That pass is the only writer of `sleeping` now.
+    if (sleepFrames > 0 && body->mass > 0 && body->sleep_mode == 1 && !body->sleeping)
     {
-        if (body->velocityLin.squaredNorm() < sleepParams.linearThreshold * sleepParams.linearThreshold &&
-                body->velocityAng.squaredNorm() < sleepParams.angularThreshold * sleepParams.angularThreshold)
-            ++body->stillFrames;
-        else
-            body->stillFrames = 0;
-        if (body->stillFrames >= sleepFrames)
+        // The reference pose chases the body at one tenth per step, which makes the difference
+        // below "travelled recently" rather than "not where it was parked": a box resting 5 mm
+        // inside its collision margin is not travelling, because the reference sits there with it.
+        // The angular half uses the solver's own rotation-delta convention (maths.h): subtract is
+        // 2 sin(theta/2) about the axis, add integrates a rotation vector and renormalises.
+        body->sleepRefLin = body->sleepRefLin + (body->positionLin - body->sleepRefLin) * kRestWindowDecay;
+        body->sleepRefAng = body->sleepRefAng + (body->positionAng - body->sleepRefAng) * kRestWindowDecay;
+
+        const SolverParams::Sleep &sp = params.sleep;
+        const float lin2 = body->velocityLin.squaredNorm();
+        const float ang2 = body->velocityAng.squaredNorm();
+        const float moved2 = (body->positionLin - body->sleepRefLin).squaredNorm();
+        const float turned2 = (body->positionAng - body->sleepRefAng).squaredNorm();
+        const float ratio2 = sp.hysteresisRatio * sp.hysteresisRatio;
+        // Rest is the two travel gates and nothing else. Deliberately not the velocity gates: the
+        // jitter a settled stack produces is a fixed distance per STEP, not per second, so dividing
+        // it by a shorter tick inflates it into a real speed. Measured on this scene - 60, 240 and
+        // 480 Hz with the velocity gates in the quiet test - the stack fell asleep in 0.82 s at
+        // 60 Hz and 2.2 s at both faster clocks, because at 480 Hz the same 0.4 mm of solver noise
+        // is a 0.19 m/s body. The window says what the tick says nothing about: where has this body
+        // actually been.
+        const bool quiet = moved2 < sp.positionTolerance * sp.positionTolerance &&
+                turned2 < sp.rotationTolerance * sp.rotationTolerance;
+        // Out of the hysteresis band on any measure - rate or travel - and the credit is gone: this
+        // is a body that is genuinely moving. Godot's thresholds still own the loudest half of the
+        // decision, and the whole of the wake test, which is where a fast neighbour is the question
+        // being asked anyway.
+        const bool loud = lin2 > sp.linearThreshold * sp.linearThreshold * ratio2 ||
+                ang2 > sp.angularThreshold * sp.angularThreshold * ratio2 ||
+                moved2 > sp.positionTolerance * sp.positionTolerance * ratio2 ||
+                turned2 > sp.rotationTolerance * sp.rotationTolerance * ratio2;
+
+        if (quiet)
         {
-            body->sleeping = true;
-            body->velocityLin = float3{0, 0, 0};
-            body->velocityAng = float3{0, 0, 0};
+            // Capped at the budget: the credit is a progress bar to the island pass's threshold, and
+            // an island that will not commit should not be counting either.
+            if (body->stillFrames < sleepFrames)
+                ++body->stillFrames;
         }
+        else if (loud)
+            body->stillFrames = 0;
+        else
+            // In the band: leak. A stack whose top box twitches at one and a half times the
+            // tolerance loses two steps of credit per step rather than its whole budget, so it
+            // settles instead of oscillating between asleep and freshly awake.
+            body->stillFrames = std::max(0, body->stillFrames - kHysteresisLeak);
     }
 }
 
-// Island-wide sleep bookkeeping. Movable, sleep-enabled bodies are grouped into islands
-// through force connectivity (union-find over the flattened body list; static bodies and
-// sleep_mode == NEVER bodies join nothing and never propagate). An island where every
-// member cleared idle detection this step (stillFrames >= Solver::sleepFrames or already
-// sleeping) is put to sleep as a unit: Godot semantics, and it removes the
-// partially-assembled-chain edge case where the bottom box qualifies a step before the
-// boxes above it. Deterministic: the union-find walks the force list in list order and
-// the minimum-body-index island representative is independent of visit order.
-void Solver::islandSleep()
+// Island-wide sleep bookkeeping, and the only thing that changes `sleeping` on the solver's own
+// authority. Movable, sleep-enabled bodies are grouped into islands through force connectivity
+// (union-find over the flattened body list; static bodies and sleep_mode == NEVER bodies join
+// nothing and never propagate), and the island is then the unit of BOTH transitions.
+//
+// Both halves are in one pass because either one alone thrashes - that is the audit's finding.
+// Sleeping boxes individually left a contact chain part static and part solved: an asleep body is
+// out of the update set, so every constraint against it resolves as if it were a wall, and the
+// neighbours above it are then solved against ground that was not there a step ago. Waking boxes
+// individually, on one step of a neighbour's velocity, restarts the idle credit of every body the
+// woken one touches - and at 240 Hz the noise floor of a settled stack is at Godot's velocity
+// threshold, so that happened constantly: the transition itself was the disturbance.
+//
+// Deterministic: the union-find walks the force list in list order, and both aggregate flags fold
+// over the whole island, so the outcome does not depend on which member is examined first.
+void Solver::updateSleepIslands()
 {
-    // Only bodies that can sleep join an island. With the default timeToSleep = 0 this
-    // whole pass is skipped by the caller, so the core suite (which never sets
-    // sleep_mode) is unaffected.
+    // Only bodies that can sleep join an island. With the default timeToSleep = 0 this whole pass
+    // is skipped by the caller, so the core suite (which never sets sleep_mode) is unaffected.
     islandBodies.clear();
     for (Rigid *body = bodies; body != 0; body = body->next)
     {
@@ -910,8 +968,10 @@ void Solver::islandSleep()
             islandBodies.push_back(body);
     }
 
+    // A single box on the ground is an island of one, and it sleeps on its own budget: this pass is
+    // what puts it there now that finishBody no longer does.
     const int count = static_cast<int>(islandBodies.size());
-    if (count < 2)
+    if (count == 0)
         return;
 
     std::vector<int> parent(count);
@@ -936,32 +996,94 @@ void Solver::islandSleep()
             parent[find(ia)] = find(ib);
     }
 
-    // Compose islands: representative -> aggregate state.
-    // islandAwake[r] = true iff any member is awake; islandStill[r] = min stillFrames.
-    std::vector<char> islandAwake(count, 0);
-    std::vector<int> islandStill(count, INT_MAX);
-    for (int i = 0; i < count; ++i)
-    {
-        const int r = find(i);
-        if (!islandBodies[i]->sleeping)
-            islandAwake[r] = 1;
-        islandStill[r] = std::min(islandStill[r], islandBodies[i]->stillFrames);
-    }
+    const SolverParams::Sleep &sp = params.sleep;
+    const float ang2 = sp.angularThreshold * sp.angularThreshold;
+    const float ratio2 = sp.hysteresisRatio * sp.hysteresisRatio;
+    // "The neighbour actually moved", in the position domain: a body whose BDF1 velocity says
+    // "moving" but whose pose did not change last step - a locked axis, or a projection whose
+    // correction finishBody took back out of the velocity - is not a disturbance. Half the distance
+    // one step of the sleep threshold implies, so that it means the same at any tick rate.
+    const float movedMin = sp.linearThreshold * dt * 0.5f;
+    const float movedMin2 = movedMin * movedMin;
 
-    // Sleep whole islands whose every member has cleared idle detection; leave mixed or
-    // awake islands exactly as they are (the per-body wake-up pass above already ran).
+    // Wake evidence, one step of it per sleeping body. The test is the RELATIVE motion along the
+    // line joining the two, not the neighbour's bare speed: what matters to a sleeping box is
+    // whether the gap to its neighbour is changing. A neighbour sliding tangentially past it does
+    // not wake it, and the friction it applies is then solved against an immovable side - the same
+    // approximation putting the island to sleep already makes. Rotation has no relative form to
+    // take, so it stays a bare threshold.
+    std::vector<char> islandWake(count, 0);
     for (int i = 0; i < count; ++i)
     {
-        const int r = find(i);
-        if (islandAwake[r] || islandStill[r] < sleepFrames)
-            continue;
         Rigid *body = islandBodies[i];
         if (!body->sleeping)
+            continue;
+        bool disturbance = false;
+        for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
         {
-            body->sleeping = true;
-            body->velocityLin = float3{0, 0, 0};
-            body->velocityAng = float3{0, 0, 0};
+            Rigid *other = (f->bodyA == body) ? f->bodyB : f->bodyA;
+            if (other == nullptr || other->mass <= 0 || other->sleeping)
+                continue;
+            if ((other->positionLin - other->initialLin).squaredNorm() <= movedMin2)
+                continue;
+            const float3 d = other->positionLin - body->positionLin;
+            const float dd = d.squaredNorm();
+            if (dd < 1e-12f)
+                continue; // coincident centres: there is no axis to measure along
+            // The sleeper's own velocity is zero while it is asleep, so this is the neighbour's for
+            // now; the subtraction is what keeps it honest if that stops being true.
+            const float along = std::fabs((other->velocityLin - body->velocityLin).dot(d)) / std::sqrt(dd);
+            const bool turning = other->velocityAng.squaredNorm() > ang2;
+            if (along > sp.linearThreshold || turning)
+            {
+                disturbance = true;
+                // Out of the hysteresis band is not noise, and an impact must not wait out the
+                // debounce: the island would spend those steps solved against a wall.
+                if (along > sp.linearThreshold * sp.hysteresisRatio ||
+                        other->velocityAng.squaredNorm() > ang2 * ratio2)
+                {
+                    islandWake[find(i)] = 1;
+                    break;
+                }
+            }
         }
+        if (!disturbance)
+            body->wakeFrames = 0;
+        else if (++body->wakeFrames >= sp.wakeDebounce)
+        {
+            islandWake[find(i)] = 1;
+            body->wakeFrames = 0;
+        }
+    }
+
+    // A disturbed island wakes as a unit, and every member's rest window starts over: the credit
+    // they accumulated was earned against a neighbourhood that has just moved.
+    for (int i = 0; i < count; ++i)
+    {
+        if (islandWake[find(i)])
+            islandBodies[i]->wake();
+    }
+
+    // Then the sleep half, measured after the wake-up so an island that has just been disturbed
+    // cannot put itself back to sleep in the same step. An island sleeps once none of its members
+    // is both awake and short of the budget.
+    std::vector<char> islandWaiting(count, 0);
+    for (int i = 0; i < count; ++i)
+    {
+        const Rigid *body = islandBodies[i];
+        if (!body->sleeping && body->stillFrames < sleepFrames)
+            islandWaiting[find(i)] = 1;
+    }
+
+    for (int i = 0; i < count; ++i)
+    {
+        Rigid *body = islandBodies[i];
+        if (body->sleeping || islandWaiting[find(i)])
+            continue;
+        body->sleeping = true;
+        body->velocityLin = float3{0, 0, 0};
+        body->velocityAng = float3{0, 0, 0};
+        body->wakeFrames = 0;
     }
 }
 
@@ -984,43 +1106,23 @@ void Block::apply(Rigid &body) const noexcept
 // split around - each manifold couples exactly two bodies - so the body-level split is
 // the natural one: race-free by construction, one 6x6 solve per body per round.
 //
-// The wake-up and island-sleep logic is unchanged from the colouring era: a sleeping body
-// sharing a force with a moving movable body re-enters the update set, and settled
-// islands sleep together.
+// Sleep state is settled before the set is built (Solver::updateSleepIslands): a sleeping body
+// only re-enters it once its island's wake evidence says so, and an island that has earned its
+// budget leaves it together.
 void Solver::selectUpdateBodies()
 {
     warmstartOrder.clear();
     updateOrder.clear();
 
-    // Wake-up pass: a sleeping body (sleep_mode enabled) sharing a force with a moving
-    // movable body is woken before selection, so it re-enters this step's update set.
-    // A neighbour that is itself below the idle thresholds is not a disturbance: stacks
-    // must be allowed to fall asleep together, one body at a time. Serial and read-only
-    // over the force adjacency apart from the examined body itself, so the outcome is
-    // fixed regardless of thread count.
+    // Both sleep transitions are island-wide and both happen here, before the update set is chosen:
+    // a body this pass wakes moves this step, and a body it puts to sleep does not. The evidence it
+    // reads - the velocities and the displacements behind them - is all from the step that just
+    // ran, which is why it has to be measured here rather than in finishBody, where the per-body
+    // dispatch is parallel and a neighbour's numbers are whatever its worker left.
+    // Serial and read-only apart from the examined bodies, so the outcome is fixed regardless of
+    // thread count.
     if (sleepFrames > 0)
-    {
-        const float lin2 = params.sleep.linearThreshold * params.sleep.linearThreshold;
-        const float ang2 = params.sleep.angularThreshold * params.sleep.angularThreshold;
-        for (Rigid *body = bodies; body != 0; body = body->next)
-        {
-            if (!body->sleeping || body->sleep_mode != 1)
-                continue;
-            for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
-            {
-                Rigid *other = (f->bodyA == body) ? f->bodyB : f->bodyA;
-                if (other != 0 && other->mass > 0 && !other->sleeping &&
-                        (other->velocityLin.squaredNorm() > lin2 ||
-                                other->velocityAng.squaredNorm() > ang2))
-                {
-                    body->sleeping = false;
-                    body->stillFrames = 0;
-                    break;
-                }
-            }
-        }
-        islandSleep();
-    }
+        updateSleepIslands();
 
     // Every body is warmed up; only movable ones are updated. Static bodies are excluded
     // from the update set: they are never moved, so nothing solves for them.

@@ -23,8 +23,15 @@ Rigid::Rigid(Solver *p_solver, float3 p_size, float p_density, float p_friction,
 Rigid::Rigid(Solver *p_solver, float3 p_size, ShapeType p_shape, float p_density, float p_friction,
         float3 p_position, float3 p_velocity)
     : solver(p_solver), forces(0), next(0), positionLin(p_position), positionAng(quat::Identity()),
+    // `initialLin` starts equal to the spawn pose rather than default-constructed garbage: the wake
+    // pass reads last step's displacement before the first warm start has anything to say, and an
+    // uninitialised snapshot there is a garbage distance, not a zero one.
+    initialLin(p_position), initialAng(quat::Identity()),
     velocityLin(p_velocity), velocityAng({ 0, 0, 0 }), prevVelocityLin(p_velocity), size(p_size),
-    shape(p_shape), friction(p_friction), gravity(p_solver->gravity)
+    shape(p_shape), friction(p_friction), gravity(p_solver->gravity),
+    // The rest window opens on the pose the body is born with; the server re-seeds it once it has
+    // stamped the real orientation (see Rigid::resetRestWindow).
+    sleepRefLin(p_position), sleepRefAng(quat::Identity())
 {
     // Add to linked list
     next = p_solver->bodies;
