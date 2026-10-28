@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <numeric>
 #include <span>
+#include <vector>
 
 #include "avbd/solver.h"
 
@@ -157,13 +158,15 @@ void Solver::clear()
 void Solver::step()
 {
     ensurePool();
+    collisionDt = dt;
     broadPhase();
     const int forceCount = warmstartForces();
     selectUpdateBodies();
+    projectContacts(false);
 
     int targetIterations = iterations;
     runSubstep(forceCount, targetIterations, true);
-    projectContacts();
+    projectContacts(positionProjection);
     rebaseContacts();
 }
 
@@ -258,6 +261,7 @@ void Solver::stepInterleaved(int substeps, int roundsPerSubstep)
 #ifdef AVBD_DIAG
     diag = Diag{}; // warmstartForces fills reaped/soft/new below; reset first
 #endif
+    collisionDt = dt * substeps;
     broadPhase();
     const int forceCount = warmstartForces();
     selectUpdateBodies();
@@ -276,11 +280,15 @@ void Solver::stepInterleaved(int substeps, int roundsPerSubstep)
         if (sub > 0) {
             rebaseContacts();
         }
+        // The contact set is only refreshed once per tick, so every substep re-brakes
+        // approach speeds against the gap measured at its own start pose, over the time
+        // still left in the tick.
+        projectContacts(false, dt * (substeps - sub));
         runSubstep(forceCount, rounds, sub + 1 == substeps);
     }
     // Once per tick, not per substep: the correction is positional and velocities are
     // already final, so a second pass inside the same tick would only re-fight the first.
-    projectContacts();
+    projectContacts(positionProjection, collisionDt);
     // The tick's stored error is the one the solver saw when its contacts were initialized;
     // the bodies have moved since. Rebase it at the final pose so what the host reads back
     // (the penetration diagnostic) is the geometry the pair actually ended the tick with,
@@ -295,7 +303,7 @@ void Solver::rebaseContacts()
 {
     const int manifoldCount = manifolds.count();
     pool->forCount(manifoldCount, [this](int i) {
-        manifolds.rebase(manifolds.live[i]);
+        manifolds.rebase(manifolds.live[i], maxPenetration);
     }, kMinForcesPerDispatch);
 }
 
@@ -345,21 +353,22 @@ void applyLocked(Rigid &body, float3 &dLin, float3 &dAng) noexcept
 } // namespace
 
 
-void Solver::projectContacts()
+void Solver::projectContacts(bool projectPositions, float brakeWindow)
 {
     const int manifoldCount = manifolds.count();
-    if (!positionProjection || manifoldCount <= 0 || projectionIterations <= 0)
+    if (manifoldCount <= 0)
         return;
 
     const float slop = projectionSlop;
     const float beta = projectionBeta;
-    const float invDt = 1.0f / dt;
-    // A per-tick length cap maps to a speed cap.
-    const float maxBiasSpeed = projectionMaxCorrection > 0.0f
-            ? projectionMaxCorrection * invDt
-            : INFINITY;
+    const float cap = projectionMaxCorrection;
+    const float window = brakeWindow > 0.0f ? brakeWindow : collisionDt;
 
-    for (int iter = 0; iter < projectionIterations; iter++)
+    // Interception. A pair may only close the gap it has at this pose within the time left
+    // before the contact set is refreshed again; otherwise a fast body travels a whole
+    // substep into its neighbour and the solver spends the next round undoing that overlap,
+    // which is what converts a collision into a launch.
+    if (speculativeMargin > 0.0f)
     {
         for (uint32_t slot : manifolds.live)
         {
@@ -378,63 +387,163 @@ void Solver::projectContacts()
             const float invMassB = moveB ? 1.0f / B->mass : 0.0f;
 
             // Row 0 of the basis is the contact normal, pointing from B to A.
-            const float3 n = manifolds.basis[slot].x;
+            const float3 n = row(manifolds.basis[slot], 0);
+
+            // The whole patch is braked as one constraint, so a symmetric face cannot
+            // acquire torque from the clamp.
+            float3 patchRA{}, patchRB{};
+            float velocityError = 0.0f;
+            int braked = 0;
 
             for (int k = 0; k < contactCount; k++)
             {
                 const float3 rA = qrot(A->positionAng, manifolds.contacts[first + k].rA);
                 const float3 rB = qrot(B->positionAng, manifolds.contacts[first + k].rB);
-                const float depth = -dot(n, (A->positionLin + rA) - (B->positionLin + rB)) - slop;
-                if (depth <= 0.0f)
+                const float gap = dot(n, (A->positionLin + rA) - (B->positionLin + rB));
+                if (!(gap > 0.0f))
                     continue;
 
-                // Relative normal velocity of the two contact points: A against B
-                // along n. Includes each body's angular contribution at the arm.
                 const float3 vAp = A->velocityLin + cross(A->velocityAng, rA);
                 const float3 vBp = B->velocityLin + cross(B->velocityAng, rB);
                 const float vn = dot(vAp - vBp, n);
-
-                // Target: resolve `beta * depth` of penetration per tick, i.e. a
-                // separation speed of beta * depth / dt.
-                float bias = beta * depth * invDt;
-                bias = std::min(bias, maxBiasSpeed);
-
-                // A contact pushes only; if the pair is already separating fast
-                // enough, there is nothing to add.
-                if (vn >= bias)
-                    continue;
-
-                const float3 tA = cross(rA, n);
-                const float3 tB = cross(rB, n);
-                const float3 tALocal = moveA ? qrot(qconj(A->positionAng), tA) : float3{0, 0, 0};
-                const float3 tBLocal = moveB ? qrot(qconj(B->positionAng), tB) : float3{0, 0, 0};
-                const float effectiveMass = invMassA + invMassB
-                        + (moveA ? angularCompliance(*A, tALocal) : 0.0f)
-                        + (moveB ? angularCompliance(*B, tBLocal) : 0.0f);
-                if (!(effectiveMass > 0.0f))
-                    continue;
-
-                const float j = (bias - vn) / effectiveMass;
-                if (!(j > 0.0f))
-                    continue;
-
-                if (moveA)
+                const float target = -gap / window;
+                if (vn < target)
                 {
-                    float3 dvLin = n * (j * invMassA);
-                    float3 dvAng = angularResponse(*A, tALocal) * j;
-                    applyLocked(*A, dvLin, dvAng);
-                    A->velocityLin = A->velocityLin + dvLin;
-                    A->velocityAng = A->velocityAng + dvAng;
-                }
-                if (moveB)
-                {
-                    float3 dvLin = n * (j * invMassB);
-                    float3 dvAng = angularResponse(*B, tBLocal) * j;
-                    applyLocked(*B, dvLin, dvAng);
-                    B->velocityLin = B->velocityLin - dvLin;
-                    B->velocityAng = B->velocityAng - dvAng;
+                    patchRA += rA;
+                    patchRB += rB;
+                    velocityError += target - vn;
+                    braked++;
                 }
             }
+
+            if (braked == 0)
+                continue;
+
+            const float invN = 1.0f / braked;
+            const float3 tALocal = moveA ? qrot(qconj(A->positionAng), cross(patchRA * invN, n)) : float3{};
+            const float3 tBLocal = moveB ? qrot(qconj(B->positionAng), cross(patchRB * invN, n)) : float3{};
+            const float K = invMassA + invMassB
+                    + (moveA ? angularCompliance(*A, tALocal) : 0.0f)
+                    + (moveB ? angularCompliance(*B, tBLocal) : 0.0f);
+            const float j = velocityError * invN / K;
+            if (moveA)
+            {
+                float3 dvLin = n * (invMassA * j);
+                float3 dvAng = angularResponse(*A, tALocal) * j;
+                applyLocked(*A, dvLin, dvAng);
+                A->velocityLin += dvLin;
+                A->velocityAng += dvAng;
+            }
+            if (moveB)
+            {
+                float3 dvLin = n * (invMassB * j);
+                float3 dvAng = angularResponse(*B, tBLocal) * j;
+                applyLocked(*B, dvLin, dvAng);
+                B->velocityLin -= dvLin;
+                B->velocityAng -= dvAng;
+            }
+        }
+    }
+
+    if (!projectPositions || projectionIterations <= 0)
+        return;
+
+    projDeltaLin.resize(updateOrder.size());
+    projDeltaAng.resize(updateOrder.size());
+    projManifoldCount.resize(updateOrder.size());
+
+    for (int iter = 0; iter < projectionIterations; iter++)
+    {
+        std::fill(projManifoldCount.begin(), projManifoldCount.end(), 0);
+        std::fill(projDeltaLin.begin(), projDeltaLin.end(), float3{0, 0, 0});
+        std::fill(projDeltaAng.begin(), projDeltaAng.end(), float3{0, 0, 0});
+
+        for (uint32_t slot : manifolds.live)
+        {
+            Rigid *A = manifolds.bodyA[slot];
+            Rigid *B = manifolds.bodyB[slot];
+            const int first = ManifoldStore::base(slot);
+            const int contactCount = manifolds.contactCount(slot);
+            if (contactCount == 0)
+                continue;
+
+            const bool moveA = A->mass > 0.0f && A->inUpdateSet;
+            const bool moveB = B->mass > 0.0f && B->inUpdateSet;
+            if (!moveA && !moveB)
+                continue;
+            const float invMassA = moveA ? 1.0f / A->mass : 0.0f;
+            const float invMassB = moveB ? 1.0f / B->mass : 0.0f;
+
+            // Row 0 of the basis is the contact normal, pointing from B to A.
+            const float3 n = row(manifolds.basis[slot], 0);
+
+            // Average the active constraint before computing its mass so a symmetric face
+            // cannot acquire torque.
+            float3 patchRA{}, patchRB{};
+            float patchDepth = 0.0f;
+            int corrected = 0;
+
+            for (int k = 0; k < contactCount; k++)
+            {
+                const float3 rA = qrot(A->positionAng, manifolds.contacts[first + k].rA);
+                const float3 rB = qrot(B->positionAng, manifolds.contacts[first + k].rB);
+                const float rawDepth = -dot(n, (A->positionLin + rA) - (B->positionLin + rB));
+
+                const float depth = rawDepth - slop;
+                if (depth > 0.0f)
+                {
+                    patchRA += rA;
+                    patchRB += rB;
+                    patchDepth += depth;
+                    corrected++;
+                }
+            }
+
+            if (corrected == 0)
+                continue;
+
+            const float invN = 1.0f / corrected;
+            const float3 tALocal = moveA ? qrot(qconj(A->positionAng), cross(patchRA * invN, n)) : float3{};
+            const float3 tBLocal = moveB ? qrot(qconj(B->positionAng), cross(patchRB * invN, n)) : float3{};
+            const float K = invMassA + invMassB
+                    + (moveA ? angularCompliance(*A, tALocal) : 0.0f)
+                    + (moveB ? angularCompliance(*B, tBLocal) : 0.0f);
+            const float dp = beta * patchDepth * invN / K;
+            if (moveA)
+            {
+                const int i = A->updateIndex;
+                projManifoldCount[i]++;
+                projDeltaLin[i] += n * (invMassA * dp);
+                projDeltaAng[i] += angularResponse(*A, tALocal) * dp;
+            }
+            if (moveB)
+            {
+                const int i = B->updateIndex;
+                projManifoldCount[i]++;
+                projDeltaLin[i] -= n * (invMassB * dp);
+                projDeltaAng[i] -= angularResponse(*B, tBLocal) * dp;
+            }
+        }
+
+        for (size_t i = 0; i < updateOrder.size(); i++)
+        {
+            Rigid *body = updateOrder[i];
+            // Shared contacts must not multiply the correction at seams between colliders.
+            const float invCount = 1.0f / std::max(projManifoldCount[i], 1);
+            float3 dLin = projDeltaLin[i] * invCount;
+            float3 dAng = projDeltaAng[i] * invCount;
+            applyLocked(*body, dLin, dAng);
+            if (cap > 0.0f)
+            {
+                const float moved = length(dLin);
+                if (moved > cap)
+                    dLin = dLin * (cap / moved);
+                const float turned = length(dAng);
+                if (turned > cap)
+                    dAng = dAng * (cap / turned);
+            }
+            body->positionLin = body->positionLin + dLin;
+            body->positionAng = body->positionAng + dAng;
         }
     }
 }
@@ -492,7 +601,8 @@ void Solver::projectContacts()
 // candidates - and is grown to cover the body's motion for the step.
 static bool pairOverlaps(const ForceAdjacency &adjacency, const ManifoldStore &manifolds,
                          Rigid *bodyA, const float3 &aHalf, const float3 &aCenter,
-                         Rigid *bodyB, const float3 &bHalf, const float3 &bCenter)
+                         Rigid *bodyB, const float3 &bHalf, const float3 &bCenter,
+                         bool verbose = false)
 {
     const float3 aMin = aCenter - aHalf;
     const float3 aMax = aCenter + aHalf;
@@ -504,7 +614,23 @@ static bool pairOverlaps(const ForceAdjacency &adjacency, const ManifoldStore &m
     // mask (defaults 1/1 keep every pair, as before these fields existed).
     const bool layersAllow = ((bodyA->collisionLayer & bodyB->collisionMask) != 0) ||
             ((bodyB->collisionLayer & bodyA->collisionMask) != 0);
-    return boundsOverlap && layersAllow && !pairConstrained(adjacency, manifolds, bodyA, bodyB);
+    const bool constrained = pairConstrained(adjacency, manifolds, bodyA, bodyB);
+    if (verbose)
+    {
+        int heldBy = -1;
+        if (constrained)
+            for (const ForceRef &ref : adjacency.of(bodyA->broadIndex))
+                if (otherBody(ref, bodyA, manifolds) == bodyB && ref.isManifold())
+                    heldBy = static_cast<int>(ref.slot());
+        std::printf("      pair %d/%d bounds=%d layers=%d constrained=%d heldSlot=%d\n"
+                "        aC=(%.3f,%.3f,%.3f) aH=(%.3f,%.3f,%.3f)"
+                " bC=(%.3f,%.3f,%.3f) bH=(%.3f,%.3f,%.3f)\n",
+                bodyA->broadIndex, bodyB->broadIndex, (int)boundsOverlap, (int)layersAllow,
+                (int)constrained, heldBy,
+                aCenter.x, aCenter.y, aCenter.z, aHalf.x, aHalf.y, aHalf.z,
+                bCenter.x, bCenter.y, bCenter.z, bHalf.x, bHalf.y, bHalf.z);
+    }
+    return boundsOverlap && layersAllow && !constrained;
 }
 
 // Contact detection: hierarchical spatial hash (big-block screen + layered
@@ -551,11 +677,11 @@ void Solver::broadPhase()
 
         // Same prediction warmstartBody applies to the pose; the adaptive warm-start's
         // extra gravity fraction is smaller than the full g*dt^2 term used here.
-        float3 disp = body->velocityLin * dt;
+        float3 disp = body->velocityLin * collisionDt;
         if (body->mass > 0)
-            disp += float3{0, 0, body->gravity * dt * dt};
+            disp += float3{0, 0, body->gravity * collisionDt * collisionDt};
 
-        const float rotSweep = body->radius * length(body->velocityAng) * dt;
+        const float rotSweep = body->radius * length(body->velocityAng) * collisionDt;
         const float grow = rotSweep + speculativeMargin;
 
         bodyAabbCenter[i] = body->positionLin + disp * 0.5f;
@@ -578,11 +704,13 @@ void Solver::broadPhase()
     pool->forCount(pairCount, [this](int k) {
         const int i = pairFirst(sweepPairs[k]);
         const int j = pairSecond(sweepPairs[k]);
+        const bool traced = traceMatch(bodiesInOrder[i], bodiesInOrder[j]);
         auto overlaps = pairOverlaps(forceAdjacency, manifolds, bodiesInOrder[i], bodyAabbHalf[i],
                                     bodyAabbCenter[i], bodiesInOrder[j], bodyAabbHalf[j],
-                                    bodyAabbCenter[j]);
+                                    bodyAabbCenter[j], traced);
         broadPairValid[k] = overlaps;
-        if (!overlaps) return;
+        if (!overlaps)
+            return;
 
         // 睡眠 + awake 的 AABB 重叠就唤醒。不需要真实接触——AABB 已经含 margin，
         // 重叠意味着"下几个 substep 内会碰"。写 sleeping=false 是幂等的，多个
@@ -620,7 +748,13 @@ void Solver::broadPhase()
             }
         }
         if (exists)
+        {
+            if (traceMatch(bodiesInOrder[i], bodiesInOrder[j]))
+                std::printf("TRACE cand %d/%d valid=1 exists=1 (slot held)\n", i, j);
             continue;
+        }
+        if (traceMatch(bodiesInOrder[i], bodiesInOrder[j]))
+            std::printf("TRACE cand %d/%d valid=1 acquire\n", i, j);
         (void)manifolds.acquire(bodiesInOrder[i], bodiesInOrder[j]);
     }
 
@@ -666,6 +800,10 @@ int Solver::warmstartForces()
         const uint32_t slot = manifolds.live[i];
         // Frozen constraints keep their state verbatim; nothing they read can move.
         manifoldActive[i] = manifolds.frozen(slot) || manifolds.initialize(slot, *this) ? 1 : 0;
+        if (traceMatch(manifolds.bodyA[slot], manifolds.bodyB[slot]))
+            std::printf("TRACE init slot=%u active=%d contacts=%d frozen=%d\n", slot,
+                    (int)manifoldActive[i], manifolds.contactCount(slot),
+                    (int)manifolds.frozen(slot));
     }, kMinForcesPerDispatch);
 
     // Dormant manifolds (contact grace) keep their slot and hot state for a few ticks
@@ -793,14 +931,17 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
     // Convergence early exit: measure the residual at the end of a round; when it
     // stops improving (delta below the threshold or rising), the remaining rounds would
     // burn cycles on float noise. 0 disables the check.
+    const int newtonRounds = std::clamp(static_cast<int>(std::ceil(
+            newtonRatio * static_cast<float>(targetIterations))), 1, targetIterations);
     for (int it = 0; it < targetIterations; it++)
     {
+        const bool newton = it < newtonRounds;
         // Colour-parallel Gauss-Seidel. One pass per colour: assemble
         // (manifolds stamp self-contained against the live poses, other
         // forces stamp directly), solve, apply. Bodies of one colour
         // share no force, so the pass is race-free without a snapshot.
 
-        for (int c = 0; c < colourCount; c++)
+        for (int c = 0; newton && c < colourCount; c++)
         {
             const int first = colourBegins[c];
             const int last = colourBegins[c + 1];
@@ -828,7 +969,7 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
         // angular jacobians, clamped forces) once - work the two body
         // stamps used to duplicate. Nobody writes a pose until the
         // combine pass, so every phase reads the same frozen snapshot.
-        const int overflowCount = static_cast<int>(overflowOrder.size());
+        const int overflowCount = newton ? static_cast<int>(overflowOrder.size()) : 0;
         if (overflowCount > 0)
         {
             sync.forItems(manifolds.count(), [this](int i) {
@@ -880,13 +1021,18 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
         // body poses and writes its own dual state, so the whole pass is independent.
         // Frozen constraints have nothing to update: every input they read is parked.
         const int manifoldCount = manifolds.count();
+        const float decay = newton ? 1.0f : stiffnessDecay;
         sync.forItems(manifoldCount + forceCount,
-                [this, manifoldCount](int k) {
+                [this, manifoldCount, decay](int k) {
             if (k < manifoldCount)
             {
                 const uint32_t slot = manifolds.live[k];
                 if (!manifolds.frozen(slot))
+                {
+                    if (decay < 1.0f)
+                        manifolds.decayPenalty(slot, decay);
                     manifolds.updateDual(slot, *this, alpha);
+                }
                 return;
             }
             forceOrder[k - manifoldCount]->updateDual(alpha);
@@ -1238,7 +1384,7 @@ void Solver::colourGraph()
     // Counting sort into per-colour runs (stable in updateOrder order).
     colourBegins.assign(kMaxColours + 1, 0);
     for (int i = 0; i < n; i++) {
-        if (updateOrder[i]->contactOnly) {
+        if (contactOnlyOverflow && updateOrder[i]->contactOnly) {
             bodyColour[i] = kOverflowColour;
             overflowOrder.push_back(i);
         }

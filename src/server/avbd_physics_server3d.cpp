@@ -358,6 +358,9 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     p_space.beta_linear = settings->get_setting("physics/avbd/beta_linear", 1e4);
     p_space.beta_angular = settings->get_setting("physics/avbd/beta_angular", 1e2);
     p_space.gamma = settings->get_setting("physics/avbd/gamma", 0.999);
+    p_space.adaptive_beta = settings->get_setting("physics/avbd/adaptive_beta", false);
+    p_space.newton_ratio = settings->get_setting("physics/avbd/newton_ratio", 1.0);
+    p_space.stiffness_decay = settings->get_setting("physics/avbd/stiffness_decay", 1.0);
     p_space.substeps = static_cast<int>(settings->get_setting("physics/avbd/substeps", 2));
     p_space.jacobian_rebuild_distance = settings->get_setting("physics/avbd/jacobian_rebuild_distance", 0.0);
     p_space.interleaved_substeps = settings->get_setting("physics/avbd/interleaved_substeps", false);
@@ -373,9 +376,9 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
             "physics/avbd/max_internal_steps", 4.0)), 1);
     p_space.position_projection = settings->get_setting("physics/avbd/position_projection", true);
     p_space.projection_iterations = static_cast<int>(settings->get_setting(
-            "physics/avbd/projection_iterations", 8.0));
+            "physics/avbd/projection_iterations", 4.0));
     p_space.projection_beta = settings->get_setting("physics/avbd/projection_beta", 1.0);
-    p_space.projection_slop = settings->get_setting("physics/avbd/projection_slop", 0.005);
+    p_space.projection_slop = settings->get_setting("physics/avbd/projection_slop", 0.008);
     p_space.projection_max_correction = settings->get_setting(
             "physics/avbd/projection_max_correction", 0.0);
     p_space.sleep_linear_threshold = settings->get_setting(
@@ -385,7 +388,7 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     p_space.sleep_time = settings->get_setting("physics/avbd/sleep_time", 1.0);
     p_space.contact_grace_ticks = static_cast<int>(settings->get_setting(
             "physics/avbd/contact_grace_ticks", 0.0));
-    p_space.speculative_margin = settings->get_setting("physics/avbd/speculative_margin", 0.0);
+    p_space.speculative_margin = settings->get_setting("physics/avbd/speculative_margin", 0.01);
 }
 
 void AVBDPhysicsServer3D::_space_set_active(const RID &p_space, bool p_active) {
@@ -1356,6 +1359,9 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         space.solver.betaLin = static_cast<float>(space.beta_linear);
         space.solver.betaAng = static_cast<float>(space.beta_angular);
         space.solver.gamma = static_cast<float>(space.gamma);
+        space.solver.adaptiveBeta = space.adaptive_beta;
+        space.solver.newtonRatio = static_cast<float>(std::clamp(space.newton_ratio, 0.0, 1.0));
+        space.solver.stiffnessDecay = static_cast<float>(std::clamp(space.stiffness_decay, 0.0, 1.0));
         space.solver.threads = space.threads;
         space.solver.jacobianRebuildDistance = static_cast<float>(std::max(space.jacobian_rebuild_distance, 0.0));
         space.solver.positionProjection = space.position_projection;

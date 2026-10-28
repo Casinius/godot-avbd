@@ -66,6 +66,9 @@ static void register_avbd_settings() {
             {"physics/avbd/beta_linear", Variant(10000.0)},
             {"physics/avbd/beta_angular", Variant(100.0)},
             {"physics/avbd/gamma", Variant(0.999)},
+            {"physics/avbd/adaptive_beta", Variant(false)},
+            {"physics/avbd/newton_ratio", Variant(1.0)},
+            {"physics/avbd/stiffness_decay", Variant(1.0)},
             {"physics/avbd/substeps", Variant(2)},
             {"physics/avbd/jacobian_rebuild_distance", Variant(0.0)},
             {"physics/avbd/interleaved_substeps", Variant(false)},
@@ -73,15 +76,15 @@ static void register_avbd_settings() {
             {"physics/avbd/internal_ticks_per_second", Variant(0.0)},
             {"physics/avbd/max_internal_steps", Variant(4)},
             {"physics/avbd/position_projection", Variant(true)},
-            {"physics/avbd/projection_iterations", Variant(8)},
+            {"physics/avbd/projection_iterations", Variant(4)},
             {"physics/avbd/projection_beta", Variant(1.0)},
-            {"physics/avbd/projection_slop", Variant(0.005)},
+            {"physics/avbd/projection_slop", Variant(0.008)},
             {"physics/avbd/projection_max_correction", Variant(0.0)},
             {"physics/avbd/sleep_linear_threshold", Variant(0.05)},
             {"physics/avbd/sleep_angular_threshold", Variant(0.05)},
             {"physics/avbd/sleep_time", Variant(1.0)},
             {"physics/avbd/contact_grace_ticks", Variant(0)},
-            {"physics/avbd/speculative_margin", Variant(0.0)},
+            {"physics/avbd/speculative_margin", Variant(0.01)},
     };
     for (const auto &entry : entries) {
         if (settings->has_setting(entry.first)) {

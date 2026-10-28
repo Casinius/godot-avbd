@@ -36,6 +36,8 @@ class TaskFlow;
 inline constexpr float PENALTY_MIN = 1.0f;
 // Maximum penalty parameter
 inline constexpr float PENALTY_MAX = 10000000000.0f;
+// Cap of the adaptive per-contact beta multiplier (see Solver::adaptiveBeta).
+inline constexpr float ADAPTIVE_BETA_MAX = 64.0f;
 // Base collision margin: a 1 mm skin keeps contacts from flickering on/off at the
 // exact surface. It is deliberately small - the margin is added to the contact
 // error, so a large value is a resting penetration floor.
@@ -66,6 +68,14 @@ inline constexpr float STICK_DRIFT_HEAL = 0.002f;
 // collision-margin skin plus this tolerance is a real gap, and a real gap carries no
 // contact force. Below it, the skin's own noise must not churn resting contacts.
 inline constexpr float CONTACT_RELEASE_GAP = 2.0e-3f;
+
+// Cap on the penetration the constraint solve sees in one step (metres). A position-level
+// step turns displacement into velocity at finishBody (v = dp/dt), so removing a deep
+// impact overlap in a single step launches the pair at tens of m/s; that body then
+// crosses other boxes before their next collision pass and the pile never settles. The
+// cap bounds the per-step expulsion to 2 cm, i.e. <= 2 cm/dt, and the residual depth is
+// resolved over the following steps.
+inline constexpr float CONTACT_MAX_PENETRATION = 0.02f;
 
 struct Rigid;
 struct Force;
@@ -499,6 +509,7 @@ struct ManifoldStore
     std::vector<float3> contactForceCache;
     std::vector<float3> rAWorld, rBWorld; // cached world arms
     std::vector<uint8_t> contactStick;
+    std::vector<float> contactBetaScale; // per-contact betaLin multiplier (adaptive beta)
     std::vector<Manifold::BasisHessian> linHessian;
 
     std::vector<uint32_t> live;     // slots owning a manifold, walk order
@@ -523,6 +534,8 @@ struct ManifoldStore
 
     // Neither body can move this step: the manifold's bookkeeping is parked verbatim.
     [[nodiscard]] bool frozen(uint32_t slot) const noexcept;
+    // Scale every contact's penalty in this slot (stiffness decay for the dual-only tail).
+    void decayPenalty(uint32_t slot, float decay) noexcept;
 
     // Refresh the contact set for the step and warm-start the hot state. Returns false
     // when the pair separated (and is not parked in the contact-grace window); the slot
@@ -530,7 +543,7 @@ struct ManifoldStore
     bool initialize(uint32_t slot, Solver &solver);
     // Recompute C0 at the current pose without re-running collision detection. Used between
     // interleaved substeps; invalidates the prepared primal force cache.
-    void rebase(uint32_t slot) noexcept;
+    void rebase(uint32_t slot, float maxPenetration) noexcept;
     // Two consumers share one cache. updatePrimal (the coloured Gauss-Seidel path) uses
     // the force/moment-arm cache the previous round's dual left behind: the first body to
     // touch the manifold this round consumes it for free, and the second colour - by then
@@ -623,6 +636,8 @@ struct Solver
     // Parameter defaults. Tuned for metre/kilogram/second scenes; `beta*` in particular is
     // unit dependent, which is why they are exposed rather than fixed.
     float dt = 1.0f / 60.0f; // Timestep
+    // Set by step/stepInterleaved to the interval until the next contact refresh.
+    float collisionDt = dt;
     float gravity = -10.0f;  // Gravity, along -Z
     int iterations = 8;      // Solver iterations per step
 
@@ -630,6 +645,26 @@ struct Solver
     float betaLin = 10000.0f;  // Penalty ramping for linear constraints
     float betaAng = 100.0f;    // Penalty ramping for angular constraints
     float gamma = 0.999f;      // Warmstarting decay, < 1
+
+    // Round split: the first ceil(newtonRatio * rounds) rounds run the full primal (the
+    // dense 6x6 block solve); the rest skip the primal and run dual-only relaxation on the
+    // existing forces, with contact stiffness decayed by `stiffnessDecay` per round so the
+    // cheap rounds finish what the Newton rounds started instead of fighting a stiff ramp.
+    // 1.0 / 1.0 = every round is a Newton round (historical behaviour).
+    float newtonRatio = 1.0f;
+    float stiffnessDecay = 1.0f;
+
+    // Adaptive beta: a per-contact multiplier on betaLin, carried across steps with the
+    // warm start. A contact whose penetration did not shrink against last step doubles its
+    // multiplier (capped at ADAPTIVE_BETA_MAX); a converging one halves it back toward 1.
+    // This is the augmented-Lagrangian kappa update applied per constraint: a loaded stack
+    // contact stiffens until it actually carries its share, instead of every contact
+    // sharing one global ramp rate.
+    bool adaptiveBeta = false;
+    // Residual penetration (metres) at or below which a contact counts as solved: the
+    // multiplier decays instead of doubling, so float noise on a resting contact cannot
+    // ratchet it to the cap.
+    float adaptiveBetaErrorFloor = 1e-3f;
 
 #ifdef AVBD_DIAG
     // Root-cause instrumentation, compiled out of the shipped library. Reset at the top
@@ -660,53 +695,41 @@ struct Solver
     // drifts a fully-cliqued stack.
     float jacobiRelaxation = 0.7f;
 
+    // Route every body whose forces are all contact manifolds (Rigid::contactOnly) into the
+    // block-Jacobi overflow bucket instead of the coloured Gauss-Seidel. True in a pile of
+    // boxes - which makes the bucket the whole primal for a contact-only scene, not an
+    // exception. False runs those bodies through the colouring.
+    bool contactOnlyOverflow = true;
+
+    // Anchor drift (metres) at which a sticky contact's frozen arms are re-adopted from the
+    // current collision pass. STICK_DRIFT_HEAL is the default; lowering it re-anchors more
+    // eagerly, which trades warm-start continuity for a C0 that always measures the surfaces
+    // that are actually touching.
+    float stickDriftHeal = STICK_DRIFT_HEAL;
+
+    // Depth (metres) the constraint solve is allowed to see for one contact. A position-level
+    // step turns the correction it applies into velocity (v = dp/dt), so an unbounded deep
+    // overlap is expelled as a launch. This is the historical cap; see Solver docs.
+    float maxPenetration = CONTACT_MAX_PENETRATION;
+
     // Incremental arm-rebuild distance (metres): later rounds reuse a contact's cached
     // world moment arms while the body rotations have drifted less than this from the
     // captured pose. 0 disables caching (fresh arms every round; default).
     // Realistic value 1e-4 (0.1 mm): in-iteration arm drift is millimetre-scale.
     float jacobianRebuildDistance = 0.0f;
 
-    // Speculative contact gap (metres). Pairs separated by less than this still produce
-    // contacts, whose positive (separated) normal error generates no force until the
-    // bodies actually close it within the step - so a fast body is stopped at the
-    // surface instead of tunnelling through it. 0 disables speculative contacts and
-    // keeps the previous behaviour; 0.02 is a useful metre-scale default.
-    float speculativeMargin = 0.0f;
+    // Base gap (metres), extended by predicted relative motion until the next collision refresh; 0 disables.
+    float speculativeMargin = 0.01f;
 
-    // Position projection: the safety net a pure penalty method does not have. Nothing in
-    // the solve above bounds the overlap directly - the contacts push with whatever
-    // stiffness the penalty ramp reached, so when a load outruns the iteration budget (a
-    // deep stack, an impact) the residual overlap is simply whatever that stiffness
-    // happened to hold, and it can be a large fraction of a body. This pass runs once per
-    // tick after the velocity finish and moves overlapping contacts apart in position
-    // only: the displacement is charged to the bodies' velocities over the tick period
-    // (see projectionVelocityAbsorb), so the net dissipates the approach it rescues
-    // instead of handing it back. On by default: with a fixed round budget it is the
-    // safety net that bounds resting penetration for round shapes and deep stacks.
+    // Position correction excludes resting contacts and does not feed displacement into velocity.
     bool positionProjection = true;
-    // Gauss-Seidel sweeps over the manifold list per tick. Serial and in force order, so
-    // the outcome is deterministic and independent of the thread count. A correction at
-    // the top of a stack needs roughly one sweep per layer to reach the bottom.
-    int projectionIterations = 8;
-    // Fraction of each contact's computed correction applied per sweep. Under 1 keeps a
-    // sweep from overshooting when a body is pushed out of one contact and into another.
+    // Jacobi passes measure all contacts before moving bodies, avoiding manifold-order pose bias.
+    int projectionIterations = 4;
     float projectionBeta = 1.0f;
-    // Overlap (metres) the pass leaves alone. Resting contacts sit a few millimetres deep
-    // and belong to the penalty solve: projecting them too rotates a body about its offset
-    // contact anchors every step, and with no velocity behind the move friction cannot
-    // answer it - a box that should hold on a ramp creeps down it. The net is for crush
-    // depths the penalty solve cannot reach, so it stays out of the ordinary case.
-    float projectionSlop = 0.005f;
-    // Per-contact cap on the correction within one tick, in metres. 0 = uncapped: a deep
-    // overlap is then resolved over a few ticks by `projectionBeta` alone.
+    // Leave millimetre-scale resting penetration to the penalty solve.
+    float projectionSlop = 0.008f;
+    // Per-body, per-pass cap on summed translation (metres) and rotation (radians); 0 is uncapped.
     float projectionMaxCorrection = 0.0f;
-    // Remove each projected body's velocity component that points back into the contact
-    // it was just lifted out of. Without this the net is a free teleport: a body the
-    // penalty solve failed to stop keeps its full approach speed after being lifted to the
-    // surface, re-enters next tick, and the net pumps the scene forever instead of
-    // settling it. Strictly dissipative - it can only remove speed along the contact
-    // normal of a contact the pass actually moved.
-    bool projectionVelocityAbsorb = true;
 
     // Ticks a manifold whose pair slipped out of the swept AABBs stays dormant instead of
     // being deleted. A reaped manifold loses its whole hot state - penalty ramp, duals,
@@ -765,6 +788,30 @@ struct Solver
     // Manifold store accessors for hosts and diagnostics. `index` is a position in the
     // live list, not a store slot; the slot is an implementation detail.
     [[nodiscard]] int manifoldCount() const { return manifolds.count(); }
+    // Primal partition sizes, for diagnostics: colour groups in use and the number of
+    // bodies solved by the block-Jacobi overflow bucket instead of coloured Gauss-Seidel.
+    [[nodiscard]] int colourGroups() const { return colourCount; }
+    [[nodiscard]] int overflowBodies() const { return static_cast<int>(overflowOrder.size()); }
+    // Diagnostics only: did the last broad phase emit this pair as a narrow-phase candidate?
+    // A pair that genuinely overlaps and answers no here is a broad-phase miss, not a solve
+    // failure. Linear scan - the callers run at diagnostic rates.
+        [[nodiscard]] bool sweepHasPair(const Rigid *a, const Rigid *b) const
+    {
+        const uint64_t key = packPair(a->broadIndex, b->broadIndex);
+        for (const uint64_t p : sweepPairs)
+            if (p == key)
+                return true;
+        return false;
+    }
+    // Diagnostics for a probe run: when a pair matches these two bodies (either order), the
+    // broad phase, the manifold pass and the reaper print every lifecycle event for it. A
+    // pair with a real overlap and no constraint needs exactly this to be attributed.
+    Rigid *tracePair[2] = { nullptr, nullptr };
+    [[nodiscard]] bool traceMatch(const Rigid *a, const Rigid *b) const
+    {
+        return tracePair[0] != nullptr && ((a == tracePair[0] && b == tracePair[1]) ||
+                (a == tracePair[1] && b == tracePair[0]));
+    }
     [[nodiscard]] Rigid *manifoldBodyA(int index) const
     {
         return manifolds.bodyA[manifolds.live[static_cast<size_t>(index)]];
@@ -791,7 +838,7 @@ struct Solver
     // First basis row: the contact normal, pointing from B to A.
     [[nodiscard]] float3 manifoldNormal(int index) const
     {
-        return manifolds.basis[manifolds.live[static_cast<size_t>(index)]].x;
+        return row(manifolds.basis[manifolds.live[static_cast<size_t>(index)]], 0);
     }
     // Total contact points across live manifolds (statistics only).
     [[nodiscard]] int manifoldContactPoints() const
@@ -860,6 +907,9 @@ private:
     std::vector<Rigid *> updateOrder;
     std::vector<float3> bodyDeltaLin;
     std::vector<float3> bodyDeltaAng;
+    std::vector<float3> projDeltaLin;
+    std::vector<float3> projDeltaAng;
+    std::vector<int> projManifoldCount;
 
     // Constraint-graph colouring, rebuilt by colourGraph() every step. Bodies of
     // one colour share no force, so a colour's whole set can solve and apply in
@@ -945,9 +995,9 @@ private:
     static void flowFinishItem(void *ctx, int i) noexcept;
     // Rebase every manifold's contact error at the current pose (parallel over slots).
     void rebaseContacts();
-    // Push overlapping contacts apart in position only, after the velocity finish, so the
-    // overlap cannot exceed what the penalty solve happened to hold (see positionProjection).
-    void projectContacts();
+    // Brake approach velocities against the gap that is still open (`brakeWindow`, default:
+    // the whole collision interval), then optionally correct overlapping positions.
+    void projectContacts(bool projectPositions, float brakeWindow = 0.0f);
     // Rebuild the per-body constraint adjacency from the current force list and manifold
     // store. Serial: the lists are mutated only on the calling thread at this point.
     void buildForceAdjacency();

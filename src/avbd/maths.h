@@ -94,10 +94,14 @@ using linalg::transpose;
     const float twx = tx * q.w, twy = ty * q.w, twz = tz * q.w;
     const float txx = tx * q.x, txy = ty * q.x, txz = tz * q.x;
     const float tyy = ty * q.y, tyz = tz * q.y, tzz = tz * q.z;
+    // Column-major: each braced float3 is a COLUMN, so column j reads (R0j, R1j, R2j).
+    // The R12/R21 pair is (tyz - twx, tyz + twx); exchanging them makes the matrix neither
+    // a rotation nor a transpose, and everything built on it silently uses the wrong
+    // orientation - the broad-phase bounds then exclude pairs that really overlap.
     return float3x3{
             {1.0f - (tyy + tzz), txy + twz, txz - twy},
-            {txy - twz, 1.0f - (txx + tzz), tyz - twx},
-            {txz + twy, tyz + twx, 1.0f - (txx + tyy)}};
+            {txy - twz, 1.0f - (txx + tzz), tyz + twx},
+            {txz + twy, tyz - twx, 1.0f - (txx + tyy)}};
 }
 
 // Hamilton product with Eigen's exact term order per component (linalg's qmul adds
@@ -120,7 +124,8 @@ using linalg::cmul;
 }
 
 // Right-handed orthonormal frame with the given unit vector as its first ROW (the contact
-// normal). Row-major on purpose: the manifold code treats row(basis, 0) as the normal.
+// normal). The manifold code reads the frame axes with row()/mul(), which use the matrix's
+// rows, so the axes must end up there: linalg matrices are column-major, hence transpose.
 [[nodiscard]] inline float3x3 orthonormal(float3 normal) noexcept
 {
     float3 t1 = std::fabs(normal.x) > std::fabs(normal.z)
@@ -128,9 +133,7 @@ using linalg::cmul;
             : float3{0, -normal.z, normal.y};
     t1 = normalize(t1);
     const float3 t2 = cross(normal, t1);
-    // Rows (normal, t1, t2) are the frame; linalg matrices are column-major, so the
-    // columns of the stored matrix are exactly those three rows.
-    return float3x3{normal, t1, t2};
+    return transpose(float3x3{normal, t1, t2});
 }
 
 // Row read/write. linalg matrices index by column (`m[col][row]`); the contact code

@@ -35,9 +35,9 @@ avbd/max_internal_steps=12
 avbd/rounds_per_substep=2
 avbd/substeps=4
 avbd/jacobian_rebuild_distance=0.02
-avbd/position_projection=false
-avbd/projection_iterations=1
-avbd/projection_beta=0.5
+avbd/position_projection=true
+avbd/projection_iterations=4
+avbd/projection_beta=1.0
 avbd/projection_max_correction=0.1
 avbd/internal_ticks_per_second=60
 

@@ -153,9 +153,8 @@ static void test_rest_contact() {
 // below with negligible lateral drift (the paper's headline stability claim).
 //
 // AVBD is a soft-penalty method: the contact interfaces interpenetrate slightly
-// under load (measured ~2.4 cm per interface at the default betaLin, and roughly
-// independent of the iteration count as long as it is >= 10). The assertions below
-// bound that behaviour and would catch collapse (gaps blowing up) or sinking.
+// under load. The assertions below bound that behaviour and would catch collapse
+// (gaps blowing up) or sinking.
 // ---------------------------------------------------------------------------
 static void test_stack_stability() {
     Solver s;
@@ -401,6 +400,154 @@ static void test_interleaved_substeps() {
     report(parallel == a, "interleaved digest threads=8", "0x%016llx vs serial 0x%016llx",
             (unsigned long long)parallel, (unsigned long long)a);
     std::printf("     digest interleaved_300 = 0x%016llx\n", (unsigned long long)a);
+
+    Solver s;
+    s.gravity = -9.8f;
+    s.dt = 1.0f / 240.0f;
+    s.iterations = 12;
+    s.betaLin = 100000.0f;
+    s.speculativeMargin = 0.02f;
+    s.jacobianRebuildDistance = 0.02f;
+    s.projectionMaxCorrection = 0.1f;
+    s.sleepFrames = 30;
+    s.sleepLinearThreshold = 0.05f;
+    s.sleepAngularThreshold = 0.05f;
+    new Rigid(&s, {100, 100, 1}, 0.0f, 0.8f, {0, 0, 0});
+    std::vector<Rigid *> boxes;
+    for (int i = 0; i < 10; i++) {
+        Rigid *box = new Rigid(&s, {1, 1, 1}, 1.0f, 0.8f, {0, 0, 1.0f + i});
+        box->sleep_mode = 1;
+        boxes.push_back(box);
+    }
+    for (int tick = 0; tick < 600; tick++)
+        s.stepInterleaved(4, 2);
+    float height = 0.0f, penetration = 0.0f, drift = 0.0f;
+    for (int i = 0; i < 10; i++) {
+        const float3 p = boxes[i]->positionLin;
+        height = std::max(height, std::fabs(p.z - (1.0f + i)));
+        penetration = std::max(penetration,
+                i == 0 ? 1.0f - p.z : 1.0f - (p.z - boxes[i - 1]->positionLin.z));
+        drift = std::max(drift, std::hypot(p.x, p.y));
+    }
+    report(height <= 0.05f, "interleaved tight stack height", "max height error=%.5f m", height);
+    report(penetration <= 0.01f, "interleaved tight stack penetration", "max interface=%.5f m", penetration);
+    report(drift <= 0.01f, "interleaved tight stack drift", "max lateral=%.5f m", drift);
+}
+
+// Depth of two box bodies as the narrow phase sees it: the deepest contact point pair a
+// collision pass returns at this pose (no speculative margin). Compare with satBoxDepth,
+// which is the geometry alone and needs no contact features.
+static float boxOverlap(const Rigid &a, const Rigid &b) {
+    std::array<Manifold::Contact, 8> contacts;
+    float3x3 basis{};
+    const Shape sa{ ShapeType::Box, a.positionLin, a.positionAng, a.size * 0.5f };
+    const Shape sb{ ShapeType::Box, b.positionLin, b.positionAng, b.size * 0.5f };
+    const int found = collideShapes(sa, sb, contacts, basis);
+    if (found <= 0)
+        return 0.0f;
+    const float3 normal = row(basis, 0);
+    float best = 0.0f;
+    for (int k = 0; k < found; k++) {
+        const float3 pa = a.positionLin + qrot(a.positionAng, contacts[k].rA);
+        const float3 pb = b.positionLin + qrot(b.positionAng, contacts[k].rB);
+        best = std::max(best, -dot(normal, pa - pb));
+    }
+    return best;
+}
+
+// Minimum separating-axis depth of two box bodies - the same test the Godot-side probe
+// runs, so a core `overlap` number and a `probe_overlap` number mean the same thing. Unlike
+// the contact points a manifold stores, this is a property of the geometry alone.
+static float satBoxDepth(const Rigid &a, const Rigid &b) {
+    const float3 ha = a.size * 0.5f, hb = b.size * 0.5f;
+    const float3 ea[3] = { qrot(a.positionAng, float3{ 1, 0, 0 }), qrot(a.positionAng, float3{ 0, 1, 0 }),
+            qrot(a.positionAng, float3{ 0, 0, 1 }) };
+    const float3 eb[3] = { qrot(b.positionAng, float3{ 1, 0, 0 }), qrot(b.positionAng, float3{ 0, 1, 0 }),
+            qrot(b.positionAng, float3{ 0, 0, 1 }) };
+    const float3 d = b.positionLin - a.positionLin;
+    float best = 1.0e9f;
+    auto axis = [&](const float3 &n, float ra, float rb) {
+        const float sep = std::fabs(dot(n, d)) - (ra + rb);
+        if (sep > 0.0f)
+            return false; // a separating axis exists: no overlap at all
+        best = std::min(best, -sep);
+        return true;
+    };
+    for (int i = 0; i < 3; i++) {
+        float ra = ha[i], rb = 0.0f;
+        for (int j = 0; j < 3; j++)
+            rb += hb[j] * std::fabs(dot(ea[i], eb[j]));
+        if (!axis(ea[i], ra, rb))
+            return 0.0f;
+        float rb2 = hb[i], ra2 = 0.0f;
+        for (int j = 0; j < 3; j++)
+            ra2 += ha[j] * std::fabs(dot(ea[j], eb[i]));
+        if (!axis(eb[i], ra2, rb2))
+            return 0.0f;
+    }
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            float3 e = cross(ea[i], eb[j]);
+            const float len2 = dot(e, e);
+            if (len2 < 1.0e-8f)
+                continue; // parallel edges: that axis carries no information
+            e = e / std::sqrt(len2);
+            float r1 = 0.0f, r2 = 0.0f;
+            for (int k = 0; k < 3; k++) {
+                r1 += ha[k] * std::fabs(dot(ea[k], e));
+                r2 += hb[k] * std::fabs(dot(eb[k], e));
+            }
+            if (!axis(e, r1, r2))
+                return 0.0f;
+        }
+    }
+    return best;
+}
+
+// Pyramid impact speed. A body arriving at 18 m/s travels 7.5 cm between two contact
+// refreshes, so interception that only works at rest speeds still overlaps by that much -
+// and the solver then converts that overlap into separation velocity, which is how a
+// collision becomes a launch. The overlap must stay far below one substep of travel and
+// the pile must not leave the impact faster than the striker arrived.
+static void test_impact_interception() {
+    Solver s;
+    s.gravity = -9.8f;
+    s.dt = 1.0f / 240.0f;
+    s.iterations = 12;
+    s.betaLin = 100000.0f;
+    s.speculativeMargin = 0.02f;
+    s.jacobianRebuildDistance = 0.02f;
+    s.projectionMaxCorrection = 0.1f;
+    s.sleepFrames = 30;
+    s.sleepLinearThreshold = 0.05f;
+    s.sleepAngularThreshold = 0.05f;
+    new Rigid(&s, {100, 100, 1}, 0.0f, 0.8f, {0, 0, 0});
+    Rigid *target = new Rigid(&s, {1, 1, 1}, 1.0f, 0.8f, {0, 0, 1.0f});
+    Rigid *striker = new Rigid(&s, {1, 1, 1}, 1.0f, 0.8f, {0, 0, 3.0f}, {0, 0, -18.0f});
+
+    float worst = 0.0f, worstSpeed = 0.0f;
+    int worstTick = -1;
+    for (int tick = 0; tick < 240; tick++) {
+        s.stepInterleaved(4, 2);
+        const float depth = boxOverlap(*striker, *target);
+        if (depth > worst) {
+            worst = depth;
+            worstTick = tick;
+        }
+        for (Rigid *b = s.bodies; b != nullptr; b = b->next)
+            if (b->mass > 0.0f)
+                worstSpeed = std::max(worstSpeed, length(b->velocityLin));
+    }
+    std::printf("     impact: worst=%.5f m at tick %d, max speed=%.3f m/s, striker z=%.4f "
+            "target z=%.4f\n",
+            worst, worstTick, worstSpeed, striker->positionLin.z, target->positionLin.z);
+    report(worst <= 0.02f, "impact overlap bounded", "worst=%.5f m at tick %d (substep travel 0.075 m)",
+            worst, worstTick);
+    report(worstSpeed <= 20.0f, "impact does not amplify speed", "max=%.2f m/s from 18 m/s arrival",
+            worstSpeed);
+    report(std::fabs(target->positionLin.z - 1.0f) <= 0.05f && std::isfinite(striker->positionLin.z),
+            "impact leaves the base placed", "target z=%.4f striker z=%.4f", target->positionLin.z,
+            striker->positionLin.z);
 }
 
 static void test_determinism() {
@@ -1040,9 +1187,298 @@ static void test_speculative_contacts() {
 }
 
 // ---------------------------------------------------------------------------
+// The velocity-side speculative clamp: a gap smaller than the margin closes at
+// most gap/dt per step, so a fast body stops at the surface instead of sinking
+// a whole step's travel deep into the slab.
+// ---------------------------------------------------------------------------
+static void test_speculative_gap_clamp() {
+    Solver s;
+    s.speculativeMargin = 0.01f;
+    new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
+    Rigid *box = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 1.005f}, {0, 0, -10.0f});
+    box->gravity = 0.0f;
+    s.step();
+    // Surface at z = 1.0 (slab top 0.5 + half 0.5). Unimpeded, one step at 10 m/s
+    // would end near z = 0.84; the clamp may only close the 5 mm gap.
+    report(box->positionLin.z > 0.95f, "speculative clamp stops at surface",
+            "z=%.4f after one 10 m/s step from gap 5 mm", box->positionLin.z);
+    report(std::fabs(box->positionLin.z - 1.0f) < 1e-4f && length(box->velocityAng) < 1e-6f,
+            "speculative face stays symmetric", "z=%.7f spin=%.7f",
+            box->positionLin.z, length(box->velocityAng));
+    s.step();
+    report(box->positionLin.z > 0.95f, "speculative clamp holds on second step",
+            "z=%.4f after two steps", box->positionLin.z);
+}
+
+static void test_speculative_collision_horizon() {
+    for (int substeps : {1, 4}) {
+        for (bool projection : {false, true}) {
+            Solver s;
+            s.gravity = 0.0f;
+            s.dt = 1.0f / (60.0f * substeps);
+            s.positionProjection = projection;
+            new Rigid(&s, {100, 100, 0.02f}, 0.0f, 0.5f, {0, 0, -0.01f});
+            Rigid *sphere = new Rigid(&s, {0.05f, 0.05f, 0.05f}, ShapeType::Sphere,
+                    1.0f, 0.5f, {0, 0, 0.3f}, {0, 0, -30.0f});
+            float minHeight = sphere->positionLin.z;
+            for (int tick = 0; tick < 5; tick++) {
+                s.stepInterleaved(substeps, 2);
+                minHeight = std::min(minHeight, sphere->positionLin.z);
+            }
+            report(minHeight >= 0.0f,
+                    "speculative full-tick interception", "substeps=%d projection=%d min z=%.5f final z=%.5f",
+                    substeps, projection, minHeight, sphere->positionLin.z);
+        }
+    }
+    Solver s;
+    s.gravity = 0.0f;
+    s.dt = 1.0f / 240.0f;
+    s.speculativeMargin = 0.0f;
+    s.positionProjection = false;
+    new Rigid(&s, {100, 100, 0.02f}, 0.0f, 0.5f, {0, 0, -0.01f});
+    Rigid *sphere = new Rigid(&s, {0.05f, 0.05f, 0.05f}, ShapeType::Sphere,
+            1.0f, 0.5f, {0, 0, 0.3f}, {0, 0, -30.0f});
+    s.stepInterleaved(4, 2);
+    report(sphere->positionLin.z < 0.0f && s.manifoldCount() == 0,
+            "zero margin disables speculation", "z=%.5f contacts=%d", sphere->positionLin.z, s.manifoldCount());
+}
+
+static void test_projection_shared_contacts() {
+    for (bool reverse : {false, true}) {
+        float3 primalVelocity{};
+        float primalHeight = 0.0f;
+        for (bool projection : {false, true}) {
+            Solver s;
+            s.gravity = 0.0f;
+            s.alpha = 1.0f;
+            s.iterations = 1;
+            s.positionProjection = projection;
+            s.projectionIterations = 1;
+            s.projectionSlop = 0.0f;
+            Rigid *box = nullptr;
+            for (int i = 0; i < 2; i++) {
+                if ((i == 0) == reverse)
+                    box = new Rigid(&s, {1, 1, 1}, 1.0f, 0.0f, {0, 0, 0.9f}, {0, 0, -1});
+                else
+                    new Rigid(&s, {100, 100, 1}, 0.0f, 0.0f, {0, 0, 0});
+            }
+            s.step();
+            if (!projection) {
+                primalVelocity = box->velocityLin;
+                primalHeight = box->positionLin.z;
+            } else {
+                report(length(box->velocityAng) < 1e-6f &&
+                                length(box->velocityLin - primalVelocity) < 1e-6f,
+                        "overlap projection preserves velocity", "reverse=%d spin=%.7f velocity delta=%.7f",
+                        reverse, length(box->velocityAng), length(box->velocityLin - primalVelocity));
+                report(std::fabs(box->positionLin.z - 1.0f) < 1e-5f,
+                        "face projection resolves in one pass", "z=%.5f without projection=%.5f",
+                        box->positionLin.z, primalHeight);
+            }
+        }
+    }
+    for (int slabs : {1, 2, 4}) {
+        for (float density : {1.0f, 10.0f}) {
+            for (float cap : {0.0f, 0.01f}) {
+                Solver s;
+                s.gravity = 0.0f;
+                s.alpha = 1.0f;
+                s.iterations = 1;
+                s.projectionIterations = 1;
+                s.projectionBeta = 1.0f;
+                s.projectionSlop = 0.0f;
+                s.projectionMaxCorrection = cap;
+                std::vector<Rigid *> ground;
+                for (int i = 0; i < slabs; i++)
+                    ground.push_back(new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0}));
+                Rigid *sphere = new Rigid(&s, {0.5f, 0.5f, 0.5f}, ShapeType::Sphere,
+                        density, 0.5f, {0, 0, 0.9f});
+                s.step();
+                const float expected = cap > 0.0f ? 0.9f + cap : 1.0f;
+                bool stationary = length2(sphere->velocityLin) < 1e-10f;
+                for (Rigid *body : ground)
+                    stationary = stationary && length2(body->positionLin) == 0.0f;
+                report(std::fabs(sphere->positionLin.z - expected) < 1e-5f && stationary,
+                        "projection shared-plane response", "slabs=%d density=%.0f cap=%.2f z=%.5f expected=%.5f",
+                        slabs, density, cap, sphere->positionLin.z, expected);
+            }
+        }
+    }
+    Solver s;
+    s.gravity = 0.0f;
+    s.alpha = 1.0f;
+    s.iterations = 1;
+    s.projectionIterations = 1;
+    s.projectionBeta = 1.0f;
+    s.projectionSlop = 0.0f;
+    new Rigid(&s, {1, 100, 100}, 0.0f, 0.5f, {-0.9f, 0, 0});
+    new Rigid(&s, {1, 100, 100}, 0.0f, 0.5f, {0.9f, 0, 0});
+    Rigid *sphere = new Rigid(&s, {0.5f, 0.5f, 0.5f}, ShapeType::Sphere,
+            1.0f, 0.5f, {0, 0, 0});
+    s.step();
+    report(length(sphere->positionLin) < 1e-5f, "opposed projections stay symmetric",
+            "centre offset=%.7f", length(sphere->positionLin));
+}
+
+// ---------------------------------------------------------------------------
+// Margin-aware cylinder paths: collideCylinderBox / collideCylinderCylinder
+// report gap contacts through the signed point queries, and a cylinder parked
+// just above a box holds a speculative manifold that pushes nothing.
+// ---------------------------------------------------------------------------
+static void test_cylinder_margin_contacts() {
+    // Narrow phase: cylinder cap 5 mm above a box face.
+    {
+        Shape box{};
+        box.type = ShapeType::Box;
+        box.half = {0.5f, 0.5f, 0.5f};
+        box.rotation = quatIdentity;
+
+        Shape cyl{};
+        cyl.type = ShapeType::Cylinder;
+        cyl.radius = 0.25f;
+        cyl.halfHeight = 0.5f;
+        cyl.rotation = quatIdentity;
+        cyl.axis = {0, 0, 1};
+        cyl.center = {0, 0, 1.005f}; // cap 5 mm above the box top (0.5)
+
+        std::array<Manifold::Contact, 8> contacts;
+        float3x3 basis{};
+        const int overlapOnly = collideShapes(cyl, box, contacts, basis);
+        const int speculative = collideShapes(cyl, box, contacts, basis, 0.01f);
+        report(overlapOnly == 0 && speculative > 0, "cylinder-box speculative narrow phase",
+                "5 mm gap: margin 0 -> %d contacts, margin 0.01 -> %d", overlapOnly, speculative);
+    }
+
+    // Cylinder against cylinder, 5 mm apart.
+    {
+        Shape lower{};
+        lower.type = ShapeType::Cylinder;
+        lower.radius = 0.25f;
+        lower.halfHeight = 0.5f;
+        lower.rotation = quatIdentity;
+        lower.axis = {0, 0, 1};
+        lower.center = {0, 0, 0};
+
+        Shape upper = lower;
+        upper.center = {0, 0, 1.005f};
+
+        std::array<Manifold::Contact, 8> contacts;
+        float3x3 basis{};
+        const int overlapOnly = collideShapes(lower, upper, contacts, basis);
+        const int speculative = collideShapes(lower, upper, contacts, basis, 0.01f);
+        report(overlapOnly == 0 && speculative > 0, "cylinder-cylinder speculative narrow phase",
+                "5 mm gap: margin 0 -> %d contacts, margin 0.01 -> %d", overlapOnly, speculative);
+    }
+
+    // Solver level: a cylinder parked in the gap holds a manifold, moves nothing.
+    {
+        Solver s;
+        s.speculativeMargin = 0.01f;
+        new Rigid(&s, {1, 1, 1}, ShapeType::Box, 0.0f, 0.5f, {0, 0, 0});
+        Rigid *cyl = new Rigid(&s, {0.5f, 0.5f, 1.0f}, ShapeType::Cylinder, 1.0f, 0.5f, {0, 0, 1.005f});
+        cyl->gravity = 0.0f;
+        s.step();
+
+        float maxNormalC0 = 0.0f;
+        const int count = manifold_contacts(s, maxNormalC0);
+        report(count > 0 && maxNormalC0 > 0.003f, "cylinder gap contact",
+                "contacts=%d max normal C0=%.4f (gap 0.005)", count, maxNormalC0);
+        report(std::fabs(cyl->positionLin.z - 1.005f) < 1.0e-4f, "cylinder gap does not push",
+                "rest z=%.5f from spawn 1.005", cyl->positionLin.z);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cylinder tunneling: falling fast onto a slab with the spawn gap inside the
+// margin, the cylinder must never sink its bottom below the slab top.
+// ---------------------------------------------------------------------------
+static void test_cylinder_tunneling() {
+    Solver s;
+    s.speculativeMargin = 0.01f;
+    new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
+    Rigid *cyl = new Rigid(&s, {0.5f, 0.5f, 1.0f}, ShapeType::Cylinder, 1.0f, 0.5f,
+            {0, 0, 1.008f}, {0, 0, -15.0f});
+    cyl->gravity = 0.0f;
+
+    bool tunnelled = false;
+    for (int i = 0; i < 60; i++)
+    {
+        s.step();
+        // Cylinder bottom (centre - half height) vs slab top (0.5).
+        if (cyl->positionLin.z - 0.5f < 0.5f - 0.01f)
+            tunnelled = true;
+    }
+    report(!tunnelled, "cylinder does not tunnel at 15 m/s",
+            "final z=%.4f (bottom %.4f vs slab top 0.5)",
+            cyl->positionLin.z, cyl->positionLin.z - 0.5f);
+}
+
+// ---------------------------------------------------------------------------
 // Layer/mask filtering: Godot semantics - a pair collides when either side's
 // layer is in the other's mask. Defaults (1/1) keep everything colliding.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Broad-phase bounds. The pair filter drops every candidate whose world AABBs miss,
+// so aabbHalfExtent() must be the tight extent of the ROTATED shape: an extent that
+// is too small hides a genuinely overlapping pair from the narrow phase, and that
+// pair then falls through its neighbour with no constraint at all. Indexing the
+// rotation matrix the wrong way round (rows for columns) is exactly a too-small
+// extent on whichever axis the shape's thin direction leans into.
+// ---------------------------------------------------------------------------
+static void test_broadphase_bounds() {
+    Solver s;
+    // Rigid::size is the full extent, so half = size * 0.5 as the narrow phase uses it.
+    const float3 fullSizes[] = { {2, 2, 1}, {1.2f, 0.4f, 2.8f}, {2, 2, 2}, {1, 4, 0.2f} };
+    const quat tilts[] = {
+            quatIdentity,
+            angleAxis(0.7f, normalize(float3{0.196f, 0.392f, -0.098f})),
+            angleAxis(1.1f, normalize(float3{-0.5f, 0.5f, 0.707f})),
+            angleAxis(-2.0f, normalize(float3{0.3f, -0.8f, 0.5f})),
+            qmul(angleAxis(0.9f, float3{1, 0, 0}), angleAxis(0.6f, float3{0, 1, 0})),
+            qmul(angleAxis(2.4f, float3{0, 1, 0}), angleAxis(-1.3f, float3{1, 0, 0})),
+    };
+    float slack = 0.0f; // largest shortfall of the helper against the corner truth
+    for (const float3 &full : fullSizes) {
+        for (const quat &q : tilts) {
+            Rigid *b = new Rigid(&s, full, 1.0f, 0.5f, {0, 0, 0});
+            b->positionAng = q;
+            const float3 h = full * 0.5f;
+            float3 truth{};
+            for (int sx = -1; sx <= 1; sx += 2)
+                for (int sy = -1; sy <= 1; sy += 2)
+                    for (int sz = -1; sz <= 1; sz += 2) {
+                        const float3 c = qrot(q, float3{sx * h.x, sy * h.y, sz * h.z});
+                        truth.x = std::max(truth.x, std::fabs(c.x));
+                        truth.y = std::max(truth.y, std::fabs(c.y));
+                        truth.z = std::max(truth.z, std::fabs(c.z));
+                    }
+            const float3 got = aabbHalfExtent(*b);
+            if (truth.x - got.x > 1.0e-5f || truth.y - got.y > 1.0e-5f || truth.z - got.z > 1.0e-5f)
+                std::printf("  AABBDIFF size=(%.2f,%.2f,%.2f) q=(%.4f,%.4f,%.4f,%.4f) "
+                        "truth=(%.4f,%.4f,%.4f) got=(%.4f,%.4f,%.4f)\n",
+                        full.x, full.y, full.z, q.x, q.y, q.z, q.w, truth.x, truth.y, truth.z,
+                        got.x, got.y, got.z);
+            slack = std::max({slack, truth.x - got.x, truth.y - got.y, truth.z - got.z});
+            delete b;
+        }
+    }
+    report(slack <= 1.0e-5f, "broadphase aabb contains shape",
+            "largest shortfall=%.6f (negative means the bound is roomy)", slack);
+
+    // The same mismatch from the other side: qmat must be the matrix qrot applies.
+    float worstRot = 0.0f;
+    for (const quat &q : tilts) {
+        const float3x3 m = qmat(q);
+        for (const float3 v : { float3{1, 0, 0}, float3{0, 1, 0}, float3{0, 0, 1},
+                float3{0.4f, -0.7f, 0.25f} }) {
+            const float3 a = qrot(q, v), b = mul(m, v);
+            worstRot = std::max({worstRot, std::fabs(a.x - b.x), std::fabs(a.y - b.y),
+                    std::fabs(a.z - b.z)});
+        }
+    }
+    report(worstRot <= 1.0e-6f, "qmat matches qrot", "largest component diff=%.6f", worstRot);
+}
+
 static void test_layer_mask() {
     Solver s;
     Rigid *ground = new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
@@ -1319,10 +1755,352 @@ static void test_colour_overflow() {
             "drift=%.4f m, max|z|=%.3f m after 10 s mid-air", worst, maxabs);
 }
 
+// ---------------------------------------------------------------------------
+// --pyramid: the Godot pyramid_dbl scene in core coordinates - a 20-column wall of
+// 1 x 1 x 0.5 m boxes with an identical wall dropping onto it from 12 m. Reproduced
+// here so impact penetration can be measured in about a second, without Godot, and
+// with the true geometric overlap read straight from the narrow phase.
+// ---------------------------------------------------------------------------
+static void buildPyramidDouble(Solver &s) {
+    new Rigid(&s, {80, 20, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
+    for (int tier = 0; tier < 2; tier++)
+        for (int row = 0; row < 20; row++) {
+            const int n = 20 - row;
+            const float z = 0.25f + row * 0.52f + tier * 11.813f;
+            for (int i = 0; i < n; i++)
+                new Rigid(&s, {1, 1, 0.5f}, 2.0f, 0.5f,
+                        {(i - (n - 1) * 0.5f) * 1.01f, 0.0f, z});
+        }
+}
+
+// Index of the manifold holding this pair, or -1. Pairs are usually found in the first
+// few slots, so the scan is fine at diagnostic rates.
+static int pairManifold(const Solver &s, const Rigid *a, const Rigid *b) {
+    for (int m = 0; m < s.manifoldCount(); m++) {
+        const Rigid *ma = s.manifoldBodyA(m);
+        const Rigid *mb = s.manifoldBodyB(m);
+        if ((ma == a && mb == b) || (ma == b && mb == a))
+            return m;
+    }
+    return -1;
+}
+
+// Diagnostic knobs for --pyramid, so a mechanism can be attributed without rebuilding
+// variants of the scene.
+static int g_substeps = 4;
+static float g_projectionCap = 0.1f;
+static bool g_projection = true;
+static float g_margin = 0.02f;
+static bool g_contactGs = false; // true: contact-only bodies join the coloured Gauss-Seidel
+static int g_iterations = 12;    // rounds available per tick; per substep it is ceil(/substeps)
+static float g_maxPen = CONTACT_MAX_PENETRATION; // depth the solve is allowed to see
+static float g_ejectGain = 8.0f; // per-tick speed jump that counts as a solver kick
+
+static int runPyramid(int ticks) {
+    Solver s;
+    s.gravity = -9.8f;
+    s.dt = 1.0f / 240.0f;
+    s.iterations = g_iterations;
+    s.betaLin = 100000.0f;
+    s.speculativeMargin = g_margin;
+    s.jacobianRebuildDistance = 0.02f;
+    s.positionProjection = g_projection;
+    s.projectionMaxCorrection = g_projectionCap;
+    s.contactOnlyOverflow = !g_contactGs;
+    s.maxPenetration = g_maxPen;
+    s.sleepFrames = 30;
+    buildPyramidDouble(s);
+
+    std::vector<Rigid *> boxes;
+    Rigid *ground = nullptr;
+    for (Rigid *b = s.bodies; b != nullptr; b = b->next) {
+        if (b->mass > 0.0f)
+            boxes.push_back(b);
+        else
+            ground = b;
+    }
+    std::sort(boxes.begin(), boxes.end(), [](const Rigid *a, const Rigid *b) {
+        return a->initialLin.z != b->initialLin.z ? a->initialLin.z < b->initialLin.z
+                                                  : a->initialLin.x < b->initialLin.x;
+    });
+    std::printf("== core pyramid_dbl  bodies=%d ticks=%d (%.2f s)\n", (int)boxes.size(), ticks,
+            ticks / 60.0f);
+
+    int blind = 0;
+    // The manifold's own constraint value for a pair, at the pose it was measured at.
+    // Deepest contact's stored normal error (the shallowest is hidden by a plain max: a
+    // sheared face carries one deep corner and several near-zero ones).
+    auto manifoldC0 = [&](int m) {
+        float v = m < 0 ? -9.0e3f : 9.0e3f;
+        const int cc = m < 0 ? 0 : s.manifoldContactCount(m);
+        for (int k = 0; k < cc; k++)
+            v = std::min(v, s.manifoldContactError(m, k)[0]);
+        return v;
+    };
+    // Depth the manifold's stored arms and normal imply at the pose they are read at -
+    // what C0 would be recomputed to right now. Compared with the stored C0 it separates a
+    // wrong contact geometry (both small) from a stale constraint value (arms deep, C0 not).
+    auto armsDepthOf = [&](int m) {
+        float v = -9.0f;
+        if (m < 0)
+            return v;
+        const Rigid *ma = s.manifoldBodyA(m), *mb = s.manifoldBodyB(m);
+        const float3 n = s.manifoldNormal(m);
+        const int cc = s.manifoldContactCount(m);
+        for (int k = 0; k < cc; k++) {
+            const Manifold::Contact &ct = s.manifoldContact(m, k);
+            const float3 pa = ma->positionLin + qrot(ma->positionAng, ct.rA);
+            const float3 pb = mb->positionLin + qrot(mb->positionAng, ct.rB);
+            v = std::max(v, COLLISION_MARGIN - dot(n, pa - pb));
+            // The stored value is the clamped one, so compare the deepest contact only.
+        }
+        return v;
+    };
+    // Worst true geometric overlap over all nearby pairs, plus how the solver itself sees
+    // that pair (manifold present? constraint value?), so an overlap that appears inside a
+    // single tick can be told apart from one the solver was told about and ignored.
+    auto findWorst = [&](float &rWorst, int &rIa, int &rIb) {
+        rWorst = 0.0f;
+        rIa = rIb = -1;
+        for (size_t i = 0; i < boxes.size(); i++) {
+            for (size_t j = i + 1; j < boxes.size(); j++) {
+                const Rigid *a = boxes[i], *b = boxes[j];
+                if (std::fabs(a->positionLin.z - b->positionLin.z) > 1.2f ||
+                        std::fabs(a->positionLin.x - b->positionLin.x) > 1.2f)
+                    continue;
+                const float d = satBoxDepth(*a, *b);
+                if (d > 0.005f && pairManifold(s, a, b) < 0) {
+                    blind++;
+                    // No constraint for a pair that is really overlapping: is the narrow
+                    // phase blind to it, or did the pair never reach the narrow phase?
+                    if (blind <= 4) {
+                        std::array<Manifold::Contact, 8> fresh{};
+                        float3x3 fb{};
+                        const Shape sa{ ShapeType::Box, a->positionLin, a->positionAng,
+                                a->size * 0.5f };
+                        const Shape sb{ ShapeType::Box, b->positionLin, b->positionAng,
+                                b->size * 0.5f };
+                        const int found = collideShapes(sa, sb, fresh, fb);
+                        const float3 gap = b->positionLin - a->positionLin;
+                        const float3 ha = aabbHalfExtent(*a), hb = aabbHalfExtent(*b);
+                        const bool aabb = std::fabs(gap.x) < ha.x + hb.x &&
+                                std::fabs(gap.y) < ha.y + hb.y && std::fabs(gap.z) < ha.z + hb.z;
+                        std::printf("  BLIND pair %zu/%zu depth=%.4f freshContacts=%d aabb=%d"
+                                " sweep=%d dist=(%.2f,%.2f,%.2f) v=(%.2f,%.2f)\n", i, j, d, found,
+                                (int)aabb, s.sweepHasPair(a, b) ? 1 : 0,
+                                gap.x, gap.y, gap.z, length(a->velocityLin), length(b->velocityLin));
+                    }
+                }
+                if (d > rWorst) {
+                    rWorst = d;
+                    rIa = (int)i;
+                    rIb = (int)j;
+                }
+            }
+        }
+    };
+
+    std::vector<float> samples;
+    float maxSpeed = 0.0f, lowest = 1.0e9f;
+    int over5cm = 0, detail = 0, inTick = 0;
+    std::vector<bool> escaped(boxes.size(), false);
+    // Ejection watch: a tick that leaves a body moving much faster than it arrived is where
+    // the pile's energy comes from, so the contacts that were open at the time get dumped.
+    std::vector<float> prevSpeed(boxes.size(), 0.0f);
+    int ejects = 0;
+    float maxGain = 0.0f;
+    int traceTicks = 0;
+    for (int tick = 0; tick < ticks; tick++) {
+        const bool sample = tick % 5 == 4;
+        float preWorst = 0.0f;
+        int pia = -1, pib = -1;
+        float preC0 = -9.0f, preArms = -9.0f;
+        if (sample) {
+            findWorst(preWorst, pia, pib);
+            if (pia >= 0) {
+                const int pm = pairManifold(s, boxes[pia], boxes[pib]);
+                preC0 = manifoldC0(pm);
+                // Stored C0 versus the stored arms read at this pose: agreement means the
+                // contact geometry is right and only the value is old; agreeing with the true
+                // depth instead means the constraint is right and the solve is what fails.
+                preArms = armsDepthOf(pm);
+                // A pair already deep and unconstrained when the tick starts: trace the tick
+                // that failed to give it a constraint, rather than the one after it.
+                if (preWorst > 0.05f && pm < 0 && traceTicks == 0) {
+                    s.tracePair[0] = boxes[pia];
+                    s.tracePair[1] = boxes[pib];
+                    traceTicks = 1;
+                }
+            }
+        }
+
+        s.stepInterleaved(g_substeps, 2);
+        if (traceTicks > 0 && --traceTicks == 0)
+            s.tracePair[0] = s.tracePair[1] = nullptr;
+        for (Rigid *b : boxes) {
+            maxSpeed = std::max(maxSpeed, length(b->velocityLin));
+            lowest = std::min(lowest, b->positionLin.z);
+        }
+        // A box below the slab's underside: tell "pushed through the floor" (still inside the
+        // slab footprint, so the ground contact failed) from "squeezed out over the edge".
+        for (size_t i = 0; i < boxes.size(); i++) {
+            Rigid *b = boxes[i];
+            if (escaped[i] || b->positionLin.z > -0.6f)
+                continue;
+            escaped[i] = true;
+            const float3 p = b->positionLin, v = b->velocityLin;
+            std::printf("  ESC t=%.2fs body %zu pose=(%.2f,%.2f,%.2f) v=(%.2f,%.2f,%.2f)"
+                    " overSlab=%d groundManifold=%d\n",
+                    (tick + 1) / 60.0f, i, p.x, p.y, p.z, v.x, v.y, v.z,
+                    (int)(std::fabs(p.x) < 40.0f && std::fabs(p.y) < 10.0f),
+                    pairManifold(s, ground, b));
+        }
+        for (size_t i = 0; i < boxes.size(); i++) {
+            const float now = length(boxes[i]->velocityLin);
+            const float before = prevSpeed[i];
+            const float gain = now - before;
+            prevSpeed[i] = now;
+            maxGain = std::max(maxGain, gain);
+            if (gain < g_ejectGain || ejects >= 12)
+                continue;
+            ejects++;
+            std::printf("  EJECT t=%.2fs body %d speed %.2f -> %.2f dir=(%.2f,%.2f,%.2f)"
+                    " pose=(%.2f,%.2f)\n", (tick + 1) / 60.0f, (int)i, before, now,
+                    boxes[i]->velocityLin.x / now, boxes[i]->velocityLin.y / now,
+                    boxes[i]->velocityLin.z / now, boxes[i]->positionLin.x,
+                    boxes[i]->positionLin.z);
+            const int mc = s.manifoldCount();
+            for (int m = 0; m < mc; m++) {
+                const Rigid *oa = s.manifoldBodyA(m), *ob = s.manifoldBodyB(m);
+                const bool isA = oa == boxes[i];
+                if (!isA && ob != boxes[i])
+                    continue;
+                const Rigid *other = isA ? ob : oa;
+                int oi = -1;
+                for (size_t j = 0; j < boxes.size(); j++)
+                    if (boxes[j] == other)
+                        oi = (int)j;
+                const int cc = s.manifoldContactCount(m);
+                const float3 n = s.manifoldNormal(m);
+                float c0 = -9.0f;
+                for (int k = 0; k < cc; k++)
+                    c0 = std::max(c0, s.manifoldContactError(m, k)[0]);
+                std::printf("      contact %d/%d contacts=%d c0=%.4f n=(%.2f,%.2f,%.2f)"
+                        " otherSpeed=%.2f\n", (int)i, oi, cc, c0, n.x, n.y, n.z,
+                        length(other->velocityLin));
+            }
+        }
+        if (!sample)
+            continue;
+
+        // Energy census: the running peak above says nothing about whether the pile is still
+        // moving, so report the live speeds and how many bodies are awake every second.
+        if ((tick + 1) % 60 == 0) {
+            float liveMax = 0.0f;
+            int awake = 0, moving = 0, flying = 0;
+            for (Rigid *b : boxes) {
+                const float v = length(b->velocityLin);
+                liveMax = std::max(liveMax, v);
+                if (!b->sleeping)
+                    awake++;
+                if (v > 1.0f)
+                    moving++;
+                if (v > 5.0f)
+                    flying++;
+            }
+            std::printf("STATUS t=%.2fs liveMax=%.2f moving=%d flying=%d awake=%d manifolds=%d\n",
+                    (tick + 1) / 60.0f, liveMax, moving, flying, awake, s.manifoldCount());
+        }
+
+        float worst = 0.0f;
+        int ia = -1, ib = -1;
+        findWorst(worst, ia, ib);
+        samples.push_back(worst);
+        if (worst > 0.05f) {
+            over5cm++;
+            if (pia == ia && pib == ib && worst - preWorst > 0.02f)
+                inTick++; // the pair was not reported that way at the start of the tick
+        }
+        if (worst > 0.05f && detail < 20) {
+            detail++;
+            Rigid *a = boxes[ia], *b = boxes[ib];
+            const int m = pairManifold(s, a, b);
+            const int cc = m < 0 ? 0 : s.manifoldContactCount(m);
+            const float c0 = manifoldC0(m);
+            const float armsDepth = armsDepthOf(m);
+            // For a pair with no constraint at all, split "the broad phase never offered
+            // them" from "the narrow phase was asked and produced nothing": call the narrow
+            // phase directly on the same poses the solver just used.
+            int fresh = -1;
+            int swept = -1;
+            if (m < 0) {
+                std::array<Manifold::Contact, 8> fc{};
+                float3x3 fb{};
+                const Shape sa{ ShapeType::Box, a->positionLin, a->positionAng, a->size * 0.5f };
+                const Shape sb{ ShapeType::Box, b->positionLin, b->positionAng, b->size * 0.5f };
+                fresh = collideShapes(sa, sb, fc, fb, 0.0f);
+                swept = s.sweepHasPair(a, b) ? 1 : 0;
+                // Follow this pair through the solver for the next ticks: candidate, filter,
+                // acquire, initialize, reap.
+                s.tracePair[0] = a;
+                s.tracePair[1] = b;
+                traceTicks = 4;
+                // Convention-independent AABB truth: the extent of the eight rotated corners.
+                // If this disagrees with aabbHalfExtent(), the broad phase tests wrong bounds.
+                auto cornerAabb = [](const Rigid &r) {
+                    const float3 h = r.size * 0.5f;
+                    float3 e{};
+                    for (int sx = -1; sx <= 1; sx += 2)
+                        for (int sy = -1; sy <= 1; sy += 2)
+                            for (int sz = -1; sz <= 1; sz += 2) {
+                                const float3 c = qrot(r.positionAng,
+                                        float3{sx * h.x, sy * h.y, sz * h.z});
+                                e.x = std::max(e.x, std::fabs(c.x));
+                                e.y = std::max(e.y, std::fabs(c.y));
+                                e.z = std::max(e.z, std::fabs(c.z));
+                            }
+                    return e;
+                };
+                const float3 ca = cornerAabb(*a), cb = cornerAabb(*b);
+                const float3 ab = aabbHalfExtent(*a), bb = aabbHalfExtent(*b);
+                std::printf("      AABB a size=(%.2f,%.2f,%.2f) corner=(%.3f,%.3f,%.3f) "
+                        "helper=(%.3f,%.3f,%.3f)\n        b size=(%.2f,%.2f,%.2f) "
+                        "corner=(%.3f,%.3f,%.3f) helper=(%.3f,%.3f,%.3f)\n",
+                        a->size.x, a->size.y, a->size.z, ca.x, ca.y, ca.z, ab.x, ab.y, ab.z,
+                        b->size.x, b->size.y, b->size.z, cb.x, cb.y, cb.z, bb.x, bb.y, bb.z);
+            }
+            std::printf("  DEEP t=%.2fs pair %d/%d overlap=%.4f (tick start %.4f, c0 then %.4f,"
+                    " same pair %d)  manifold=%d contacts=%d c0=%.4f armsNow=%.4f preArms=%.4f"
+                    " sweep=%d fresh=%d"
+                    "  a=(%.2f,%.2f) v=%.2f  b=(%.2f,%.2f) v=%.2f\n",
+                    (tick + 1) / 60.0f, ia, ib, worst, preWorst, preC0, pia == ia && pib == ib, m,
+                    cc, c0, armsDepth, preArms, swept, fresh, a->positionLin.x, a->positionLin.z,
+                    length(a->velocityLin),
+                    b->positionLin.x, b->positionLin.z, length(b->velocityLin));
+        }
+        if (worst > 0.05f)
+            std::printf("t=%.2fs worst=%.4f (%d/%d) max_v=%.2f lowest=%.3f\n", (tick + 1) / 60.0f,
+                    worst, ia, ib, maxSpeed, lowest);
+    }
+    std::sort(samples.begin(), samples.end());
+    const size_t n = samples.size();
+    std::printf("RESULT substeps=%d iters=%d proj=%d cap=%.3f spec=%.3f gs=%d penmax=%.3f groups=%d "
+            "overflow=%d "
+            "p50=%.4f p95=%.4f max=%.4f over5cm=%d/%zu blindPairs=%d grewInTick=%d max_v=%.2f "
+            "lowest=%.3f maxGain=%.2f\n",
+            g_substeps, g_iterations, (int)g_projection, g_projectionCap, g_margin, (int)g_contactGs,
+            g_maxPen,
+            s.colourGroups(), s.overflowBodies(), n > 0 ? samples[n / 2] : 0.0f,
+            n > 0 ? samples[(size_t)(n * 0.95)] : 0.0f,
+            n > 0 ? samples[n - 1] : 0.0f, over5cm, n, blind, inTick, maxSpeed, lowest, maxGain);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     std::string scene;
     int steps = 300;
     int threads = 0; // 0 = automatic
+    bool pyramid = false;
 
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -1338,6 +2116,24 @@ int main(int argc, char **argv) {
         } else if (arg == "--shape") {
             report_parallel_shape();
             return 0;
+        } else if (arg == "--pyramid") {
+            pyramid = true;
+        } else if (arg.rfind("--substeps=", 0) == 0) {
+            g_substeps = std::atoi(arg.c_str() + 11);
+        } else if (arg.rfind("--cap=", 0) == 0) {
+            g_projectionCap = (float)std::atof(arg.c_str() + 6);
+        } else if (arg.rfind("--proj=", 0) == 0) {
+            g_projection = std::atoi(arg.c_str() + 7) != 0;
+        } else if (arg.rfind("--spec=", 0) == 0) {
+            g_margin = (float)std::atof(arg.c_str() + 7);
+        } else if (arg.rfind("--gs=", 0) == 0) {
+            g_contactGs = std::atoi(arg.c_str() + 5) != 0;
+        } else if (arg.rfind("--iters=", 0) == 0) {
+            g_iterations = std::atoi(arg.c_str() + 8);
+        } else if (arg.rfind("--penmax=", 0) == 0) {
+            g_maxPen = (float)std::atof(arg.c_str() + 9);
+        } else if (arg.rfind("--eject=", 0) == 0) {
+            g_ejectGain = (float)std::atof(arg.c_str() + 8);
         } else if (arg == "--scene" && i + 1 < argc) {
             scene = argv[++i];
         } else if (arg == "--steps" && i + 1 < argc) {
@@ -1345,14 +2141,17 @@ int main(int argc, char **argv) {
         } else if (arg == "--threads" && i + 1 < argc) {
             threads = std::atoi(argv[++i]);
         } else {
-            std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --bench-two | --shape | --scene NAME [--steps N]]"
-                                 " [--threads N]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --bench-two | --shape |"
+                                 " --pyramid [--steps N] | --scene NAME [--steps N]] [--threads N]\n", argv[0]);
             return 2;
         }
     }
 
     if (!scene.empty()) {
         return run_scene(scene, steps, threads);
+    }
+    if (pyramid) {
+        return runPyramid(steps);
     }
 
     test_rest_contact();
@@ -1379,7 +2178,14 @@ int main(int argc, char **argv) {
     test_round_shape_rolls();
     test_collide_shapes_equivalence();
     test_speculative_contacts();
+    test_speculative_gap_clamp();
+    test_speculative_collision_horizon();
+    test_projection_shared_contacts();
+    test_cylinder_margin_contacts();
+    test_cylinder_tunneling();
+    test_impact_interception();
     test_layer_mask();
+    test_broadphase_bounds();
     test_axis_lock();
     test_pick_mask();
     test_idle_sleep();

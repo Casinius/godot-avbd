@@ -212,6 +212,11 @@ protected:
         double beta_linear = 10000.0;
         double beta_angular = 100.0;
         double gamma = 0.999;
+        // Per-contact adaptive beta ramp (see Solver::adaptiveBeta).
+        bool adaptive_beta = false;
+        // Round split / dual-tail stiffness decay (see Solver::newtonRatio).
+        double newton_ratio = 1.0;
+        double stiffness_decay = 1.0;
         int substeps = 1;
         // Rotation drift (unit-column distance, ~2 sin(angle/2)) above which a manifold's
         // cached angular jacobians are rebuilt. 0 disables the cache and reassembles them
@@ -232,17 +237,9 @@ protected:
         // in a large pile, and BDF1 turns any later correction into velocity; this bounds
         // the overlap in position instead, so under-solving cannot become kinetic energy.
         bool position_projection = true;
-        // Serial Gauss-Seidel sweeps. A correction at the top of a stack needs one sweep
-        // per layer to reach the bottom, so tall piles want more; contacts already
-        // separated cost a single depth test each.
-        int projection_iterations = 8;
+        int projection_iterations = 4;
         double projection_beta = 1.0;
-        // Overlap the net ignores. Resting contacts sit a few millimetres deep and the
-        // penalty solve owns them: projecting those too rotates bodies about their offset
-        // contact anchors every step, and friction has no velocity to counter it with -
-        // a box that should hold on a ramp creeps down it. The net is for crush depths
-        // the penalty solve cannot reach, so it stays out of the ordinary case.
-        double projection_slop = 0.005;
+        double projection_slop = 0.008;
         double projection_max_correction = 0.0;
 
         // Idle-sleep thresholds. The horizon (how long a body must stay under both
@@ -260,10 +257,11 @@ protected:
         int contact_grace_ticks = 0;
 
         // Contact generation distance, in metres (see Solver::speculativeMargin). A contact
-        // is created while the shapes are still separated by up to this much, so a fast
-        // body is stopped at the surface instead of first penetrating several centimetres
-        // and paying for it with a stiff-penalty impulse. 0 = only real overlaps.
-        double speculative_margin = 0.0;
+        // is created while the shapes are still separated by up to this much, and the
+        // velocity pass clamps the approach so the gap closes within one step at most -
+        // a fast body is stopped at the surface instead of first penetrating several
+        // centimetres and paying for it with a stiff-penalty impulse. 0 = only real overlaps.
+        double speculative_margin = 0.01;
 
         // Debug contacts collected during the last step (world space, Godot frame).
 

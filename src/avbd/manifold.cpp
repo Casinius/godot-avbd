@@ -45,6 +45,7 @@ uint32_t ManifoldStore::acquire(Rigid *p_bodyA, Rigid *p_bodyB)
         rAWorld.resize(rAWorld.size() + kMaxManifoldContacts);
         rBWorld.resize(rBWorld.size() + kMaxManifoldContacts);
         contactStick.resize(contactStick.size() + kMaxManifoldContacts);
+        contactBetaScale.resize(contactBetaScale.size() + kMaxManifoldContacts);
         linHessian.resize(linHessian.size() + kMaxManifoldContacts);
     }
 
@@ -72,6 +73,7 @@ uint32_t ManifoldStore::acquire(Rigid *p_bodyA, Rigid *p_bodyB)
         rAWorld[first + k] = float3{};
         rBWorld[first + k] = float3{};
         contactStick[first + k] = 0;
+        contactBetaScale[first + k] = 1.0f;
         linHessian[first + k] = Manifold::BasisHessian{};
     }
 
@@ -104,6 +106,7 @@ void ManifoldStore::clear()
     rAWorld.clear();
     rBWorld.clear();
     contactStick.clear();
+    contactBetaScale.clear();
     linHessian.clear();
     live.clear();
     freeList.clear();
@@ -206,6 +209,21 @@ inline float3 constraintError(const float3 &c0, const float3 &bracket, const flo
     const bool separated = speculative && c0.x > COLLISION_MARGIN + CONTACT_RELEASE_GAP;
     return c0 * (separated ? 1.0f : oneMinusAlpha) + mul(basis, bracket);
 }
+
+// Cap the stored penetration (see CONTACT_MAX_PENETRATION) on the normal row only. The two
+// tangential rows are the friction error, and their size is a property of where the contact
+// anchors sit on the two faces, not of how deep the pair is: in a sheared pile the anchors of
+// one contact are routinely decimetres apart along the friction axes. Scaling the whole
+// vector by its norm then divides the normal depth down by that tangential distance -
+// measured on the double pyramid, a 9 cm penetration arrived at the solve as 0.65 cm, which
+// is under the projection slop and buys almost no penalty force, so the pair sank as far as
+// it could and stayed there. The tangential rows need no cap here: the friction cone limits
+// the force they can produce.
+inline void clampPenetration(float3 &c0, float cap) noexcept
+{
+    if (c0.x < -cap)
+        c0.x = -cap;
+}
 } // namespace
 
 bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
@@ -231,10 +249,20 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
     int newNumContacts = Manifold::collide(a, b, std::span<Manifold::Contact>(newContacts),
             basis[slot]);
 
+    if (solver.traceMatch(a, b))
+    {
+        const float3 d = (a->velocityLin - b->velocityLin) * solver.collisionDt;
+        std::printf("TRACE narrow slot=%u new=%d prev=%d gap=%.4f relV=%.2f margin=%.3f\n", slot,
+                newNumContacts, numContacts[slot],
+                length(a->positionLin - b->positionLin), length(d), solver.speculativeMargin);
+    }
+
     // Hot state carried from the matched previous contacts, indexed by the new contact.
     std::array<float3, kMaxManifoldContacts> newPenalty{};
     std::array<float3, kMaxManifoldContacts> newLambda{};
     std::array<uint8_t, kMaxManifoldContacts> newStick{};
+    std::array<float, kMaxManifoldContacts> newBetaScale;
+    newBetaScale.fill(1.0f);
 
     // Merge old contact data with new contacts. prevErr[i] carries the matched contact's
     // error from the previous step so the diagnostics below can count fresh contacts.
@@ -249,10 +277,13 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
                 const float3 newRA = newContacts[i].rA;
                 const float3 newRB = newContacts[i].rB;
                 newContacts[i] = contacts[first + j];
-                prevErr[i] = length(contactC0[first + j]);
+                // Residual penetration depth, not |C0|: C0 carries the collision margin,
+                // so a resting contact would otherwise look like a constant error.
+                prevErr[i] = std::max(0.0f, COLLISION_MARGIN - contactC0[first + j].x);
                 newPenalty[i] = contactPenalty[first + j];
                 newLambda[i] = contactLambda[first + j];
                 newStick[i] = contactStick[first + j];
+                newBetaScale[i] = contactBetaScale[first + j];
 
                 // If no static friction in last frame, use the new contact point locations
                 if (!contactStick[first + j])
@@ -326,6 +357,7 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
         contactPenalty[first + i] = newPenalty[i];
         contactLambda[first + i] = newLambda[i];
         contactStick[first + i] = newStick[i];
+        contactBetaScale[first + i] = newBetaScale[i];
     }
 
     // Grace dormancy: the pair separated and no contacts came back. Parking the manifold
@@ -365,13 +397,39 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
         float3 xB = b->positionLin + qrot(b->positionAng, contacts[first + i].rB);
         contactC0[first + i] = mul(basis[slot], xA - xB) + float3{COLLISION_MARGIN, 0, 0};
 
-        // The reference implementation reports the full penetration depth here:
-        // a deep impact then produces a proportionally large error and force, and
-        // the primal pushes the body back out within the step. Capping the depth
-        // (as this port once did, at 2 cm) removes the restoring gradient past the
-        // cap - bodies settle anywhere below it and rebound off the stored spring
-        // energy, which showed up as endless bouncing and sink-through on the
-        // round-shape scenes. No clamp.
+        // Cap the depth the solve sees. The BDF1 finish turns the step's displacement into
+        // velocity (v = dp/dt), so an unclamped 10 cm impact overlap is expelled at ~24 m/s,
+        // that body crosses several neighbours before their next collision pass, and each of
+        // those hits injects another ejection - the pile never settles (measured: a double
+        // pyramid at 0.6 m overlaps, boxes leaving at 18 m/s). The residual is re-measured and
+        // driven out over the following steps.
+        clampPenetration(contactC0[first + i], solver.maxPenetration);
+
+        // Adaptive beta (the augmented-Lagrangian kappa update, per contact): a sticking
+        // contact whose penetration did not shrink against last step doubles its personal
+        // ramp multiplier; a converging one halves it back toward 1. Fresh contacts start
+        // neutral. The residual is penetration depth (the margin is not an error to
+        // converge), and a residual at or below the floor counts as solved so float noise
+        // on a resting contact cannot ratchet the multiplier to the cap.
+        if (solver.adaptiveBeta && prevErr[i] >= 0.0f)
+        {
+            const float err = std::max(0.0f, COLLISION_MARGIN - contactC0[first + i].x);
+            const float floor = solver.adaptiveBetaErrorFloor;
+            float scale = newBetaScale[i];
+            if (err <= floor)
+                scale = std::max(scale * 0.5f, 1.0f);
+            else if (prevErr[i] <= floor)
+                scale = std::min(scale * 2.0f, ADAPTIVE_BETA_MAX);
+            else if (err > 0.5f * prevErr[i])
+                scale = std::min(scale * 2.0f, ADAPTIVE_BETA_MAX);
+            else if (err < 0.1f * prevErr[i])
+                scale = std::max(scale * 0.5f, 1.0f);
+            contactBetaScale[first + i] = scale;
+        }
+        else
+        {
+            contactBetaScale[first + i] = 1.0f;
+        }
 
         // Contact release: the anchors say the pair is geometrically apart, so no contact
         // force can act - whatever impulse the dual still holds came from an earlier pose
@@ -410,10 +468,19 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
     return numContacts[slot] > 0;
 }
 
+void ManifoldStore::decayPenalty(uint32_t slot, float decay) noexcept
+{
+    const int first = base(slot);
+    const float3 floor{PENALTY_MIN, PENALTY_MIN, PENALTY_MIN};
+    const float3 cap{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX};
+    for (int i = 0; i < numContacts[slot]; i++)
+        contactPenalty[first + i] = clamp(contactPenalty[first + i] * decay, floor, cap);
+}
+
 // Recompute C0 at the current pose, keeping the contact set (rA/rB/basis) from the tick's
 // collision pass. The prepared force cache belongs to the old C0, so invalidate it; the
 // next primal touch will precompute against the rebased error.
-void ManifoldStore::rebase(uint32_t slot) noexcept
+void ManifoldStore::rebase(uint32_t slot, float maxPenetration) noexcept
 {
     Rigid *a = this->bodyA[slot];
     Rigid *b = this->bodyB[slot];
@@ -423,6 +490,7 @@ void ManifoldStore::rebase(uint32_t slot) noexcept
         const float3 xA = a->positionLin + qrot(a->positionAng, contacts[first + i].rA);
         const float3 xB = b->positionLin + qrot(b->positionAng, contacts[first + i].rB);
         contactC0[first + i] = mul(basis[slot], xA - xB) + float3{COLLISION_MARGIN, 0, 0};
+        clampPenetration(contactC0[first + i], maxPenetration);
     }
     flags[slot] = static_cast<uint8_t>(flags[slot] & ~kPrimalCacheReady);
 }
@@ -656,7 +724,7 @@ void ManifoldStore::updateDual(uint32_t slot, const Solver &solver, float alpha)
         contactLambda[first + i] = F;
 
         // Update the penalty parameter and clamp to material stiffness if we are within the force bounds (Eq. 16)
-        const float beta = solver.betaLin;
+        const float beta = solver.betaLin * contactBetaScale[first + i];
         if (F[0] < 0)
             contactPenalty[first + i][0] = std::min(contactPenalty[first + i][0] + beta * std::fabs(C[0]), PENALTY_MAX);
         if (frictionScale <= bounds)
@@ -710,7 +778,9 @@ void ManifoldStore::accumulatePenetration(uint32_t slot, const Solver &solver, f
     {
         if (speculative && contactC0[first + i][0] > 0.0f)
             continue;
-        const float penetration = length(contactC0[first + i]);
+        // The normal row alone: the tangential rows are anchor offsets on the friction axes
+        // and would dominate the probe without saying anything about penetration.
+        const float penetration = -contactC0[first + i][0];
         if (penetration > 0.0f)
         {
             r_total += penetration;

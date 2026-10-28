@@ -515,11 +515,14 @@ inline int buildEdgeContact(const Shape& shapeA, const Shape& shapeB, const OBB&
 // from frame to frame and warm-starting works.
 // -----------------------------------------------------------------------------
 
-constexpr int RIM_SAMPLES = 12;
+constexpr int RIM_SAMPLES = 8;
 // Interior rings along a cylinder's side, between the two caps.
 constexpr int AXIAL_SAMPLES = 3;
+// Per-cylinder surface sample count; also the array size used by cylinderSamples callers.
+constexpr int MAX_CYL_SAMPLES = 2 * (RIM_SAMPLES + 1) + RIM_SAMPLES * (AXIAL_SAMPLES - 1);
 // Upper bound on the candidate contacts one shape pair can produce before they are ranked.
-constexpr int MAX_CANDIDATES = 96;
+// cyl-cyl samples both shapes, box-cylinder adds the 8 corners on top.
+constexpr int MAX_CANDIDATES = 2 * MAX_CYL_SAMPLES + 8;
 
 inline Shape makeShape(const Rigid* body)
 {
@@ -560,6 +563,40 @@ inline bool pointInBox(const Shape& box, const float3& p, float3& r_push, float&
     localPush[bestAxis] = bestSign;
     r_push = qrot(box.rotation, localPush);
     r_depth = bestDepth;
+    return true;
+}
+
+// Speculative variant of pointInBox: a point outside but within `margin` of the box reports a
+// gap - r_depth negative, r_push pointing out of the box toward the point, so the existing
+// anchor math `other = sample + push * depth` lands on the box surface for both signs. The
+// closest point is the componentwise clamp of the local coordinates, which is exact for box
+// edges. Returns false when the point is inside (use pointInBox) or farther than margin out.
+inline bool pointNearBox(const Shape& box, const float3& p, float margin, float3& r_push, float& r_depth)
+{
+    const float3 local = qrot(qconj(box.rotation), p - box.center);
+
+    bool outside = false;
+    for (size_t i = 0; i < 3; ++i)
+    {
+        if (std::fabs(local[i]) >= box.half[i])
+        {
+            outside = true;
+            break;
+        }
+    }
+    if (!outside)
+        return false;
+
+    const float3 clampedLocal{std::clamp(local.x, -box.half.x, box.half.x),
+            std::clamp(local.y, -box.half.y, box.half.y),
+            std::clamp(local.z, -box.half.z, box.half.z)};
+    const float3 d = local - clampedLocal;
+    const float gap = length(d);
+    if (gap > margin || gap <= 1.0e-9f)
+        return false;
+
+    r_push = qrot(box.rotation, d / gap);
+    r_depth = -gap;
     return true;
 }
 
@@ -634,6 +671,28 @@ inline bool pointInCylinder(const Shape& cyl, const float3& p, float3& r_push, f
     }
 
     r_push = qrot(cyl.rotation, pushLocal);
+    return true;
+}
+
+// Speculative variant of pointInCylinder: a point outside but within `margin` of the cylinder
+// reports a gap - r_depth negative, r_push pointing out of the cylinder toward the point, so
+// `other = sample + push * depth` lands on the cylinder surface for both signs. Returns false
+// when the point is inside (use pointInCylinder) or farther than margin out.
+inline bool pointNearCylinder(const Shape& cyl, const float3& p, float margin, float3& r_push, float& r_depth)
+{
+    const float3 local = qrot(qconj(cyl.rotation), p - cyl.center);
+    const float radialSq = local.x * local.x + local.y * local.y;
+    if (radialSq < cyl.radius * cyl.radius && std::fabs(local.z) < cyl.halfHeight)
+        return false;
+
+    float3 outward;
+    float distance;
+    closestPointOnCylinder(cyl, p, outward, distance);
+    if (distance > margin)
+        return false;
+
+    r_push = outward;
+    r_depth = -distance;
     return true;
 }
 
@@ -857,7 +916,7 @@ inline int collideSphereCylinder(const Shape& a, const Shape& b, bool sphereIsA,
 // samples against the box, and the box's corners against the cylinder - so neither shape can slip
 // through the other however they are arranged.
 inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
-        std::span<Manifold::Contact> contacts, float3x3& basisOut)
+        std::span<Manifold::Contact> contacts, float3x3& basisOut, float speculativeMargin)
 {
     const Shape& cyl = cylinderIsA ? a : b;
     const Shape& box = cylinderIsA ? b : a;
@@ -867,7 +926,7 @@ inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
     float3 normalAB{0, 0, 0};
 
     // Cylinder surface points that are inside the box.
-    float3 samples[2 * (RIM_SAMPLES + 1) + RIM_SAMPLES * (AXIAL_SAMPLES - 1)];
+    float3 samples[MAX_CYL_SAMPLES];
     int sampleCount = 0;
     cylinderSamples(cyl, samples, sampleCount);
 
@@ -875,7 +934,8 @@ inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
     {
         float3 pushOut;
         float depth;
-        if (!pointInBox(box, samples[i], pushOut, depth))
+        if (!pointInBox(box, samples[i], pushOut, depth) &&
+                !(speculativeMargin > 0.0f && pointNearBox(box, samples[i], speculativeMargin, pushOut, depth)))
             continue;
 
         Candidate& c = candidates[candidateCount++];
@@ -898,7 +958,8 @@ inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
 
         float3 pushOut;
         float surfaceDist;
-        if (!pointInCylinder(cyl, cornerWorld, pushOut, surfaceDist))
+        if (!pointInCylinder(cyl, cornerWorld, pushOut, surfaceDist) &&
+                !(speculativeMargin > 0.0f && pointNearCylinder(cyl, cornerWorld, speculativeMargin, pushOut, surfaceDist)))
             continue;
 
         Candidate& c = candidates[candidateCount++];
@@ -923,13 +984,13 @@ inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
 
 // Cylinder against cylinder: each one's surface samples tested against the other.
 inline int collideCylinderCylinder(const Shape& a, const Shape& b,
-        std::span<Manifold::Contact> contacts, float3x3& basisOut)
+        std::span<Manifold::Contact> contacts, float3x3& basisOut, float speculativeMargin)
 {
     std::array<Candidate, MAX_CANDIDATES> candidates;
     int candidateCount = 0;
     float3 normalAB{0, 0, 0};
 
-    float3 samples[2 * (RIM_SAMPLES + 1) + RIM_SAMPLES * (AXIAL_SAMPLES - 1)];
+    float3 samples[MAX_CYL_SAMPLES];
     const Shape* pair[2] = {&a, &b};
 
     for (int pass = 0; pass < 2; ++pass)
@@ -945,7 +1006,8 @@ inline int collideCylinderCylinder(const Shape& a, const Shape& b,
         {
             float3 pushOut;
             float surfaceDist;
-            if (!pointInCylinder(into, samples[i], pushOut, surfaceDist))
+            if (!pointInCylinder(into, samples[i], pushOut, surfaceDist) &&
+                    !(speculativeMargin > 0.0f && pointNearCylinder(into, samples[i], speculativeMargin, pushOut, surfaceDist)))
                 continue;
 
             Candidate& c = candidates[candidateCount++];
@@ -993,15 +1055,16 @@ int collideShapes(const Shape& a, const Shape& b,
             return collideSphereBox(a, b, sphereIsA, contacts, basisOut, speculativeMargin);
         }
 
-        // The sampled cylinder paths stay penetration-only: every sample must be inside
-        // the other shape. The swept broad phase still admits the pair, and a contact
-        // appears the moment the shapes actually touch.
+        // The sampled cylinder paths accept gap contacts through the same signed point
+        // queries: a sample within the margin of the other shape reports a negative depth
+        // (a gap), and the solver's speculative machinery turns that into a contact that
+        // only pushes once the pair would close the gap within the step.
         if (a.type == ShapeType::Cylinder && b.type == ShapeType::Cylinder)
-            return collideCylinderCylinder(a, b, contacts, basisOut);
+            return collideCylinderCylinder(a, b, contacts, basisOut, speculativeMargin);
 
         // One cylinder, one box.
         const bool cylinderIsA = a.type == ShapeType::Cylinder;
-        return collideCylinderBox(a, b, cylinderIsA, contacts, basisOut);
+        return collideCylinderBox(a, b, cylinderIsA, contacts, basisOut, speculativeMargin);
     }
 
     OBB boxA = makeOBB(a);
@@ -1076,8 +1139,19 @@ int Manifold::collide(Rigid* bodyA, Rigid* bodyB,
 {
     // Thin wrapper: flatten both bodies into shape queries and reuse the solver-free path.
     // Only the solver's contacts are speculative; the space-query paths keep margin 0.
-    const Solver *owner = bodyA != nullptr ? bodyA->solver : nullptr;
-    const float speculativeMargin = owner != nullptr ? owner->speculativeMargin : 0.0f;
+    const Solver *owner = bodyA->solver;
+    float speculativeMargin = owner->speculativeMargin;
+    if (speculativeMargin > 0.0f)
+    {
+        const float horizon = owner->collisionDt;
+        const float gravityA = bodyA->mass > 0.0f ? bodyA->gravity : 0.0f;
+        const float gravityB = bodyB->mass > 0.0f ? bodyB->gravity : 0.0f;
+        const float3 displacement = (bodyA->velocityLin - bodyB->velocityLin) * horizon
+                + float3{0, 0, (gravityA - gravityB) * horizon * horizon};
+        speculativeMargin += length(displacement)
+                + (bodyA->radius * length(bodyA->velocityAng)
+                        + bodyB->radius * length(bodyB->velocityAng)) * horizon;
+    }
     return collideShapes(makeShape(bodyA), makeShape(bodyB), contacts, basisOut, speculativeMargin);
 }
 
