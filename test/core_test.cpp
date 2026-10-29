@@ -10,6 +10,11 @@
  *   xmake run avbd_core_test --list          # names of the ported scenes
  *   xmake run avbd_core_test --scene Stack --steps 300
  *   xmake run avbd_core_test --bench         # 512-box pyramid timing
+ *   xmake run avbd_core_test --bench-ratio --threads 8   # serial vs parallel speedup
+ *   xmake run avbd_core_test --sleep         # sleep/wake audit across tick rates
+ *
+ * A --scene run also reads the AVBD_* tuning overrides listed in step_n(), which is how the
+ * measurements quoted next to a knob are reproduced without editing the solver defaults.
  */
 
 #include <algorithm>
@@ -21,6 +26,8 @@
 #include <cstdlib>
 #include <ctime>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "avbd/solver.h"
@@ -46,6 +53,84 @@ static void report(bool ok, const char *name, const char *fmt, ...) {
 }
 
 static void step_n(Solver &s, int n) {
+    // Tuning affordance: AVBD_JACOBI_RELAX / AVBD_CHEBYSHEV_RHO override the combine
+    // controls for sweep runs without touching the solver defaults. Same value for every
+    // solver in a process, so determinism/parallel-equivalence checks stay meaningful.
+    static const float relax = []() {
+        const char *env = std::getenv("AVBD_JACOBI_RELAX");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0f;
+    }();
+    static const float rho = []() {
+        const char *env = std::getenv("AVBD_CHEBYSHEV_RHO");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0f;
+    }();
+    // The projection layer and the round budget it is meant to substitute for, for the same
+    // reason and with the same 0-means-leave-alone convention.
+    static const int projection = []() {
+        const char *env = std::getenv("AVBD_PROJECTION_ROUNDS");
+        return env != nullptr ? std::atoi(env) : 0;
+    }();
+    static const int iterations = []() {
+        const char *env = std::getenv("AVBD_ITERATIONS");
+        return env != nullptr ? std::atoi(env) : 0;
+    }();
+    static const float newtonRatio = []() {
+        const char *env = std::getenv("AVBD_NEWTON_RATIO");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0f;
+    }();
+    // "0" is the only meaningful override here (the default is on), so the convention is inverted:
+    // set it to zero to take the dual feedback away from the projection.
+    static const int feedback = []() {
+        const char *env = std::getenv("AVBD_PROJECTION_FEEDBACK");
+        return env != nullptr ? std::atoi(env) : -1;
+    }();
+    static const float projScale = []() {
+        const char *env = std::getenv("AVBD_PROJECTION_SCALE");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0f;
+    }();
+    static const float projMax = []() {
+        const char *env = std::getenv("AVBD_PROJECTION_MAX");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : -1.0f;
+    }();
+    // Read as a raw value, including 0: the default is 0, and a sweep needs to be able to ask for
+    // the other end of the range without a second convention.
+    static const float projTransfer = []() {
+        const char *env = std::getenv("AVBD_PROJECTION_TRANSFER");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : -1.0f;
+    }();
+    // The two scopes, with the same inverted convention as feedback: only the off side is worth
+    // asking for from the shell, because the numbers documented in SolverParams::Projection are
+    // on/off pairs.
+    static const int projJoints = []() {
+        const char *env = std::getenv("AVBD_PROJECTION_JOINTS");
+        return env != nullptr ? std::atoi(env) : -1;
+    }();
+    static const int projContacts = []() {
+        const char *env = std::getenv("AVBD_PROJECTION_CONTACTS");
+        return env != nullptr ? std::atoi(env) : -1;
+    }();
+    if (relax > 0.0f)
+        s.params.primal.jacobiRelaxation = relax;
+    if (rho > 0.0f)
+        s.params.primal.chebyshevRho = rho;
+    if (projection > 0)
+        s.params.projection.rounds = projection;
+    if (iterations > 0)
+        s.iterations = iterations;
+    if (newtonRatio > 0.0f)
+        s.params.primal.newtonRatio = newtonRatio;
+    if (feedback >= 0)
+        s.params.projection.dualFeedback = feedback != 0;
+    if (projScale > 0.0f)
+        s.params.projection.scale = projScale;
+    if (projMax >= 0.0f)
+        s.params.projection.maxCorrection = projMax;
+    if (projTransfer >= 0.0f)
+        s.params.projection.velocityTransfer = projTransfer;
+    if (projJoints >= 0)
+        s.params.projection.joints = projJoints != 0;
+    if (projContacts >= 0)
+        s.params.projection.contacts = projContacts != 0;
     for (int i = 0; i < n; i++) {
         s.step();
     }
@@ -390,9 +475,10 @@ static const CoreScene *find_scene(const std::string &name) {
 }
 
 // ---------------------------------------------------------------------------
-// The parallel update must not depend on how many threads run it: work inside a colour
-// is independent, so the split cannot change the result. If this ever fails, the
-// colouring has put two coupled bodies in the same group (a race and a wrong answer).
+// The parallel update must not depend on how many threads run it: every force solves its
+// own mass-split problem against the same pose snapshot, and each body sums its shares in
+// list order, so the split cannot change the result. If this ever fails, a phase boundary
+// is missing and coupled work is racing.
 // ---------------------------------------------------------------------------
 static uint64_t scene_digest(int threads, int steps) {
     Solver s;
@@ -404,11 +490,9 @@ static uint64_t scene_digest(int threads, int steps) {
     return state_digest(s);
 }
 
-static uint64_t mixed_digest(int threads) {
-    Solver s;
-    s.threads = threads;
-    // Bodies coupled by contacts and joints, plus a free-falling stack, so the colours are
-    // varied: contacts (coupled), joints (coupled), and singletons.
+// Bodies coupled by contacts and joints, plus a free-falling stack, so the update set
+// is varied: contacts (coupled), joints (coupled), and singletons.
+static void build_mixed(Solver &s) {
     new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
     Rigid *prev = 0;
     for (int i = 0; i < 30; i++) {
@@ -419,6 +503,12 @@ static uint64_t mixed_digest(int threads) {
     }
     for (int i = 0; i < 40; i++)
         new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {5.0f + (float)i * 1.2f, 0, 3.0f + (float)(i % 5)});
+}
+
+static uint64_t mixed_digest(int threads) {
+    Solver s;
+    s.threads = threads;
+    build_mixed(s);
     step_n(s, 240);
     return state_digest(s);
 }
@@ -446,8 +536,35 @@ static void test_parallel_equivalence() {
     }
 }
 
-// Report the shape of the constraint graph: how much of the work can run at once.
-static void report_colouring() {
+// Two solvers stepped from two host threads. Both must match the serial reference, and
+// neither may deadlock on the shared worker pool: a region reserves its helpers instead of
+// holding a process-global loop mutex, and every join is a per-dispatch latch. With
+// threads=4 each, two regions fit in an 8-thread machine and can overlap.
+static void test_concurrent_solvers() {
+    const uint64_t expected = mixed_digest(1);
+
+    Solver a;
+    Solver b;
+    a.threads = 4;
+    b.threads = 4;
+    build_mixed(a);
+    build_mixed(b);
+
+    std::thread ta([&a] { step_n(a, 240); });
+    std::thread tb([&b] { step_n(b, 240); });
+    ta.join();
+    tb.join();
+
+    const uint64_t da = state_digest(a);
+    const uint64_t db = state_digest(b);
+    report(da == expected, "concurrent solver A", "0x%016llx vs serial 0x%016llx",
+            (unsigned long long)da, (unsigned long long)expected);
+    report(db == expected, "concurrent solver B", "0x%016llx vs serial 0x%016llx",
+            (unsigned long long)db, (unsigned long long)expected);
+}
+
+// Report the parallel shape of each scene: how many bodies the Jacobi primal moves.
+static void report_parallel_shape() {
     const char *names[] = {"Stack", "Pyramid", "Soft Body", "Bridge"};
     for (const char *name : names) {
         const CoreScene *scene = find_scene(name);
@@ -461,8 +578,8 @@ static void report_colouring() {
         for (Rigid *b = s.bodies; b != 0; b = b->next)
             if (b->mass > 0)
                 movable++;
-        std::printf("     colours %-10s colours=%2d widest=%4d movable=%4d threads=%d\n", name, s.colourCount(),
-                s.widestColour(), movable, s.threadCount());
+        std::printf("     shape    %-10s bodies=%4d movable=%4d threads=%d\n", name, count_bodies(s),
+                movable, s.threadCount());
     }
 }
 
@@ -595,7 +712,7 @@ static void test_spin_retention() {
 // as the axis is stiffened, so this is the check that catches it.
 static float limit_excursion(float p_betaAng) {
     Solver s;
-    s.betaAng = p_betaAng;
+    s.params.dual.betaAng = p_betaAng;
     GenericRig rig(s, {0, 0, 0});
     for (int i = 0; i < 3; i++)
         rig.setAxis(i, false, AxisMode::Locked);
@@ -991,12 +1108,13 @@ static void test_pick_mask() {
 
 // ---------------------------------------------------------------------------
 // Idle sleep: a settled stack of sleep-enabled boxes must fall asleep on its own
-// (Solver::sleepFrames idle detection), and sleeping must not corrupt state. The core
-// suite default keeps sleepFrames = 0, so this is opt-in behaviour.
+// (SolverParams::Sleep::timeToSleep idle detection), and sleeping must not corrupt state. The
+// core suite default keeps timeToSleep = 0, so this is opt-in behaviour. The window is five
+// steps of the default 60 Hz dt, which is what the seconds budget converts back to.
 // ---------------------------------------------------------------------------
 static void test_idle_sleep() {
     Solver s;
-    s.sleepFrames = 5;
+    s.params.sleep.timeToSleep = 5.0f / 60.0f;
     new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
     Rigid *a = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f});
     Rigid *b = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 1.5f});
@@ -1009,6 +1127,182 @@ static void test_idle_sleep() {
 }
 
 // ---------------------------------------------------------------------------
+// Sleep audit (--sleep)
+//
+// Three measurements behind the wake/sleep review, in the order their claims get stronger:
+//
+//  1. Jitter rows - a body disturbed by a fixed DISTANCE every step, which is what a solver's
+//     residual actually is, at three tick rates. The distance is the same at every rate; the BDF1
+//     velocity it implies is not. Half a millimetre per step is 0.03 m/s at 60 Hz and 0.24 m/s at
+//     480 Hz, past Godot's 0.1 m/s threshold, so a rest test that reads that velocity sleeps at one
+//     rate and never at the other, and a rest test that reads travel over a window sleeps at the
+//     same second on both. The seconds are asserted. (The window gate is dt-independent by
+//     construction - this row is the guard that keeps it that way if a rate gate creeps back into
+//     the quiet test.)
+//  2. Stack rows - a real three-box stack on the ground, which is where the thrash used to live:
+//     how many times it wakes itself after its first sleep. Asserted at zero. The seconds are only
+//     printed, because this scene is still creeping when it sleeps (its boxes sink 20-60 mm over
+//     the run, and about half as fast again per second at 240 Hz as at 60): its onset measures the
+//     solver's own settling, not the sleep logic, and no threshold on it would be a fair test.
+//  3. Wake row - a box dropped on the sleeping island. It has to wake, once, as a unit, and the
+//     island has to be parked again afterwards. Asserted.
+// ---------------------------------------------------------------------------
+struct SleepRow {
+    float dt = 0.0f;
+    float secondsToSleep = -1.0f; // simulated seconds until the watched bodies are all asleep
+    int wakeEvents = 0;           // all-asleep -> any-awake flips after that first sleep
+    bool asleepAtEnd = false;
+};
+
+// The island's transitions are counted, not each body's: a chain that wakes one box at a time is
+// the behaviour under audit, so the unit of the count has to be the chain.
+static void audit_note_tick(SleepRow &row, int tick, int asleep, int total) {
+    const bool allAsleep = asleep == total;
+    if (row.secondsToSleep < 0.0f) {
+        if (allAsleep) {
+            row.secondsToSleep = static_cast<float>(tick + 1) * row.dt;
+        }
+    } else if (row.asleepAtEnd && !allAsleep) {
+        row.wakeEvents++;
+    }
+    if (row.secondsToSleep >= 0.0f) {
+        row.asleepAtEnd = allAsleep;
+    }
+}
+
+static SleepRow audit_jitter_row(float dt, float budget, float amplitude) {
+    Solver s;
+    s.threads = 1;
+    s.dt = dt;
+    s.gravity = 0.0f; // nothing but the disturbance may move this body
+    s.params.sleep.timeToSleep = budget;
+    Rigid *body = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0});
+    body->sleep_mode = 1;
+
+    SleepRow row;
+    row.dt = dt;
+    const int maxTicks = static_cast<int>(10.0f / dt);
+    for (int t = 0; t < maxTicks && row.secondsToSleep < 0.0f; t++) {
+        // Injected as the velocity the integrator turns into exactly `amplitude` of travel, so the
+        // distance per step is the same at every tick rate and its velocity is not.
+        body->velocityLin = float3{((t & 1) ? -amplitude : amplitude) / dt, 0, 0};
+        s.step();
+        audit_note_tick(row, t, body->sleeping ? 1 : 0, 1);
+    }
+    return row;
+}
+
+// `dropAfterSeconds` < 0 runs the plain settle; otherwise the stack is watched until it has parked,
+// a box is dropped on it from 8 m at that second, and the run continues. The watched set stays the
+// three boxes either way: a striker born awake is not a wake-up, and counting it as one would let
+// the row assert its own bookkeeping instead of the island's.
+static SleepRow audit_stack_row(float dt, float budget, float dropAfterSeconds) {
+    Solver s;
+    s.threads = 1;
+    s.dt = dt;
+    s.params.sleep.timeToSleep = budget;
+    new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, -0.5f}); // static ground
+    std::vector<Rigid *> island;
+    for (int i = 0; i < 3; i++) {
+        Rigid *b = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f + static_cast<float>(i)});
+        b->sleep_mode = 1;
+        island.push_back(b);
+    }
+
+    SleepRow row;
+    row.dt = dt;
+    const int maxTicks = static_cast<int>(20.0f / dt);
+    const int strikeTick = dropAfterSeconds < 0.0f ? -1 : static_cast<int>(dropAfterSeconds / dt);
+    // How long, after the last transition, the island has to hold still for the row to have answered
+    // its question: six seconds of parked stack is the thrash watch, one is the re-park proof.
+    const float parkSeconds = strikeTick < 0 ? 6.0f : 1.0f;
+    int parked = 0;
+
+    for (int t = 0; t < maxTicks; t++) {
+        if (t == strikeTick) {
+            Rigid *striker = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 8.0f});
+            striker->sleep_mode = 1;
+        }
+        s.step();
+        int asleep = 0;
+        for (Rigid *b : island) {
+            asleep += b->sleeping ? 1 : 0;
+        }
+        audit_note_tick(row, t, asleep, static_cast<int>(island.size()));
+        if (asleep == static_cast<int>(island.size())) {
+            parked++;
+        } else {
+            parked = 0;
+        }
+        // The plain rows answer with six parked seconds; the strike row may only end once the
+        // island has actually woken - a parked count from before the drop proves nothing.
+        if (parked > static_cast<int>(parkSeconds / dt) && (strikeTick < 0 || row.wakeEvents > 0)) {
+            break;
+        }
+    }
+    int asleep = 0;
+    for (Rigid *b : island) {
+        asleep += b->sleeping ? 1 : 0;
+    }
+    row.asleepAtEnd = asleep == static_cast<int>(island.size());
+    return row;
+}
+
+static float spread_of(const SleepRow rows[], int n) {
+    float spread = 0.0f;
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            if (rows[i].secondsToSleep >= 0.0f && rows[j].secondsToSleep >= 0.0f) {
+                spread = std::max(spread, std::fabs(rows[i].secondsToSleep - rows[j].secondsToSleep));
+            }
+        }
+    }
+    return spread;
+}
+
+static void print_rows(const char *title, const SleepRow rows[], int n) {
+    std::printf("%s\n%-10s %-18s %-12s %s\n", title, "dt", "seconds to sleep", "wake events",
+            "asleep at end");
+    for (int i = 0; i < n; i++) {
+        std::printf("%-10.6f %-18.3f %-12d %s\n", rows[i].dt, rows[i].secondsToSleep,
+                rows[i].wakeEvents, rows[i].asleepAtEnd ? "yes" : "NO");
+    }
+}
+
+static int run_sleep_audit() {
+    std::printf("sleep audit: threads=1, 0.5 s budget\n");
+
+    // 0.5 mm of travel per step: 0.03 m/s at 60 Hz, 0.24 m/s at 480 Hz.
+    SleepRow jitter[3] = {audit_jitter_row(1.0f / 60.0f, 0.5f, 0.0005f),
+            audit_jitter_row(1.0f / 240.0f, 0.5f, 0.0005f), audit_jitter_row(1.0f / 480.0f, 0.5f, 0.0005f)};
+    print_rows("jitter: one body, 0.5 mm of position noise per step", jitter, 3);
+    const float jitterSpread = spread_of(jitter, 3);
+    // Two ticks of the slowest clock is the slack: the budget conversion rounds, and that is all
+    // this scene has to disagree about.
+    report(jitter[0].secondsToSleep > 0.0f && jitterSpread < 0.05f, "sleep onset in seconds",
+            "spread across dt = %.4f s (limit 0.05)", jitterSpread);
+
+    SleepRow stack[3] = {audit_stack_row(1.0f / 60.0f, 0.5f, -1.0f),
+            audit_stack_row(1.0f / 240.0f, 0.5f, -1.0f), audit_stack_row(1.0f / 480.0f, 0.5f, -1.0f)};
+    print_rows("stack: three boxes on ground, settling", stack, 3);
+    int wakeEvents = 0;
+    for (const SleepRow &row : stack) {
+        wakeEvents += row.wakeEvents;
+    }
+    report(wakeEvents == 0, "settled stack stays asleep", "wake events = %d", wakeEvents);
+    report(stack[0].asleepAtEnd && stack[1].asleepAtEnd && stack[2].asleepAtEnd,
+            "every rate ends asleep", "60=%d 240=%d 480=%d", stack[0].asleepAtEnd, stack[1].asleepAtEnd,
+            stack[2].asleepAtEnd);
+
+    SleepRow hit = audit_stack_row(1.0f / 120.0f, 0.5f, 5.0f);
+    print_rows("wake: same stack, a fourth box dropped on it at 5 s", &hit, 1);
+    report(hit.wakeEvents == 1, "impact wakes the island", "slept at %.2f s, wake events = %d",
+            hit.secondsToSleep, hit.wakeEvents);
+    report(hit.asleepAtEnd, "and it parks again", "after wake events = %d", hit.wakeEvents);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // CLI helpers
 // ---------------------------------------------------------------------------
 static void list_scenes() {
@@ -1017,7 +1311,32 @@ static void list_scenes() {
     }
 }
 
-static int run_scene(const std::string &name, int steps, int threads) {
+// Scene-generic quality: the contact residual over the whole solver, mean and worst, in metres.
+// `C0.norm()` is the number the solver ramps its own penalty against, collision margin included,
+// so a well-settled contact reads about COLLISION_MARGIN (5 mm) rather than zero. Comparing two
+// configurations of the same scene is what it is for; the absolute value carries the margin bias.
+static void scene_penetration(const Solver &s, float &r_mean, float &r_worst) {
+    double total = 0.0;
+    int count = 0;
+    r_mean = 0.0f;
+    r_worst = 0.0f;
+    for (const Force *f = s.forces; f != nullptr; f = f->next) {
+        if (f->kind != ForceKind::Contact)
+            continue;
+        const Manifold *manifold = f->asManifold();
+        for (int i = 0; i < manifold->numContacts; i++) {
+            const float depth = manifold->contacts[i].C0.norm();
+            total += depth;
+            count++;
+            if (depth > r_worst)
+                r_worst = depth;
+        }
+    }
+    if (count > 0)
+        r_mean = static_cast<float>(total / static_cast<double>(count));
+}
+
+static int run_scene(const std::string &name, int steps, int threads, bool adaptiveBeta) {
     const CoreScene *scene = find_scene(name);
     if (scene == nullptr) {
         std::fprintf(stderr, "unknown scene: %s\n", name.c_str());
@@ -1025,12 +1344,19 @@ static int run_scene(const std::string &name, int steps, int threads) {
     }
     Solver s;
     s.threads = threads;
+    s.params.dual.adaptiveBeta = adaptiveBeta;
     scene->build(&s);
     std::printf("scene '%s': %d bodies, %d forces\n", scene->name, count_bodies(s), count_forces(s));
+    const auto t0 = std::chrono::steady_clock::now();
     step_n(s, steps);
-    std::printf("after %d steps: threads=%d colours=%d widest=%d contacts=%d max|x|=%.4f finite=%s digest=0x%016llx\n",
-            steps, s.threadCount(), s.colourCount(), s.widestColour(), count_contact_points(s), max_abs_position(s),
-            all_finite(s) ? "yes" : "NO", (unsigned long long)state_digest(s));
+    const auto t1 = std::chrono::steady_clock::now();
+    float mean = 0.0f, worst = 0.0f;
+    scene_penetration(s, mean, worst);
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / static_cast<double>(steps);
+    std::printf("after %d steps: threads=%d bodies=%d contacts=%d max|x|=%.4f finite=%s"
+                " penetration mean=%.5f worst=%.5f  %.3f ms/step digest=0x%016llx\n",
+            steps, s.threadCount(), count_bodies(s), count_contact_points(s), max_abs_position(s),
+            all_finite(s) ? "yes" : "NO", mean, worst, ms, (unsigned long long)state_digest(s));
     return all_finite(s) ? 0 : 1;
 }
 
@@ -1046,48 +1372,13 @@ static void build_bench_scene(Solver &s) {
     }
 }
 
-
-// N independent pyramids, spaced far enough apart that no two share a body or a force:
-// they are separate islands, which is the shape island parallelism is for.
-static void build_multi_island_scene(Solver &s, int islandCount, int size) {
-    new Rigid(&s, {2000, 2000, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
-    for (int i = 0; i < islandCount; i++) {
-        const float ox = (float)i * 40.0f;
-        for (int y = 0; y < size; y++) {
-            for (int x = 0; x < size - y; x++) {
-                new Rigid(&s, {1, 0.5f, 0.5f}, 1.0f, 0.5f,
-                        {ox + x * 1.01f + y * 0.5f, 0.0f, y * 0.85f + 0.5f});
-            }
-        }
-    }
-}
-
-static int run_bench_multi(int threads, int islandCount, int size) {
+static int run_bench(int threads, bool adaptiveBeta) {
     Solver s;
     s.threads = threads;
-    build_multi_island_scene(s, islandCount, size);
-    std::printf("bench-multi: %d islands x %d-layer pyramid = %d bodies, %d iterations\n",
-            islandCount, size, count_bodies(s), s.iterations);
-
-    const int warmup = 30;
-    const int timed = 120;
-    step_n(s, warmup);
-    const auto t0 = std::chrono::steady_clock::now();
-    step_n(s, timed);
-    const auto t1 = std::chrono::steady_clock::now();
-    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / (double)timed;
-    std::printf("bench-multi: threads=%d bodies=%d -> %.3f ms/step, contacts=%d, finite=%s\n",
-            s.threadCount(), count_bodies(s), ms, count_contact_points(s),
-            all_finite(s) ? "yes" : "NO");
-    return all_finite(s) ? 0 : 1;
-}
-
-static int run_bench(int threads) {
-    Solver s;
-    s.threads = threads;
+    s.params.dual.adaptiveBeta = adaptiveBeta;
     build_bench_scene(s);
-    std::printf("bench: %d boxes, %d iterations, %d bodies movable\n", count_bodies(s), s.iterations,
-            s.widestColour());
+    std::printf("bench: %d boxes, %d iterations, adaptiveBeta=%s\n", count_bodies(s), s.iterations,
+            adaptiveBeta ? "on" : "off");
 
     const int warmup = 30;
     const int timed = 120;
@@ -1099,14 +1390,13 @@ static int run_bench(int threads) {
     const auto t1 = std::chrono::steady_clock::now();
 
     const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / (double)timed;
-    std::printf("bench: threads=%d colours=%d widest=%d -> %.3f ms/step, contacts=%d, finite=%s\n", s.threadCount(),
-            s.colourCount(), s.widestColour(), ms, count_contact_points(s), all_finite(s) ? "yes" : "NO");
-    return all_finite(s) ? 0 : 1;
+    std::printf("bench: threads=%d -> %.3f ms/step, contacts=%d, finite=%s\n", s.threadCount(),
+            ms, count_contact_points(s), all_finite(s) ? "yes" : "NO");    return all_finite(s) ? 0 : 1;
 }
 
 // Sweep the thread count over the same scene so the speedup (and where it stops) is
 // visible rather than claimed.
-static int run_bench_sweep() {
+static int run_bench_sweep(bool adaptiveBeta) {
     const int warmup = 30;
     const int timed = 120;
     double serialMs = 0.0;
@@ -1114,6 +1404,7 @@ static int run_bench_sweep() {
     for (int threads : {1, 2, 4, 8, 12}) {
         Solver s;
         s.threads = threads;
+        s.params.dual.adaptiveBeta = adaptiveBeta;
         build_bench_scene(s);
         step_n(s, warmup);
         const auto t0 = std::chrono::steady_clock::now();
@@ -1122,21 +1413,76 @@ static int run_bench_sweep() {
         const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / (double)timed;
         if (threads == 1)
             serialMs = ms;
-        std::printf("bench: threads=%2d  %7.3f ms/step  speedup %5.2fx  (colours=%d widest=%d)\n", threads, ms,
-                serialMs / ms, s.colourCount(), s.widestColour());
+        std::printf("bench: threads=%2d  %7.3f ms/step  speedup %5.2fx  (bodies=%d)\n", threads, ms,
+                serialMs / ms, count_bodies(s));
     }
     return 0;
 }
 
+// One timed run of the bench scene. Returns ms/step and the worker count the solver
+// actually claimed, so the ratio report can name the effective width.
+static std::pair<double, int> bench_once(int threads, bool adaptiveBeta, int warmup, int timed) {
+    Solver s;
+    s.threads = threads;
+    s.params.dual.adaptiveBeta = adaptiveBeta;
+    build_bench_scene(s);
+    step_n(s, warmup);
+    const auto t0 = std::chrono::steady_clock::now();
+    step_n(s, timed);
+    const auto t1 = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / (double)timed;
+    const bool ok = all_finite(s);
+    return {ok ? ms : -1.0, s.threadCount()};
+}
+
+// Serial vs parallel wall time on the same scene: the thread-accelerate ratio. Warmup
+// precedes the timed steps, and the best of three reps is reported so an unlucky
+// scheduler slice does not define the result. Efficiency is speedup / effective width,
+// which is what tells whether the extra workers are actually earning their keep.
+static int run_bench_ratio(int threads, bool adaptiveBeta) {
+    const int warmup = 30;
+    const int timed = 120;
+    const int reps = 3;
+    double serialMs = 1e30;
+    double parallelMs = 1e30;
+    int workers = 1;
+    bool finite = true;
+
+    for (int r = 0; r < reps; r++) {
+        const auto serial = bench_once(1, adaptiveBeta, warmup, timed);
+        const auto parallel = bench_once(threads, adaptiveBeta, warmup, timed);
+        finite = finite && serial.first > 0.0 && parallel.first > 0.0;
+        if (serial.first > 0.0)
+            serialMs = std::min(serialMs, serial.first);
+        if (parallel.first > 0.0)
+            parallelMs = std::min(parallelMs, parallel.first);
+        workers = parallel.second;
+    }
+
+    if (!finite || serialMs >= 1e30 || parallelMs >= 1e30) {
+        std::printf("bench-ratio: FAIL (non-finite state)\n");
+        return 1;
+    }
+
+    const double speedup = serialMs / parallelMs;
+    const double efficiency = speedup / (double)workers * 100.0;
+    Solver shape;
+    build_bench_scene(shape);
+    std::printf("bench-ratio: adaptiveBeta=%s bodies=%d\n", adaptiveBeta ? "on" : "off",
+            count_bodies(shape));
+    std::printf("bench-ratio: threads=1 %.3f ms/step, threads=%d %.3f ms/step, "
+                "speedup=%.2fx efficiency=%.1f%%\n",
+            serialMs, workers, parallelMs, speedup, efficiency);
+    return 0;
+}
+
+
+// so a contact force appears between bodies whose update-set membership was decided
+// on earlier, force-free steps. Every awake, movable body taking part in a stamping
+// force must be in the update set - otherwise the constraint is silently dropped
+// for that side and the pair drifts.
 // ---------------------------------------------------------------------------
-// Incremental graph colouring: two boxes at different heights collide mid-run,
-// so a contact force appears between two bodies whose colours were assigned on
-// earlier, force-free steps. The recolouring pass must see the clash and split
-// the colours - a stale colour reuse (or a lost conflict check) shows up as two
-// force-connected bodies sharing one colour, which would corrupt the parallel
-// phases.
-// ---------------------------------------------------------------------------
-static void test_incremental_colouring() {
+static void test_jacobi_shares() {
     Solver s;
     new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
     Rigid *a = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 2});
@@ -1144,38 +1490,329 @@ static void test_incremental_colouring() {
 
     step_n(s, 300);
 
-    bool conflictFree = true;
+    bool covered = true;
     for (const Force *f = s.forces; f != nullptr; f = f->next) {
-        if (f->bodyA->colour >= 0 && f->bodyB->colour >= 0 && f->bodyA->colour == f->bodyB->colour)
-            conflictFree = false;
+        const Rigid *sides[2] = {f->bodyA, f->bodyB};
+        for (const Rigid *side : sides) {
+            if (side != nullptr && side->mass > 0 && !side->sleeping && side->updateSlot < 0)
+                covered = false;
+        }
     }
-    report(conflictFree, "colouring conflict-free", "forces=%d colours=%d", count_forces(s), s.colourCount());
-    report(s.colourCount() >= 1, "colour count valid", "colours=%d widest=%d", s.colourCount(), s.widestColour());
-    report(all_finite(s), "colouring finite", "bodies=%d", count_bodies(s));
+    report(covered, "update set covers every awake constraint", "forces=%d", count_forces(s));
+    report(all_finite(s), "update set finite", "bodies=%d", count_bodies(s));
     (void)a;
     (void)b;
+}
+
+// ---------------------------------------------------------------------------
+// The position projection layer (SolverParams::Projection), four things in the order they
+// matter: off it must not exist, even through the host's own entry point; on, the same scene
+// ends with less penetration than it would have; the layer must not make the answer depend on
+// how many threads ran it; and what it moved must be visible in the pose and - at the default
+// velocity transfer - nowhere else.
+// ---------------------------------------------------------------------------
+static void build_stack(Solver &s, std::vector<Rigid *> &r_boxes) {
+    new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
+    for (int i = 0; i < 10; i++) {
+        r_boxes.push_back(new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, i * 1.5f + 1.0f}));
+    }
+}
+
+// Same measure test_stack_stability asserts on: how far the worst interface has sunk, counting
+// the slab as the bottom of the stack. Body order, not list order - the list is not the stack.
+static float worst_stack_penetration(const std::vector<Rigid *> &boxes) {
+    float worst = 0.0f;
+    for (size_t i = 0; i < boxes.size(); i++) {
+        const float z = boxes[i]->positionLin.z();
+        worst = std::max(worst, 1.0f - (i == 0 ? z : z - boxes[i - 1]->positionLin.z()));
+    }
+    return worst;
+}
+
+static uint64_t projection_stack(const SolverParams &p, int threads, float &r_worst) {
+    Solver s;
+    s.threads = threads;
+    s.setParams(p);
+    std::vector<Rigid *> boxes;
+    build_stack(s, boxes);
+    step_n(s, 300);
+    r_worst = worst_stack_penetration(boxes);
+    return state_digest(s);
+}
+
+// A sphere sunk 10 cm into the slab, with the Newton primal switched off (newtonRatio 0 leaves
+// the dual-only rounds, which never write a pose). The projection is then the only thing that
+// moves the body, so the distance it moved and the velocity the step reports can be compared
+// against each other exactly - which is what projection_velocity_transfer means.
+static void projection_probe(int steps, float transfer, float &r_z, float &r_vz) {
+    Solver s;
+    s.threads = 1;
+    s.gravity = 0.0f;
+    SolverParams p;
+    p.projection.rounds = 8;
+    p.projection.scale = 1.0f;
+    p.projection.maxCorrection = 0.05f;
+    p.projection.velocityTransfer = transfer;
+    p.primal.newtonRatio = 0.0f;
+    s.setParams(p);
+    new Rigid(&s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
+    Rigid *ball = new Rigid(&s, {0.5f, 0, 0}, ShapeType::Sphere, 1.0f, 0.5f, {0, 0, 0.9f});
+    step_n(s, steps);
+    r_z = ball->positionLin.z();
+    r_vz = ball->velocityLin.z();
+}
+
+// A hard joint with nothing else near it: the bodies stay five metres apart, so no manifold ever
+// joins and the only thing acting on the body is the 5 cm anchor error it starts with. That makes
+// it the read of the joint half of the projection scope, the way projection_stack is the read of
+// the contact half.
+static uint64_t joint_rig(const SolverParams &p, int steps, float &r_error) {
+    Solver s;
+    s.threads = 1;
+    s.gravity = 0.0f;
+    s.setParams(p);
+    Rigid *anchor = new Rigid(&s, {1, 1, 1}, 0.0f, 0.5f, {0, 0, 0});
+    Rigid *body = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0.05f, 0, 5});
+    new Joint(&s, anchor, body, {0, 0, 0}, {0, 0, -5});
+    step_n(s, steps);
+    const float3 a = anchor->positionLin + anchor->positionAng * float3{0, 0, 0};
+    const float3 b = body->positionLin + body->positionAng * float3{0, 0, -5};
+    r_error = (a - b).norm();
+    return state_digest(s);
+}
+
+static void test_projection() {
+    // 1. Off, through the clamp site the host uses. Every digest printed by this binary was
+    //    measured before the layer existed, so this is the one that has to keep matching.
+    {
+        float worst = 0.0f;
+        const uint64_t digest = projection_stack(SolverParams{}, 1, worst);
+        const uint64_t reference = stack_digest();
+        report(digest == reference, "projection off is bit-neutral", "0x%016llx vs default 0x%016llx",
+                (unsigned long long)digest, (unsigned long long)reference);
+    }
+
+    // 2. On: the same 300 steps of the same stack, and the scene must end shallower.
+    {
+        float offWorst = 0.0f, onWorst = 0.0f;
+        projection_stack(SolverParams{}, 1, offWorst);
+        SolverParams on;
+        on.projection.rounds = 4;
+        const uint64_t serial = projection_stack(on, 1, onWorst);
+        report(onWorst < offWorst, "projection heals penetration", "worst interface %.5f m vs %.5f m off",
+                onWorst, offWorst);
+        report(onWorst <= 0.05f, "projection holds the stack bound", "worst interface %.5f m (limit 0.05)", onWorst);
+
+        for (int t : {2, 4, 8}) {
+            float w = 0.0f;
+            const uint64_t digest = projection_stack(on, t, w);
+            char name[64];
+            std::snprintf(name, sizeof(name), "projection digest threads=%d", t);
+            report(digest == serial, name, "0x%016llx vs serial, worst %.5f m", (unsigned long long)digest, w);
+        }
+    }
+
+    // 3. The correction is positional; the velocity is a choice.
+    {
+        constexpr float dt = 1.0f / 60.0f; // Solver::dt, which the probe leaves at its default
+        // Eight steps: the sunk sphere starts 10 cm under the surface and the error the layer sees
+        // is capped at PENETRATION_MAX per step, so the climb is what takes it the rest of the way.
+        float z0 = 0.0f, v0 = 0.0f;
+        projection_probe(8, 0.0f, z0, v0);
+        // The body ends one margin short of touching: the projection stops at the surface the
+        // solver itself aims at, which is COLLISION_MARGIN inside contact.
+        const float target = 1.0f - COLLISION_MARGIN;
+        report(std::fabs(z0 - target) < 1e-3f, "projection reaches the constraint",
+                "centre z=%.5f (target %.5f, sunk to 0.9)", z0, target);
+        report(std::fabs(v0) < 1e-3f, "the lift is not kept as velocity", "vz=%.6f after 8 steps", v0);
+
+        // One step, so the lift is a single dt of velocity and the two transfer settings differ
+        // by exactly that: giving it back leaves the body where it was put, at rest.
+        float one0 = 0.0f, lift0 = 0.0f, one1 = 0.0f, lift1 = 0.0f;
+        projection_probe(1, 0.0f, one0, lift0);
+        projection_probe(1, 1.0f, one1, lift1);
+        report(one0 == one1, "velocity transfer does not move the pose", "z=%.6f vs %.6f", one0, one1);
+        report(std::fabs(lift0) < 1e-3f, "transfer 0 gives the move back", "vz=%.6f", lift0);
+        report(std::fabs(lift1 - (one1 - 0.9f) / dt) < 1e-2f, "transfer 1 keeps it as velocity",
+                "vz=%.4f (lift %.4f m over one dt)", lift1, one1 - 0.9f);
+    }
+
+    // 4. Scope. Each half of the constraint set is switched separately, so each half has to answer
+    //    for its switch: off in a scene that has none of it changes nothing at all, and off in a
+    //    scene that has all of it takes the layer away. The second pair is the one that catches a
+    //    bug the clearing order would otherwise leave - a projection that stops measuring but still
+    //    hands the share pass last pass's correction.
+    {
+        SolverParams on;
+        on.projection.rounds = 4;
+        SolverParams jointsOff = on;
+        jointsOff.projection.joints = false;
+        SolverParams contactsOff = on;
+        contactsOff.projection.contacts = false;
+
+        float stackOn = 0.0f, stackJointsOff = 0.0f, stackContactsOff = 0.0f, stackNone = 0.0f;
+        const uint64_t dOn = projection_stack(on, 1, stackOn);
+        const uint64_t dJointsOff = projection_stack(jointsOff, 1, stackJointsOff);
+        const uint64_t dContactsOff = projection_stack(contactsOff, 1, stackContactsOff);
+        const uint64_t dNone = projection_stack(SolverParams{}, 1, stackNone);
+        report(dJointsOff == dOn, "joint scope is inert without joints", "0x%016llx vs 0x%016llx",
+                (unsigned long long)dJointsOff, (unsigned long long)dOn);
+        report(dContactsOff == dNone, "contact scope off is the whole layer off", "0x%016llx vs 0x%016llx",
+                (unsigned long long)dContactsOff, (unsigned long long)dNone);
+
+        float errOn = 0.0f, errJointsOff = 0.0f, errContactsOff = 0.0f, errNone = 0.0f;
+        const uint64_t rNone = joint_rig(SolverParams{}, 60, errNone);
+        joint_rig(on, 60, errOn);
+        const uint64_t rJointsOff = joint_rig(jointsOff, 60, errJointsOff);
+        joint_rig(contactsOff, 60, errContactsOff);
+        report(rJointsOff == rNone, "joint scope off is the whole layer off for joints",
+                "0x%016llx vs 0x%016llx", (unsigned long long)rJointsOff, (unsigned long long)rNone);
+        report(errOn < errNone && errContactsOff < errNone, "projection closes a hard anchor",
+                "anchor error on=%.5f contacts-off=%.5f off=%.5f m", errOn, errContactsOff, errNone);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive beta: the per-contact ramp multiplier must react to real penetration,
+// not to the collision margin, must carry its penalty across steps only when the
+// feature is enabled, and must decay back to neutral when the contact is solved.
+// ---------------------------------------------------------------------------
+static Manifold *first_manifold(Solver &s) {
+    for (Force *f = s.forces; f != nullptr; f = f->next) {
+        if (f->kind == ForceKind::Contact)
+            return f->asManifold();
+    }
+    return nullptr;
+}
+
+static float max_beta_scale(Solver &s) {
+    float maxScale = 0.0f;
+    for (Force *f = s.forces; f != nullptr; f = f->next) {
+        if (f->kind != ForceKind::Contact)
+            continue;
+        const Manifold *m = f->asManifold();
+        for (int i = 0; i < m->numContacts; i++)
+            maxScale = std::max(maxScale, m->contacts[i].betaScale);
+    }
+    return maxScale;
+}
+
+// Prime the old contact state that initialize() reads: betaScale/penalty are carried,
+// and C0 expresses the previous step's residual as a penetration depth.
+static void prime_contacts(Manifold *m, float betaScale, float penalty, float prevDepth) {
+    for (int i = 0; i < m->numContacts; i++) {
+        m->contacts[i].betaScale = betaScale;
+        m->contacts[i].penalty = float3{penalty, penalty, penalty};
+        m->contacts[i].C0 = float3{COLLISION_MARGIN - prevDepth, 0, 0};
+    }
+}
+
+static void test_adaptive_beta() {
+    // Off path: the multiplier stays neutral.
+    {
+        Solver s;
+        new Rigid(&s, {10, 10, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
+        new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f});
+        step_n(s, 120);
+        report(first_manifold(s) != nullptr && max_beta_scale(s) == 1.0f,
+                "adaptive beta off is neutral", "max scale = %.3f", max_beta_scale(s));
+    }
+
+    // Direct mechanism: prime the old contact state, run one initialize(), read the result.
+    {
+        Solver s;
+        s.params.dual.adaptiveBeta = true;
+        new Rigid(&s, {10, 10, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
+        Rigid *box = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f});
+        s.step(); // create the manifold
+        Manifold *m = first_manifold(s);
+        report(m != nullptr, "adaptive beta probe has a manifold", "contacts=%d",
+                m != nullptr ? m->numContacts : 0);
+        if (m == nullptr)
+            return;
+
+        // New violation (previous residual below the floor, fresh one above): doubles, and
+        // the carried penalty decays from its primed value instead of resetting.
+        box->positionLin[2] = 0.49f; // ~1 cm penetration
+        prime_contacts(m, 8.0f, 100.0f, 0.001f);
+        const bool initialized = m->initialize();
+        report(initialized && max_beta_scale(s) == 16.0f, "adaptive beta doubles on a new violation",
+                "max scale = %.3f", max_beta_scale(s));
+        report(m->contacts[0].penalty.x() > 50.0f, "adaptive beta carries the penalty",
+                "penalty = %.3f (primed 100, gamma %.3f)", m->contacts[0].penalty.x(), s.params.dual.gamma);
+
+        // Cap holds.
+        prime_contacts(m, ADAPTIVE_BETA_MAX, 100.0f, 0.001f);
+        m->initialize();
+        report(max_beta_scale(s) == ADAPTIVE_BETA_MAX, "adaptive beta cap holds",
+                "max scale = %.3f (cap %.1f)", max_beta_scale(s), ADAPTIVE_BETA_MAX);
+
+        // Solved residual: halves back toward neutral.
+        box->positionLin[2] = 0.5f;
+        prime_contacts(m, 8.0f, 100.0f, 0.01f);
+        m->initialize();
+        report(max_beta_scale(s) == 4.0f, "adaptive beta decays when solved",
+                "max scale = %.3f", max_beta_scale(s));
+
+        // With the feature off the same primed penalty restarts at the floor.
+        s.params.dual.adaptiveBeta = false;
+        prime_contacts(m, 8.0f, 100.0f, 0.01f);
+        m->initialize();
+        report(std::fabs(m->contacts[0].penalty.x() - PENALTY_MIN) < 1e-6f,
+                "adaptive beta off resets the penalty", "penalty = %.3f (floor %.3f)",
+                m->contacts[0].penalty.x(), PENALTY_MIN);
+    }
+
+    // Solved scene (no gravity): a resting contact must not ratchet.
+    {
+        Solver s;
+        s.params.dual.adaptiveBeta = true;
+        s.gravity = 0.0f;
+        new Rigid(&s, {10, 10, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
+        new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f});
+        step_n(s, 300);
+        report(all_finite(s) && max_beta_scale(s) == 1.0f, "solved contact stays neutral",
+                "max scale = %.3f", max_beta_scale(s));
+    }
+
+    // Loaded scene: the multiplier may grow, but stays finite and capped.
+    {
+        Solver s;
+        s.params.dual.adaptiveBeta = true;
+        new Rigid(&s, {10, 10, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
+        new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0.5f});
+        step_n(s, 300);
+        report(all_finite(s) && max_beta_scale(s) <= ADAPTIVE_BETA_MAX,
+                "loaded contact stays capped", "max scale = %.3f (cap %.1f)",
+                max_beta_scale(s), ADAPTIVE_BETA_MAX);
+    }
 }
 
 int main(int argc, char **argv) {
     std::string scene;
     int steps = 300;
     int threads = 0; // 0 = automatic
+    bool adaptiveBeta = false;
+    bool benchRatio = false;
 
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--list") {
             list_scenes();
             return 0;
+        } else if (arg == "--adaptive-beta") {
+            adaptiveBeta = true;
         } else if (arg == "--bench") {
-            return run_bench(threads);
-        } else if (arg == "--bench-multi") {
-            return run_bench_multi(threads, 4, 16);
-        } else if (arg.rfind("--bench-multi=", 0) == 0) {
-            return run_bench_multi(threads, std::atoi(arg.substr(14).c_str()), 16);
+            return run_bench(threads, adaptiveBeta);
         } else if (arg == "--bench-sweep") {
-            return run_bench_sweep();
-        } else if (arg == "--colour") {
-            report_colouring();
+            return run_bench_sweep(adaptiveBeta);
+        } else if (arg == "--bench-ratio") {
+            // Deferred so --threads/--adaptive-beta may follow it on the command line.
+            benchRatio = true;
+        } else if (arg == "--sleep") {
+            return run_sleep_audit();
+        } else if (arg == "--shape") {
+            report_parallel_shape();
             return 0;
         } else if (arg == "--scene" && i + 1 < argc) {
             scene = argv[++i];
@@ -1184,14 +1821,19 @@ int main(int argc, char **argv) {
         } else if (arg == "--threads" && i + 1 < argc) {
             threads = std::atoi(argv[++i]);
         } else {
-            std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --colour | --scene NAME [--steps N]]"
-                                 " [--threads N]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --bench-ratio | --sleep |"
+                                 " --shape | --scene NAME [--steps N]] [--threads N] [--adaptive-beta]\n",
+                    argv[0]);
             return 2;
         }
     }
 
+    if (benchRatio) {
+        return run_bench_ratio(threads, adaptiveBeta);
+    }
+
     if (!scene.empty()) {
-        return run_scene(scene, steps, threads);
+        return run_scene(scene, steps, threads, adaptiveBeta);
     }
 
     test_rest_contact();
@@ -1201,9 +1843,12 @@ int main(int argc, char **argv) {
     test_soft_lattice();
     test_all_scenes();
     test_determinism();
-    test_incremental_colouring();
+    test_jacobi_shares();
+    test_projection();
+    test_adaptive_beta();
     test_parallel_equivalence();
-    report_colouring();
+    test_concurrent_solvers();
+    report_parallel_shape();
     test_generic_hinge();
     test_generic_axis_limit();
     test_generic_prismatic_spring();

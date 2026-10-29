@@ -45,7 +45,7 @@ const float3 &frameAxis(int p_axis)
 } // namespace
 
 GenericJoint::GenericJoint(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, float3 p_rB)
-    : Force(p_solver, p_bodyA, p_bodyB), rA(p_rA), rB(p_rB)
+    : Force(p_solver, p_bodyA, p_bodyB, ForceKind::GenericJoint), rA(p_rA), rB(p_rB)
 {
     // The arrangement the joint is created in is its zero. Held as B-relative-to-A in A's frame,
     // the same form angularValues() computes for the live pose, so the two compose directly.
@@ -290,8 +290,8 @@ bool GenericJoint::initialize()
         JointAxis *both[2] = {&linear[i], &angular[i]};
         for (JointAxis *axis : both)
         {
-            axis->lambda *= solver->alpha * solver->gamma;
-            axis->penalty = std::clamp(axis->penalty * solver->gamma, PENALTY_MIN, PENALTY_MAX);
+            axis->lambda *= solver->params.dual.alpha * solver->params.dual.gamma;
+            axis->penalty = std::clamp(axis->penalty * solver->params.dual.gamma, PENALTY_MIN, PENALTY_MAX);
         }
     }
 
@@ -350,7 +350,7 @@ void GenericJoint::updateDual(float alpha)
     {
         JointAxis *both[2] = {&linear[i], &angular[i]};
         const float values[2] = {offset[i], angularValue_[i]};
-        const float betas[2] = {solver->betaLin, solver->betaAng};
+        const float betas[2] = {solver->params.dual.betaLin, solver->params.dual.betaAng};
 
         for (int k = 0; k < 2; k++)
         {
@@ -377,6 +377,96 @@ void GenericJoint::updateDual(float alpha)
             if (bodyA != 0) cap = std::min(cap, penaltyLimit(bodyA, axisDir, k == 1));
             axis.penalty = std::clamp(axis.penalty + std::abs(C) * betas[k], 0.0f, cap);
         }
+    }
+}
+
+// The projection's measure pass, over the three linear degrees of freedom.
+//
+// Every row it takes is a hard one: axisConstraint already answers with nothing at all for a Free
+// axis, which is where a spring lives, so no compliant degree of freedom can be projected flat.
+// A Limited axis is projected onto its bound and no further, which is the one place this layer
+// enforces something a penalty method structurally cannot - that a slider stops at the end of its
+// travel instead of easing through it.
+//
+// The error is the raw one, measured at the current pose against the axis's own zero, without the
+// lock stabilisation axisForce applies. Same target, different appetite for closing it in one
+// step; see Manifold::projectMeasure for the reasoning and the risk of the two disagreeing.
+//
+// The angular axes are deliberately not projected. Their measurement removes the twist about each
+// free axis one at a time and hands the locked axes the components of what is left, so an error
+// there is not a scalar with a single world direction and a compliance-weighted split of it would
+// move the bodies by something that is not the error. That is a job for a rotation-space
+// projection, with its own baseline; the linear side pays for most of the visible sag anyway.
+void GenericJoint::projectMeasure(float scale, float maxCorrection)
+{
+    (void)maxCorrection; // a per-body ceiling, applied where the shares are summed
+
+    // Cleared before every way out of this function, as in Joint::projectMeasure: an axis that
+    // stops being constrained mid-run must not leave its last correction lying in the state the
+    // share pass reads.
+    projLinear = {};
+
+    // Out of scope, after the clear - see Joint::projectMeasure for why the order matters.
+    if (!solver->params.projection.joints)
+        return;
+
+    const Compliance cA = complianceOf(bodyA);
+    const Compliance cB = complianceOf(bodyB);
+    if (cA.immobile() && cB.immobile())
+        return;
+
+    const quat qA = frameOrientation();
+    const float3 rAWorld = qA * rA;
+    const float3 rBWorld = bodyB->positionAng * rB;
+    const float3 offset = qA.conjugate() * (anchorA() - anchorB());
+    const float dtSq = solver->dt * solver->dt;
+    const bool feedback = solver->params.projection.dualFeedback && dtSq > 0.0f;
+
+    for (int i = 0; i < 3; i++)
+    {
+        projLinear[i] = 0.0f;
+        float C;
+        if (!axisConstraint(linear[i], offset[i], C))
+            continue;
+        if (C == 0.0f)
+            continue;
+
+        // The row's world direction, as updatePrimal stamps it.
+        const float3 n = qA * frameAxis(i);
+        const float w = cA.row(n, rAWorld) + cB.row(n, rBWorld);
+        if (w <= 0.0f)
+            continue;
+
+        const float mu = -C * scale / w;
+        projLinear[i] = mu;
+        if (feedback)
+            linear[i].lambda = linear[i].lambda - mu / dtSq;
+    }
+}
+
+void GenericJoint::projectShare(const Rigid *body, float3 &r_deltaLin, float3 &r_deltaAng) const
+{
+    if (projLinear == std::array<float, 3>{0, 0, 0})
+        return;
+
+    const bool isA = body == bodyA;
+    if (!isA && body != bodyB)
+        return;
+
+    const Compliance c = complianceOf(isA ? bodyA : bodyB);
+    if (c.immobile())
+        return;
+
+    const quat qA = frameOrientation();
+    const float sign = isA ? 1.0f : -1.0f;
+    const float3 arm = isA ? qA * rA : bodyB->positionAng * rB;
+    for (int i = 0; i < 3; i++)
+    {
+        if (projLinear[i] == 0.0f)
+            continue;
+        const float3 n = qA * frameAxis(i);
+        r_deltaLin = r_deltaLin + n * (sign * projLinear[i] * c.invMass);
+        r_deltaAng = r_deltaAng + c.invInertiaTimes(arm.cross(n)) * (sign * projLinear[i]);
     }
 }
 

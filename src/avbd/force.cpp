@@ -14,8 +14,8 @@
 
 namespace avbd {
 
-Force::Force(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB)
-    : solver(p_solver), bodyA(p_bodyA), bodyB(p_bodyB), nextA(0), nextB(0)
+Force::Force(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, ForceKind p_kind)
+    : solver(p_solver), bodyA(p_bodyA), bodyB(p_bodyB), nextA(0), nextB(0), kind(p_kind)
 {
     // Add to the solver's linked list
     next = p_solver->forces;

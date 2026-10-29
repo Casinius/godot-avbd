@@ -1,6 +1,6 @@
 [gd_scene format=3 uid="uid://cmngnsh2iq66m"]
 
-[ext_resource type="Script" uid="uid://dqjm6ud8kqiwg" path="res://scenes/demo.gd" id="1_asdio"]
+[ext_resource type="Script" uid="uid://ckg0ecqiri7sc" path="res://scenes/demo.gd" id="1_asdio"]
 
 [sub_resource type="Environment" id="Environment_1"]
 background_mode = 1
@@ -50,7 +50,7 @@ mesh = SubResource("BoxMesh_plank")
 
 [node name="Plank0" type="RigidBody3D" parent="." unique_id=1067052101]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.571, 2, 0)
-mass = 1.407
+mass = 200000.0
 physics_material_override = SubResource("Mat_plank")
 
 [node name="Shape" type="CollisionShape3D" parent="Plank0" unique_id=1624890462]

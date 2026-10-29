@@ -12,7 +12,9 @@
  * One instance per space is cached by the server and re-pointed at each body before
  * the callbacks run, so the engine never holds a stale view. Every getter reads the
  * avbd::Rigid live; setters write straight through to it, mirroring what the engine's
- * own `_integrate_forces` users expect.
+ * own `_integrate_forces` users expect. The one exception is the pose: a space that
+ * interpolates hands the sync callback the blended delivery instead, and treats a
+ * write-back of exactly that pose as the echo it is.
  *
  * The converter lives in src/nodes/godot_convert.hpp and maps Godot's Y-up scene
  * space onto the solver's Z-up space.
@@ -39,6 +41,12 @@ class AVBDDirectBodyState3D : public PhysicsDirectBodyState3DExtension {
     AVBDPhysicsServer3D *server = nullptr;
     avbd::Rigid *rigid = nullptr; // the body this instance currently views
     RID body_rid;
+    // The pose the scene was shown for this body, when the space blends one. Read back out of
+    // _get_transform so the node moves to the delivery rather than to the solver's newer pose,
+    // and compared in _set_transform so echoing that pose into the server cannot drag the solver
+    // back to what was only ever drawn. Null for a plain live view, which is every other read.
+    Transform3D delivered;
+    bool has_delivered = false;
 
 protected:
     static void _bind_methods() {}
@@ -47,17 +55,20 @@ public:
     AVBDDirectBodyState3D() = default;
     ~AVBDDirectBodyState3D() override = default;
 
-    // Re-aim the cached instance at one body before its callbacks run.
-    void bind(AVBDPhysicsServer3D *p_server, avbd::Rigid *p_rigid, const RID &p_body_rid);
+    // Re-aim the cached instance at one body before its callbacks run. Pass p_delivered for the
+    // engine's scene sync, so the pose it reads is the pose its write-back will be matched
+    // against; pass nothing for scripted integration, which must see and write the solver itself.
+    void bind(AVBDPhysicsServer3D *p_server, avbd::Rigid *p_rigid, const RID &p_body_rid,
+            const Transform3D *p_delivered = nullptr);
 
     // --- reads/writes onto the bound body ------------------------------------
     Vector3 _get_total_gravity() const override;
-    double _get_total_linear_damp() const override;
-    double _get_total_angular_damp() const override;
+    float _get_total_linear_damp() const override;
+    float _get_total_angular_damp() const override;
     Vector3 _get_center_of_mass() const override;
     Vector3 _get_center_of_mass_local() const override;
     Basis _get_principal_inertia_axes() const override;
-    double _get_inverse_mass() const override;
+    float _get_inverse_mass() const override;
     Vector3 _get_inverse_inertia() const override;
     Basis _get_inverse_inertia_tensor() const override;
     void _set_linear_velocity(const Vector3 &p_velocity) override;
@@ -82,6 +93,11 @@ public:
     Vector3 _get_constant_torque() const override;
     void _set_sleep_state(bool p_enabled) override;
     bool _is_sleeping() const override;
+    // Godot 4.4+ extension surface: the engine reads these during state sync.
+    uint32_t _get_collision_layer() const override;
+    void _set_collision_layer(uint32_t p_layer) override;
+    uint32_t _get_collision_mask() const override;
+    void _set_collision_mask(uint32_t p_mask) override;
     int32_t _get_contact_count() const override;
     Vector3 _get_contact_local_position(int32_t p_contact_idx) const override;
     Vector3 _get_contact_local_normal(int32_t p_contact_idx) const override;
@@ -94,7 +110,7 @@ public:
     Object *_get_contact_collider_object(int32_t p_contact_idx) const override;
     int32_t _get_contact_collider_shape(int32_t p_contact_idx) const override;
     Vector3 _get_contact_collider_velocity_at_position(int32_t p_contact_idx) const override;
-    double _get_step() const override;
+    float _get_step() const override;
     void _integrate_forces() override;
     PhysicsDirectSpaceState3D *_get_space_state() override;
 };

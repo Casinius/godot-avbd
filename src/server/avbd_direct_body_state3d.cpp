@@ -22,10 +22,47 @@
 using namespace godot;
 using namespace avbd_godot;
 
-void AVBDDirectBodyState3D::bind(AVBDPhysicsServer3D *p_server, avbd::Rigid *p_rigid, const RID &p_body_rid) {
+void AVBDDirectBodyState3D::bind(AVBDPhysicsServer3D *p_server, avbd::Rigid *p_rigid, const RID &p_body_rid,
+        const Transform3D *p_delivered) {
     server = p_server;
     rigid = p_rigid;
     body_rid = p_body_rid;
+    has_delivered = p_delivered != nullptr;
+    if (has_delivered) {
+        delivered = *p_delivered;
+    }
+}
+
+uint32_t AVBDDirectBodyState3D::_get_collision_layer() const {
+    const AVBDPhysicsServer3D::BodyData *body = server != nullptr ? server->find_body(body_rid) : nullptr;
+    return body != nullptr ? static_cast<uint32_t>(body->collision_layer) : 1;
+}
+
+void AVBDDirectBodyState3D::_set_collision_layer(uint32_t p_layer) {
+    AVBDPhysicsServer3D::BodyData *body = server != nullptr ? server->find_body(body_rid) : nullptr;
+    if (body == nullptr) {
+        return;
+    }
+    body->collision_layer = p_layer;
+    if (body->rigid != nullptr) {
+        body->rigid->collisionLayer = p_layer;
+    }
+}
+
+uint32_t AVBDDirectBodyState3D::_get_collision_mask() const {
+    const AVBDPhysicsServer3D::BodyData *body = server != nullptr ? server->find_body(body_rid) : nullptr;
+    return body != nullptr ? static_cast<uint32_t>(body->collision_mask) : 1;
+}
+
+void AVBDDirectBodyState3D::_set_collision_mask(uint32_t p_mask) {
+    AVBDPhysicsServer3D::BodyData *body = server != nullptr ? server->find_body(body_rid) : nullptr;
+    if (body == nullptr) {
+        return;
+    }
+    body->collision_mask = p_mask;
+    if (body->rigid != nullptr) {
+        body->rigid->collisionMask = p_mask;
+    }
 }
 
 Vector3 AVBDDirectBodyState3D::_get_total_gravity() const {
@@ -37,11 +74,11 @@ Vector3 AVBDDirectBodyState3D::_get_total_gravity() const {
     return Vector3(0, -std::fabs(rigid->gravity), 0);
 }
 
-double AVBDDirectBodyState3D::_get_total_linear_damp() const {
+float AVBDDirectBodyState3D::_get_total_linear_damp() const {
     return 0.0; // damping is not simulated (documented in the README)
 }
 
-double AVBDDirectBodyState3D::_get_total_angular_damp() const {
+float AVBDDirectBodyState3D::_get_total_angular_damp() const {
     return 0.0;
 }
 
@@ -59,7 +96,7 @@ Basis AVBDDirectBodyState3D::_get_principal_inertia_axes() const {
     return rigid != nullptr ? to_godot_basis(rigid->positionAng) : Basis();
 }
 
-double AVBDDirectBodyState3D::_get_inverse_mass() const {
+float AVBDDirectBodyState3D::_get_inverse_mass() const {
     return rigid != nullptr && rigid->mass > 0.0f ? 1.0 / rigid->mass : 0.0;
 }
 
@@ -101,15 +138,33 @@ Vector3 AVBDDirectBodyState3D::_get_angular_velocity() const {
 }
 
 void AVBDDirectBodyState3D::_set_transform(const Transform3D &p_transform) {
-    if (rigid != nullptr) {
-        rigid->positionLin = to_sim(p_transform.origin);
-        rigid->positionAng = to_sim(p_transform.basis.get_rotation_quaternion());
+    if (rigid == nullptr) {
+        return;
     }
+    // A write that lands on the pose we just showed the scene is an echo of that display, not a
+    // request to move the body: taking it literally would pull the solver back to what the node
+    // was drawn at, a fraction of a tick behind itself. Anything else is a real teleport. Headless
+    // Godot 4.7 was measured not to write back on its own, so this is a guard for the scripts and
+    // node paths that do.
+    if (has_delivered && poses_match(p_transform, delivered)) {
+        return;
+    }
+    rigid->positionLin = to_sim(p_transform.origin);
+    rigid->positionAng = to_sim(p_transform.basis.get_rotation_quaternion());
 }
 
 Transform3D AVBDDirectBodyState3D::_get_transform() const {
     if (rigid == nullptr) {
         return Transform3D();
+    }
+    // The engine's body sync asks in order to move the node, so it gets the pose the space
+    // delivers - the blend of the last two snapshots. Note that Godot 4.7 runs a script's
+    // _integrate_forces inside that same callback, so a script reads what its node shows: one
+    // value, consistent with the global_position it can compare it against. The solver's own pose
+    // stays behind the blend, because a write-back of the shown pose is ignored below rather than
+    // fed into the simulation.
+    if (has_delivered) {
+        return delivered;
     }
     return sim_transform(rigid->positionLin, rigid->positionAng);
 }
@@ -209,10 +264,14 @@ Vector3 AVBDDirectBodyState3D::_get_constant_torque() const {
 
 void AVBDDirectBodyState3D::_set_sleep_state(bool p_enabled) {
     if (rigid != nullptr) {
-        rigid->sleeping = p_enabled;
         if (p_enabled) {
+            rigid->sleeping = true;
             rigid->velocityLin = avbd::float3{0, 0, 0};
             rigid->velocityAng = avbd::float3{0, 0, 0};
+        } else {
+            // Waking through Rigid::wake(), not the flag alone: a script that woke this body
+            // invalidated the idle credit and the rest window measured under it.
+            rigid->wake();
         }
     }
 }
@@ -278,7 +337,7 @@ Vector3 AVBDDirectBodyState3D::_get_contact_collider_velocity_at_position(int32_
     return server != nullptr ? server->body_state_contact_collider_velocity(body_rid, p_contact_idx) : Vector3();
 }
 
-double AVBDDirectBodyState3D::_get_step() const {
+float AVBDDirectBodyState3D::_get_step() const {
     return server != nullptr ? server->body_state_step() : 0.0;
 }
 

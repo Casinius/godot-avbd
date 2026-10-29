@@ -12,14 +12,13 @@
 
 using namespace godot;
 
-PhysicsServer3D* PhysicsServerFactory::create_server() {
+Object *PhysicsServerFactory::create_server() {
     UtilityFunctions::print("AVBD physics server: factory invoked - the engine selected AVBD");
     return memnew(AVBDPhysicsServer3D);
 }
 
 void PhysicsServerFactory::_bind_methods() {
-    // The engine invokes this through a Callable, so the method has to be bound to
-    // ClassDB - without this the callable is invalid, PhysicsServer3DManager silently
-    // falls back to the default engine and "AVBD" runs Godot Physics.
+    // The manager calls the registered callable to instantiate the server; without this
+    // binding the call fails and Godot silently falls back to the built-in engine.
     ClassDB::bind_method(D_METHOD("create_server"), &PhysicsServerFactory::create_server);
 }

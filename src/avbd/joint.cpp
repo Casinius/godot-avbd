@@ -16,6 +16,11 @@
 
 namespace avbd {
 
+namespace {
+// The three rows of the anchor error are the three world axes.
+const float3 kAxis[3] = {float3(1, 0, 0), float3(0, 1, 0), float3(0, 0, 1)};
+} // namespace
+
 inline float3x3 geometricStiffnessBallSocket(int k, float3 v)
 {
     float3x3 m = diagonal(-v[k], -v[k], -v[k]);
@@ -27,7 +32,7 @@ inline float3x3 geometricStiffnessBallSocket(int k, float3 v)
 
 Joint::Joint(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, float3 p_rB,
         float p_stiffnessLin, float p_stiffnessAng, float p_fracture)
-    : Force(p_solver, p_bodyA, p_bodyB), rA(p_rA), rB(p_rB), stiffnessLin(p_stiffnessLin),
+    : Force(p_solver, p_bodyA, p_bodyB, ForceKind::Joint), rA(p_rA), rB(p_rB), stiffnessLin(p_stiffnessLin),
     stiffnessAng(p_stiffnessAng), fracture(p_fracture), broken(false)
 {
     // Dual variables and penalties start at zero and are built up over the first steps.
@@ -48,17 +53,17 @@ bool Joint::initialize()
 
     // Warmstart the dual variables and penalty parameters (Eq. 19)
     // Penalty is safely clamped to a minimum and maximum value
-    lambdaLin = lambdaLin * solver->alpha * solver->gamma;
-    lambdaAng = lambdaAng * solver->alpha * solver->gamma;
+    lambdaLin = lambdaLin * solver->params.dual.alpha * solver->params.dual.gamma;
+    lambdaAng = lambdaAng * solver->params.dual.alpha * solver->params.dual.gamma;
     penaltyLin = float3{
-        std::clamp(penaltyLin.x() * solver->gamma, PENALTY_MIN, PENALTY_MAX),
-        std::clamp(penaltyLin.y() * solver->gamma, PENALTY_MIN, PENALTY_MAX),
-        std::clamp(penaltyLin.z() * solver->gamma, PENALTY_MIN, PENALTY_MAX)
+        std::clamp(penaltyLin.x() * solver->params.dual.gamma, PENALTY_MIN, PENALTY_MAX),
+        std::clamp(penaltyLin.y() * solver->params.dual.gamma, PENALTY_MIN, PENALTY_MAX),
+        std::clamp(penaltyLin.z() * solver->params.dual.gamma, PENALTY_MIN, PENALTY_MAX)
     };
     penaltyAng = float3{
-        std::clamp(penaltyAng.x() * solver->gamma, PENALTY_MIN, PENALTY_MAX),
-        std::clamp(penaltyAng.y() * solver->gamma, PENALTY_MIN, PENALTY_MAX),
-        std::clamp(penaltyAng.z() * solver->gamma, PENALTY_MIN, PENALTY_MAX)
+        std::clamp(penaltyAng.x() * solver->params.dual.gamma, PENALTY_MIN, PENALTY_MAX),
+        std::clamp(penaltyAng.y() * solver->params.dual.gamma, PENALTY_MIN, PENALTY_MAX),
+        std::clamp(penaltyAng.z() * solver->params.dual.gamma, PENALTY_MIN, PENALTY_MAX)
     };
 
     // Clamp penalty to material stiffness
@@ -162,6 +167,94 @@ void Joint::updatePrimal(Rigid *body, float alpha, Block &block)
     }
 }
 
+// The projection's measure pass: the anchor error, row by row, as the multiplier that would take
+// each row to zero. Bilateral, unlike a contact: an anchor is wrong in both directions.
+//
+// Only a hard anchor is projected. A finite stiffnessLin caps its own penalty (updateDual clamps
+// to it), so the error left under that cap is the compliance the joint was built with, and taking
+// it out by moving a body would turn a spring into a rod. Infinitely stiff is different: there the
+// method only *approaches* the anchor, one percent of the remaining error per step because that is
+// what the alpha stabilisation asks, and a positional layer is where the rest can be paid for.
+//
+// Only the linear half is projected. The angular lock of this joint is stamped through a
+// Jacobian built on `torqueArm` - a body-size scale factor, with the identity for A and a
+// degenerate matrix for B - which is a first-order stand-in rather than a rotation Jacobian, so
+// a compliance-weighted split of it would move the bodies by an amount that is not the error.
+// The Lagrangian keeps that row; see GenericJoint::projectMeasure for the same decision.
+void Joint::projectMeasure(float scale, float maxCorrection)
+{
+    (void)maxCorrection; // a per-body ceiling, applied where the shares are summed
+
+    // Cleared before every way out of this function: the share pass reads it for whichever body is
+    // in the update set, and a left-over multiplier from an earlier step would be applied to a
+    // constraint that has since decided it is soft.
+    projLin = float3{0, 0, 0};
+
+    // Out of scope, after the clear: the share pass reads projLin and nothing else, so a joint left
+    // measuring nothing must leave it holding nothing.
+    if (!solver->params.projection.joints)
+        return;
+
+    if (!std::isinf(stiffnessLin))
+        return;
+
+    const Compliance cA = complianceOf(bodyA);
+    const Compliance cB = complianceOf(bodyB);
+    if (cA.immobile() && cB.immobile())
+        return;
+
+    const float3 anchorA = bodyA ? bodyA->positionLin + bodyA->positionAng * rA : rA;
+    const float3 anchorB = bodyB->positionLin + bodyB->positionAng * rB;
+    // Measured at the current pose, against the constraint's own zero, unstabilised - see
+    // Manifold::projectMeasure for the same choice and why.
+    const float3 C = anchorA - anchorB;
+
+    const float3 rAWorld = bodyA ? bodyA->positionAng * rA : float3{0, 0, 0};
+    const float3 rBWorld = bodyB->positionAng * rB;
+    const float dtSq = solver->dt * solver->dt;
+    const bool feedback = solver->params.projection.dualFeedback && dtSq > 0.0f;
+
+    float3 mu = float3{0, 0, 0};
+    for (int r = 0; r < 3; r++)
+    {
+        if (C[r] == 0.0f)
+            continue;
+        const float w = cA.row(kAxis[r], rAWorld) + cB.row(kAxis[r], rBWorld);
+        if (w > 0.0f)
+            mu[r] = -C[r] * scale / w;
+    }
+
+    projLin = mu;
+
+    if (feedback)
+        lambdaLin = lambdaLin - mu / dtSq;
+}
+
+void Joint::projectShare(const Rigid *body, float3 &r_deltaLin, float3 &r_deltaAng) const
+{
+    if (projLin.isZero(0.0f))
+        return;
+
+    const bool isA = body == bodyA;
+    if (!isA && body != bodyB)
+        return;
+
+    const Compliance c = complianceOf(isA ? bodyA : bodyB);
+    if (c.immobile())
+        return;
+
+    const float sign = isA ? 1.0f : -1.0f;
+    const float3 arm = isA ? (bodyA ? bodyA->positionAng * rA : float3{0, 0, 0})
+                           : bodyB->positionAng * rB;
+    for (int r = 0; r < 3; r++)
+    {
+        if (projLin[r] == 0.0f)
+            continue;
+        r_deltaLin = r_deltaLin + kAxis[r] * (sign * projLin[r] * c.invMass);
+        r_deltaAng = r_deltaAng + c.invInertiaTimes(arm.cross(kAxis[r])) * (sign * projLin[r]);
+    }
+}
+
 void Joint::breakNow()
 {
     penaltyLin = { 0, 0, 0 };
@@ -193,10 +286,10 @@ void Joint::updateDual(float alpha)
         }
 
         // Update the penalty parameter and clamp to material stiffness if we are within the force bounds (Eq. 16)
-        penaltyLin = (penaltyLin + C.cwiseAbs() * solver->betaLin).cwiseMin(float3{stiffnessLin, stiffnessLin, stiffnessLin}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
+        penaltyLin = (penaltyLin + C.cwiseAbs() * solver->params.dual.betaLin).cwiseMin(float3{stiffnessLin, stiffnessLin, stiffnessLin}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
 
         // Angular
-        penaltyAng = (penaltyAng + C.cwiseAbs() * solver->betaAng).cwiseMin(float3{stiffnessAng, stiffnessAng, stiffnessAng}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
+        penaltyAng = (penaltyAng + C.cwiseAbs() * solver->params.dual.betaAng).cwiseMin(float3{stiffnessAng, stiffnessAng, stiffnessAng}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
     }
     // Angular constraint
     if (penaltyAng.squaredNorm() > 0)
@@ -218,7 +311,7 @@ void Joint::updateDual(float alpha)
         }
 
         // Update the penalty parameter and clamp to material stiffness if we are within the force bounds (Eq. 16)
-        penaltyAng = (penaltyAng + C.cwiseAbs() * solver->betaAng).cwiseMin(float3{stiffnessAng, stiffnessAng, stiffnessAng}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
+        penaltyAng = (penaltyAng + C.cwiseAbs() * solver->params.dual.betaAng).cwiseMin(float3{stiffnessAng, stiffnessAng, stiffnessAng}.cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
     }
 
     // Fracture test

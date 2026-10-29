@@ -11,9 +11,7 @@
 
 #pragma once
 
-// cppcheck-suppress missingIncludeSystem
 #include <vector>
-// cppcheck-suppress missingIncludeSystem
 #include <span>
 
 #include "avbd/maths.h"
@@ -70,19 +68,46 @@ public:
     [[nodiscard]] const float3& boundsMin(int index) const noexcept { return boundsMin_[index]; }
     [[nodiscard]] const float3& boundsMax(int index) const noexcept { return boundsMax_[index]; }
     [[nodiscard]] const int& bodyIndex(int index) const noexcept { return bodyIndex_[index]; }
+    // Whether the node's subtree contains at least one real leaf. Empty subtrees exist
+    // in the implicit layout whenever the leaf count is not a power of two (the right
+    // tail), and their bounds are left uninitialized by design - traversals must skip
+    // them instead of testing garbage floats.
+    [[nodiscard]] bool valid(int index) const noexcept { return valid_[index] != 0; }
     [[nodiscard]] int countLeaves() const noexcept;
     [[nodiscard]] int root() const noexcept { return 0; }
 
+    // Implicit (heap) layout support: resize to an exact node count and write nodes by
+    // index. Children of node i are 2i+1 / 2i+2 by construction - no left/right arrays.
+    void resizeImplicit(int nodeCount) noexcept {
+        boundsMin_.resize(nodeCount);
+        boundsMax_.resize(nodeCount);
+        bodyIndex_.resize(nodeCount, -1);
+        valid_.assign(nodeCount, 0);
+    }
+    void setImplicitLeaf(int slot, const float3& min, const float3& max, int bodyIndex) noexcept {
+        boundsMin_[slot] = min;
+        boundsMax_[slot] = max;
+        bodyIndex_[slot] = bodyIndex;
+        valid_[slot] = 1;
+    }
+    void setImplicitInternalBounds(int slot, const float3& min, const float3& max, bool subtreeValid) noexcept {
+        boundsMin_[slot] = min;
+        boundsMax_[slot] = max;
+        valid_[slot] = subtreeValid ? 1 : 0;
+    }
+
+private:
+    std::vector<uint8_t> valid_;
+
+public:
+
     // Node creation (SafeC++: returns int, no nullptr)
-    int createLeaf(const float3& min, const float3& max, int bodyIdx) noexcept;
-    int createInternal(const float3& min, const float3& max, int leftIdx, int rightIdx, int parentIdx = -1) noexcept;
-    [[nodiscard]] bool isLeaf(int nodeId) const noexcept { return bodyIndex_[nodeId] >= 0; }
+    int createLeaf(const float3& min, const float3& max, int bodyIndex) noexcept;
+    int createInternal(const float3& min, const float3& max, int left, int right, int parent = -1) noexcept;
     void updateBounds(int nodeId, const float3& min, const float3& max) noexcept;
 
-    // Per-node child access used by the refit pass: building a span for every visited
-    // node adds an indirection to the innermost loop.
-    [[nodiscard]] int leftChild(int nodeId) const noexcept { return left_[nodeId]; }
-    [[nodiscard]] int rightChild(int nodeId) const noexcept { return right_[nodeId]; }
+private:
+    int addNode(const float3& min, const float3& max, int left, int right, int parent, int bodyIndex) noexcept;
 };
 
 } // namespace nodes

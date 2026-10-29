@@ -105,6 +105,17 @@ inline avbd::float3 point_to_sim(const godot::Transform3D &world_global, const g
     return to_sim(world_global.affine_inverse().xform(p));
 }
 
+// Whether two poses are the same to within the dust a Node3D transform round trip leaves behind.
+// A deliberate move lands centimetres away from the pose we handed out; an echo lands here. Both
+// the scene-sync write-back and the server's body_set_state use this to tell one from the other.
+inline bool poses_match(const godot::Transform3D &p_a, const godot::Transform3D &p_b) {
+    if (p_a.origin.distance_squared_to(p_b.origin) > 1.0e-14) {
+        return false;
+    }
+    const double dot = p_a.basis.get_rotation_quaternion().dot(p_b.basis.get_rotation_quaternion());
+    return std::abs(std::abs(dot) - 1.0) < 1.0e-9;
+}
+
 // Property value to solver stiffness: strictly negative means "infinitely stiff"
 // (a hard constraint). Godot floats and scene files cannot carry INFINITY, so the
 // sentinel keeps the property serialisable. Zero disables the constraint.

@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -25,23 +27,26 @@ namespace bvh::nodes { class NodeStorage; }
 
 namespace avbd {
 
-// Defined in job_pool.hpp, which is only included by solver.cpp.
+// Defined in job_pool.hpp / taskflow.hpp, which are only included by solver.cpp.
 namespace detail {
 class JobPool;
+class TaskFlow;
 }
 
 // Minimum penalty parameter
 inline constexpr float PENALTY_MIN = 1.0f;
 // Maximum penalty parameter
 inline constexpr float PENALTY_MAX = 10000000000.0f;
-// Base margin for collision detection to avoid flickering contacts
-inline constexpr float COLLISION_MARGIN_BASE = 0.005f;
-// Margin damping factor per iteration
-inline constexpr float COLLISION_MARGIN_DAMPING = 0.5f;
-// Cap on penetration margin
-inline constexpr float COLLISION_MARGIN_MAX = 0.02f;
-// Base collision margin for compatibility
-inline constexpr float COLLISION_MARGIN = COLLISION_MARGIN_BASE;
+// Cap of the adaptive per-contact betaScale multiplier (see SolverParams::Dual::adaptiveBeta).
+inline constexpr float ADAPTIVE_BETA_MAX = 64.0f;
+// Speculative contact margin: the normal constraint is satisfied at the margin surface,
+// not at true zero separation, so a resting contact does not flicker in and out of the
+// broad phase.
+inline constexpr float COLLISION_MARGIN = 0.005f;
+// Cap on the contact error a manifold will model: deeper than this, the residual is
+// clamped (a shape that fell through its partner is not going to be rescued by one more
+// unit of penalty).
+inline constexpr float PENETRATION_MAX = 0.02f;
 // Position threshold for sticking contacts (ie static friction)
 inline constexpr float STICK_THRESH = 0.00001f;
 
@@ -108,24 +113,23 @@ struct Rigid
     // solver's global gravity; a host may stamp a different value per body (this
     // is how per-body gravity modes are expressed).
     float gravity;
+
+    // The one-byte flags, kept in one run so their padding is spent once instead of once per
+    // field.
     bool sleeping = false;
-    // Consecutive finishVelocities() steps with both velocities under the solver's sleep
-    // thresholds; reaching sleepFrames flips `sleeping` on. Only meaningful when the body
-    // is movable and sleep_mode enables sleeping.
-    int stillFrames = 0;
-
-    // Godot-style collision filtering: a pair collides when either side's layer is in the
-    // other's mask. Defaults keep every pair colliding, which is what the solver did
-    // before these existed.
-    uint32_t collisionLayer = 1;
-    uint32_t collisionMask = 1;
-
+    // True when every force on the body is a contact manifold. Only such bodies take the
+    // Chebyshev extrapolation: the contact map is clamped and tolerates gamma > 1, hard
+    // joints do not.
+    bool contactOnly = true;
     // Per-axis motion locks, bit 0..2 = solver x, y, z. A locked axis gets no gravity and
     // cannot carry velocity into a step, which is what keeps a locked body hanging in
     // place. Constraint coupling can still move it within a step; that residual is a
     // documented approximation.
     uint8_t axisLockLinear = 0;
     uint8_t axisLockAngular = 0;
+    int8_t sleep_mode = 0; // 0=NEVER, 1=SLEEP, 2=START_IN_SLEEP
+    // Three bytes of this word are still free: the next flag lands here rather than in a new
+    // cache line.
 
     // Mass and inertia follow from the shape, so it is a constructor argument rather than
     // something set afterwards: a body that exists with the wrong inertia is a bug waiting to
@@ -142,15 +146,133 @@ struct Rigid
     Rigid(Rigid &&) = delete;
     Rigid &operator=(Rigid &&) = delete;
 
-    // Graph-colouring label used by the parallel solver: bodies in one colour never share
-    // a force, so they can be updated concurrently. Written only by Solver::colourGraph();
-    // kept across steps and reset to -1 whenever the body drops out of the update set
-    // (static or sleeping), so -1 = "not in this step's update set".
-    int colour = -1;
-    int sleep_mode = 0; // 0=NEVER, 1=SLEEP, 2=START_IN_SLEEP
+    // Sleep bookkeeping. All of it intrusive rather than a scratch column on purpose: a sleeping
+    // body has no update slot (`updateSlot` is -1, it is out of the primal set), and the wake pass
+    // reads this state for exactly those bodies; it also has to survive between steps, which the
+    // per-step scratch does not.
+    //
+    // Idle credit: steps in which finishBody() found the body quiet, capped at the budget in
+    // Solver::sleepFrames. Solver::updateSleepIslands() is the only thing that turns it into
+    // `sleeping`, and it does so for a whole island at once.
+    int32_t stillFrames = 0;
+    // Consecutive steps the wake evidence has held for this sleeping body. One step's velocity
+    // spike is a numerical nuisance, not a disturbance, so a body has to earn its wake-up over
+    // SolverParams::Sleep::wakeDebounce steps.
+    int32_t wakeFrames = 0;
+    // The pose the rest test measures drift against: a one-tenth-per-step low-pass of the body's
+    // own pose, so what it reports is roughly "how far has this body travelled over the last ten
+    // steps". That is the position-domain, and therefore dt-independent, version of the idle test -
+    // the velocity half of the test divides the same travel by the tick, which at 240 Hz reads four
+    // times the speed it does at 60 Hz for a body that is moving exactly as slowly.
+    float3 sleepRefLin;
+    quat sleepRefAng;
+
+    // Snap the rest window onto the current pose and drop the idle credit. A reference pose from
+    // before a teleport, a wake-up or a rebuild says nothing about where the body is now, and
+    // leaving it would either hold the body awake while the window catches up or, worse, hand it
+    // back credit measured against a pose it no longer has.
+    void resetRestWindow()
+    {
+        sleepRefLin = positionLin;
+        sleepRefAng = positionAng;
+        stillFrames = 0;
+        wakeFrames = 0;
+    }
+
+    // Forced wake, the one that does not go through the island pass: a host that moves a body,
+    // gives it a velocity or asks for it awake has broken the assumption the sleep state was built
+    // on, and its rest window has to start over.
+    void wake()
+    {
+        sleeping = false;
+        resetRestWindow();
+    }
+
+    // Scratch-set membership, rewritten by Solver::selectUpdateBodies() and
+    // Solver::updateSleepIslands() each step. These are handles into the solver's per-step arrays,
+    // not state of the body: `updateSlot` is the index of this body in `Solver::updateOrder`
+    // (and therefore into the columns of Solver::BodyScratch), and -1 marks a body the primal
+    // phases may not move this step (static, sleeping). `islandSlot` is the same idea for the
+    // union-find's island body list. A handle instead of a flag: the array index the phases
+    // need is then free, and reading one says nothing about the other set.
+    int32_t updateSlot = -1;
+    int32_t islandSlot = -1;
+
+    // Godot-style collision filtering: a pair collides when either side's layer is in the
+    // other's mask. Defaults keep every pair colliding, which is what the solver did
+    // before these existed.
+    //
+    // These two, the flags above and `host` below are host vocabulary: the primal never reads
+    // them. They are read once each per step - pairOverlaps() for the layer/mask pair,
+    // warmstartBody() for the axis locks, the update-set selection for sleep_mode - so they
+    // live on the body they describe instead of costing a lookup per body per step. That is
+    // the line this struct holds: solver state and host mapping stay here, per-pass working
+    // sets go in Solver's scratch, and a new field has to say which side it belongs to.
+    uint32_t collisionLayer = 1;
+    uint32_t collisionMask = 1;
+
+    // Host-side back-pointer: the solver never reads or writes it, it exists so a host resolves
+    // a body - and, with it, its own record - from the solver object the broad phase hands back.
+    // A body the host has not registered keeps nullptr. Forces get no such pointer: a host that
+    // reaches a constraint has already reached at least one of its bodies, and the six pointers
+    // plus the vtable fill this object's first 64 bytes exactly, so a byte here would cost a
+    // whole word on every Manifold.
+    void *host = nullptr;
 
     bool constrainedTo(Rigid *other) const;
 };
+
+// How much a body gives way along a constraint direction, for the position projection. The
+// projection splits one correction between a constraint's two sides in proportion to these, so
+// a side that cannot move this step (static, or sleeping and therefore out of the update set)
+// takes none of it and the other side takes all of it.
+//
+// A body's inertia is diagonal (`Rigid::moment`), which is what makes the split arithmetic a
+// componentwise product rather than a 3x3 solve.
+struct Compliance
+{
+    float invMass = 0.0f;
+    float3 invInertia = float3{0, 0, 0};
+
+    [[nodiscard]] bool immobile() const noexcept { return invMass == 0.0f && invInertia.isZero(0.0f); }
+
+    // The body's inverse inertia applied to a world-frame vector. Componentwise by definition:
+    // `Rigid::moment` is diagonal, which is what makes the projection's split arithmetic a
+    // multiply instead of a 3x3 solve. The inertia is stored in the body's own frame and the
+    // solver's angular block treats the rotation vector as if it were in the world one (the
+    // first-order approximation the primal stamps are built on), so the projection follows the
+    // same convention rather than inventing a rotation of its own.
+    [[nodiscard]] float3 invInertiaTimes(float3 v) const noexcept
+    {
+        return float3{invInertia.x() * v.x(), invInertia.y() * v.y(), invInertia.z() * v.z()};
+    }
+
+    // w = J M^-1 J^T for a row whose linear half is `n` and whose angular half is `arm x n`.
+    // Invariant under flipping `n`, which is why one call serves both sides of a constraint.
+    [[nodiscard]] float row(float3 n, float3 arm) const noexcept
+    {
+        const float3 jAng = arm.cross(n);
+        return invMass + jAng.dot(invInertiaTimes(jAng));
+    }
+};
+
+// Defined after Rigid, which is what it reads. `updateSlot >= 0` is the primal's own answer to
+// "may this body be moved this step": the same test the iteration phases use, so a projection
+// can never move a body the rest of the step has left frozen - that would break both the sleep
+// bookkeeping and the thread-count independence the update set is there to protect.
+inline Compliance complianceOf(const Rigid *body)
+{
+    Compliance c;
+    if (body == nullptr || body->mass <= 0.0f || body->updateSlot < 0)
+        return c;
+    c.invMass = 1.0f / body->mass;
+    // A zero or negative principal inertia means the body cannot rotate about that axis
+    // (a cylinder's own axis, for instance); the projection leaves those alone.
+    c.invInertia = float3{body->moment.x() > 0.0f ? 1.0f / body->moment.x() : 0.0f,
+            body->moment.y() > 0.0f ? 1.0f / body->moment.y() : 0.0f,
+            body->moment.z() > 0.0f ? 1.0f / body->moment.z() : 0.0f};
+    return c;
+}
 
 // The 6x6 Newton system a single body solves each iteration, split into its two 3x3
 // diagonal blocks plus the coupling block, and the matching right-hand side.
@@ -177,11 +299,33 @@ struct Block
             rhsLin(diagonal(mass, mass, mass) / dtSq * (positionLin - inertialLin)),
             rhsAng(diagonal(moment.x(), moment.y(), moment.z()) / dtSq * (positionAng - inertialAng)) {}
 
+    // Solve for the update without applying it (block-Jacobi path: each force stores its
+    // partial delta and a later combine pass applies the sum over a body's constraints).
+    void solveDelta(float3 &r_dxLin, float3 &r_dxAng) const noexcept {
+        solve(lhsLin, lhsAng, lhsCross, -rhsLin, -rhsAng, r_dxLin, r_dxAng);
+    }
+
     // Solve for and apply the update (Eq. 4).
     void apply(Rigid &body) const noexcept;
 };
 
 // Holds all user defined and derived constraint parameters, and provides a common interface for all forces.
+
+// Which constraint a Force actually is, fixed at construction. The solver dispatches on this
+// rather than calling contactPointCount() as a type test: that query answers "how many
+// contacts does this manifold hold right now", and every one of its dispatch uses wanted the
+// type. A fresh or emptied manifold is exactly where the two differ - it holds no contacts
+// yet but is still a manifold - so the count stays a reporting query and the kind carries the
+// dispatch.
+enum class ForceKind : uint8_t
+{
+    Contact,      // Manifold
+    Joint,        // Joint (revolute plus angle constraint)
+    GenericJoint, // the 6-DOF joint
+    Spring,
+    Ignore,       // exists only so the broad phase skips a pair
+};
+
 struct Force
 {
     Solver *solver;
@@ -190,8 +334,9 @@ struct Force
     Force *nextA;
     Force *nextB;
     Force *next;
+    const ForceKind kind;
 
-    Force(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB);
+    Force(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, ForceKind p_kind);
     virtual ~Force();
 
     // Same reason as Rigid: a force is a node in three intrusive lists at once.
@@ -200,13 +345,46 @@ struct Force
     Force(Force &&) = delete;
     Force &operator=(Force &&) = delete;
 
+    // Downcast, valid exactly when `kind == ForceKind::Contact`. Checking the kind is the
+    // caller's job; this does not verify it, and there is nothing cheap to verify.
+    [[nodiscard]] Manifold *asManifold();
+    [[nodiscard]] const Manifold *asManifold() const;
 
     virtual bool initialize() = 0;
     virtual void updatePrimal(Rigid *body, float alpha, Block &block) = 0;
     virtual void updateDual(float alpha) = 0;
 
-    // Number of contact points this force contributes (0 for non-contact forces).
-    // Used for statistics/reporting only; the solver never reads it.
+    // --- position projection (see SolverParams::Projection) -------------------
+    //
+    // The projection runs as two passes, and the split is the whole point: pass one is
+    // dispatched over forces, so a constraint may write only its own step-scoped state; pass two
+    // is dispatched over bodies, so a body may write only itself. That is what makes the layer
+    // thread-count independent, and it is why the measured correction is stored here rather than
+    // applied on the spot - applying it would be a second body writing this one's pose.
+    //
+    // Both default to doing nothing: a constraint that models a soft pull (a spring) or no pull
+    // at all (an ignore pair) has no feasibility to guarantee.
+    //
+    // `scale` is the fraction of the error to remove, `maxCorrection` the per-body distance
+    // ceiling in metres.
+    virtual void projectMeasure(float scale, float maxCorrection)
+    {
+        (void)scale;
+        (void)maxCorrection;
+    }
+    // This body's own share of what projectMeasure stored, summed into the two accumulators by
+    // the caller. Zero for a body that is not one of this constraint's, and for one the pass may
+    // not move.
+    virtual void projectShare(const Rigid *body, float3 &r_deltaLin, float3 &r_deltaAng) const
+    {
+        (void)body;
+        (void)r_deltaLin;
+        (void)r_deltaAng;
+    }
+
+    // How many contact points this force currently holds (0 for every non-contact force).
+    // A reporting query - penetration statistics, the host's contact list. Dispatch uses
+    // `kind`, which is also not a virtual call.
     virtual int contactPointCount() const { return 0; }
 
     // Accumulate penetration error (total) and positive-penetration contact count, in
@@ -216,10 +394,6 @@ struct Force
     // Whether this constraint has broken and stopped acting on its bodies. Only
     // breakable joints ever report true; every other force is permanent.
     virtual bool isBroken() const { return false; }
-
-    // Host-side ownership tag. The solver never reads or writes it; it exists so a
-    // host can map a force back to its own object, including one the solver removed.
-    void *owner = nullptr;
 };
 
 // Revolute joint + angle constraint between two rigid bodies, with optional fracture
@@ -233,11 +407,19 @@ struct Joint : Force
     float torqueArm;
     bool broken;
 
+    // Position projection state: the multiplier of each of the three anchor-error rows, in world
+    // axes. Step-scoped for the same reason a manifold's cache is - it describes the correction
+    // being applied right now. The share pass recomputes the arms and rows from the poses, which
+    // have not moved between the two passes, so nothing else has to be stored.
+    float3 projLin = float3{0, 0, 0};
+
     Joint(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, float3 p_rB, float p_stiffnessLin = INFINITY, float p_stiffnessAng = 0.0f, float p_fracture = INFINITY);
 
     bool initialize() override;
     void updatePrimal(Rigid *body, float alpha, Block &block) override;
     void updateDual(float alpha) override;
+    void projectMeasure(float scale, float maxCorrection) override;
+    void projectShare(const Rigid *body, float3 &r_deltaLin, float3 &r_deltaAng) const override;
 
     // Break the joint immediately, discarding its dual state. Used when a host
     // application wants the fracture decision to survive being re-created (the
@@ -264,9 +446,10 @@ struct Spring : Force
 // Force which has no physical effect, but is used to ignore collisions between two bodies
 struct IgnoreCollision : Force
 {
-    // No state of its own, so it inherits the base constructor and overrides nothing:
-    // this force exists purely so that two bodies skip each other in the broad phase.
-    using Force::Force;
+    // No state of its own, so it overrides nothing: this force exists purely so that two
+    // bodies skip each other in the broad phase.
+    IgnoreCollision(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB)
+        : Force(p_solver, p_bodyA, p_bodyB, ForceKind::Ignore) {}
 
     bool initialize() override { return true; }
     void updatePrimal(Rigid *, float, Block &) override {}
@@ -317,11 +500,20 @@ struct GenericJoint : Force
     JointAxis linear[3];
     JointAxis angular[3];
 
+    // Position projection state: the multiplier of each linear axis's row, along that axis in
+    // world space. Step-scoped, like Joint::projLin and the manifold's cache.
+    std::array<float, 3> projLinear = {};
+
     GenericJoint(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, float3 p_rB);
 
     bool initialize() override;
     void updatePrimal(Rigid *body, float alpha, Block &block) override;
     void updateDual(float alpha) override;
+
+    // Position projection of the three linear axes only; see projectMeasure for why the angular
+    // degrees of freedom are left to the Lagrangian.
+    void projectMeasure(float scale, float maxCorrection) override;
+    void projectShare(const Rigid *body, float3 &r_deltaLin, float3 &r_deltaAng) const override;
 
     // Anchor of each body in world space.
     [[nodiscard]] float3 anchorA() const;
@@ -377,16 +569,33 @@ struct Manifold : Force
         int key;
     };
 
-    // Contact point information for a single contact
+    // Contact point information for a single contact.
+    //
+    // This is the cross-step half of a manifold's state: warm-started dual variables that a
+    // resting contact carries from one step to the next, matched into the new contact set by
+    // feature id in initialize(). Anything that only means something inside the current step
+    // belongs in JacobianCache below instead - the split is the rule, and the reason it is
+    // worth a rule: Contact lives in a fixed eight-slot array, so a new field here grows every
+    // pooled manifold block and the per-slot copy loop initialize() runs to warm the set up.
+    // Before adding one, ask whether it survives the step; only then does it come here.
     struct Contact
     {
         FeaturePair feature;
         float3 rA; // contact offset in A's local space (relative to center)
         float3 rB; // contact offset in B's local space (relative to center)
+        // The contact's linear constraint at the previous step's geometry, restamped by
+        // initialize() for the current one: the stabilised form blends the live error against
+        // it, and the adaptive-beta rule reads the value just before it is overwritten to
+        // know how far this contact's error moved. Recomputed every step, but its predecessor
+        // has to survive the boundary - which is what puts it here rather than in the cache.
         float3 C0;
         float3 penalty;
         float3 lambda;
         bool stick;
+        // Personal multiplier on the betaLin penalty ramp, carried across steps with
+        // the warmstart. Adaptive beta (SolverParams::Dual::adaptiveBeta) raises it for contacts
+        // whose error stopped shrinking and lets it fall back for converging ones.
+        float betaScale = 1.0f;
     };
 
     std::array<Contact, 8> contacts;
@@ -399,17 +608,31 @@ struct Manifold : Force
     // is per BODY (rotations are loop-invariant across a manifold's contacts): rebuild
     // everything when either rotation moved more than jacobianRebuildDistance (unit-
     // column distance ~ 2 sin(angle/2)). Invalidated by initialize() (new contact set).
+    //
+    // Step-scoped state, the other half of the split documented on Contact: a field that
+    // only means something inside the current iteration set goes here, not into the
+    // eight-slot persistent array.
     struct JacobianCache
     {
         float3 rAWorld;
         float3 rBWorld;
         float3x3 jAAng;
         float3x3 jBAng;
+        // Position projection (SolverParams::Projection): the correction the measure pass worked
+        // out for each row of this contact, as a multiplier in the contact basis, and which rows
+        // it actually corrected. Step-scoped for the same reason the arms are - it describes the
+        // correction being applied right now, and nothing about it survives to the next step. The
+        // row mask is what the dual ramp reads to avoid ramping against an error already gone.
+        float3 projLambda = float3{0, 0, 0};
+        uint8_t projectedRows = 0;
     };
     std::array<JacobianCache, 8> jacobianCache;
     float3x3 rotACaptured = float3x3::Identity(); // body rotations at capture
     float3x3 rotBCaptured = float3x3::Identity();
     bool jacobiansCached = false;
+    // Clamped contact forces from the primal's shared precompute pass; the two body
+    // stamps read these instead of each recomputing the same C/F from the snapshot.
+    std::array<float3, 8> contactForceCache;
 
     Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB);
 
@@ -425,12 +648,31 @@ struct Manifold : Force
 
     bool initialize() override;
     void updatePrimal(Rigid *body, float alpha, Block &block) override;
+    // Two-phase primal: preCompute (parallel over forces) evaluates the shared per-
+    // contact arms/jacobians/clamped forces once; stampCached (parallel over bodies)
+    // stamps one body's side from that cache. updatePrimal is the self-contained
+    // fallback that runs both.
+    void preCompute(float alpha);
+    void stampCached(Rigid *body, Block &block);
     void updateDual(float alpha) override;
+    // Position projection. The measure pass reads the contact's error at the poses the rest of
+    // the step has left, unstabilised, works out the multiplier that would take each violating row
+    // to zero - shared between the two bodies in proportion to their compliance, the row's total
+    // being the sum of theirs - and keeps it in the cache for the share pass. With dual feedback
+    // it also charges that correction to the contact's multiplier, which is what stops the next
+    // round re-fighting an error the projection has already paid for.
+    void projectMeasure(float scale, float maxCorrection) override;
+    void projectShare(const Rigid *body, float3 &r_deltaLin, float3 &r_deltaAng) const override;
     int contactPointCount() const override { return numContacts; }
     void accumulatePenetration(float &r_total, int &r_count) const override;
 
     static int collide(Rigid *bodyA, Rigid *bodyB, std::span<Contact> contacts, float3x3 &basis);
 };
+
+// Defined here rather than in Force, which is where they are declared: the downcast needs
+// Manifold to be complete, and that happens further down this header.
+inline Manifold *Force::asManifold() { return static_cast<Manifold *>(this); }
+inline const Manifold *Force::asManifold() const { return static_cast<const Manifold *>(this); }
 
 // Discrete shape-pair collision query: up to 8 contact points between two `Shape`s,
 // independent of any solver. `contacts` must hold at least 8 slots (`Manifold`'s
@@ -450,65 +692,236 @@ int collideShapes(const Shape &a, const Shape &b,
 constexpr int kMinBodiesPerDispatch = 48;
 constexpr int kMinForcesPerDispatch = 256;
 
+// Tuning knobs, grouped by the phase that reads them, so a host can hand the whole set over
+// in one assignment (Solver::setParams) instead of copying field by field, and so every knob
+// has one name and one clamp site.
+//
+// Deliberately NOT in here: dt, gravity, iterations and threads. Those are per-tick inputs
+// the phases read bare and often - dt alone appears in the inertial prediction, the Block
+// construction and the BDF1 finish - and nesting them would add a hop to the hottest lines
+// for no clarity.
+struct SolverParams
+{
+    // The force law and the warm-start decay: read by every constraint, in every primal and
+    // dual pass. `beta*` in particular is unit dependent, which is why these are exposed
+    // rather than fixed.
+    struct Dual
+    {
+        float alpha = 0.99f;       // Stabilization parameter, in (0, 1]
+        float betaLin = 10000.0f;  // Penalty ramping for linear constraints
+        float betaAng = 100.0f;    // Penalty ramping for angular constraints
+        float gamma = 0.999f;      // Warmstarting decay, < 1
+
+        // Adaptive beta: per-contact penalty-ramp multipliers carried across steps,
+        // raised (x2, capped) for contacts whose error did not shrink against last step
+        // and decayed (x0.5, floored at 1) for converging ones - the classic augmented
+        // Lagrangian kappa update, per constraint instead of a global betaLin.
+        bool adaptiveBeta = false;
+        // Residual penetration depth (metres) at or below which a contact counts as solved
+        // by the adaptive-beta update: the multiplier decays toward 1 instead of doubling,
+        // so float-scale noise on a resting contact cannot ratchet it to the cap.
+        float adaptiveBetaErrorFloor = 1e-3f;
+    } dual;
+
+    // How the iteration set is scheduled and relaxed: read by computeIterations and by the
+    // primal/dual rounds, never by the constraint code.
+    struct Primal
+    {
+        // Real-time phase split: the first ceil(newtonRatio * iterations) rounds run the full
+        // Newton primal (dense 6x6 solve); the remaining rounds skip the primal entirely and
+        // run dual-only relaxation on the existing jacobians. 1.0 = original AVBD behaviour.
+        // Newton carries the stiff corrections; the dual-only tail is where the convergence
+        // is cheapest to give up.
+        float newtonRatio = 1.0f;
+        // Per-iteration multiplicative decay applied to contact penalties during the
+        // dual-only tail: a stiff penalty converges slowly under relaxation, softening it
+        // lets the cheap rounds actually converge instead of spinning. 1.0 = no decay.
+        float stiffnessDecay = 1.0f;
+
+        // Upper bound of the adaptive iteration boost. The boost multiplies the round count
+        // by the penetration ratio, so at impact moments a scene pays this many dense rounds
+        // per substep - the frame spike the profiler blames. Lower it for smoother frames;
+        // the healing those rounds did is recovered by substeps at high tick rates instead.
+        int adaptiveMaxIterations = 16;
+
+        // Early-exit threshold on the mean penetration residual: when a Newton round
+        // improves the average residual by less than this (or worsens it), the iteration set
+        // ends early - remaining rounds would polish float noise at full price. 0 disables
+        // the check (default: bit-identical iteration counts). Realistic value ~1e-5.
+        float convergenceThreshold = 0.0f;
+
+        // Combine-pass relaxation for the block-Jacobi primal. Every body solves its full
+        // block system against the iteration-start pose snapshot (Jacobi, not Gauss-Seidel),
+        // which for stiff densely-coupled scenes can overshoot where the sequential update
+        // would not; scaling the applied delta by omega < 1 trades per-iteration progress
+        // for stability. 1.0 = unrelaxed. The Chebyshev variant replaces this constant with
+        // a per-iteration schedule. Suite sweep: 0.5-0.7 hold every rigid scene; 1.0 drifts
+        // the 32-layer pyramid.
+        float jacobiRelaxation = 0.7f;
+
+        // Chebyshev semi-iteration over the block-Jacobi primal (0 = off, the default). The
+        // plain Jacobi estimate x + delta is convex-combined with the previous iterate
+        // through the Chebyshev weights for a symmetric iteration matrix with spectral
+        // radius <= rho: gamma_0 = 1, gamma_1 = 1/(1 - rho^2/2), then
+        // gamma_{k+1} = 1/(1 - rho^2 * gamma_k / 4). Only pure-contact bodies take it
+        // (Rigid::contactOnly): extrapolation diverges joint chains. Suite sweeps: rho=0.9
+        // recovers deep-stack penetration (0.058 -> 0.027 m on the 10-box stack) but
+        // diverges the 32-layer stack's interfaces; rho=0.7 is safe but the prev-mixing
+        // smoothing gives back what the extrapolation gains. The textbook schedule assumes
+        // a linear map; this one is clamped with ramping penalties, so it ships default-off
+        // as a per-scene experiment rather than a win.
+        float chebyshevRho = 0.0f;
+
+        // Incremental jacobian rebuild distance (metres): after the first Newton round
+        // assembles a contact's angular jacobian, later rounds reuse it while the contact's
+        // world-space moment arms have drifted less than this from the captured values.
+        // 0 disables caching (full assembly every round; default, bit-identical digests).
+        // Realistic value 1e-4 (0.1 mm): in-iteration arm drift is millimetre-scale.
+        float jacobianRebuildDistance = 0.0f;
+    } primal;
+
+    // The position projection layer (PBD-style), which sits on top of the augmented Lagrangian
+    // and does what a penalty method structurally cannot: make the delivered pose feasible.
+    // The Lagrangian converges towards zero error over rounds, its penalty is capped and its
+    // residual is clamped, so whatever the round budget did not pay for stays as penetration.
+    // Projection takes the error that is left and moves the bodies out of it directly, split
+    // between the two sides by their own compliance so it stays a Jacobi step and therefore
+    // thread-count independent.
+    //
+    // `rounds` is the whole switch: 0 runs none of the passes, and every digest in the suite is
+    // the one measured before this layer existed.
+    struct Projection
+    {
+        // Trailing rounds of the iteration set that end in a projection pass, and the closing
+        // pass after the set. 0 = off, 8 = every round.
+        int rounds = 0;
+        // How much of the measured error one pass removes. 1.0 would be exact projection;
+        // below 1 it is a damped step, which is what keeps a stack of projections from
+        // oscillating when several constraints fight over the same body.
+        float scale = 0.9f;
+        // Ceiling, in metres, on the correction one pass applies to one body. Measured down from
+        // the 0.01 first shipped: a ceiling-sized move is a teleport, and the jointed Bridge
+        // absorbs it at 3 mm (|x| stays 20 at every round count) but throws itself apart at 10 mm
+        // with only the trailing two rounds projected (|x| 1382).
+        float maxCorrection = 0.003f;
+        // Fraction of the projected displacement that shows up as velocity. 1 - standard PBD -
+        // because 0 is measured to be the unstable half: subtracting the move back out of BDF1
+        // leaves the pose saying one thing and its velocity another, and the jointed scenes diverge
+        // at every ceiling tried (Bridge 1141 - 2152 at transfer 0, held at 20 at transfer 1).
+        float velocityTransfer = 1.0f;
+        // Charge the projected correction to the constraint's dual variable (the multiplier)
+        // instead of leaving it as a purely geometric move, and let the penalty ramp skip the
+        // rows the projection already resolved. On, the correction survives the next round
+        // instead of being re-fought by the Lagrangian from scratch, which is what lets a
+        // smaller iteration budget reach the same residual.
+        bool dualFeedback = true;
+        // Which half of the constraint set the passes may touch. Separate switches, because the two
+        // halves measured nothing alike (run_scene over the core scenes, 300 steps, threads=8, with
+        // AVBD_PROJECTION_ROUNDS and the two scope knobs below):
+        //   joints: the baseline loses its jointed chains - by step 300 the Bridge reaches
+        //     |x|=617 and the Rope 1075 - and projection holds the Bridge at 20 with either scope
+        //     and the Rope at 20 with both. Nothing else in the suite moves at all, because nothing
+        //     else has joints. A hard anchor the Lagrangian leaves 2.7 cm open closes to zero
+        //     (avbd_core_test, "projection closes a hard anchor").
+        //   contacts: pays for the residual in scene motion. The stack's worst box-box interface
+        //     goes 0.1145 -> 0.0020 m and the 512-box Pyramid XL improves too (314 -> 152), but the
+        //     16-layer Pyramid, which the baseline holds at |x|=8.008 for 1000 steps, loses a box
+        //     at every scale (0.25 - 1), ceiling (0.001 - 0.01), depth gate, round count and
+        //     transfer tried, the most conservative configuration included (|x| 17 - 184). The
+        //     mass-ratio stack (6.97 -> 250) and the breakable beam (5.24 -> 18.05) go the same way.
+        // That asymmetry is why `rounds` stays 0 by default: the joint half has no measured cost,
+        // the contact half trades residual for stability, and a project has to decide which of the
+        // two it is buying.
+        bool joints = true;
+        bool contacts = true;
+    } projection;
+
+    // Idle detection: a movable body whose recent travel (see Rigid::sleepRefLin) stays under the
+    // tolerances falls asleep - velocity zeroed, Godot semantics - once that has held for
+    // `timeToSleep` seconds. 0 disables automatic sleeping, which is the default the core tests
+    // measure against; the Godot server opens it at Godot's own space default.
+    //
+    // The velocity thresholds are deliberately NOT part of the rest test: solver jitter is a fixed
+    // distance per step, so its BDF1 velocity is a distance divided by the tick and no velocity
+    // gate can be tick-rate independent. They still own the loudest half of the idle decision
+    // (hysteresisRatio) and the whole of the wake test in Solver::updateSleepIslands, which is
+    // where a fast neighbour is the question being asked anyway.
+    struct Sleep
+    {
+        float linearThreshold = 0.1f;       // m/s
+        float angularThreshold = 0.139626f; // rad/s (Godot default: 8 deg/s)
+        // Seconds of uninterrupted idle before a body sleeps. Seconds, not steps, because the
+        // clock the scene runs on is a setting: at tick_rate 120 a step is half as long, and a
+        // budget counted in steps would sleep everything twice as early. Solver::sleepFrames is
+        // the same budget converted for the dt of the tick being run.
+        float timeToSleep = 0.0f;
+        // The position half of the rest test: how far the body may have travelled over the window
+        // its reference pose defines (roughly ten steps) and still count as idle. Metres and
+        // radians, so neither depends on the tick the scene runs on. Both sit well above the
+        // collision margin's own 5 mm of resting overlap because that overlap is a static offset
+        // the reference pose follows, not travel - only movement accumulates against it.
+        float positionTolerance = 0.005f;
+        float rotationTolerance = 0.02f;
+        // Hysteresis. A body inside the tolerances earns a step of idle credit; a body beyond
+        // `hysteresisRatio` times a tolerance loses all of it; in between it only leaks credit, so
+        // a stack whose top box twitches at one and a half times the tolerance does not have to
+        // restart its whole budget from nothing. The ratio is the width of that middle band, and
+        // the reason it exists is the thing this section is about: the transition itself used to be
+        // the disturbance.
+        float hysteresisRatio = 3.0f;
+        // Steps a wake condition has to hold for before the island is woken. One step of a
+        // neighbour's velocity is the same noise the rest test rides out, and an island that wakes
+        // on it restarts every budget inside it - which is what a settled stack did at high tick
+        // rates, over and over. A neighbour moving `hysteresisRatio` times the threshold is not
+        // noise, and wakes the island on the spot.
+        int wakeDebounce = 2;
+    } sleep;
+};
+
 // Core solver class which holds all the rigid bodies and forces, and has logic to step the simulation forward in time
 struct Solver
 {
-    // Parameter defaults. Tuned for metre/kilogram/second scenes; `beta*` in particular is
-    // unit dependent, which is why they are exposed rather than fixed.
+    // Per-tick inputs, tuned for metre/kilogram/second scenes.
     float dt = 1.0f / 60.0f; // Timestep
     float gravity = -10.0f;  // Gravity, along -Z
     int iterations = 10;     // Solver iterations per step
 
-    float alpha = 0.99f;    // Stabilization parameter, in (0, 1]
-    float betaLin = 10000.0f;  // Penalty ramping for linear constraints
-    float betaAng = 100.0f;    // Penalty ramping for angular constraints
-    float gamma = 0.999f;      // Warmstarting decay, < 1
-
-    // Real-time phase split: the first ceil(newtonRatio * iterations) rounds run the full
-    // Newton primal (dense 6x6 solve); the remaining rounds skip the primal entirely and
-    // run dual-only relaxation on the existing jacobians. 1.0 = original AVBD behaviour.
-    // Newton carries the stiff corrections; the dual-only tail is where the convergence
-    // is cheapest to give up.
-    float newtonRatio = 1.0f;
-    // Per-iteration multiplicative decay applied to contact penalties during the
-    // dual-only tail: a stiff penalty converges slowly under relaxation, softening it
-    // lets the cheap rounds actually converge instead of spinning. 1.0 = no decay.
-    float stiffnessDecay = 1.0f;
-
-    // Early-exit threshold on the mean penetration residual: when a Newton round
-    // improves the average residual by less than this (or worsens it), the iteration set
-    // ends early - remaining rounds would polish float noise at full price. 0 disables
-    // the check (default: bit-identical iteration counts). Realistic value ~1e-5.
-    float convergenceThreshold = 1e-5f;
-
-    // Incremental jacobian rebuild distance (metres): after the first Newton round
-    // assembles a contact's angular jacobian, later rounds reuse it while the contact's
-    // world-space moment arms have drifted less than this from the captured values.
-    // 0 disables caching (full assembly every round; default, bit-identical digests).
-    // Realistic value 1e-4 (0.1 mm): in-iteration arm drift is millimetre-scale.
-    float jacobianRebuildDistance = 0.0f;
-
     // Worker threads for the per-body phases. 0 = one per hardware thread, 1 = run
     // everything inline on the calling thread. The result does not depend on this value:
-    // the update order is fixed by the colouring, and threads only spread one colour's
-    // independent bodies over more cores.
+    // every body solves its own block system against the same pose snapshot, and applies
+    // its own delta.
     int threads = 0;
 
-    // Idle detection: a movable body whose BDF1 velocities stay under both thresholds for
-    // this many consecutive steps falls asleep (velocity zeroed, Godot semantics).
-    // 0 disables automatic sleeping; the core tests rely on the default for bit-identical
-    // digests. Thresholds follow Godot's space-parameter defaults.
-    float sleepLinearThreshold = 0.1f;       // m/s
-    float sleepAngularThreshold = 0.139626f; // rad/s (Godot default: 8 deg/s)
-    int sleepFrames = 0;                     // steps below thresholds before sleeping
+    SolverParams params;
+
+    // The host's entry point for the tuning knobs. Range fixing happens here, once, so the
+    // phases can read their knobs bare and a bad project setting cannot reach the math.
+    void setParams(SolverParams p)
+    {
+        p.primal.newtonRatio = std::clamp(p.primal.newtonRatio, 0.0f, 1.0f);
+        p.primal.stiffnessDecay = std::clamp(p.primal.stiffnessDecay, 0.0f, 1.0f);
+        p.primal.jacobianRebuildDistance = std::max(p.primal.jacobianRebuildDistance, 0.0f);
+        p.primal.chebyshevRho = std::max(p.primal.chebyshevRho, 0.0f);
+        p.primal.adaptiveMaxIterations = std::max(p.primal.adaptiveMaxIterations, 2);
+        p.projection.rounds = std::clamp(p.projection.rounds, 0, 8);
+        p.projection.scale = std::clamp(p.projection.scale, 0.0f, 1.0f);
+        p.projection.maxCorrection = std::max(p.projection.maxCorrection, 0.0f);
+        p.projection.velocityTransfer = std::clamp(p.projection.velocityTransfer, 0.0f, 1.0f);
+        p.sleep.linearThreshold = std::max(p.sleep.linearThreshold, 0.0f);
+        p.sleep.angularThreshold = std::max(p.sleep.angularThreshold, 0.0f);
+        p.sleep.timeToSleep = std::max(p.sleep.timeToSleep, 0.0f);
+        p.sleep.positionTolerance = std::max(p.sleep.positionTolerance, 0.0f);
+        p.sleep.rotationTolerance = std::max(p.sleep.rotationTolerance, 0.0f);
+        // Below 1 the leaky band is empty and the hard-reset threshold sits inside the quiet
+        // threshold, which would reset the credit of a body the same step it earned it.
+        p.sleep.hysteresisRatio = std::max(p.sleep.hysteresisRatio, 1.0f);
+        p.sleep.wakeDebounce = std::max(p.sleep.wakeDebounce, 1);
+        params = p;
+    }
 
     // Heads of the two intrusive lists. Owned: `clear()` deletes through them.
     Rigid *bodies = nullptr;
     Force *forces = nullptr;
-
-    // BVH for broad-phase collision detection (SAH-based)
-    bvh::nodes::NodeStorage* bvh = nullptr;
-    bool bvhBuilt = false;
 
     Solver();
     ~Solver();
@@ -525,45 +938,23 @@ struct Solver
     [[nodiscard]] Rigid *pick(float3 origin, float3 dir, float3 &local);
     // Masked variant with Godot's pair semantics: a body is a candidate when
     // (body.layer & p_mask) != 0. The two-argument form above forwards with an
-    // accept-everything mask.
+    // accept-everything mask. Both walk the last built broad-phase tree (ray/AABB
+    // pruned); before any step has built one, they fall back to a body-list walk.
     [[nodiscard]] Rigid *pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask);
+    // Bodies whose last-built broad-phase bounds overlap the query AABB, filtered by
+    // (layer & p_mask) != 0. Backs the direct space state's shape and point queries;
+    // the same no-tree fallback applies.
+    void collectAABB(float3 min, float3 max, uint32_t p_mask, std::vector<Rigid *> &out) const;
     // Delete every body and force.
     void clear();
     void step();
 
-    // Split the bodies into colours such that no two bodies in a colour share a force, and
-    // store them grouped by colour in `updateOrder`. Incremental: updated bodies keep their
-    // previous colour unless a neighbour took it; only conflicting bodies are re-coloured.
-    void colourGraph();
+    // Decide which bodies the primal phases may move this step (wake-up, island sleep and
+    // the sleep-mode gate), and size the per-body delta buffers.
+    void selectUpdateBodies();
 
-    // Number of colours in the current ordering (1 means nothing can run in parallel).
-    [[nodiscard]] int colourCount() const { return colours; }
-    // Number of bodies in the largest colour: the most work one parallel phase can spread
-    // over the worker threads. Reporting only.
-    [[nodiscard]] int widestColour() const { return widest; }
     // Number of worker threads actually in use (1 when running inline).
     [[nodiscard]] int threadCount() const;
-
-    // BVH methods
-    void rebuildBvh();
-    void updateBvhBodyPosition(int bodyIndex);
-    void updateBvh();
-
-    // Performance timing counters (ms).
-    static double _time_broadPhase;
-    static double _time_colourGraph;
-    static double _time_solve;
-    static double _time_finish;
-
-    // Performance timing getters (ms). Returns 0 if timing is not active.
-    [[nodiscard]] static double get_broadPhase_time() { return 0.0; }
-    [[nodiscard]] static double get_colourGraph_time() { return 0.0; }
-    [[nodiscard]] static double get_solve_time() { return 0.0; }
-    [[nodiscard]] static double get_finish_time() { return 0.0; }
-    // Reset all timing counters to zero.
-    static void reset_timing();
-    // Get current CPU time in microseconds.
-    static double get_time();
 
 private:
     // Every body in list order. The inertial/warmstart and BDF1 phases run over this,
@@ -572,34 +963,46 @@ private:
     // the ground is usually one of them.
     std::vector<Rigid *> warmstartOrder;
 
-    // Broad phase: the body list flattened to index-addressable order (rebuilt every
+    // Broad-phase: the body list flattened to index-addressable order (rebuilt every
     // step), plus the BVH built over those bodies and the candidate pair list.
     std::vector<Rigid *> bodiesInOrder;
     bvh::nodes::NodeStorage bvhNodes;
     std::vector<std::pair<int, int>> sweepPairs;
 
-    // BVH refit state. `bvhTreeBodies` is the exact body list the current topology was
-    // built from: leaf nodes store indices into it, so the tree may only be refit while
-    // that list is unchanged (same pointers, same order). `bvhRoot` is the root index the
-    // builder returned - it is not 0, nodes are emitted post-order.
-    int bvhRoot = -1;
-    std::vector<Rigid *> bvhTreeBodies;
-    std::vector<uint8_t> bvhDirty;
-
-    // Steps of refit allowed before the LBVH is rebuilt from Morton codes again. A refit
-    // never re-sorts, so bodies that wander slowly degrade pruning until the next
-    // rebuild caps the drift. Purely a speed knob: refit keeps every internal box the
-    // exact union of its children, so the candidate set - and therefore the result -
-    // is bit-identical whatever this is set to.
-    int bvhAge = 0;
-    int bvhRefitBudget = 16;
-
-    // Bodies that take part in the primal update (movable ones), grouped by colour:
-    // colour c owns updateOrder[colourStart[c] .. colourStart[c + 1]).
+    // Bodies that take part in the primal update (movable, awake ones), in list order.
+    // The Jacobi primal solves one block system per body against the iteration-start
+    // pose, holding the delta in the scratch columns below until the combine pass.
     std::vector<Rigid *> updateOrder;
-    std::vector<int> colourStart;
-    int colours = 0;
-    int widest = 0;
+
+    // The per-step, per-body working set, addressed by Rigid::updateSlot. One struct rather
+    // than loose members so the columns that travel together are declared and sized
+    // together - one resize call, in selectUpdateBodies - and an index can never be valid in
+    // one array and stale in the next.
+    struct BodyScratch
+    {
+        std::vector<float3> deltaLin; // the block solve's linear half, per body
+        std::vector<float3> deltaAng; // ... and its angular half
+        // Previous linear iterate, the Chebyshev combination's x_{k-1}; only read when
+        // chebyshevRho > 0. Angular iterates are not mixed: quats are not a vector space, so
+        // the angular delta only takes the schedule's gamma.
+        std::vector<float3> prevLin;
+        // What the position projection has moved this body so far this step, summed over every
+        // pass (SolverParams::Projection). `finishBody` gives this back out of the BDF1 velocity
+        // only when projection_velocity_transfer asks for a purely positional layer; at the
+        // default the move stays in the velocity, as standard PBD. Zeroed once per step in
+        // warmstartBody, not per pass.
+        std::vector<float3> projLin;
+        std::vector<float3> projAng;
+
+        void resize(size_t bodyCount)
+        {
+            deltaLin.resize(bodyCount);
+            deltaAng.resize(bodyCount);
+            prevLin.resize(bodyCount);
+            projLin.resize(bodyCount);
+            projAng.resize(bodyCount);
+        }
+    } scratch;
 
     // The force list rebuilt each step so the phases can address forces by index, plus the
     // per-force result of initialize() so that deletion can be done in one thread after the
@@ -607,28 +1010,24 @@ private:
     std::vector<Force *> forceOrder;
     std::vector<uint8_t> forceActive;
 
-    // Island scratch (rebuilt when sleep is active): body index base for the union-find,
-    // per-force body slots, and the island id of every movable body (-1 = no island).
+    // Island scratch (rebuilt when sleep is active): the union-find's member list, kept as a
+    // member so its capacity survives between steps. Rigid::islandSlot is the index side of
+    // the deal, which is why the per-force index pairs no longer need storing.
     std::vector<Rigid *> islandBodies;
-    std::vector<std::pair<int, int>> islandForceSlots;
-    std::vector<int> bodyIsland;
+
+    // The idle window expressed in steps, derived from Sleep::timeToSleep and `dt` at the top of
+    // every tick (computeSleepFrames). Idle detection counts steps because the state it compares
+    // against, Rigid::stillFrames, is a step counter; the budget is seconds because the tick is a
+    // setting. 0 means idle detection is off.
+    int sleepFrames = 0;
 
     std::unique_ptr<detail::JobPool> pool;
-
-    // Current collision margin for this frame (dynamically adjusted)
-    float currentCollisionMargin = COLLISION_MARGIN_BASE;
+    // Sequence of classified stages for one step, rebuilt each time `runSubstep` runs.
+    std::unique_ptr<detail::TaskFlow> flow;
 
     // Adaptive iteration count parameters
     float maxPenetrationError = 1e-4f; // Target penetration error tolerance
     bool adaptiveIterations = true;    // Enable adaptive iteration count
-
-    // Compute dynamic collision margin based on penetration depth and timestep
-    inline float computeCollisionMargin(float penetrationDepth, float timestep)
-    {
-        // Dynamically reduce penetration margin as solver converges
-        // Use penetration depth to avoid oscillation
-        return std::min(COLLISION_MARGIN_BASE + penetrationDepth * 0.1f *timestep, COLLISION_MARGIN_MAX);
-    }
 
     // Create the pool on first use so that a serial solver never spawns threads.
     void ensurePool();
@@ -637,25 +1036,42 @@ private:
 
     // The phases of a step, in the order `step()` runs them.
     void broadPhase();
-    // Refresh the broad-phase tree's bounds in place, keeping the topology of the last
-    // `buildLBVH` call. Precondition: every leaf index still addresses the same body,
-    // i.e. `bvhTreeBodies` equals `bodiesInOrder`.
-    void refitTree();
     int warmstartForces();
-    void warmstartBodies();
-    void solveIterations(int forceCount);
-    // The whole iteration set as one persistent-worker loop: `targetIterations` rounds of
-    // per-colour primal passes plus dual passes, fenced by LoopSync barriers instead of
-    // one pool dispatch per phase. Declared here so `iterate` stays testable.
-    void iterate(int targetIterations, int forceCount, int newtonRounds);
-    void finishVelocities();
-    void updatePrimal(Rigid *body);
+    // One body's inertial/warm-start update (independent across the list).
+    void warmstartBody(int i);
+    // Decide this step's round count once, before the region starts.
+    void computeIterations(int &r_targetIterations, int &r_newtonRounds);
+    // Convert the seconds-based idle window into steps for the dt of this tick.
+    void computeSleepFrames();
+    // The whole iteration set as one persistent-worker region: `targetIterations` rounds of
+    // the block-Jacobi primal (one full block solve per body against the iteration-start
+    // pose, then a combine pass) plus dual passes, fenced by LoopSync barriers. Both sync
+    // types run the identical body; NullSync is the inline/reference path.
+    template <typename Sync>
+    void iterateBody(int workerIndex, Sync &sync, int targetIterations, int forceCount,
+            int newtonRounds, float &r_prevResidual, std::atomic<bool> &r_converged);
+    // One body's BDF1 velocity update and idle detection (independent across the list).
+    void finishBody(int i);
+    // The position projection layer: two fenced passes, measure over forces then share and apply
+    // over the update set. Runs as part of the iteration region (the trailing rounds) and again
+    // as the closing stage of a step, so both call sites drive it through the same `Sync`.
+    // Does nothing when projection_rounds is 0, and issues no barriers in that case.
+    template <typename Sync>
+    void projectPass(Sync &sync, int forceCount);
+    // The projection's two per-item halves: one constraint's measure, one body's share and apply.
+    void projectForce(int i);
+    void projectBody(int i);
+    // One step's body warmstart, iteration region, and velocity finish, as a flow.
+    void runSubstep(int forceCount, int targetIterations, int newtonRounds);
 
-    // Island-wide sleep bookkeeping (runs when sleeping is enabled): movable bodies are
-    // grouped into islands through force connectivity, and an island whose every body
-    // cleared idle detection this step puts all its members to sleep together. Prevents
-    // the partially-asleep contact chain from thrashing between states.
-    void islandSleep();
+    // Island-wide sleep bookkeeping, and the only thing that changes `sleeping` on the solver's own
+    // authority (it runs when sleeping is enabled): movable sleep-enabled bodies are grouped into
+    // islands through force connectivity, an island whose every member has earned its idle credit
+    // sleeps as a unit, and an island whose sleeper has held wake evidence for
+    // Sleep::wakeDebounce steps wakes as a unit. Either half alone thrashes: boxes sleeping one at a
+    // time leaves a chain that is part static and part solved, and waking one box of a settled
+    // island restarts the credit of every body it touches.
+    void updateSleepIslands();
 };
 
 } // namespace avbd

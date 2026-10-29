@@ -10,7 +10,10 @@
 
 #include "avbd/list_range.hpp"
 
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <ranges>
@@ -29,6 +32,64 @@ using namespace godot;
 // Singleton pointer declaration.
 AVBDPhysicsServer3D *AVBDPhysicsServer3D::SpaceData::singleton = nullptr;
 using namespace avbd_godot;
+
+// --- step profiling (AVBD_PROFILE=1) -----------------------------------------
+//
+// Env-gated aggregate timers for headless runs that need to attribute per-tick
+// cost to a phase: rebuild, project-settings reads, force integration, the
+// solver itself, contact collection, sync dispatch. Off by default; the on
+// path is a handful of steady_clock reads per step.
+
+namespace {
+using ProfClock = std::chrono::steady_clock;
+
+double seconds_since(const ProfClock::time_point &p_since) {
+    return std::chrono::duration<double, std::nano>(ProfClock::now() - p_since).count();
+}
+
+struct StepProfile {
+    bool enabled = false;
+    bool decided = false;
+    uint64_t ticks = 0;
+    double total_ns = 0.0;
+    double solver_ns = 0.0;
+    double sync_ns = 0.0;
+    double contacts_ns = 0.0;
+    double rebuild_ns = 0.0;
+    double params_ns = 0.0;
+    double forces_ns = 0.0;
+    // Spike attribution: per-phase maxima within the reporting window. The average
+    // hides exactly what a player feels - the one tick in a hundred that stalls the
+    // frame (an impact running max adaptive rounds, a broad-phase pair storm, a
+    // rebuild).
+    double max_total_ns = 0.0;
+    double max_solver_ns = 0.0;
+    double max_sync_ns = 0.0;
+    double max_contacts_ns = 0.0;
+    double max_rebuild_ns = 0.0;
+    double max_params_ns = 0.0;
+    double max_forces_ns = 0.0;
+    uint32_t over_2ms_ticks = 0; // ticks above a 2 ms budget in the window
+    uint32_t rebuilds = 0;
+    int threads_used = 1;
+    // The clock's own output: the most ticks any one engine call ran, and the whole ticks
+    // the catch-up cap refused to run. Together they say whether this window spent its time
+    // simulating or dilating.
+    int ticks_run = 0;
+    uint64_t ticks_dropped = 0;
+    int iterations = 0;
+};
+
+StepProfile &step_profile() {
+    static StepProfile profile;
+    if (!profile.decided) {
+        profile.decided = true;
+        const char *env = std::getenv("AVBD_PROFILE");
+        profile.enabled = env != nullptr && env[0] != '\0' && env[0] != '0';
+    }
+    return profile;
+}
+} // namespace
 
 // Godot 4.3 added per-axis springs to the generic 6-DOF joint and grew the server enums; the
 // godot-cpp headers this extension builds against predate that, so the new slots are named
@@ -85,6 +146,11 @@ AVBDPhysicsServer3D::SpaceData *AVBDPhysicsServer3D::find_space(const RID &p_rid
     return found == spaces.end() ? nullptr : &found->second;
 }
 
+const AVBDPhysicsServer3D::SpaceData *AVBDPhysicsServer3D::find_space(const RID &p_rid) const {
+    const auto found = spaces.find(id_of(p_rid));
+    return found == spaces.end() ? nullptr : &found->second;
+}
+
 // -----------------------------------------------------------------------------
 // Lifecycle
 // -----------------------------------------------------------------------------
@@ -133,11 +199,85 @@ void AVBDPhysicsServer3D::_init() {
         read_project_gravity(space);
         read_project_params(space);
     }
+    if (ProjectSettings *settings = ProjectSettings::get_singleton()) {
+        // Solver parameters are re-read only when a setting actually changes (the signal
+        // is deferred), instead of hashing the setting names on every tick.
+        settings->connect("settings_changed", Callable(this, "_on_project_settings_changed"));
+    }
+}
+
+void AVBDPhysicsServer3D::_on_project_settings_changed() {
+    for (auto &[id, space] : spaces) {
+        (void)id;
+        space.params_dirty = true;
+    }
 }
 
 void AVBDPhysicsServer3D::_flush_queries() {
     flushing_queries = true;
-    // Nothing accumulates queries yet; the direct space state answers immediately.
+    // The engine flushes before stepping, so this is where the last step's poses reach
+    // the scene: the per-body state-sync callable, then scripted integration. Both read
+    // and write the solver's live state, so forces a script applies in _integrate_forces
+    // land in the step about to run (the GodotPhysics contract, and godot-jolt's shape).
+    // The first flush of a scene has no step behind it yet: nothing to deliver.
+    if (has_stepped) {
+        StepProfile &prof = step_profile();
+        const ProfClock::time_point prof_t_sync = ProfClock::now();
+
+        static thread_local Array one_arg = []() {
+            Array array;
+            array.resize(1);
+            return array;
+        }();
+        static thread_local Array two_args = []() {
+            Array array;
+            array.resize(2);
+            return array;
+        }();
+
+        for (auto &[body_id, body] : bodies) {
+            if (body.rigid == nullptr) {
+                continue;
+            }
+            if (!body.sync.is_valid() && !body.force_integration_callback.is_valid()) {
+                continue;
+            }
+            // The pose this body's node is about to be moved to. Only a space that interpolates
+            // has one that differs from the solver's, and the lookup that finds it is per body, so
+            // the common path is a single flag test.
+            const SpaceData *space = any_interpolating ? find_space(body.space) : nullptr;
+            Transform3D shown;
+            const bool blend = space != nullptr && space->interpolate_poses;
+            if (blend) {
+                shown = delivered_transform(body, *space);
+            }
+            body_state->bind(this, body.rigid, make_rid(body_id), blend ? &shown : nullptr);
+            if (body.sync.is_valid()) {
+                one_arg[0] = body_state;
+                body.sync.callv(one_arg);
+            }
+            if (body.force_integration_callback.is_valid()) {
+                // Re-aim the shared instance at the solver's real pose: a script that reads the
+                // transform here is about to write something back into the simulation.
+                if (blend) {
+                    body_state->bind(this, body.rigid, make_rid(body_id));
+                }
+                if (body.force_integration_userdata.get_type() != Variant::NIL) {
+                    two_args[0] = body_state;
+                    two_args[1] = body.force_integration_userdata;
+                    body.force_integration_callback.callv(two_args);
+                } else {
+                    one_arg[0] = body_state;
+                    body.force_integration_callback.callv(one_arg);
+                }
+            }
+        }
+        if (prof.enabled) {
+            const double sync_elapsed = seconds_since(prof_t_sync);
+            prof.sync_ns += sync_elapsed;
+            prof.max_sync_ns = std::max(prof.max_sync_ns, sync_elapsed);
+        }
+    }
     flushing_queries = false;
 }
 
@@ -153,13 +293,14 @@ int32_t AVBDPhysicsServer3D::_get_process_info(PhysicsServer3D::ProcessInfo p_in
         case PhysicsServer3D::INFO_ISLAND_COUNT:
             return static_cast<int32_t>(spaces.size());
         case PhysicsServer3D::INFO_COLLISION_PAIRS: {
-            // Manifolds are the forces with contact points.
+            // Collision pairs are the manifolds; every other force couples bodies that
+            // are not touching.
             int32_t count = 0;
             for (const auto &[id, space] : spaces) {
                 (void)id;
                 count += static_cast<int32_t>(std::ranges::count_if(
                         avbd::next_range(space.solver.forces),
-                        [](const avbd::Force *force) { return force->contactPointCount() > 0; }));
+                        [](const avbd::Force *force) { return force->kind == avbd::ForceKind::Contact; }));
             }
             return count;
         }
@@ -172,6 +313,16 @@ void AVBDPhysicsServer3D::_set_active(bool p_active) {
     // SceneTree::set_pause calls PhysicsServer3D.set_active(!paused): this is the point
     // where simulation must follow the game. _step refuses to run while false.
     server_active = p_active;
+    if (!p_active) {
+        // _step returns before touching the clocks while inactive, so nothing accrues during a
+        // pause. What is left is the sub-tick remainder from the last step before it: spending
+        // that across an arbitrary pause gap would put the resume's first tick at a phase the
+        // scene has no claim on, so the bank is emptied instead.
+        for (auto &[id, space] : spaces) {
+            (void)id;
+            space.clock.reset();
+        }
+    }
 }
 
 void AVBDPhysicsServer3D::_sync() {
@@ -197,21 +348,11 @@ void AVBDPhysicsServer3D::_free_rid(const RID &p_rid) {
     }
     const auto body_found = bodies.find(id);
     if (body_found != bodies.end()) {
-        const uint64_t space_id = id_of(body_found->second.space);
-        if (body_found->second.space.is_valid()) {
-            space_rebuild_pending[space_id] = true;
-        }
-        for (auto joint_it = joints.begin(); joint_it != joints.end();) {
-            if (joint_it->second.body_a == p_rid || joint_it->second.body_b == p_rid) {
-                joint_it = joints.erase(joint_it);
-            } else {
-                ++joint_it;
-            }
-        }
-        for (auto &[other_id, other] : bodies) {
-            (void)other_id;
-            other.exceptions.erase(std::remove(other.exceptions.begin(), other.exceptions.end(), id),
-                    other.exceptions.end());
+        // The record goes now; the solver body it owned stays live until the space rebuilds,
+        // so detach it first. A body with a null host is one the host no longer claims, and the
+        // query paths skip it instead of naming a record that is gone.
+        if (body_found->second.rigid != nullptr) {
+            body_found->second.rigid->host = nullptr;
         }
         bodies.erase(body_found);
         return;
@@ -219,18 +360,7 @@ void AVBDPhysicsServer3D::_free_rid(const RID &p_rid) {
     if (shapes.erase(id) > 0) {
         return;
     }
-    const auto joint_found = joints.find(id);
-    if (joint_found != joints.end()) {
-        const JointData &joint = joint_found->second;
-        const BodyData *body_a = find_body(joint.body_a);
-        const BodyData *body_b = find_body(joint.body_b);
-        if (body_a != nullptr && body_a->space.is_valid()) {
-            space_rebuild_pending[id_of(body_a->space)] = true;
-        }
-        if (body_b != nullptr && body_b->space.is_valid()) {
-            space_rebuild_pending[id_of(body_b->space)] = true;
-        }
-        joints.erase(joint_found);
+    if (joints.erase(id) > 0) {
         return;
     }
     areas.erase(id);
@@ -248,6 +378,10 @@ RID AVBDPhysicsServer3D::_space_create() {
                                .first->second;
     read_project_gravity(space);
     read_project_params(space);
+    // Godot's own space default for how long a body must idle before sleeping. It is set here and
+    // not in read_project_params because that function runs again whenever a project setting
+    // changes, and this value is a per-space one: it belongs to _space_set_param, not to settings.
+    space.params.sleep.timeToSleep = 1.0f;
     return make_rid(id);
 }
 
@@ -260,15 +394,92 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
         return;
     }
 
+    avbd::SolverParams &params = p_space.params;
     p_space.threads = static_cast<int>(settings->get_setting("physics/avbd/threads", 0));
     p_space.iterations = static_cast<int>(settings->get_setting("physics/avbd/iterations", 4));
-    p_space.alpha = settings->get_setting("physics/avbd/alpha", 0.99);
-    p_space.beta_linear = settings->get_setting("physics/avbd/beta_linear", 10000.0);
-    p_space.beta_angular = settings->get_setting("physics/avbd/beta_angular", 100.0);
-    p_space.gamma = settings->get_setting("physics/avbd/gamma", 0.999);
     p_space.substeps = static_cast<int>(settings->get_setting("physics/avbd/substeps", 2));
-    p_space.newton_ratio = settings->get_setting("physics/avbd/newton_ratio", 1.0);
-    p_space.stiffness_decay = settings->get_setting("physics/avbd/stiffness_decay", 0.8);
+
+    // The internal clock. 0 (or a project that never sets it) leaves the engine step in charge;
+    // any rate pins the solver's dt and makes the engine step a sampling rate. Clamped here
+    // because a rate that rounds to zero dt would silently freeze the solver.
+    double tick_rate = static_cast<double>(settings->get_setting("physics/avbd/tick_rate", 0.0));
+    if (tick_rate > 0.0) {
+        tick_rate = std::clamp(tick_rate, 1.0, 1000.0);
+    }
+    p_space.tick_rate = tick_rate;
+    const int catchup = static_cast<int>(settings->get_setting("physics/avbd/max_catchup_ticks", 4));
+    p_space.max_catchup_ticks = std::clamp(catchup, 1, 64);
+    p_space.clock.max_ticks = p_space.max_catchup_ticks;
+    if (tick_rate > 0.0) {
+        // Legal, but the point of the clock is that the solver no longer runs per engine tick.
+        // Sampling below the rate the solver steps at throws ticks away.
+        const double engine_rate = static_cast<double>(
+                settings->get_setting("physics/common/physics_ticks_per_second", 60.0));
+        if (tick_rate < engine_rate && !warned_slow_tick_rate) {
+            warned_slow_tick_rate = true;
+            WARN_PRINT(vformat("AVBD physics server: avbd/tick_rate (%f) is below "
+                               "physics/common/physics_ticks_per_second (%f); the solver will run "
+                               "fewer steps than the engine asks for and drop the surplus time.",
+                    tick_rate, engine_rate));
+        }
+    }
+
+    // Delivery smoothing. The clock's leftover is what a blend is drawn at, and this switch says
+    // whether the scene gets the blend or the newest simulated pose.
+    p_space.interpolate_poses = static_cast<bool>(settings->get_setting("physics/avbd/interpolate_poses", false));
+    any_interpolating = any_interpolating || p_space.interpolate_poses;
+    if (p_space.interpolate_poses && !warned_double_interpolation &&
+            static_cast<bool>(settings->get_setting("physics/common/physics_interpolation", false))) {
+        warned_double_interpolation = true;
+        WARN_PRINT("AVBD physics server: avbd/interpolate_poses is on while "
+                   "physics/common/physics_interpolation is also on. The engine already blends the "
+                   "poses it is delivered, so both layers smooth the same pair and the motion lags "
+                   "by about twice one solver tick. Turn one of them off.");
+    }
+
+    params.dual.alpha = static_cast<float>(settings->get_setting("physics/avbd/alpha", 0.99));
+    params.dual.betaLin = static_cast<float>(settings->get_setting("physics/avbd/beta_linear", 1e5));
+    params.dual.betaAng = static_cast<float>(settings->get_setting("physics/avbd/beta_angular", 1e2));
+    params.dual.gamma = static_cast<float>(settings->get_setting("physics/avbd/gamma", 0.999));
+    params.dual.adaptiveBeta = static_cast<bool>(settings->get_setting("physics/avbd/adaptive_beta", false));
+
+    params.primal.newtonRatio = static_cast<float>(settings->get_setting("physics/avbd/newton_ratio", 0.5));
+    params.primal.stiffnessDecay = static_cast<float>(settings->get_setting("physics/avbd/stiffness_decay", 0.8));
+    params.primal.jacobianRebuildDistance =
+            static_cast<float>(settings->get_setting("physics/avbd/jacobian_rebuild_distance", 0.0));
+    params.primal.chebyshevRho = static_cast<float>(settings->get_setting("physics/avbd/chebyshev_rho", 0.0));
+    params.primal.adaptiveMaxIterations =
+            static_cast<int>(settings->get_setting("physics/avbd/adaptive_max_iterations", 16.0));
+
+    // The position projection layer. Off by default here as well: it changes every delivered pose,
+    // and the two halves of the constraint set buy different things with it - see the
+    // SolverParams::Projection comments for what each scope was measured to help and to cost.
+    // `rounds` is the switch, the rest shape what it does.
+    params.projection.rounds =
+            static_cast<int>(settings->get_setting("physics/avbd/projection_rounds", 0.0));
+    params.projection.scale = static_cast<float>(settings->get_setting("physics/avbd/projection_scale", 0.9));
+    params.projection.maxCorrection =
+            static_cast<float>(settings->get_setting("physics/avbd/projection_max_correction", 0.003));
+    params.projection.velocityTransfer =
+            static_cast<float>(settings->get_setting("physics/avbd/projection_velocity_transfer", 1.0));
+    params.projection.dualFeedback =
+            static_cast<bool>(settings->get_setting("physics/avbd/projection_dual_feedback", true));
+    params.projection.joints =
+            static_cast<bool>(settings->get_setting("physics/avbd/projection_joints", true));
+    params.projection.contacts =
+            static_cast<bool>(settings->get_setting("physics/avbd/projection_contacts", true));
+
+    // The parts of the rest test Godot has no space parameter for. The defaults are the solver's,
+    // and they are the ones the core suite's --sleep audit measures: see SolverParams::Sleep for
+    // what each of them is for and what the tick-rate arithmetic that motivated them looks like.
+    params.sleep.positionTolerance =
+            static_cast<float>(settings->get_setting("physics/avbd/sleep_position_tolerance", 0.005));
+    params.sleep.rotationTolerance =
+            static_cast<float>(settings->get_setting("physics/avbd/sleep_rotation_tolerance", 0.02));
+    params.sleep.hysteresisRatio =
+            static_cast<float>(settings->get_setting("physics/avbd/sleep_hysteresis_ratio", 3.0));
+    params.sleep.wakeDebounce =
+            static_cast<int>(settings->get_setting("physics/avbd/sleep_wake_debounce", 2.0));
 }
 
 void AVBDPhysicsServer3D::_space_set_active(const RID &p_space, bool p_active) {
@@ -282,14 +493,33 @@ bool AVBDPhysicsServer3D::_space_is_active(const RID &p_space) const {
     return found == spaces.end() ? false : found->second.active;
 }
 
-void AVBDPhysicsServer3D::_space_set_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param, double p_value) {
-    // The space parameters are contact tolerances and sleep thresholds, none of which map onto
-    // AVBD's model. They are accepted and ignored rather than rejected, so a project's settings do
-    // not error out on load. Gravity does not come through here at all: Godot keeps it in the
-    // project settings, and a server is expected to read it (see read_project_gravity).
-    (void)p_space;
-    (void)p_param;
-    (void)p_value;
+void AVBDPhysicsServer3D::_space_set_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param, float p_value) {
+    SpaceData *space = find_space(p_space);
+    if (space == nullptr) {
+        return;
+    }
+
+    // The three sleep parameters land on the solver's idle detection as-is. The budget is in
+    // seconds there rather than in steps because the clock it is spent on is itself a setting
+    // (avbd/tick_rate), and a step budget would sleep a scene twice as early at 120 Hz.
+    // The contact tolerances and SPACE_PARAM_SOLVER_ITERATIONS have no AVBD counterpart - the
+    // solver's own collision margin and its adaptive round budget are the equivalents - so those
+    // stay accepted and ignored rather than rejected. Gravity does not come through here at all:
+    // Godot keeps it in the project settings, and a server is expected to read it
+    // (see read_project_gravity).
+    switch (p_param) {
+        case SPACE_PARAM_BODY_LINEAR_VELOCITY_SLEEP_THRESHOLD:
+            space->params.sleep.linearThreshold = p_value;
+            break;
+        case SPACE_PARAM_BODY_ANGULAR_VELOCITY_SLEEP_THRESHOLD:
+            space->params.sleep.angularThreshold = p_value;
+            break;
+        case SPACE_PARAM_BODY_TIME_TO_SLEEP:
+            space->params.sleep.timeToSleep = p_value;
+            break;
+        default:
+            break;
+    }
 }
 
 // Godot stores gravity in the project settings rather than passing it to the server, so the server
@@ -309,10 +539,24 @@ void AVBDPhysicsServer3D::read_project_gravity(SpaceData &p_space) {
     p_space.solver.gravity = -magnitude * sign;
 }
 
-double AVBDPhysicsServer3D::_space_get_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param) const {
-    (void)p_space;
-    (void)p_param;
-    return 0.0;
+float AVBDPhysicsServer3D::_space_get_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param) const {
+    const SpaceData *space = find_space(p_space);
+    if (space == nullptr) {
+        return 0.0f;
+    }
+
+    // The three the server actually keeps; the rest read back as 0.0 rather than a number the
+    // solver never used.
+    switch (p_param) {
+        case SPACE_PARAM_BODY_LINEAR_VELOCITY_SLEEP_THRESHOLD:
+            return space->params.sleep.linearThreshold;
+        case SPACE_PARAM_BODY_ANGULAR_VELOCITY_SLEEP_THRESHOLD:
+            return space->params.sleep.angularThreshold;
+        case SPACE_PARAM_BODY_TIME_TO_SLEEP:
+            return space->params.sleep.timeToSleep;
+        default:
+            return 0.0f;
+    }
 }
 
 // One state object per space, created on first ask. PhysicsDirectSpaceState3D is
@@ -346,13 +590,13 @@ PackedVector3Array AVBDPhysicsServer3D::_space_get_contacts(const RID &p_space) 
     // The engine's debug contacts are world-space points of recent contacts; serve the
     // first-shape contact points of every manifold seen this step.
     for (const avbd::Force *force = found->second.solver.forces; force != nullptr; force = force->next) {
-        const int count = force->contactPointCount();
-        if (count <= 0) {
+        if (force->kind != avbd::ForceKind::Contact) {
             continue;
         }
         // Walk the manifold's stored contacts: rA/rB are local offsets from each body.
         const avbd::Rigid *a = force->bodyA;
-        const avbd::Manifold *manifold = static_cast<const avbd::Manifold *>(force);
+        const avbd::Manifold *manifold = force->asManifold();
+        const int count = manifold->numContacts;
         for (int i = 0; i < count; i++) {
             const avbd::float3 world = a->positionLin + a->positionAng * manifold->contacts[i].rA;
             out.push_back(to_godot(world));
@@ -404,6 +648,141 @@ RID AVBDPhysicsServer3D::_cylinder_shape_create() {
     return make_rid(id);
 }
 
+RID AVBDPhysicsServer3D::_capsule_shape_create() {
+    const uint64_t id = next_id++;
+    ShapeData &shape = shapes[id];
+    shape.type = PhysicsServer3D::SHAPE_CAPSULE;
+    return make_rid(id);
+}
+
+RID AVBDPhysicsServer3D::_convex_polygon_shape_create() {
+    const uint64_t id = next_id++;
+    ShapeData &shape = shapes[id];
+    shape.type = PhysicsServer3D::SHAPE_CONVEX_POLYGON;
+    return make_rid(id);
+}
+
+RID AVBDPhysicsServer3D::_concave_polygon_shape_create() {
+    const uint64_t id = next_id++;
+    ShapeData &shape = shapes[id];
+    shape.type = PhysicsServer3D::SHAPE_CONCAVE_POLYGON;
+    return make_rid(id);
+}
+
+RID AVBDPhysicsServer3D::_heightmap_shape_create() {
+    const uint64_t id = next_id++;
+    ShapeData &shape = shapes[id];
+    shape.type = PhysicsServer3D::SHAPE_HEIGHTMAP;
+    return make_rid(id);
+}
+
+RID AVBDPhysicsServer3D::_world_boundary_shape_create() {
+    const uint64_t id = next_id++;
+    ShapeData &shape = shapes[id];
+    shape.type = PhysicsServer3D::SHAPE_WORLD_BOUNDARY;
+    return make_rid(id);
+}
+
+RID AVBDPhysicsServer3D::_separation_ray_shape_create() {
+    const uint64_t id = next_id++;
+    ShapeData &shape = shapes[id];
+    shape.type = PhysicsServer3D::SHAPE_SEPARATION_RAY;
+    return make_rid(id);
+}
+
+RID AVBDPhysicsServer3D::_custom_shape_create() {
+    const uint64_t id = next_id++;
+    ShapeData &shape = shapes[id];
+    shape.type = PhysicsServer3D::SHAPE_CUSTOM;
+    return make_rid(id);
+}
+
+void AVBDPhysicsServer3D::_shape_set_custom_solver_bias(const RID &p_shape, float p_bias) {
+    if (ShapeData *shape = find_shape(p_shape)) {
+        shape->custom_bias = p_bias;
+    }
+}
+
+float AVBDPhysicsServer3D::_shape_get_custom_solver_bias(const RID &p_shape) const {
+    const auto found = shapes.find(id_of(p_shape));
+    return found == shapes.end() ? 0.0f : found->second.custom_bias;
+}
+
+void AVBDPhysicsServer3D::_shape_set_margin(const RID &p_shape, float p_margin) {
+    if (ShapeData *shape = find_shape(p_shape)) {
+        shape->margin = p_margin;
+    }
+}
+
+float AVBDPhysicsServer3D::_shape_get_margin(const RID &p_shape) const {
+    const auto found = shapes.find(id_of(p_shape));
+    return found == shapes.end() ? 0.0f : found->second.margin;
+}
+
+// -----------------------------------------------------------------------------
+// Soft-body server API: documented unsupported. Godot only drives these through
+// SoftBody3D nodes; every method answers neutrally and nothing is simulated.
+// -----------------------------------------------------------------------------
+
+RID AVBDPhysicsServer3D::_soft_body_create() {
+    return make_rid(next_id++);
+}
+void AVBDPhysicsServer3D::_soft_body_set_space(const RID &p_body, const RID &p_space) { (void)p_body; (void)p_space; }
+RID AVBDPhysicsServer3D::_soft_body_get_space(const RID &p_body) const { (void)p_body; return RID(); }
+void AVBDPhysicsServer3D::_soft_body_set_mesh(const RID &p_body, const RID &p_mesh) { (void)p_body; (void)p_mesh; }
+void AVBDPhysicsServer3D::_soft_body_set_transform(const RID &p_body, const Transform3D &p_transform) { (void)p_body; (void)p_transform; }
+void AVBDPhysicsServer3D::_soft_body_set_collision_layer(const RID &p_body, uint32_t p_layer) { (void)p_body; (void)p_layer; }
+uint32_t AVBDPhysicsServer3D::_soft_body_get_collision_layer(const RID &p_body) const { (void)p_body; return 1; }
+void AVBDPhysicsServer3D::_soft_body_set_collision_mask(const RID &p_body, uint32_t p_mask) { (void)p_body; (void)p_mask; }
+uint32_t AVBDPhysicsServer3D::_soft_body_get_collision_mask(const RID &p_body) const { (void)p_body; return 1; }
+void AVBDPhysicsServer3D::_soft_body_add_collision_exception(const RID &p_body, const RID &p_body_b) { (void)p_body; (void)p_body_b; }
+void AVBDPhysicsServer3D::_soft_body_remove_collision_exception(const RID &p_body, const RID &p_body_b) { (void)p_body; (void)p_body_b; }
+TypedArray<RID> AVBDPhysicsServer3D::_soft_body_get_collision_exceptions(const RID &p_body) const { (void)p_body; return {}; }
+void AVBDPhysicsServer3D::_soft_body_set_total_mass(const RID &p_body, float p_total_mass) { (void)p_body; (void)p_total_mass; }
+float AVBDPhysicsServer3D::_soft_body_get_total_mass(const RID &p_body) const { (void)p_body; return 0.0f; }
+void AVBDPhysicsServer3D::_soft_body_set_linear_stiffness(const RID &p_body, float p_linear_stiffness) { (void)p_body; (void)p_linear_stiffness; }
+float AVBDPhysicsServer3D::_soft_body_get_linear_stiffness(const RID &p_body) const { (void)p_body; return 0.0f; }
+void AVBDPhysicsServer3D::_soft_body_set_pressure_coefficient(const RID &p_body, float p_pressure_coefficient) { (void)p_body; (void)p_pressure_coefficient; }
+float AVBDPhysicsServer3D::_soft_body_get_pressure_coefficient(const RID &p_body) const { (void)p_body; return 0.0f; }
+void AVBDPhysicsServer3D::_soft_body_set_damping_coefficient(const RID &p_body, float p_damping_coefficient) { (void)p_body; (void)p_damping_coefficient; }
+float AVBDPhysicsServer3D::_soft_body_get_damping_coefficient(const RID &p_body) const { (void)p_body; return 0.0f; }
+void AVBDPhysicsServer3D::_soft_body_set_drag_coefficient(const RID &p_body, float p_drag_coefficient) { (void)p_body; (void)p_drag_coefficient; }
+float AVBDPhysicsServer3D::_soft_body_get_drag_coefficient(const RID &p_body) const { (void)p_body; return 0.0f; }
+void AVBDPhysicsServer3D::_soft_body_set_simulation_precision(const RID &p_body, int32_t p_simulation_precision) { (void)p_body; (void)p_simulation_precision; }
+int32_t AVBDPhysicsServer3D::_soft_body_get_simulation_precision(const RID &p_body) const { (void)p_body; return 0; }
+void AVBDPhysicsServer3D::_soft_body_set_shrinking_factor(const RID &p_body, float p_shrinking_factor) { (void)p_body; (void)p_shrinking_factor; }
+float AVBDPhysicsServer3D::_soft_body_get_shrinking_factor(const RID &p_body) const { (void)p_body; return 0.0f; }
+void AVBDPhysicsServer3D::_soft_body_set_state(const RID &p_body, PhysicsServer3D::BodyState p_state, const Variant &p_variant) { (void)p_body; (void)p_state; (void)p_variant; }
+Variant AVBDPhysicsServer3D::_soft_body_get_state(const RID &p_body, PhysicsServer3D::BodyState p_state) const { (void)p_body; (void)p_state; return {}; }
+void AVBDPhysicsServer3D::_soft_body_apply_central_force(const RID &p_body, const Vector3 &p_force) { (void)p_body; (void)p_force; }
+void AVBDPhysicsServer3D::_soft_body_apply_central_impulse(const RID &p_body, const Vector3 &p_impulse) { (void)p_body; (void)p_impulse; }
+void AVBDPhysicsServer3D::_soft_body_apply_point_force(const RID &p_body, int32_t p_point_index, const Vector3 &p_force) { (void)p_body; (void)p_point_index; (void)p_force; }
+void AVBDPhysicsServer3D::_soft_body_apply_point_impulse(const RID &p_body, int32_t p_point_index, const Vector3 &p_impulse) { (void)p_body; (void)p_point_index; (void)p_impulse; }
+void AVBDPhysicsServer3D::_soft_body_move_point(const RID &p_body, int32_t p_point_index, const Vector3 &p_global_position) { (void)p_body; (void)p_point_index; (void)p_global_position; }
+void AVBDPhysicsServer3D::_soft_body_pin_point(const RID &p_body, int32_t p_point_index, bool p_pin) { (void)p_body; (void)p_point_index; (void)p_pin; }
+bool AVBDPhysicsServer3D::_soft_body_is_point_pinned(const RID &p_body, int32_t p_point_index) const { (void)p_body; (void)p_point_index; return false; }
+Vector3 AVBDPhysicsServer3D::_soft_body_get_point_global_position(const RID &p_body, int32_t p_point_index) const { (void)p_body; (void)p_point_index; return Vector3(); }
+void AVBDPhysicsServer3D::_soft_body_remove_all_pinned_points(const RID &p_body) { (void)p_body; }
+void AVBDPhysicsServer3D::_soft_body_set_ray_pickable(const RID &p_body, bool p_enable) { (void)p_body; (void)p_enable; }
+AABB AVBDPhysicsServer3D::_soft_body_get_bounds(const RID &p_body) const { (void)p_body; return AABB(); }
+void AVBDPhysicsServer3D::_soft_body_update_rendering_server(const RID &p_body,
+        PhysicsServer3DRenderingServerHandler *p_rendering_server_handler) { (void)p_body; (void)p_rendering_server_handler; }
+
+bool AVBDPhysicsServer3D::_body_test_motion(const RID &p_body, const Transform3D &p_from, const Vector3 &p_motion,
+        float p_margin, int32_t p_max_collisions, bool p_collide_separation_ray, bool p_recovery_as_collision,
+        PhysicsServer3DExtensionMotionResult *p_result) const {
+    // Motion queries are documented unsupported: the neutral answer is "no hit".
+    (void)p_body;
+    (void)p_from;
+    (void)p_motion;
+    (void)p_margin;
+    (void)p_max_collisions;
+    (void)p_collide_separation_ray;
+    (void)p_recovery_as_collision;
+    (void)p_result;
+    return false;
+}
+
 void AVBDPhysicsServer3D::_shape_set_data(const RID &p_shape, const Variant &p_data) {
     ShapeData *shape = find_shape(p_shape);
     if (shape == nullptr) {
@@ -434,6 +813,33 @@ void AVBDPhysicsServer3D::_shape_set_data(const RID &p_shape, const Variant &p_d
             }
             break;
         }
+        case PhysicsServer3D::SHAPE_CAPSULE: {
+            if (p_data.get_type() == Variant::DICTIONARY) {
+                const Dictionary data = p_data;
+                if (data.has("radius")) {
+                    shape->radius = data["radius"];
+                }
+                if (data.has("height")) {
+                    shape->height = data["height"];
+                }
+            }
+            break;
+        }
+        case PhysicsServer3D::SHAPE_CONVEX_POLYGON: {
+            // Proxy contract: the convex hull is simulated as the local AABB of its
+            // points, stored as full extents (the solver rotates it as an OBB).
+            if (p_data.get_type() == Variant::PACKED_VECTOR3_ARRAY) {
+                const PackedVector3Array points = p_data;
+                Vector3 lo = points.is_empty() ? Vector3() : points[0];
+                Vector3 hi = lo;
+                for (const Vector3 &pt : points) {
+                    lo = lo.min(pt);
+                    hi = hi.max(pt);
+                }
+                shape->extents = hi - lo;
+            }
+            break;
+        }
         default: {
             if (p_data.get_type() == Variant::VECTOR3) {
                 // Half extents in, full extents stored (the resource's `size / 2`).
@@ -445,6 +851,8 @@ void AVBDPhysicsServer3D::_shape_set_data(const RID &p_shape, const Variant &p_d
             break;
         }
     }
+    // Round-trip for _shape_get_data (the engine reads back what it sent).
+    shape->data = p_data;
 }
 
 PhysicsServer3D::ShapeType AVBDPhysicsServer3D::_shape_get_type(const RID &p_shape) const {
@@ -470,8 +878,15 @@ Variant AVBDPhysicsServer3D::_shape_get_data(const RID &p_shape) const {
             data["height"] = shape.height;
             return data;
         }
+        case PhysicsServer3D::SHAPE_CAPSULE: {
+            Dictionary data;
+            data["radius"] = shape.radius;
+            data["height"] = shape.height;
+            return data;
+        }
         default:
-            return Variant(shape.extents / 2.0);
+            // Proxied and excluded shapes round-trip the engine's own payload.
+            return shape.data;
     }
 }
 
@@ -592,6 +1007,7 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
 
         avbd::float3 extents{1, 1, 1};
         avbd::ShapeType type = avbd::ShapeType::Box;
+        bool simulated = true;
         switch (shape.type) {
             case PhysicsServer3D::SHAPE_SPHERE:
                 type = avbd::ShapeType::Sphere;
@@ -605,25 +1021,65 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space) {
                 extents = {static_cast<float>(shape.radius), static_cast<float>(shape.radius),
                         static_cast<float>(shape.height)};
                 break;
+            case PhysicsServer3D::SHAPE_CAPSULE:
+                // Capsule proxy: the solver's cylinder over the capsule's radius and full
+                // height. The hemispherical caps are flat, dimensions and segment match.
+                type = avbd::ShapeType::Cylinder;
+                extents = {static_cast<float>(shape.radius), static_cast<float>(shape.radius),
+                        static_cast<float>(shape.height)};
+                break;
+            case PhysicsServer3D::SHAPE_CONVEX_POLYGON:
+                // Convex proxy: the points' local AABB as a box (stored at set_data time);
+                // the solver rotates it as an OBB. A bounding-box hull, not the hull.
+                extents = to_sim_extents(shape.extents);
+                break;
+            case PhysicsServer3D::SHAPE_CONCAVE_POLYGON:
+            case PhysicsServer3D::SHAPE_HEIGHTMAP:
+            case PhysicsServer3D::SHAPE_WORLD_BOUNDARY:
+            case PhysicsServer3D::SHAPE_SEPARATION_RAY:
+            case PhysicsServer3D::SHAPE_CUSTOM:
+                simulated = false;
+                break;
             default:
                 // Godot's BoxShape3D size is full extents, and so is the solver's box size;
                 // permute into sim axes rather than scaling.
                 extents = to_sim_extents(shape.extents);
                 break;
         }
+        if (!simulated) {
+            // No neutral proxy exists (a trimesh ground's AABB would be a giant solid
+            // box): the body stays out of the solver entirely, per the unsupported-list
+            // contract in the header. Swap the scene to a box shape instead.
+            if (!body.unsupported_warned) {
+                body.unsupported_warned = true;
+                WARN_PRINT("AVBD physics server: a body uses a shape AVBD cannot simulate "
+                        "(concave/heightmap/world boundary/separation ray/custom); the body "
+                        "is excluded from simulation. Use box/sphere/cylinder shapes.");
+            }
+            continue;
+        }
 
         body.rigid = new avbd::Rigid(&space->solver, extents, type, density_for(body), body.friction,
                 to_sim(body.transform.origin), to_sim(body.linear_velocity));
+        // The one bridge from a solver body back to this record; every query result and every
+        // contact report resolves through it.
+        body.rigid->host = &body;
         // The same Y-up to Z-up mapping the node layer uses, applied to the orientation too.
         body.rigid->positionAng = to_sim(body.transform.basis.get_rotation_quaternion());
         body.rigid->velocityAng = to_sim(body.angular_velocity);
         body.rigid->collisionLayer = body.collision_layer;
         body.rigid->collisionMask = body.collision_mask;
         axis_locks_to_sim(body.axis_locks, body.rigid->axisLockLinear, body.rigid->axisLockAngular);
-        body.rigid->sleeping = body.sleeping;
+        // The host's pending request wins over the last reported state; a body the solver had
+        // parked comes back parked.
+        body.rigid->sleeping = body.sleep_requested.value_or(body.sleep_reported);
         // Solver sleep modes: 0 = never sleeps, 1 = may sleep. Idle detection lives in the
-        // solver (Solver::sleepFrames); can_sleep only opens the gate.
+        // solver (SolverParams::Sleep), on this body's rest window - can_sleep only opens the gate.
         body.rigid->sleep_mode = body.can_sleep ? 1 : 0;
+        // The Rigid was built at the node's position with an identity orientation and had its real
+        // rotation stamped afterwards, so its rest window is looking at a pose the body never had.
+        // A rebuild is also, by definition, a change to the body - its credit is void either way.
+        body.rigid->resetRestWindow();
         body.rigid->gravity = space->solver.gravity * static_cast<float>(body.gravity_scale);
     }
 
@@ -955,9 +1411,14 @@ void AVBDPhysicsServer3D::rebuild_cone_twist_joint(SpaceData *space, const Joint
 // Run every active space for one step, then tell each body what happened.
 //
 // Stepping follows the game: while the engine has the server inactive (SceneTree paused)
-// nothing steps. Solver parameters are stamped from project settings every step, and each
-// space runs `substeps` solver steps per engine step with dt split across them.
-void AVBDPhysicsServer3D::_step(double p_step) {
+// nothing steps. Solver parameters are stamped from project settings every step.
+//
+// How much simulation one engine call covers is the space's clock, not the call. With
+// physics/avbd/tick_rate set the space banks the step and hands back whole internal ticks -
+// possibly none, possibly several, never more than the catch-up cap - so the solver's dt and the
+// engine's rate are independent. Without a rate the old behaviour stands: one step split across
+// `substeps`, dt taken from the engine.
+void AVBDPhysicsServer3D::_step(float p_step) {
     if (!server_active) {
         return;
     }
@@ -966,6 +1427,21 @@ void AVBDPhysicsServer3D::_step(double p_step) {
     if (body_state == nullptr) {
         body_state = memnew(AVBDDirectBodyState3D);
     }
+
+    StepProfile &prof = step_profile();
+    const bool profiling = prof.enabled;
+    const ProfClock::time_point prof_t0 = ProfClock::now();
+    double prof_rebuild = 0.0;
+    double prof_params = 0.0;
+    double prof_forces = 0.0;
+    double prof_solver = 0.0;
+    double prof_contacts = 0.0;
+    int prof_threads = 1;
+    int prof_ticks = 0;
+    uint64_t prof_dropped = 0;
+    int prof_iterations = 0;
+    int prof_rebuild_count = 0;
+    bool stepped_any = false;
 
     for (auto &[id, space] : spaces) {
         if (!space.active) {
@@ -977,34 +1453,58 @@ void AVBDPhysicsServer3D::_step(double p_step) {
         // the empty check: a space may be pending precisely because its first body is
         // only now arriving.
         if (space_rebuild_pending.erase(id) > 0) {
+            const ProfClock::time_point prof_t_rebuild = ProfClock::now();
             rebuild_space(make_rid(id));
+            prof_rebuild += seconds_since(prof_t_rebuild);
+            prof_rebuild_count++;
         }
 
         if (space.solver.bodies == nullptr) {
             continue;
         }
 
-        // Project settings may have changed since the last step (the tests flip
-        // physics/avbd/substeps at runtime); re-read before stamping.
-        read_project_params(space);
+        // Project settings are re-read only after a change (the tests flip
+        // physics/avbd/substeps at runtime and expect it to apply without a restart).
+        const ProfClock::time_point prof_t_params = ProfClock::now();
+        if (space.params_dirty) {
+            read_project_params(space);
+            space.params_dirty = false;
+        }
+        prof_params += seconds_since(prof_t_params);
 
-        const float dt = static_cast<float>(p_step);
+        // Two clocks, chosen by physics/avbd/tick_rate. With a rate the solver advances on its
+        // own fixed tick and the engine step only says how much of it has been paid for; without
+        // one the engine step is the clock and splits across `substeps` as it always did.
         const int substeps = space.substeps > 0 ? space.substeps : 1;
-        space.solver.dt = dt / static_cast<float>(substeps);
-        space.solver.iterations = space.iterations > 0 ? space.iterations : space.solver.iterations;
-        space.solver.alpha = static_cast<float>(space.alpha);
-        space.solver.betaLin = static_cast<float>(space.beta_linear);
-        space.solver.betaAng = static_cast<float>(space.beta_angular);
-        space.solver.gamma = static_cast<float>(space.gamma);
-        space.solver.threads = space.threads;
-        // Newton/impulse phase split and tail-stiffness decay (real-time trade-off knobs).
-        space.solver.newtonRatio = static_cast<float>(std::clamp(space.newton_ratio, 0.0, 1.0));
-        space.solver.stiffnessDecay = static_cast<float>(std::clamp(space.stiffness_decay, 0.0, 1.0));
-        // Idle-sleep horizon: 30 steps at the usual 60 Hz tick = Godot's 0.5 s default.
-        space.solver.sleepFrames = 30;
+        double alpha = 1.0;
+        int ticks = 0;
+        if (space.tick_rate > 0.0) {
+            space.clock.tick_dt = 1.0 / space.tick_rate;
+            const uint64_t dropped_before = space.clock.dropped_ticks;
+            ticks = space.clock.consume(p_step, alpha);
+            prof_dropped += space.clock.dropped_ticks - dropped_before;
+            space.solver.dt = static_cast<float>(space.clock.tick_dt);
+        } else {
+            ticks = substeps;
+            space.solver.dt = static_cast<float>(p_step) / static_cast<float>(substeps);
+        }
+        // The delivery path reads this instead of the local: a call that bought no tick still
+        // moves the blend closer to the pose the next tick will produce, and that is what makes
+        // a slow solver tick look smooth. Without a clock the leftover is meaningless, so the
+        // blend is the newest pose (alpha 1) and nothing changes.
+        space.interpolation_alpha = alpha;
+        prof_ticks = std::max(prof_ticks, ticks);
 
-        // Forces accumulated since the last step (persistent constant_* plus one-shot frame
-        // ones) become velocity changes now, so the solver integrates them with everything else.
+        // Forces accumulated since the last call (persistent constant_* plus one-shot frame ones)
+        // become velocity changes now, so the solver integrates them with everything else.
+        //
+        // This runs on every engine call, including one that buys no tick. `frame_force` holds
+        // what the scene asked for during this call, and the velocity change it stands for is
+        // F/m * p_step - the sampling the scene made. Consuming it instead with the span the
+        // clock happened to run would double-count a force that arrived in a call which ran
+        // nothing, which is exactly what a solver tick slower than the engine tick produces.
+        const float dt = static_cast<float>(p_step);
+        const ProfClock::time_point prof_t_forces = ProfClock::now();
         for (auto &[body_id, body] : bodies) {
             if (id_of(body.space) != id || body.rigid == nullptr || body.rigid->mass <= 0.0f) {
                 continue;
@@ -1030,47 +1530,61 @@ void AVBDPhysicsServer3D::_step(double p_step) {
                 body.rigid->velocityAng += body.rigid->positionAng * delta;
             }
         }
+        prof_forces += seconds_since(prof_t_forces);
 
-        for (int sub = 0; sub < substeps; sub++) {
+        if (ticks == 0) {
+            // Less than one internal tick has arrived. Whatever the forces above put into the
+            // bodies' velocities waits here for the tick that spends it; nothing else in this
+            // call has a changed state to report, so the space is left alone.
+            continue;
+        }
+
+        space.solver.iterations = space.iterations > 0 ? space.iterations : space.solver.iterations;
+        space.solver.threads = space.threads;
+        space.solver.setParams(space.params);
+
+        const ProfClock::time_point prof_t_solver = ProfClock::now();
+        for (int tick = 0; tick < ticks; tick++) {
             space.solver.step();
         }
+        prof_solver += seconds_since(prof_t_solver);
+        stepped_any = true;
 
         // Area monitoring runs once per engine step, after the solver's output is in hand
         // and before the scene reads anything back.
         _monitor_areas();
+        const ProfClock::time_point prof_t_contacts = ProfClock::now();
 
         // Collect each body's contacts for the step (used by the DirectBodyState contact
         // getters, i.e. RigidBody3D contact monitoring). Manifolds are the forces with
         // contact points; a contact's world position comes from the anchor of the body
         // being filled. Capped by max_contacts_reported, as Godot does: without the cap
-        // request no contacts are recorded.
+        // request no contacts are recorded. The manifold walk (and its two hash maps)
+        // only runs when some body in this space actually reports contacts.
+        bool any_reports = false;
         for (auto &[collect_id, collect_body] : bodies) {
             (void)collect_id;
             if (id_of(collect_body.space) != id) {
+                continue;
+            }
+            if (collect_body.max_contacts_reported > 0) {
                 collect_body.frame_contacts.clear();
+                any_reports = true;
             }
         }
-        {
-            // Rigid -> owning record, resolved once for the whole manifold walk.
-            std::unordered_map<const avbd::Rigid *, BodyData *> rigid_map;
-            std::unordered_map<const BodyData *, uint64_t> id_map;
-            for (auto &[bid, b] : bodies) {
-                if (id_of(b.space) == id && b.rigid != nullptr) {
-                    b.frame_contacts.clear();
-                    rigid_map.emplace(b.rigid, &b);
-                    id_map.emplace(&b, bid);
-                }
-            }
+        if (any_reports) {
+            // Manifolds are the reporting force. Each endpoint names its own record through
+            // avbd::Rigid::host, so the walk needs no side tables.
             for (avbd::Force *force = space.solver.forces; force != nullptr; force = force->next) {
-                const int count = force->contactPointCount();
+                if (force->kind != avbd::ForceKind::Contact) {
+                    continue;
+                }
+                const avbd::Manifold *manifold = force->asManifold();
+                const int count = manifold->numContacts;
                 if (count <= 0) {
                     continue;
                 }
-                const avbd::Manifold *manifold = static_cast<const avbd::Manifold *>(force);
-                const auto it_a = rigid_map.find(force->bodyA);
-                const auto it_b = rigid_map.find(force->bodyB);
-                BodyData *data[2] = {it_a != rigid_map.end() ? it_a->second : nullptr,
-                        it_b != rigid_map.end() ? it_b->second : nullptr};
+                BodyData *data[2] = {host_of(force->bodyA), host_of(force->bodyB)};
 
                 for (int side = 0; side < 2; side++) {
                     BodyData *fill = data[side];
@@ -1089,56 +1603,109 @@ void AVBDPhysicsServer3D::_step(double p_step) {
                         // normal as pointing out of the other body towards itself.
                         fc.normal = to_godot(avbd::float3{manifold->basis(0, 0), manifold->basis(0, 1), manifold->basis(0, 2)}
                                 * (side == 0 ? 1.0f : -1.0f));
-                        fc.collider_body_id = other != nullptr ? id_map[other] : 0;
+                        fc.collider_body_id = other != nullptr ? other->server_id : 0;
                         fill->frame_contacts.push_back(fc);
                     }
                 }
             }
         }
+        prof_contacts += seconds_since(prof_t_contacts);
 
         for (auto &[body_id, body] : bodies) {
             if (id_of(body.space) != id || body.rigid == nullptr) {
                 continue;
             }
 
-            // Wall clock the result back, through the callback the engine registered for this
-            // body. The server does not touch the scene itself: the engine applies it.
+            // Snapshot the solver's output into the host record; _flush_queries delivers
+            // it to the scene before the next step, through the callback the engine
+            // registered for this body. The server does not touch the scene itself.
             const avbd::Rigid *rigid = body.rigid;
 
             Transform3D transform;
             transform.origin = to_godot(rigid->positionLin);
             transform.basis = Basis(to_godot(rigid->positionAng).normalized());
 
+            // The pair an interpolated delivery blends between. Both halves move one *delivery*
+            // forward, not one tick: the scene can only observe one pose per engine call, so the
+            // interval between two of them is the only span a blend can be drawn across. When a
+            // call runs several ticks they all land in the newer half, and the leftover the clock
+            // reports slides the shown pose between the two - which is a steady lag, never a jitter.
+            body.pose_prev = body.transform;
             body.transform = transform;
             body.linear_velocity = to_godot(rigid->velocityLin);
             body.angular_velocity = to_godot(rigid->velocityAng);
-            // Keep the host copy in step with the solver's sleep state: the pre-step sync
-            // writes body.sleeping back into body.rigid->sleeping, so a solver-side sleep
-            // decision would otherwise be overwritten on the next step.
-            body.sleeping = rigid->sleeping;
+            body.sleep_reported = rigid->sleeping;
+            body.sleep_requested.reset();
+            // The solver's word for this step. It replaces any request the host made before
+            // it, and rebuild_space() restores exactly this when the body is next created.
+        }
 
-            // Godot 4.x sync contract (verified against 4.7 sources): the callable receives
-            // exactly one argument - the PhysicsDirectBodyState3D. The engine reads transform,
-            // velocities, sleeping and contacts off it.
-            if (body.sync.is_valid()) {
-                body_state->bind(this, body.rigid, make_rid(body_id));
-                Array args;
-                args.push_back(body_state);
-                body.sync.callv(args);
-            }
+        prof_threads = std::max(prof_threads, space.solver.threadCount());
+        prof_iterations = std::max(prof_iterations, space.solver.iterations);
+    }
 
-            // Scripted integration: the callback gets the state plus the stored userdata
-            // (Godot drops the userdata argument when it is nil).
-            if (body.force_integration_callback.is_valid()) {
-                body_state->bind(this, body.rigid, make_rid(body_id));
-                Array args;
-                args.push_back(body_state);
-                const bool has_userdata = body.force_integration_userdata.get_type() != Variant::NIL;
-                if (has_userdata) {
-                    args.push_back(body.force_integration_userdata);
-                }
-                body.force_integration_callback.callv(args);
-            }
+    if (stepped_any) {
+        has_stepped = true;
+    }
+
+    if (profiling) {
+        const double prof_total = seconds_since(prof_t0);
+        prof.total_ns += prof_total;
+        prof.solver_ns += prof_solver;
+        prof.contacts_ns += prof_contacts;
+        prof.rebuild_ns += prof_rebuild;
+        prof.params_ns += prof_params;
+        prof.forces_ns += prof_forces;
+        prof.max_total_ns = std::max(prof.max_total_ns, prof_total);
+        prof.max_solver_ns = std::max(prof.max_solver_ns, prof_solver);
+        prof.max_contacts_ns = std::max(prof.max_contacts_ns, prof_contacts);
+        prof.max_rebuild_ns = std::max(prof.max_rebuild_ns, prof_rebuild);
+        prof.max_params_ns = std::max(prof.max_params_ns, prof_params);
+        prof.max_forces_ns = std::max(prof.max_forces_ns, prof_forces);
+        prof.rebuilds += prof_rebuild_count;
+        if (prof_total > 2.0e6)
+            prof.over_2ms_ticks++;
+        prof.threads_used = std::max(prof.threads_used, prof_threads);
+        prof.ticks_run = std::max(prof.ticks_run, prof_ticks);
+        prof.ticks_dropped += prof_dropped;
+        prof.iterations = prof_iterations;
+        prof.ticks++;
+        if (prof.ticks % 240 == 0) {
+            constexpr double to_us = 0.001;
+            std::fprintf(stdout,
+                    "[avbd-profile] calls=%llu total=%.1fus max=%.1fus solver=%.1fus(max %.1fus) sync=%.1fus(max %.1fus) "
+                    "contacts=%.1fus rebuild=%.1fus(max %.1fus x%u) params=%.1fus forces=%.1fus over2ms=%u "
+                    "threads=%d ticks/call=%d dropped=%llu iterations=%d\n",
+                    static_cast<unsigned long long>(prof.ticks), prof.total_ns * to_us,
+                    prof.max_total_ns * to_us,
+                    prof.solver_ns * to_us, prof.max_solver_ns * to_us,
+                    prof.sync_ns * to_us, prof.max_sync_ns * to_us,
+                    prof.contacts_ns * to_us,
+                    prof.rebuild_ns * to_us, prof.max_rebuild_ns * to_us, prof.rebuilds,
+                    prof.params_ns * to_us, prof.forces_ns * to_us, prof.over_2ms_ticks,
+                    prof.threads_used, prof.ticks_run,
+                    static_cast<unsigned long long>(prof.ticks_dropped), prof.iterations);
+            std::fflush(stdout);
+            prof.ticks = 0;
+            prof.ticks_run = 0;
+            prof.ticks_dropped = 0;
+            prof.total_ns = 0.0;
+            prof.solver_ns = 0.0;
+            prof.sync_ns = 0.0;
+            prof.contacts_ns = 0.0;
+            prof.rebuild_ns = 0.0;
+            prof.params_ns = 0.0;
+            prof.forces_ns = 0.0;
+            prof.max_total_ns = 0.0;
+            prof.max_solver_ns = 0.0;
+            prof.max_sync_ns = 0.0;
+            prof.max_contacts_ns = 0.0;
+            prof.max_rebuild_ns = 0.0;
+            prof.max_params_ns = 0.0;
+            prof.max_forces_ns = 0.0;
+            prof.over_2ms_ticks = 0;
+            prof.rebuilds = 0;
+            prof.threads_used = 1;
         }
     }
 }
@@ -1255,7 +1822,7 @@ void AVBDPhysicsServer3D::_joint_make_pin(const RID &p_joint, const RID &p_body_
 }
 
 void AVBDPhysicsServer3D::_pin_joint_set_param(const RID &p_joint, PhysicsServer3D::PinJointParam p_param,
-        double p_value) {
+        float p_value) {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end()) {
         return;
@@ -1264,7 +1831,7 @@ void AVBDPhysicsServer3D::_pin_joint_set_param(const RID &p_joint, PhysicsServer
     // BIAS/DAMPING/IMPULSE_CLAMP are recorded only; the solver's stabilisation is its own.
 }
 
-double AVBDPhysicsServer3D::_pin_joint_get_param(const RID &p_joint, PhysicsServer3D::PinJointParam p_param) const {
+float AVBDPhysicsServer3D::_pin_joint_get_param(const RID &p_joint, PhysicsServer3D::PinJointParam p_param) const {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end()) {
         return 0.0;
@@ -1343,7 +1910,7 @@ void AVBDPhysicsServer3D::_joint_make_hinge_simple(const RID &p_joint, const RID
 }
 
 void AVBDPhysicsServer3D::_hinge_joint_set_param(const RID &p_joint, PhysicsServer3D::HingeJointParam p_param,
-        double p_value) {
+        float p_value) {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end()) {
         return;
@@ -1354,7 +1921,7 @@ void AVBDPhysicsServer3D::_hinge_joint_set_param(const RID &p_joint, PhysicsServ
     }
 }
 
-double AVBDPhysicsServer3D::_hinge_joint_get_param(const RID &p_joint, PhysicsServer3D::HingeJointParam p_param) const {
+float AVBDPhysicsServer3D::_hinge_joint_get_param(const RID &p_joint, PhysicsServer3D::HingeJointParam p_param) const {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end()) {
         return 0.0;
@@ -1400,7 +1967,7 @@ void AVBDPhysicsServer3D::_joint_make_slider(const RID &p_joint, const RID &p_bo
 }
 
 void AVBDPhysicsServer3D::_slider_joint_set_param(const RID &p_joint, PhysicsServer3D::SliderJointParam p_param,
-        double p_value) {
+        float p_value) {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end()) {
         return;
@@ -1414,7 +1981,7 @@ void AVBDPhysicsServer3D::_slider_joint_set_param(const RID &p_joint, PhysicsSer
     }
 }
 
-double AVBDPhysicsServer3D::_slider_joint_get_param(const RID &p_joint, PhysicsServer3D::SliderJointParam p_param) const {
+float AVBDPhysicsServer3D::_slider_joint_get_param(const RID &p_joint, PhysicsServer3D::SliderJointParam p_param) const {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end()) {
         return 0.0;
@@ -1439,7 +2006,7 @@ void AVBDPhysicsServer3D::_joint_make_cone_twist(const RID &p_joint, const RID &
 }
 
 void AVBDPhysicsServer3D::_cone_twist_joint_set_param(const RID &p_joint, PhysicsServer3D::ConeTwistJointParam p_param,
-        double p_value) {
+        float p_value) {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end()) {
         return;
@@ -1451,7 +2018,7 @@ void AVBDPhysicsServer3D::_cone_twist_joint_set_param(const RID &p_joint, Physic
     }
 }
 
-double AVBDPhysicsServer3D::_cone_twist_joint_get_param(const RID &p_joint,
+float AVBDPhysicsServer3D::_cone_twist_joint_get_param(const RID &p_joint,
         PhysicsServer3D::ConeTwistJointParam p_param) const {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end()) {
@@ -1462,7 +2029,7 @@ double AVBDPhysicsServer3D::_cone_twist_joint_get_param(const RID &p_joint,
 }
 
 void AVBDPhysicsServer3D::_generic_6dof_joint_set_param(const RID &p_joint, Vector3::Axis p_axis,
-        PhysicsServer3D::G6DOFJointAxisParam p_param, double p_value) {
+        PhysicsServer3D::G6DOFJointAxisParam p_param, float p_value) {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end() || p_axis < 0 || p_axis > Vector3::AXIS_Z ||
             static_cast<int>(p_param) >= JointData::kMaxParams) {
@@ -1483,7 +2050,7 @@ void AVBDPhysicsServer3D::_generic_6dof_joint_set_param(const RID &p_joint, Vect
     }
 }
 
-double AVBDPhysicsServer3D::_generic_6dof_joint_get_param(const RID &p_joint, Vector3::Axis p_axis,
+float AVBDPhysicsServer3D::_generic_6dof_joint_get_param(const RID &p_joint, Vector3::Axis p_axis,
         PhysicsServer3D::G6DOFJointAxisParam p_param) const {
     const auto found = joints.find(id_of(p_joint));
     if (found == joints.end() || p_axis < 0 || p_axis > Vector3::AXIS_Z ||
@@ -1536,6 +2103,7 @@ bool AVBDPhysicsServer3D::_generic_6dof_joint_get_flag(const RID &p_joint, Vecto
 RID AVBDPhysicsServer3D::_body_create() {
     const uint64_t id = next_id++;
     bodies.emplace(std::piecewise_construct, std::forward_as_tuple(id), std::forward_as_tuple());
+    bodies.find(id)->second.server_id = id;
     return make_rid(id);
 }
 
@@ -1585,20 +2153,35 @@ void AVBDPhysicsServer3D::_body_set_state(const RID &p_body, PhysicsServer3D::Bo
     }
 
     switch (p_state) {
-        case PhysicsServer3D::BODY_STATE_TRANSFORM:
-            body->transform = p_value;
+        case PhysicsServer3D::BODY_STATE_TRANSFORM: {
+            const Transform3D incoming = p_value;
+            // Godot pushes a body's node transform back here whenever the node changes, and the
+            // engine's own sync moves that node to the pose this server delivered. When the
+            // delivery is a blend, the echo is a pose the solver has already left behind, and
+            // writing it would drag the simulation backwards a fraction of a tick - and wake
+            // everything it touched. A write that lands on what we just handed out is not a move.
+            // Only tested when the space blends: with the switch off the delivered pose is
+            // `transform` itself and the write is the ordinary one.
+            const SpaceData *space = find_space(body->space);
+            if (space != nullptr && space->interpolate_poses &&
+                    poses_match(incoming, delivered_transform(*body, *space))) {
+                break;
+            }
+            body->transform = incoming;
+            // A teleport is the body's pose right now, so both halves of the pair move to it and
+            // the next blend starts from here rather than sliding out of the old pose.
+            body->pose_prev = body->transform;
             if (body->rigid != nullptr) {
-                // A transform set from the scene is the body's new pose right now, so the solver
-                // is told to match rather than being left to interpolate towards it.
                 const Transform3D &t = body->transform;
                 body->rigid->positionLin = avbd::float3{static_cast<float>(t.origin.x),
                         static_cast<float>(-t.origin.z), static_cast<float>(t.origin.y)};
                 body->rigid->positionAng = to_sim(t.basis.get_rotation_quaternion());
-                // External teleports wake a sleeping body (Godot semantics).
-                body->rigid->sleeping = false;
-                body->rigid->stillFrames = 0;
+                // External teleports wake a sleeping body (Godot semantics) - and reset its rest
+                // window with it, since the pose the credit was measured against is gone.
+                body->rigid->wake();
             }
             break;
+        }
 
         case PhysicsServer3D::BODY_STATE_LINEAR_VELOCITY:
             body->linear_velocity = p_value;
@@ -1606,9 +2189,9 @@ void AVBDPhysicsServer3D::_body_set_state(const RID &p_body, PhysicsServer3D::Bo
                 const Vector3 &v = body->linear_velocity;
                 body->rigid->velocityLin = avbd::float3{static_cast<float>(v.x), static_cast<float>(-v.z),
                         static_cast<float>(v.y)};
-                // An explicit velocity assignment wakes a sleeping body (Godot semantics).
-                body->rigid->sleeping = false;
-                body->rigid->stillFrames = 0;
+                // An explicit velocity assignment wakes a sleeping body (Godot semantics), with the
+                // same rest-window reset a teleport gets.
+                body->rigid->wake();
             }
             break;
 
@@ -1618,21 +2201,24 @@ void AVBDPhysicsServer3D::_body_set_state(const RID &p_body, PhysicsServer3D::Bo
                 const Vector3 &w = body->angular_velocity;
                 body->rigid->velocityAng = avbd::float3{static_cast<float>(w.x), static_cast<float>(-w.z),
                         static_cast<float>(w.y)};
-                body->rigid->sleeping = false;
-                body->rigid->stillFrames = 0;
+                body->rigid->wake();
             }
             break;
 
         case PhysicsServer3D::BODY_STATE_SLEEPING: {
-            body->sleeping = p_value;
+            // Recorded as the host's request: it is what a rebuild restores until the solver
+            // reports a state of its own.
+            body->sleep_requested = p_value;
             if (body->rigid != nullptr) {
-                body->rigid->sleeping = p_value;
                 if (p_value) {
+                    body->rigid->sleeping = true;
                     // Godot zeroes velocity when a body is put to sleep explicitly.
                     body->rigid->velocityLin = avbd::float3{0, 0, 0};
                     body->rigid->velocityAng = avbd::float3{0, 0, 0};
                     body->linear_velocity = Vector3();
                     body->angular_velocity = Vector3();
+                } else {
+                    body->rigid->wake();
                 }
             }
             break;
@@ -1650,6 +2236,13 @@ void AVBDPhysicsServer3D::_body_set_state(const RID &p_body, PhysicsServer3D::Bo
     }
 }
 
+Transform3D AVBDPhysicsServer3D::delivered_transform(const BodyData &p_body, const SpaceData &p_space) {
+    if (!p_space.interpolate_poses || p_space.interpolation_alpha >= 1.0 || !p_body.pose_prev.has_value()) {
+        return p_body.transform;
+    }
+    return p_body.pose_prev->interpolate_with(p_body.transform, p_space.interpolation_alpha);
+}
+
 Variant AVBDPhysicsServer3D::_body_get_state(const RID &p_body, PhysicsServer3D::BodyState p_state) const {
     const auto found = bodies.find(id_of(p_body));
     if (found == bodies.end()) {
@@ -1658,14 +2251,17 @@ Variant AVBDPhysicsServer3D::_body_get_state(const RID &p_body, PhysicsServer3D:
     const BodyData &body = found->second;
 
     switch (p_state) {
-        case PhysicsServer3D::BODY_STATE_TRANSFORM:
-            return body.transform;
+        case PhysicsServer3D::BODY_STATE_TRANSFORM: {
+            const SpaceData *space = find_space(body.space);
+            return Variant(space != nullptr ? delivered_transform(body, *space) : body.transform);
+        }
         case PhysicsServer3D::BODY_STATE_LINEAR_VELOCITY:
             return body.linear_velocity;
         case PhysicsServer3D::BODY_STATE_ANGULAR_VELOCITY:
             return body.angular_velocity;
         case PhysicsServer3D::BODY_STATE_SLEEPING:
-            return body.rigid != nullptr ? body.rigid->sleeping : body.sleeping;
+            return body.rigid != nullptr ? body.rigid->sleeping
+                                         : body.sleep_requested.value_or(body.sleep_reported);
         case PhysicsServer3D::BODY_STATE_CAN_SLEEP:
             return body.can_sleep;
         default:
@@ -1781,7 +2377,10 @@ Vector3 AVBDPhysicsServer3D::body_state_contact_collider_velocity(const RID &p_b
 }
 
 double AVBDPhysicsServer3D::body_state_step() const {
-    // Every space steps with the engine's fixed timestep; report the common value.
+    // The solver's own step length, which is what it integrates a callback's velocity over.
+    // Under physics/avbd/tick_rate that is the internal tick rather than a slice of the engine
+    // step; the server's own force integration still uses the engine step, because that is the
+    // interval a script's add_force() call actually covers.
     for (const auto &[id, space] : spaces) {
         (void)id;
         return space.solver.dt;
@@ -1789,37 +2388,9 @@ double AVBDPhysicsServer3D::body_state_step() const {
     return 0.0;
 }
 
-double AVBDPhysicsServer3D::get_solver_broad_phase_time() const {
-    for (const auto &[id, space] : spaces) {
-        (void)id;
-        return space.solver.get_broadPhase_time();
-    }
-    return 0.0;
-}
-
-double AVBDPhysicsServer3D::get_solver_colour_graph_time() const {
-    for (const auto &[id, space] : spaces) {
-        (void)id;
-        return space.solver.get_colourGraph_time();
-    }
-    return 0.0;
-}
-
-double AVBDPhysicsServer3D::get_solver_solve_time() const {
-    for (const auto &[id, space] : spaces) {
-        (void)id;
-        return space.solver.get_solve_time();
-    }
-    return 0.0;
-}
-
-double AVBDPhysicsServer3D::get_solver_finish_time() const {
-    for (const auto &[id, space] : spaces) {
-        (void)id;
-        return space.solver.get_finish_time();
-    }
-    return 0.0;
-}
+// Solver phase timings were exposed here once the solver had per-phase counters; the
+// counters were dead code (every getter returned a constant), and the live instrumentation
+// is the AVBD_PROFILE step profile in _step. The GDScript surface is gone with them.
 
 AVBDPhysicsServer3D *AVBDPhysicsServer3D::get_singleton() {
     return SpaceData::singleton;
@@ -1865,6 +2436,29 @@ std::vector<AVBDPhysicsServer3D::QueryCandidate> AVBDPhysicsServer3D::query_cand
     );
 }
 
+std::vector<AVBDPhysicsServer3D::QueryCandidate> AVBDPhysicsServer3D::query_candidates_aabb(
+        const RID &p_space, avbd::float3 p_min, avbd::float3 p_max, uint32_t p_mask) const {
+    const auto found = spaces.find(id_of(p_space));
+    if (found == spaces.end()) {
+        return {};
+    }
+    const SpaceData &space = found->second;
+
+    std::vector<avbd::Rigid *> rigids;
+    space.solver.collectAABB(p_min, p_max, p_mask, rigids);
+
+    std::vector<QueryCandidate> out;
+    out.reserve(rigids.size());
+    for (const avbd::Rigid *rigid : rigids) {
+        const BodyData *host = host_of(rigid);
+        if (host == nullptr) {
+            continue; // a body the server no longer claims
+        }
+        out.push_back(QueryCandidate{const_cast<avbd::Rigid *>(rigid), host->server_id});
+    }
+    return out;
+}
+
 avbd::Rigid *AVBDPhysicsServer3D::solver_pick(const RID &p_space, avbd::float3 p_origin, avbd::float3 p_dir,
         uint32_t p_mask, avbd::float3 &r_local) {
     SpaceData *space = find_space(p_space);
@@ -1874,14 +2468,20 @@ avbd::Rigid *AVBDPhysicsServer3D::solver_pick(const RID &p_space, avbd::float3 p
     return space->solver.pick(p_origin, p_dir, r_local, p_mask);
 }
 
+AVBDPhysicsServer3D::BodyData *AVBDPhysicsServer3D::host_of(avbd::Rigid *p_rigid) const {
+    return p_rigid != nullptr && p_rigid->host != nullptr ? static_cast<BodyData *>(p_rigid->host) : nullptr;
+}
+
+const AVBDPhysicsServer3D::BodyData *AVBDPhysicsServer3D::host_of(const avbd::Rigid *p_rigid) const {
+    return host_of(const_cast<avbd::Rigid *>(p_rigid));
+}
+
 uint64_t AVBDPhysicsServer3D::body_id_of(const RID &p_space, const avbd::Rigid *p_rigid) const {
-    const uint64_t space_id = id_of(p_space);
-    for (const auto &[id, body] : bodies) {
-        if (body.rigid == p_rigid && id_of(body.space) == space_id) {
-            return id;
-        }
-    }
-    return 0;
+    // One dereference: the solver body points at its own record, and the record knows the id
+    // it lives under. The space still filters - a body of another space is not an answer here,
+    // which is what the per-space index used to guarantee by construction.
+    const BodyData *body = host_of(p_rigid);
+    return body != nullptr && body->space == p_space ? body->server_id : 0;
 }
 
 RID AVBDPhysicsServer3D::solver_pick_rid(const RID &p_space, const avbd::Rigid *p_rigid) {
@@ -2157,13 +2757,13 @@ int32_t AVBDPhysicsServer3D::_body_get_max_contacts_reported(const RID &p_body) 
     return found == bodies.end() ? 0 : found->second.max_contacts_reported;
 }
 
-void AVBDPhysicsServer3D::_body_set_contacts_reported_depth_threshold(const RID &p_body, double p_threshold) {
+void AVBDPhysicsServer3D::_body_set_contacts_reported_depth_threshold(const RID &p_body, float p_threshold)  {
     if (BodyData *body = find_body(p_body)) {
         body->contacts_depth_threshold = p_threshold; // recorded; not applied (contact depths come from the solver)
     }
 }
 
-double AVBDPhysicsServer3D::_body_get_contacts_reported_depth_threshold(const RID &p_body) const {
+float AVBDPhysicsServer3D::_body_get_contacts_reported_depth_threshold(const RID &p_body) const {
     const auto found = bodies.find(id_of(p_body));
     return found == bodies.end() ? 0.0 : found->second.contacts_depth_threshold;
 }
@@ -2270,13 +2870,13 @@ uint32_t AVBDPhysicsServer3D::_body_get_collision_mask(const RID &p_body) const 
     return found == bodies.end() ? 1 : found->second.collision_mask;
 }
 
-void AVBDPhysicsServer3D::_body_set_collision_priority(const RID &p_body, double p_priority) {
+void AVBDPhysicsServer3D::_body_set_collision_priority(const RID &p_body, float p_priority) {
     if (BodyData *body = find_body(p_body)) {
         body->collision_priority = p_priority; // recorded; solver has no priority weighting
     }
 }
 
-double AVBDPhysicsServer3D::_body_get_collision_priority(const RID &p_body) const {
+float AVBDPhysicsServer3D::_body_get_collision_priority(const RID &p_body) const {
     const auto found = bodies.find(id_of(p_body));
     return found == bodies.end() ? 1.0 : found->second.collision_priority;
 }
