@@ -36,6 +36,7 @@ avbd/chebyshev_rho=0.05
 avbd/adaptive_max_iterations=12
 avbd/threads=8
 avbd/adaptive_beta=true
+avbd/beta_linear=1000000.0
 
 [rendering]
 
