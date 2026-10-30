@@ -78,11 +78,21 @@ static void register_avbd_settings() {
             // Delivery smoothing, not a solver knob: the scene is handed the blend of the last two
             // deliveries instead of the newest pose. Off keeps every existing project's numbers.
             {"physics/avbd/interpolate_poses", Variant(false)},
+            // Both 1.0: a dual-only round (newton_ratio < 1) has no fixed point while the pose is
+            // frozen, so it winds the multiplier up by K*C per round - the 16-layer Pyramid ends at
+            // |x| = 1224 m with the tail this used to default to, against 8.04 m without it. See
+            // SolverParams::Primal::newtonRatio.
             {"physics/avbd/newton_ratio", Variant(1.0)},
-            {"physics/avbd/stiffness_decay", Variant(0.8)},
+            {"physics/avbd/stiffness_decay", Variant(1.0)},
             {"physics/avbd/jacobian_rebuild_distance", Variant(0.0)},
             {"physics/avbd/chebyshev_rho", Variant(0.0)},
-            {"physics/avbd/adaptive_max_iterations", Variant(16)},
+            // Combine-pass relaxation, split by what a body's rows are. A contact map is unilateral
+            // and clamped and takes the plain constant; a body on a stiffness-coupled chain needs
+            // the extra damping, because block-Jacobi on a stiff chain with a hard end has a spectral
+            // radius above 1 at the contact constant (measured: a 20-link chain of 1 kg bodies
+            // diverges at 0.7 and holds at 0.5). See SolverParams::Primal::jointRelaxation.
+            {"physics/avbd/jacobi_relaxation", Variant(0.7)},
+            {"physics/avbd/joint_relaxation", Variant(0.5)},
             {"physics/avbd/adaptive_beta", Variant(false)},
             // The position projection layer: a positional pass over the constraints that declares
             // itself hard (contacts, locked and limited joint axes), so a delivered pose is legal
@@ -105,6 +115,16 @@ static void register_avbd_settings() {
             // Charge the correction to the constraint's force multiplier so the next round's
             // penalty ramp does not buy the same lift twice.
             {"physics/avbd/projection_dual_feedback", Variant(true)},
+            // Re-anchor the stabilisation reference onto the pose a pass delivered instead of
+            // charging the multiplier. One ledger instead of two: the pose is what the layer
+            // changed, so the pose is what the Lagrangian's acceptance surface has to follow.
+            // Supersedes projection_dual_feedback while it is on. See
+            // SolverParams::Projection::rebase for why charging the multiplier makes a bilateral
+            // chain oscillate.
+            {"physics/avbd/projection_rebase", Variant(true)},
+            // Project on the trailing Newton rounds only, keeping the pass out of the dual-only
+            // tail where stiffness_decay is softening the penalty it measures against.
+            {"physics/avbd/projection_trailing_newton_only", Variant(false)},
             {"physics/avbd/projection_joints", Variant(true)},
             {"physics/avbd/projection_contacts", Variant(true)},
             // Sleeping. Godot's own space parameters (3d/sleep_linear_threshold,

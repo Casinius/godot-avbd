@@ -25,6 +25,49 @@
 
 namespace avbd {
 
+namespace {
+
+// Times one phase into a profile slot: construction starts the clock, `workDone` closes the item
+// loop's span and `syncDone` the barrier's. A null slot - every worker but 0, and every build
+// without AVBD_PROFILE - makes every call a no-op, which is what keeps the timers off the hot path.
+class PhaseTimer
+{
+public:
+    explicit PhaseTimer(Solver::PhaseProfile *p_slot) noexcept :
+            slot(p_slot)
+    {
+#ifdef AVBD_PROFILE
+        if (slot != nullptr)
+            start = std::chrono::steady_clock::now();
+#endif
+    }
+
+    void workDone() noexcept { stamp(true); }
+    void syncDone() noexcept { stamp(false); }
+
+private:
+    void stamp(bool work) noexcept
+    {
+#ifdef AVBD_PROFILE
+        if (slot == nullptr)
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        const double seconds = std::chrono::duration<double>(now - start).count();
+        (work ? slot->work : slot->sync) += seconds;
+        start = now;
+#else
+        (void)work;
+#endif
+    }
+
+    Solver::PhaseProfile *slot;
+#ifdef AVBD_PROFILE
+    std::chrono::steady_clock::time_point start;
+#endif
+};
+
+} // namespace
+
 Solver::Solver()
 {
 }
@@ -37,6 +80,42 @@ Solver::~Solver()
     // whole simulation shuts down the cache must not leak.
     Manifold::drainPool();
 }
+
+// Instrumentation (see Solver's "Instrumentation" block). Everything here folds away outside an
+// AVBD_PROFILE / AVBD_DIAG build, which is why the phases can call it unconditionally.
+Solver::PhaseProfile *Solver::phaseSlot(int id, int workerIndex) noexcept
+{
+#ifdef AVBD_PROFILE
+    if (workerIndex == 0 && id >= 0 && id < kPhaseCount)
+        return &profileData.phases[id];
+#else
+    (void)id;
+    (void)workerIndex;
+#endif
+    return nullptr;
+}
+
+void Solver::StepProfile::reset() noexcept
+{
+    for (PhaseProfile &phase : phases)
+        phase = PhaseProfile{};
+    wall = 0.0;
+    rounds = 0.0;
+    samples = 0;
+}
+
+#ifdef AVBD_DIAG
+void Solver::Diag::reset() noexcept
+{
+    maxJointLambda.store(0.0f, std::memory_order_relaxed);
+    maxJointC0.store(0.0f, std::memory_order_relaxed);
+    chargeContact.store(0.0f, std::memory_order_relaxed);
+    chargeJoint.store(0.0f, std::memory_order_relaxed);
+    askedContact.store(0.0f, std::memory_order_relaxed);
+    askedJoint.store(0.0f, std::memory_order_relaxed);
+    maxBodyMove.store(0.0f, std::memory_order_relaxed);
+}
+#endif
 
 Rigid *Solver::pick(float3 origin, float3 dir, float3 &local)
 {
@@ -273,6 +352,9 @@ void Solver::step()
 {
     ensurePool();
 
+#ifdef AVBD_DIAG
+    diag.reset();
+#endif
     computeSleepFrames();
     broadPhase();
     const int forceCount = warmstartForces();
@@ -526,34 +608,22 @@ void Solver::computeSleepFrames()
 
 // Decide this step's round count once, on the caller, after warm-starting and before the
 // region starts; every participant then reads the same values.
+//
+// `iterations` is the round budget, full stop. It used to be multiplied by the scene's mean
+// penetration over a tolerance and then clamped to a second limit, which meant every scene resting
+// at millimetre scale - i.e. every scene with a stack in it - ran the clamp and ignored the number
+// the host asked for. A budget that silently becomes a constant is not a budget, and it also hid
+// how much the round count was really costing. The estimate is gone.
 void Solver::computeIterations(int &r_targetIterations, int &r_newtonRounds)
 {
     const SolverParams::Primal &primal = params.primal;
-    int targetIterations = iterations;
 
-    if (adaptiveIterations)
-    {
-        // Estimate total penetration error from current manifolds
-        float totalPenetration = 0.0f;
-        int penetrationCount = 0;
-        for (Force *f = forces; f != nullptr; f = f->next)
-            f->accumulatePenetration(totalPenetration, penetrationCount);
-
-        // Adaptive iteration count: more iterations needed if penetration is large
-        if (penetrationCount > 0)
-        {
-            float avgPenetration = totalPenetration / penetrationCount;
-            targetIterations = static_cast<int>(std::round(iterations * avgPenetration / maxPenetrationError));
-        }
-        targetIterations = std::max(2, targetIterations);  // Minimum 2 iterations
-        targetIterations = std::min(targetIterations, primal.adaptiveMaxIterations); // Impact-moment cost bound; see the knob comment.
-    }
-
-    r_targetIterations = targetIterations;
+    r_targetIterations = std::max(iterations, 0);
     // newtonRatio splits the set: the leading rounds run primal + dual, the tail runs
     // dual-only relaxation (optionally with penalty decay via stiffnessDecay).
     r_newtonRounds = std::clamp(
-            static_cast<int>(std::ceil(primal.newtonRatio * static_cast<float>(targetIterations))), 0, targetIterations);
+            static_cast<int>(std::ceil(primal.newtonRatio * static_cast<float>(r_targetIterations))),
+            0, r_targetIterations);
 }
 
 // One step: body warmstart (independent), the block-Jacobi iteration region, then the BDF1
@@ -564,6 +634,10 @@ void Solver::runSubstep(int forceCount, int targetIterations, int newtonRounds)
 {
     float prevResidual = 0.0f;
     std::atomic<bool> converged{false};
+
+#ifdef AVBD_PROFILE
+    const auto profileStart = std::chrono::steady_clock::now();
+#endif
 
     flow->clear();
     flow->independent([this] { return static_cast<int>(warmstartOrder.size()); },
@@ -595,6 +669,11 @@ void Solver::runSubstep(int forceCount, int targetIterations, int newtonRounds)
             kMinBodiesPerDispatch, [this](int i) { finishBody(i); });
 
     flow->run();
+
+#ifdef AVBD_PROFILE
+    profileData.wall += std::chrono::duration<double>(std::chrono::steady_clock::now() - profileStart).count();
+    profileData.samples++;
+#endif
 }
 
 // One worker-loop body for the whole iteration set: `iterations` rounds of the block
@@ -618,11 +697,14 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
     // worker derives the same weights without sharing anything.
     int chebRound = 0;
     float chebGammaPrev = 1.0f;
+    int roundsRun = 0;
     // Read once: every participant must agree on which rounds project, or the barriers inside
     // the pass stop being paired.
     const int projectionRounds = params.projection.rounds;
+    const bool projectNewtonOnly = params.projection.trailingNewtonOnly;
     for (int it = 0; it < targetIterations; it++)
     {
+        roundsRun++;
         const bool newton = it < newtonRounds;
         if (newton)
         {
@@ -632,6 +714,7 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
             // body stamps used to duplicate. Nobody writes a pose until the combine
             // pass, so every phase reads the same frozen snapshot: race-free by
             // construction, no colours, and no thread-count dependence.
+            PhaseTimer preTimer(phaseSlot(kPhasePrecompute, workerIndex));
             sync.forItems(forceCount, [this](int i) {
                 Force *f = forceOrder[i];
                 if (f->kind != ForceKind::Contact)
@@ -641,11 +724,14 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                     return; // frozen: neither side moves this round
                 manifold->preCompute(params.dual.alpha);
             });
+            preTimer.workDone();
             sync.arriveAndWait();
+            preTimer.syncDone();
 
             // Phase B: each body assembles its full block system (own inertia plus
             // every incident constraint - manifolds stamped from the phase-A cache,
             // other forces stamping directly) and solves for its delta.
+            PhaseTimer stampTimer(phaseSlot(kPhaseStamp, workerIndex));
             sync.forItems(static_cast<int>(updateOrder.size()), [this](int i) {
                 Rigid *body = updateOrder[i];
                 Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
@@ -659,7 +745,9 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                 }
                 block.solveDelta(scratch.deltaLin[i], scratch.deltaAng[i]);
             });
+            stampTimer.workDone();
             sync.arriveAndWait();
+            stampTimer.syncDone();
 
             // Combine: each body applies its own delta. With chebyshevRho > 0 the
             // plain Jacobi estimate x + delta is convex-combined with the previous
@@ -669,9 +757,10 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
             // not, and the first-order quat integration stays exact as written. A
             // body with no constraints solves to exactly its inertial pose - free
             // flight falls out of the same path.
-            // Read once per round: both are loop-invariant inside the combine pass, where
+            // Read once per round: all three are loop-invariant inside the combine pass, where
             // every body in the update set reads them.
             const float relax = params.primal.jacobiRelaxation;
+            const float jointRelax = params.primal.jointRelaxation;
             const float rho = params.primal.chebyshevRho;
             float gamma = relax;
             if (rho > 0.0f)
@@ -686,14 +775,19 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                 chebGammaPrev = gamma;
             }
             chebRound++;
-            sync.forItems(static_cast<int>(updateOrder.size()), [this, gamma, rho, relax](int i) {
+            PhaseTimer combineTimer(phaseSlot(kPhaseCombine, workerIndex));
+            sync.forItems(static_cast<int>(updateOrder.size()), [this, gamma, rho, relax, jointRelax](int i) {
                 Rigid *body = updateOrder[i];
                 if (rho <= 0.0f || !body->contactOnly)
                 {
-                    // Plain relaxed Jacobi - the constant, or the safe fallback for
-                    // bodies coupled by joints (extrapolation diverges those).
-                    body->positionLin = body->positionLin + scratch.deltaLin[i] * relax;
-                    body->positionAng = body->positionAng + scratch.deltaAng[i] * relax;
+                    // Plain relaxed Jacobi - the constant, or the safe fallback for bodies coupled
+                    // by joints (extrapolation diverges those). Which constant depends on what the
+                    // body's rows are: a contact-only body's map tolerates the full relaxation, a
+                    // body on a stiffness-coupled chain needs the damping for its block-Jacobi
+                    // spectral radius to stay inside the unit circle (see jointRelaxation).
+                    const float step = body->contactOnly ? relax : jointRelax;
+                    body->positionLin = body->positionLin + scratch.deltaLin[i] * step;
+                    body->positionAng = body->positionAng + scratch.deltaAng[i] * step;
                     return;
                 }
                 // x_{k+1} = gamma * (x_k + delta_k) + (1 - gamma) * x_{k-1}
@@ -702,7 +796,9 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                 scratch.prevLin[i] = xLin;
                 body->positionAng = body->positionAng + scratch.deltaAng[i] * gamma;
             });
+            combineTimer.workDone();
             sync.arriveAndWait();
+            combineTimer.syncDone();
         }
 
         // Dual update: one item per force, and each force only reads the (frozen)
@@ -726,19 +822,41 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
             });
             sync.arriveAndWait();
         }
-        sync.forItems(forceCount, [this](int i) {
-            if (!constraintFrozen(forceOrder[i]))
-                forceOrder[i]->updateDual(params.dual.alpha);
+        PhaseTimer dualTimer(phaseSlot(kPhaseDual, workerIndex));
+        sync.forItems(forceCount, [this, newton](int i) {
+            Force *f = forceOrder[i];
+            if (constraintFrozen(f))
+                return;
+            // A dual-only round relaxes a multiplier against a pose nothing is going to change. For
+            // a contact row that is dual ascent on a clamped convex constraint, which is what the
+            // tail is for. For a bilateral row it is pure windup: C cannot move, so lambda grows by
+            // K*C every round and the next step's primal inherits a force no displacement ever paid
+            // for. Joints therefore keep the multiplier the last Newton round gave them, and the
+            // tail stays what it claims to be - a cheap relaxation of the contact impulses.
+            if (!newton && f->kind != ForceKind::Contact)
+                return;
+            f->updateDual(params.dual.alpha);
         });
+        dualTimer.workDone();
         sync.arriveAndWait();
+        dualTimer.syncDone();
 
         // The trailing rounds of the set project. Leading rounds leave it to the Lagrangian,
         // which reaches the same target faster where it can - a projection has no force behind
         // it, so a stack held up by projections would separate the moment one contact breaks.
         // The last rounds are where the projection earns its keep: those are the ones whose
         // residual the set runs out of budget to pay.
-        if (projectionRounds > 0 && it >= targetIterations - projectionRounds)
-            projectPass(sync, forceCount);
+        //
+        // `trailingNewtonOnly` moves that window onto the last Newton rounds instead, which keeps
+        // the layer out of the dual-only tail where stiffnessDecay is softening the very penalty
+        // it measures against. Either way the window is a suffix of a fixed range, so every
+        // participant agrees on it and the barriers stay paired.
+        if (projectionRounds > 0)
+        {
+            const int lastProjected = projectNewtonOnly ? newtonRounds : targetIterations;
+            if (it < lastProjected && it >= lastProjected - projectionRounds)
+                projectPass(sync, forceCount, workerIndex);
+        }
 
         // Convergence probe after a Newton round: a full primal pass is expensive, so
         // skip further rounds when the residual stops shrinking. Only the calling
@@ -762,6 +880,14 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
         if (stop)
             break; // every participant breaks at the same iteration - barriers stay paired
     }
+
+#ifdef AVBD_PROFILE
+    // Diagnostics only, and only on the thread that owns the profile block.
+    if (workerIndex == 0)
+        profileData.rounds += roundsRun;
+#else
+    (void)roundsRun;
+#endif
 }
 
 // The position projection's measure half: one constraint, reading the poses every other pass has
@@ -792,6 +918,12 @@ void Solver::projectBody(int i)
     // first-order integration the primal's delta uses, so its magnitude is an angle.
     const float ceiling = params.projection.maxCorrection;
     const float moved = deltaLin.norm();
+#ifdef AVBD_DIAG
+    // The magnitude *requested*, before the per-body ceiling below. Paired with the applied move it
+    // is what makes the old accounting bug visible: a charge computed for the requested move while
+    // the ceiling delivered a fraction of it.
+    atomicMaxFloat(diag.maxBodyMove, moved);
+#endif
     if (moved > ceiling && moved > 0.0f)
         deltaLin = deltaLin * (ceiling / moved);
     const float turned = deltaAng.norm();
@@ -815,12 +947,42 @@ void Solver::projectBody(int i)
 // that does not hold the region executes the identical body inline, in list order - the threads=1
 // reference the digest tests compare against.
 template <typename Sync>
-void Solver::projectPass(Sync &sync, int forceCount)
+void Solver::projectPass(Sync &sync, int forceCount, int workerIndex)
 {
+    PhaseTimer timer(phaseSlot(kPhaseProject, workerIndex));
     sync.forItems(forceCount, [this](int i) { projectForce(i); });
+    timer.workDone();
     sync.arriveAndWait();
+    timer.syncDone();
     sync.forItems(static_cast<int>(updateOrder.size()), [this](int i) { projectBody(i); });
+    timer.workDone();
     sync.arriveAndWait();
+    timer.syncDone();
+
+    // Re-anchor the stabilisation reference onto the pose this pass delivered, when the layer is
+    // configured to work that way. The two halves above move the bodies; this is what stops the
+    // next round's Lagrangian from pulling them straight back to the pose the step started from.
+    // The closing pass of a step needs no such stage: nothing reads a reference after it, and the
+    // next step re-measures every reference at the pose it inherits.
+    if (params.projection.rebase)
+    {
+        sync.forItems(forceCount, [this](int i) { projectRebase(i); });
+        timer.workDone();
+        sync.arriveAndWait();
+        timer.syncDone();
+    }
+}
+
+// One constraint's re-anchoring: it re-measures its own error at the pose the pass left behind and
+// adopts that as the pose the Lagrangian will not fight. Nothing else is touched - the multiplier
+// keeps carrying whatever load it was carrying, and the penalty keeps its value - because the pose
+// is the state the projection changed, so the pose is the state the reference has to follow.
+void Solver::projectRebase(int i)
+{
+    Force *f = forceOrder[i];
+    if (constraintFrozen(f))
+        return;
+    f->rebaseStabilisation();
 }
 
 // The rest window's follow-up rate, and the credit a body in the hysteresis band loses per step.

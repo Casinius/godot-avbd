@@ -443,13 +443,24 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     params.dual.gamma = static_cast<float>(settings->get_setting("physics/avbd/gamma", 0.999));
     params.dual.adaptiveBeta = static_cast<bool>(settings->get_setting("physics/avbd/adaptive_beta", false));
 
-    params.primal.newtonRatio = static_cast<float>(settings->get_setting("physics/avbd/newton_ratio", 0.5));
-    params.primal.stiffnessDecay = static_cast<float>(settings->get_setting("physics/avbd/stiffness_decay", 0.8));
+    // All rounds are Newton rounds by default. A dual-only round updates a multiplier against a pose
+    // nothing is going to change, so it has no fixed point: the multiplier grows by K*C every round.
+    // That is cheap and it is not free - measured on the 16-layer Pyramid (1000 steps, 12 rounds,
+    // adaptive beta, beta_linear 1e5), the tail combination this used to default to ends with
+    // |x| = 1224 m, and the same set without it holds at 8.04 m. Softening the contact penalty in
+    // the tail (stiffness_decay < 1) makes it worse, not better: the penalty shrinks while the
+    // multiplier it is charging against grows. Both stay available for experiments; 1.0/1.0 is the
+    // configuration that is sound, and the rounds are what the solver work in this branch is
+    // buying back.
+    params.primal.newtonRatio = static_cast<float>(settings->get_setting("physics/avbd/newton_ratio", 1.0));
+    params.primal.stiffnessDecay = static_cast<float>(settings->get_setting("physics/avbd/stiffness_decay", 1.0));
     params.primal.jacobianRebuildDistance =
             static_cast<float>(settings->get_setting("physics/avbd/jacobian_rebuild_distance", 0.0));
     params.primal.chebyshevRho = static_cast<float>(settings->get_setting("physics/avbd/chebyshev_rho", 0.0));
-    params.primal.adaptiveMaxIterations =
-            static_cast<int>(settings->get_setting("physics/avbd/adaptive_max_iterations", 16.0));
+    params.primal.jacobiRelaxation =
+            static_cast<float>(settings->get_setting("physics/avbd/jacobi_relaxation", 0.7));
+    params.primal.jointRelaxation =
+            static_cast<float>(settings->get_setting("physics/avbd/joint_relaxation", 0.5));
 
     // The position projection layer. Off by default here as well: it changes every delivered pose,
     // and the two halves of the constraint set buy different things with it - see the
@@ -468,6 +479,10 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
             static_cast<bool>(settings->get_setting("physics/avbd/projection_joints", true));
     params.projection.contacts =
             static_cast<bool>(settings->get_setting("physics/avbd/projection_contacts", true));
+    params.projection.rebase =
+            static_cast<bool>(settings->get_setting("physics/avbd/projection_rebase", true));
+    params.projection.trailingNewtonOnly = static_cast<bool>(
+            settings->get_setting("physics/avbd/projection_trailing_newton_only", false));
 
     // The parts of the rest test Godot has no space parameter for. The defaults are the solver's,
     // and they are the ones the core suite's --sleep audit measures: see SolverParams::Sleep for

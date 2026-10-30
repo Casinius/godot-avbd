@@ -78,6 +78,24 @@ static void step_n(Solver &s, int n) {
         const char *env = std::getenv("AVBD_NEWTON_RATIO");
         return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0f;
     }();
+    // The two combine-pass constants, separately: a contact-only body and a body on a joint chain
+    // need different amounts of damping (see SolverParams::Primal::jointRelaxation).
+    static const float jointRelax = []() {
+        const char *env = std::getenv("AVBD_JOINT_RELAX");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : -1.0f;
+    }();
+    static const float betaLin = []() {
+        const char *env = std::getenv("AVBD_BETA_LIN");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0f;
+    }();
+    static const int stiffnessDecay = []() {
+        const char *env = std::getenv("AVBD_STIFFNESS_DECAY");
+        return env != nullptr ? 1 : 0;
+    }();
+    static const float stiffnessDecayValue = []() {
+        const char *env = std::getenv("AVBD_STIFFNESS_DECAY");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : 1.0f;
+    }();
     // "0" is the only meaningful override here (the default is on), so the convention is inverted:
     // set it to zero to take the dual feedback away from the projection.
     static const int feedback = []() {
@@ -109,6 +127,17 @@ static void step_n(Solver &s, int n) {
         const char *env = std::getenv("AVBD_PROJECTION_CONTACTS");
         return env != nullptr ? std::atoi(env) : -1;
     }();
+    // The accounting the layer uses for the correction it delivers. Both are 0/1 with a
+    // leave-alone default, because the interesting question is "does the alternative fix the
+    // bridge", not "what is the tuning".
+    static const int projRebase = []() {
+        const char *env = std::getenv("AVBD_PROJECTION_REBASE");
+        return env != nullptr ? std::atoi(env) : -1;
+    }();
+    static const int projNewtonOnly = []() {
+        const char *env = std::getenv("AVBD_PROJECTION_NEWTON_ONLY");
+        return env != nullptr ? std::atoi(env) : -1;
+    }();
     if (relax > 0.0f)
         s.params.primal.jacobiRelaxation = relax;
     if (rho > 0.0f)
@@ -119,6 +148,12 @@ static void step_n(Solver &s, int n) {
         s.iterations = iterations;
     if (newtonRatio > 0.0f)
         s.params.primal.newtonRatio = newtonRatio;
+    if (jointRelax >= 0.0f)
+        s.params.primal.jointRelaxation = jointRelax;
+    if (betaLin > 0.0f)
+        s.params.dual.betaLin = betaLin;
+    if (stiffnessDecay)
+        s.params.primal.stiffnessDecay = stiffnessDecayValue;
     if (feedback >= 0)
         s.params.projection.dualFeedback = feedback != 0;
     if (projScale > 0.0f)
@@ -131,6 +166,10 @@ static void step_n(Solver &s, int n) {
         s.params.projection.joints = projJoints != 0;
     if (projContacts >= 0)
         s.params.projection.contacts = projContacts != 0;
+    if (projRebase >= 0)
+        s.params.projection.rebase = projRebase != 0;
+    if (projNewtonOnly >= 0)
+        s.params.projection.trailingNewtonOnly = projNewtonOnly != 0;
     for (int i = 0; i < n; i++) {
         s.step();
     }
@@ -1357,6 +1396,37 @@ static int run_scene(const std::string &name, int steps, int threads, bool adapt
                 " penetration mean=%.5f worst=%.5f  %.3f ms/step digest=0x%016llx\n",
             steps, s.threadCount(), count_bodies(s), count_contact_points(s), max_abs_position(s),
             all_finite(s) ? "yes" : "NO", mean, worst, ms, (unsigned long long)state_digest(s));
+#ifdef AVBD_DIAG
+    // The projection counters of the last step: is the layer delivering pose (asked > 0, joints'
+    // C0 shrinking) or injecting force (charge growing while C0 does not)?
+    std::printf("  diag: maxJoint|lambda|=%.3f maxJoint|C0|=%.5f charge=%.3f/%.3f"
+                " asked=%.5f/%.5f maxBodyMove=%.5f\n",
+            (double)s.diag.maxJointLambda.load(), (double)s.diag.maxJointC0.load(),
+            (double)s.diag.chargeContact.load(), (double)s.diag.chargeJoint.load(),
+            (double)s.diag.askedContact.load(), (double)s.diag.askedJoint.load(),
+            (double)s.diag.maxBodyMove.load());
+#endif
+#ifdef AVBD_PROFILE
+    // Per-phase cost, by worker 0, averaged over the window the profile accumulated. `sync` is the
+    // barrier fence, the time the thread spent waiting for the slowest item of that phase - which
+    // is the number that says whether a phase is short of work or short of balance.
+    Solver::StepProfile prof = s.stepProfile();
+    const double n = prof.samples > 0 ? 1.0 / (double)prof.samples : 0.0;
+    const double us = 1.0e6 * n;
+    std::printf("  profile(n=%lld substeps): wall=%.1fus rounds=%.1f | work pre=%.1f stamp=%.1f"
+                " comb=%.1f dual=%.1f proj=%.1f | sync pre=%.1f stamp=%.1f comb=%.1f dual=%.1f proj=%.1f\n",
+            prof.samples, prof.wall * us, prof.rounds * n,
+            prof.phases[Solver::kPhasePrecompute].work * us,
+            prof.phases[Solver::kPhaseStamp].work * us,
+            prof.phases[Solver::kPhaseCombine].work * us,
+            prof.phases[Solver::kPhaseDual].work * us,
+            prof.phases[Solver::kPhaseProject].work * us,
+            prof.phases[Solver::kPhasePrecompute].sync * us,
+            prof.phases[Solver::kPhaseStamp].sync * us,
+            prof.phases[Solver::kPhaseCombine].sync * us,
+            prof.phases[Solver::kPhaseDual].sync * us,
+            prof.phases[Solver::kPhaseProject].sync * us);
+#endif
     return all_finite(s) ? 0 : 1;
 }
 

@@ -19,6 +19,10 @@
 #include <array>
 #include <span>
 
+#ifdef AVBD_PROFILE
+#include <chrono>
+#endif
+
 #include "avbd/maths.h"
 #include "avbd/bvh/node_storage.hpp"
 
@@ -54,6 +58,22 @@ struct Rigid;
 struct Force;
 struct Manifold;
 struct Solver;
+
+// Monotonic max / sum on a float held in an atomic, for the AVBD_DIAG counters. Best-effort
+// reporting, not solver state: several workers can raise the same counter, and a lost race only
+// means a slightly staler number.
+inline void atomicMaxFloat(std::atomic<float> &slot, float p_value) noexcept
+{
+    float current = slot.load(std::memory_order_relaxed);
+    while (p_value > current &&
+            !slot.compare_exchange_weak(current, p_value, std::memory_order_relaxed)) {
+    }
+}
+
+inline void atomicAddFloat(std::atomic<float> &slot, float p_value) noexcept
+{
+    slot.fetch_add(p_value, std::memory_order_relaxed);
+}
 
 // The collision and inertia shape of a body.
 //
@@ -354,6 +374,15 @@ struct Force
     virtual void updatePrimal(Rigid *body, float alpha, Block &block) = 0;
     virtual void updateDual(float alpha) = 0;
 
+    // Adopt the current pose as this constraint's stabilisation reference
+    // (SolverParams::Projection::rebase). Called after a projection pass has moved the bodies, and
+    // only when that knob is on. A force with no stabilisation reference has nothing to adopt and
+    // leaves the default, and a *contact* keeps the default on purpose: a unilateral row is held up
+    // across rounds by the multiplier charge, and re-anchoring it as well tells the penalty that the
+    // sunken pose is acceptable (measured on the 10-box stack: worst interface 0.00199 m with the
+    // charge, 0.00845 m with both).
+    virtual void rebaseStabilisation() {}
+
     // --- position projection (see SolverParams::Projection) -------------------
     //
     // The projection runs as two passes, and the split is the whole point: pass one is
@@ -420,6 +449,7 @@ struct Joint : Force
     void updateDual(float alpha) override;
     void projectMeasure(float scale, float maxCorrection) override;
     void projectShare(const Rigid *body, float3 &r_deltaLin, float3 &r_deltaAng) const override;
+    void rebaseStabilisation() override;
 
     // Break the joint immediately, discarding its dual state. Used when a host
     // application wants the fracture decision to survive being re-created (the
@@ -514,6 +544,7 @@ struct GenericJoint : Force
     // degrees of freedom are left to the Lagrangian.
     void projectMeasure(float scale, float maxCorrection) override;
     void projectShare(const Rigid *body, float3 &r_deltaLin, float3 &r_deltaAng) const override;
+    void rebaseStabilisation() override;
 
     // Anchor of each body in world space.
     [[nodiscard]] float3 anchorA() const;
@@ -742,8 +773,7 @@ struct SolverParams
         // by the penetration ratio, so at impact moments a scene pays this many dense rounds
         // per substep - the frame spike the profiler blames. Lower it for smoother frames;
         // the healing those rounds did is recovered by substeps at high tick rates instead.
-        int adaptiveMaxIterations = 16;
-
+        //
         // Early-exit threshold on the mean penetration residual: when a Newton round
         // improves the average residual by less than this (or worsens it), the iteration set
         // ends early - remaining rounds would polish float noise at full price. 0 disables
@@ -756,8 +786,21 @@ struct SolverParams
         // would not; scaling the applied delta by omega < 1 trades per-iteration progress
         // for stability. 1.0 = unrelaxed. The Chebyshev variant replaces this constant with
         // a per-iteration schedule. Suite sweep: 0.5-0.7 hold every rigid scene; 1.0 drifts
-        // the 32-layer pyramid.
+        // the 32-layer pyramid. Applies to the bodies whose forces are all contacts; see
+        // jointRelaxation for the other half.
         float jacobiRelaxation = 0.7f;
+
+        // Combine-pass relaxation for a body carrying any non-contact force (a joint, spring or
+        // world anchor; Rigid::contactOnly is the test). A contact-only body's rows are unilateral
+        // and clamped, and its Jacobi map tolerates the plain relaxation; a stiffness-coupled chain
+        // does not. Block-Jacobi on a stiff chain with a hard end has a spectral radius above 1 at
+        // omega = 0.7 - the error grows, the penalty ramps against the growing error, and the chain
+        // is expelled (measured on the 20-link Rope: omega 0.7 -> |x| = 1618 m after 1000 steps,
+        // 0.5 -> 20.0 m, where the chain's own length is 20). This is the damping that keeps the
+        // chain's map inside the unit circle, and it is why the jointed scenes needed the projection
+        // layer to look stable at all. It costs convergence per round, so it is only paid by the
+        // bodies that need it.
+        float jointRelaxation = 0.5f;
 
         // Chebyshev semi-iteration over the block-Jacobi primal (0 = off, the default). The
         // plain Jacobi estimate x + delta is convex-combined with the previous iterate
@@ -814,7 +857,48 @@ struct SolverParams
         // rows the projection already resolved. On, the correction survives the next round
         // instead of being re-fought by the Lagrangian from scratch, which is what lets a
         // smaller iteration budget reach the same residual.
+        // Which of the two ledgers the layer uses for the correction it delivers. Both are on the
+        // same pose change, but only one of them can be booked per constraint kind:
+        //
+        // Contacts keep `dualFeedback`: the charge is what holds the lift across rounds (a resting
+        // stack that is only re-anchored sinks back between passes), and the clamps make it safe -
+        // a contact can only press and friction cannot exceed the cone, so the charge cannot
+        // outgrow the load.
+        //
+        // Joints take `rebase`: their rows are bilateral and unbounded, so a charge there has no
+        // clamp to hold it and no equilibrium to converge to. Re-anchoring the stabilisation
+        // reference instead moves the pose the Lagrangian accepts, and leaves the multiplier
+        // carrying the load it was already carrying. See `rebase` below for the full argument.
         bool dualFeedback = true;
+
+        // Re-anchor each *bilateral* constraint's stabilisation reference onto the pose a pass just
+        // delivered (Joint::C0Lin / JointAxis::initial), instead of charging the multiplier. On by
+        // default: it is the only one of the two ledgers that is stable for a row with no clamp, and
+        // while `rounds` is 0 - the shipped default - the knob cannot reach any scene at all.
+        // Contacts are excluded (see Force::rebaseStabilisation): their charge is what holds the lift,
+        // and re-anchoring them too costs a factor of four in resting penetration.
+        //
+        // This is the two-ledger problem in one sentence. The stabilised row is satisfied at
+        // `C = alpha * C0`, so C0 - not lambda - is the state that declares which pose the
+        // Lagrangian is willing to accept; lambda is only the force at that pose. A projection pass
+        // moves the pose. Charging the move to lambda leaves C0 behind, and the next round's Newton
+        // step pulls the body straight back towards `alpha * C0` with a force of order `K * C`,
+        // while the charged lambda pushes with an unrelated force of its own - two injections per
+        // pass that do not cancel. On a bilateral chain - the jointed Bridge, whose rows carry a
+        // gravity load and never reach zero error, because the stabilisation keeps 1% of C0 per
+        // step - that is an oscillator. Measured on the Bridge (1000 steps, threads=8,
+        // newtonRatio=1, jacobiRelaxation=0.7, projection rounds=2, iterations=12): charging the
+        // multiplier leaves |x|=1100 m and lambda in the thousands, moving the reference holds
+        // |x|=20.0 m with lambda three times lower and no charge at all.
+        bool rebase = true;
+
+        // Run the projection passes on the trailing Newton rounds only, not on the dual-only tail
+        // of the set. In the tail `primal.stiffnessDecay` is softening the contact penalty round by
+        // round, so the surface the dual relaxes against is moving away from the surface the
+        // projection measures - and joint penalties are not decayed at all, so the two halves of
+        // the set drift apart. Off, the window is the last `rounds` rounds of the set.
+        bool trailingNewtonOnly = false;
+
         // Which half of the constraint set the passes may touch. Separate switches, because the two
         // halves measured nothing alike (run_scene over the core scenes, 300 steps, threads=8, with
         // AVBD_PROJECTION_ROUNDS and the two scope knobs below):
@@ -884,7 +968,16 @@ struct Solver
     // Per-tick inputs, tuned for metre/kilogram/second scenes.
     float dt = 1.0f / 60.0f; // Timestep
     float gravity = -10.0f;  // Gravity, along -Z
-    int iterations = 10;     // Solver iterations per step
+    // The round budget: how many primal+dual rounds one step runs, split by
+    // SolverParams::Primal::newtonRatio. This is the number the host asked for and the number the
+    // solver spends - 16 because that is what the pinned scenes need at their tolerance (a box
+    // resting on the slab lands at 1.6 cm of skin; below 16 the 10-box stack's worst interface breaks
+    // the suite's 5 cm bound). It used to be multiplied by a penetration estimate and clamped to a
+    // second limit, which is why it was effectively a constant: this is that constant, stated where a
+    // host can see it. Cheaper settings are a measurement, not a default - with the projection layer
+    // on, 12 rounds beat 16 without it by a wide margin on the same scenes (mean penetration 0.0033
+    // vs 0.0200 m on the 10-box stack, 0.0004 vs 0.0058 m on the Pyramid), for a third less time.
+    int iterations = 16;
 
     // Worker threads for the per-body phases. 0 = one per hardware thread, 1 = run
     // everything inline on the calling thread. The result does not depend on this value:
@@ -900,9 +993,10 @@ struct Solver
     {
         p.primal.newtonRatio = std::clamp(p.primal.newtonRatio, 0.0f, 1.0f);
         p.primal.stiffnessDecay = std::clamp(p.primal.stiffnessDecay, 0.0f, 1.0f);
+        p.primal.jacobiRelaxation = std::clamp(p.primal.jacobiRelaxation, 0.0f, 1.0f);
+        p.primal.jointRelaxation = std::clamp(p.primal.jointRelaxation, 0.0f, 1.0f);
         p.primal.jacobianRebuildDistance = std::max(p.primal.jacobianRebuildDistance, 0.0f);
         p.primal.chebyshevRho = std::max(p.primal.chebyshevRho, 0.0f);
-        p.primal.adaptiveMaxIterations = std::max(p.primal.adaptiveMaxIterations, 2);
         p.projection.rounds = std::clamp(p.projection.rounds, 0, 8);
         p.projection.scale = std::clamp(p.projection.scale, 0.0f, 1.0f);
         p.projection.maxCorrection = std::max(p.projection.maxCorrection, 0.0f);
@@ -918,6 +1012,64 @@ struct Solver
         p.sleep.wakeDebounce = std::max(p.sleep.wakeDebounce, 1);
         params = p;
     }
+
+    // --- Instrumentation ---------------------------------------------------------------
+    // Both surfaces are compiled out of the shipped build. They are configure options rather than
+    // local hacks because the defines have to match across the library, the test binary and the
+    // GDExtension: `xmake f --profile=y --diag=y`.
+    enum PhaseId : int
+    {
+        kPhasePrecompute = 0, // A: manifold assembly, parallel over forces
+        kPhaseStamp,          // B: per-body block assembly and solve
+        kPhaseCombine,        // per-body delta application
+        kPhaseDual,           // per-force dual update
+        kPhaseProject,        // projection measure + share (+ rebase)
+        kPhaseCount,
+    };
+
+    struct PhaseProfile
+    {
+        double work = 0.0; // seconds inside the phase's item loop, worker 0
+        double sync = 0.0; // seconds at the barrier that fences it, worker 0
+    };
+
+    struct StepProfile
+    {
+        // Totals over the window since the last reset, not the last substep's numbers: a single
+        // step's barrier wait swings by an order of magnitude with what else the machine is doing,
+        // so a mean over a few hundred is the only figure worth reading. Divide by `samples`.
+        PhaseProfile phases[kPhaseCount];
+        double wall = 0.0; // whole substep, measured on the calling thread
+        double rounds = 0.0; // rounds actually run (Newton + relaxation), total
+        long long samples = 0; // substeps accumulated
+        void reset() noexcept;
+    };
+
+    // The slot worker 0 should time into, or null. Null for every other worker - one thread's view
+    // of, and wait at, the phase is the measurement - and for every build without AVBD_PROFILE,
+    // where the callers' clock calls fold away entirely.
+    [[nodiscard]] PhaseProfile *phaseSlot(int id, int workerIndex) noexcept;
+    [[nodiscard]] const StepProfile &stepProfile() const noexcept { return profileData; }
+    // Start a fresh measurement window (the profile accumulates until this is called).
+    void resetStepProfile() noexcept { profileData.reset(); }
+
+#ifdef AVBD_DIAG
+    // What the projection layer actually did this step, for the bridge investigation. The point is
+    // to separate "the layer delivered pose" from "the layer injected force": a pose correction
+    // shows up as `maxBodyMove` and shrinks `maxJointC0`; an injection shows up as `charge*` and
+    // raises `maxJointLambda` without the load having changed.
+    struct Diag
+    {
+        std::atomic<float> maxJointLambda{0.0f}; // largest |lambda| on any joint row
+        std::atomic<float> maxJointC0{0.0f};     // largest |C0| any joint row stabilised against
+        std::atomic<float> chargeContact{0.0f};  // sum |d(lambda)| the projection charged, contacts
+        std::atomic<float> chargeJoint{0.0f};    // ... and joints
+        std::atomic<float> askedContact{0.0f};   // sum |C| the measure pass asked to remove
+        std::atomic<float> askedJoint{0.0f};
+        std::atomic<float> maxBodyMove{0.0f}; // largest single-body move a share pass applied
+        void reset() noexcept;
+    } diag;
+#endif
 
     // Heads of the two intrusive lists. Owned: `clear()` deletes through them.
     Rigid *bodies = nullptr;
@@ -1026,8 +1178,6 @@ private:
     std::unique_ptr<detail::TaskFlow> flow;
 
     // Adaptive iteration count parameters
-    float maxPenetrationError = 1e-4f; // Target penetration error tolerance
-    bool adaptiveIterations = true;    // Enable adaptive iteration count
 
     // Create the pool on first use so that a serial solver never spawns threads.
     void ensurePool();
@@ -1057,10 +1207,14 @@ private:
     // as the closing stage of a step, so both call sites drive it through the same `Sync`.
     // Does nothing when projection_rounds is 0, and issues no barriers in that case.
     template <typename Sync>
-    void projectPass(Sync &sync, int forceCount);
-    // The projection's two per-item halves: one constraint's measure, one body's share and apply.
+    void projectPass(Sync &sync, int forceCount, int workerIndex);
+    // The projection's per-item halves: one constraint's measure, one body's share and apply, and
+    // - when SolverParams::Projection::rebase is on - one constraint's re-anchoring.
     void projectForce(int i);
     void projectBody(int i);
+    void projectRebase(int i);
+    // Per-phase wall clock, filled only under AVBD_PROFILE (see Instrumentation above).
+    StepProfile profileData;
     // One step's body warmstart, iteration region, and velocity finish, as a flow.
     void runSubstep(int forceCount, int targetIterations, int newtonRounds);
 

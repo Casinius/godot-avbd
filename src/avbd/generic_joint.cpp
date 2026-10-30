@@ -377,6 +377,14 @@ void GenericJoint::updateDual(float alpha)
             axis.penalty = std::clamp(axis.penalty + std::abs(C) * betas[k], 0.0f, cap);
         }
     }
+
+#ifdef AVBD_DIAG
+    atomicMaxFloat(solver->diag.maxJointC0,
+            std::fabs(linear[0].initial) + std::fabs(linear[1].initial) + std::fabs(linear[2].initial));
+    atomicMaxFloat(solver->diag.maxJointLambda,
+            std::fabs(linear[0].lambda) + std::fabs(linear[1].lambda) + std::fabs(linear[2].lambda) +
+                    std::fabs(angular[0].lambda) + std::fabs(angular[1].lambda) + std::fabs(angular[2].lambda));
+#endif
 }
 
 // The projection's measure pass, over the three linear degrees of freedom.
@@ -419,7 +427,10 @@ void GenericJoint::projectMeasure(float scale, float maxCorrection)
     const float3 rBWorld = bodyB->positionAng * rB;
     const float3 offset = qA.conjugate() * (anchorA() - anchorB());
     const float dtSq = solver->dt * solver->dt;
-    const bool feedback = solver->params.projection.dualFeedback && dtSq > 0.0f;
+    // One ledger, not two: skipped when the layer re-anchors `initial` instead of charging lambda
+    // (SolverParams::Projection::rebase).
+    const bool feedback = solver->params.projection.dualFeedback &&
+            !solver->params.projection.rebase && dtSq > 0.0f;
 
     for (int i = 0; i < 3; i++)
     {
@@ -438,8 +449,33 @@ void GenericJoint::projectMeasure(float scale, float maxCorrection)
 
         const float mu = -C * scale / w;
         projLinear[i] = mu;
+#ifdef AVBD_DIAG
+        atomicAddFloat(solver->diag.askedJoint, std::fabs(mu));
+#endif
         if (feedback)
+        {
+#ifdef AVBD_DIAG
+            atomicAddFloat(solver->diag.chargeJoint, std::fabs(mu) / dtSq);
+#endif
             linear[i].lambda = linear[i].lambda - mu / dtSq;
+        }
+    }
+}
+
+// Adopt the pose the pass delivered as each projected axis's reference. Only `initial` moves: the
+// axis's lambda keeps carrying whatever force it was carrying, because the layer changed the pose,
+// not the load (SolverParams::Projection::rebase).
+void GenericJoint::rebaseStabilisation()
+{
+    if (!solver->params.projection.rebase)
+        return;
+
+    const float3 offset = frameOrientation().conjugate() * (anchorA() - anchorB());
+    for (int i = 0; i < 3; i++)
+    {
+        if (projLinear[i] == 0.0f)
+            continue;
+        linear[i].initial = offset[i];
     }
 }
 

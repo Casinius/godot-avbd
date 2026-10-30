@@ -46,6 +46,18 @@ option("tsan")
     set_default(false)
     set_showmenu(true)
     set_description("Build with ThreadSanitizer")
+-- Instrumentation. `--profile=y` fills Solver::StepProfile with per-phase wall-clock totals
+-- (worker 0: the thread that waits when a phase is imbalanced); `--diag=y` fills Solver::Diag with
+-- the projection counters. Both are compile-time: the counters sit in the per-contact hot path and
+-- an always-on atomic there would change the thing being measured.
+option("profile")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Per-phase timing (AVBD_PROFILE)")
+option("diag")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Projection counters (AVBD_DIAG)")
 
 -- Warnings are errors of intent: the tree builds clean at this level, and a new warning
 -- should be dealt with rather than accumulated.
@@ -61,7 +73,19 @@ local function avbd_common()
     set_strip("none")
     set_warnings(avbd_warnings)
     add_cxflags("-Wshadow", "-Wnon-virtual-dtor")
+    -- Cross-platform bit-exact digests are a hard constraint, and floating-point contraction is the
+    -- one default that silently breaks it: `a*b + c` becomes a single fma on any target that has
+    -- one (AVX2, ARMv8) and stays two rounded operations on one that does not, so the same scene
+    -- lands on different bits per platform. Off everywhere, explicitly, so a target's ISA cannot
+    -- change an answer. No -ffast-math for the same reason: no reassociation, no reciprocal swaps.
+    add_cxflags("-ffp-contract=off", "-fno-fast-math")
     add_syslinks("pthread")
+    if has_config("profile") then
+        add_defines("AVBD_PROFILE")
+    end
+    if has_config("diag") then
+        add_defines("AVBD_DIAG")
+    end
     if has_config("asan") then
         add_cxflags("-fsanitize=address", { force = true })
         add_ldflags("-fsanitize=address", { force = true })

@@ -212,7 +212,10 @@ void Joint::projectMeasure(float scale, float maxCorrection)
     const float3 rAWorld = bodyA ? bodyA->positionAng * rA : float3{0, 0, 0};
     const float3 rBWorld = bodyB->positionAng * rB;
     const float dtSq = solver->dt * solver->dt;
-    const bool feedback = solver->params.projection.dualFeedback && dtSq > 0.0f;
+    // Skipped when the layer re-anchors the reference instead: the two are alternative ledgers for
+    // the same correction, and running both books the same displacement twice (see the knob).
+    const bool feedback = solver->params.projection.dualFeedback &&
+            !solver->params.projection.rebase && dtSq > 0.0f;
 
     float3 mu = float3{0, 0, 0};
     for (int r = 0; r < 3; r++)
@@ -226,8 +229,31 @@ void Joint::projectMeasure(float scale, float maxCorrection)
 
     projLin = mu;
 
+#ifdef AVBD_DIAG
+    atomicAddFloat(solver->diag.askedJoint, std::fabs(mu[0]) + std::fabs(mu[1]) + std::fabs(mu[2]));
+#endif
+
     if (feedback)
+    {
+#ifdef AVBD_DIAG
+        atomicAddFloat(solver->diag.chargeJoint,
+                (std::fabs(mu[0]) + std::fabs(mu[1]) + std::fabs(mu[2])) / dtSq);
+#endif
         lambdaLin = lambdaLin - mu / dtSq;
+    }
+}
+
+// Adopt the pose the pass delivered as the anchor's reference, leaving lambdaLin alone: the anchor
+// error is stabilised against C0Lin (SolverParams::Projection::rebase), so moving C0Lin is what
+// makes the next round accept the projected pose, while the multiplier keeps carrying the load the
+// chain was already transferring through this joint.
+void Joint::rebaseStabilisation()
+{
+    if (!solver->params.projection.rebase || projLin.isZero(0.0f))
+        return;
+
+    C0Lin = (bodyA ? bodyA->positionLin + bodyA->positionAng * rA : rA) -
+            (bodyB->positionLin + bodyB->positionAng * rB);
 }
 
 void Joint::projectShare(const Rigid *body, float3 &r_deltaLin, float3 &r_deltaAng) const
@@ -323,6 +349,14 @@ void Joint::updateDual(float alpha)
         lambdaAng = { 0, 0, 0 };
         broken = true;
     }
+
+#ifdef AVBD_DIAG
+    // The two numbers that say whether the Lagrangian and the projection are aiming at the same
+    // pose: the force this joint is carrying, and the reference the stabilisation holds it to. A
+    // lambda that grew while |C0| did not shrink is an injection, not a pose correction.
+    atomicMaxFloat(solver->diag.maxJointC0, C0Lin.norm());
+    atomicMaxFloat(solver->diag.maxJointLambda, lambdaLin.norm() + lambdaAng.norm());
+#endif
 }
 
 } // namespace avbd

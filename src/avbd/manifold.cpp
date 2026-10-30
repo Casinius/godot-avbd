@@ -364,6 +364,13 @@ void Manifold::projectMeasure(float scale, float maxCorrection)
     // the projected correction to the multiplier says "this much of the contact force has already
     // been delivered, by moving the pose instead of pushing through it", which is what stops the
     // next round's penalty ramp from re-buying the same correction.
+    //
+    // One ledger per kind, because the two kinds need opposite things. A contact is unilateral and
+    // clamped, so charging its multiplier is how the lift a pass delivered is *held* across rounds
+    // (the clamps keep the charge in the cone, so it cannot run away). A joint is bilateral and
+    // unbounded, so a charge there is an oscillator - the reference has to move instead. Contacts
+    // therefore keep `dualFeedback` regardless of this knob, and the joint classes read it as
+    // "charge the multiplier or re-anchor instead".
     const bool feedback = solver->params.projection.dualFeedback && dtSq > 0.0f;
 
     // A contact patch is one constraint seen through up to eight points, and this is a Jacobi
@@ -439,8 +446,18 @@ void Manifold::projectMeasure(float scale, float maxCorrection)
         cache.projLambda = mu;
         cache.projectedRows = rows;
 
+#ifdef AVBD_DIAG
+        // What the pass asked to remove, and - when it is charged - what that came to as a force.
+        atomicAddFloat(solver->diag.askedContact,
+                std::fabs(mu[0]) + std::fabs(mu[1]) + std::fabs(mu[2]));
+#endif
+
         if (feedback && rows != 0)
         {
+#ifdef AVBD_DIAG
+            atomicAddFloat(solver->diag.chargeContact,
+                    (std::fabs(mu[0]) + std::fabs(mu[1]) + std::fabs(mu[2])) / dtSq);
+#endif
             float3 &lambda = contacts[i].lambda;
             lambda = lambda - mu / dtSq;
             // The same two clamps updateDual applies to a force, for the same reasons: a contact
@@ -491,8 +508,7 @@ void Manifold::projectShare(const Rigid *body, float3 &r_deltaLin, float3 &r_del
 }
 
 void Manifold::updateDual(float alpha)
-{
-    const float betaLinBase = solver->params.dual.betaLin;
+{    const float betaLinBase = solver->params.dual.betaLin;
 
     float3 dqALin = bodyA->positionLin - bodyA->initialLin;
     float3 dqAAng = bodyA->positionAng - bodyA->initialAng;
