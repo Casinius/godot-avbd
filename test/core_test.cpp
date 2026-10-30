@@ -1567,6 +1567,17 @@ static int run_scene(const std::string &name, int steps, int threads, bool adapt
     Solver::StepProfile prof = s.stepProfile();
     const double n = prof.samples > 0 ? 1.0 / (double)prof.samples : 0.0;
     const double us = 1.0e6 * n;
+    // The stages outside the region, per tick: this is where a scene's time goes once the rounds are
+    // cheap, and it is what the substep number cannot show.
+    const double ns = prof.samplesPerStep > 0 ? 1.0 / (double)prof.samplesPerStep : 0.0;
+    std::printf("  stage: step=%.1fus broad=%.1f (build=%.1f search=%.1f sort=%.1f manifold=%.1f)"
+                " forceInit=%.1f"
+                " select=%.1f substep=%.1f\n",
+            prof.step * 1.0e6 * ns, prof.broad * 1.0e6 * ns, prof.bvhBuild * 1.0e6 * ns,
+            prof.pairSearch * 1.0e6 * ns,
+            (prof.pairQuery - prof.bvhBuild - prof.pairSearch) * 1.0e6 * ns,
+            prof.manifoldCreate * 1.0e6 * ns, prof.forceInit * 1.0e6 * ns, prof.selectStage * 1.0e6 * ns,
+            prof.wall * 1.0e6 * ns);
     std::printf("  profile(n=%lld substeps): wall=%.1fus rounds=%.1f | work pre=%.1f stamp=%.1f"
                 " comb=%.1f dual=%.1f proj=%.1f | sync pre=%.1f stamp=%.1f comb=%.1f dual=%.1f proj=%.1f\n",
             prof.samples, prof.wall * us, prof.rounds * n,

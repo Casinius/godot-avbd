@@ -1,6 +1,13 @@
 extends SceneTree
 
 func _initialize():
+	# Round-budget sweep from the shell, so the same scene can be timed at the demo's own settings
+	# and at the cheaper ones without editing project.godot:
+	#   AVBD_BENCH_ITERATIONS=8 godot --headless --path demo --script res://tests/bench_eight.gd
+	var iterations := OS.get_environment("AVBD_BENCH_ITERATIONS")
+	if iterations != "":
+		ProjectSettings.set_setting("physics/avbd/iterations", int(iterations))
+		print("bench: iterations overridden to ", iterations)
 	var scene = load("res://scenes/pyramid_eight.tscn")
 	if not scene:
 		print("NO_SCENE")

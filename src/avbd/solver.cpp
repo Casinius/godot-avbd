@@ -100,8 +100,17 @@ void Solver::StepProfile::reset() noexcept
     for (PhaseProfile &phase : phases)
         phase = PhaseProfile{};
     wall = 0.0;
+    broad = 0.0;
+    pairQuery = 0.0;
+    bvhBuild = 0.0;
+    pairSearch = 0.0;
+    manifoldCreate = 0.0;
+    forceInit = 0.0;
+    selectStage = 0.0;
+    step = 0.0;
     rounds = 0.0;
     samples = 0;
+    samplesPerStep = 0;
 }
 
 #ifdef AVBD_DIAG
@@ -355,15 +364,33 @@ void Solver::step()
 #ifdef AVBD_DIAG
     diag.reset();
 #endif
+#ifdef AVBD_PROFILE
+    const auto stepStart = std::chrono::steady_clock::now();
+#endif
     computeSleepFrames();
     broadPhase();
+#ifdef AVBD_PROFILE
+    const auto afterBroad = std::chrono::steady_clock::now();
+    profileData.broad += std::chrono::duration<double>(afterBroad - stepStart).count();
+#endif
     const int forceCount = warmstartForces();
+#ifdef AVBD_PROFILE
+    const auto afterForces = std::chrono::steady_clock::now();
+    profileData.forceInit += std::chrono::duration<double>(afterForces - afterBroad).count();
+#endif
     selectUpdateBodies();
+#ifdef AVBD_PROFILE
+    profileData.selectStage += std::chrono::duration<double>(std::chrono::steady_clock::now() - afterForces).count();
+#endif
 
     int targetIterations = iterations;
     int newtonRounds = iterations;
     computeIterations(targetIterations, newtonRounds);
     runSubstep(forceCount, targetIterations, newtonRounds);
+#ifdef AVBD_PROFILE
+    profileData.step += std::chrono::duration<double>(std::chrono::steady_clock::now() - stepStart).count();
+    profileData.samplesPerStep++;
+#endif
 }
 
 // A broad-phase candidate test: bounding spheres plus Godot's layer/mask pair rule,
@@ -400,6 +427,9 @@ void Solver::broadPhase()
     if (count < 2)
         return;
 
+#ifdef AVBD_PROFILE
+    const auto pairStart = std::chrono::steady_clock::now();
+#endif
     std::vector<int> indices(count);
     for (int i = 0; i < count; ++i)
         indices[i] = i;
@@ -411,6 +441,10 @@ void Solver::broadPhase()
 
     bvh::builder::Builder builder(bvhNodes, indices, bodiesPtr);
     const int leafCount = builder.buildLBVH();
+#ifdef AVBD_PROFILE
+    const auto afterBuild = std::chrono::steady_clock::now();
+    profileData.bvhBuild += std::chrono::duration<double>(afterBuild - pairStart).count();
+#endif
     if (leafCount < 2)
         return;
     const int padded = 1;
@@ -470,9 +504,17 @@ void Solver::broadPhase()
         self(self, r);
     };
     selfTraverse(selfTraverse, 0);
+#ifdef AVBD_PROFILE
+    const auto afterTraverse = std::chrono::steady_clock::now();
+    profileData.pairSearch += std::chrono::duration<double>(afterTraverse - afterBuild).count();
+#endif
 
     std::sort(sweepPairs.begin(), sweepPairs.end());
     sweepPairs.erase(std::unique(sweepPairs.begin(), sweepPairs.end()), sweepPairs.end());
+#ifdef AVBD_PROFILE
+    const auto afterPairs = std::chrono::steady_clock::now();
+    profileData.pairQuery += std::chrono::duration<double>(afterPairs - pairStart).count();
+#endif
     for (const auto &[i, j] : sweepPairs)
     {
         Rigid *bodyA = bodiesInOrder[i];
@@ -480,6 +522,10 @@ void Solver::broadPhase()
         if (pairOverlaps(bodyA, bodyB))
             new Manifold(this, bodyA, bodyB);
     }
+#ifdef AVBD_PROFILE
+    profileData.manifoldCreate +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - afterPairs).count();
+#endif
 }
 
 // A constraint is frozen when neither of its bodies can move this step. Joints and springs
@@ -823,9 +869,20 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                                 f->updatePrimal(body, params.dual.alpha, block);
                             }
                         }
-                        block.solveDelta(scratch.deltaLin[i], scratch.deltaAng[i]);
+                        float3 dLin;
+                        float3 dAng;
+                        block.solveDelta(dLin, dAng);
                         if (body->contactOnly)
-                            applyDelta(i, gamma, rho, relax, jointRelax);
+                        {
+                            // Applied on the spot: nothing else in this phase reads this body's pose,
+                            // and the delta never has to reach memory.
+                            applyDelta(i, body, dLin, dAng, gamma, rho, relax, jointRelax);
+                        }
+                        else
+                        {
+                            scratch.deltaLin[i] = dLin;
+                            scratch.deltaAng[i] = dAng;
+                        }
                     });
             stampTimer.workDone();
             sync.arriveAndWait();
@@ -839,9 +896,11 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                 PhaseTimer combineTimer(phaseSlot(kPhaseCombine, workerIndex));
                 sync.forItems(static_cast<int>(updateOrder.size()),
                         [this, gamma, rho, relax, jointRelax](int i) {
-                            if (updateOrder[i]->contactOnly)
+                            Rigid *body = updateOrder[i];
+                            if (body->contactOnly)
                                 return; // applied in the assembly phase
-                            applyDelta(i, gamma, rho, relax, jointRelax);
+                            applyDelta(i, body, scratch.deltaLin[i], scratch.deltaAng[i], gamma, rho,
+                                    relax, jointRelax);
                         });
                 combineTimer.workDone();
                 sync.arriveAndWait();
@@ -938,14 +997,14 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
 // Apply one body's solved delta with the combine pass's schedule. The relaxation constant depends on
 // what the body's rows are (see SolverParams::Primal::jointRelaxation), and the derived pose state
 // every constraint reads is refreshed here, which is the only place a pose change can be observed.
-void Solver::applyDelta(int i, float gamma, float rho, float relax, float jointRelax) noexcept
+void Solver::applyDelta(int i, Rigid *body, float3 dLin, float3 dAng, float gamma, float rho,
+        float relax, float jointRelax) noexcept
 {
-    Rigid *body = updateOrder[i];
     if (rho <= 0.0f || !body->contactOnly)
     {
         const float step = body->contactOnly ? relax : jointRelax;
-        body->positionLin = body->positionLin + scratch.deltaLin[i] * step;
-        body->positionAng = body->positionAng + scratch.deltaAng[i] * step;
+        body->positionLin = body->positionLin + dLin * step;
+        body->positionAng = body->positionAng + dAng * step;
     }
     else
     {
@@ -953,9 +1012,9 @@ void Solver::applyDelta(int i, float gamma, float rho, float relax, float jointR
         // half gets the same gamma but no prev-mixing: positions are a vector space, rotations are
         // not, and the first-order quat integration stays exact as written.
         const float3 xLin = body->positionLin;
-        body->positionLin = gamma * (xLin + scratch.deltaLin[i]) + (1.0f - gamma) * scratch.prevLin[i];
+        body->positionLin = gamma * (xLin + dLin) + (1.0f - gamma) * scratch.prevLin[i];
         scratch.prevLin[i] = xLin;
-        body->positionAng = body->positionAng + scratch.deltaAng[i] * gamma;
+        body->positionAng = body->positionAng + dAng * gamma;
     }
     refreshDerivedPose(body);
 }
@@ -1430,6 +1489,39 @@ void Solver::selectUpdateBodies()
     hasJointedBodies = false;
     for (const Rigid *body : updateOrder)
         hasJointedBodies = hasJointedBodies || !body->contactOnly;
+
+    // Load balance. The assembly phase hands bodies out in this list's order, and a body's cost is
+    // dominated by how many constraints it stamps, so sorting dearest-first puts the long items at the
+    // head where the dynamic cursor overlaps them instead of leaving one heavy body as a tail no
+    // worker can help with. Items are independent, so the order cannot change the result - only which
+    // participant takes which body - and the sort is on a stable key, so the order itself is fixed.
+    if (updateOrder.size() > 1)
+    {
+        const size_t count = updateOrder.size();
+        updateCost.resize(count);
+        for (size_t i = 0; i < count; ++i)
+        {
+            Rigid *body = updateOrder[i];
+            int incident = 0;
+            for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
+                ++incident;
+            updateCost[i] = incident;
+        }
+        updateOrderIndex.resize(count);
+        for (size_t i = 0; i < count; ++i)
+            updateOrderIndex[i] = static_cast<int>(i);
+        std::stable_sort(updateOrderIndex.begin(), updateOrderIndex.end(), [this](int a, int b) {
+            return updateCost[static_cast<size_t>(a)] > updateCost[static_cast<size_t>(b)];
+        });
+        updateOrderSorted.clear();
+        for (int index : updateOrderIndex)
+            updateOrderSorted.push_back(updateOrder[static_cast<size_t>(index)]);
+        updateOrder.swap(updateOrderSorted);
+        // Renumber the slots so Rigid::updateSlot keeps addressing the column the body now occupies;
+        // every scratch array is indexed by it.
+        for (size_t i = 0; i < count; ++i)
+            updateOrder[i]->updateSlot = static_cast<int32_t>(i);
+    }
 }
 
 // Fill `forceOrder` with the solver's forces, so the phases can address them by index.

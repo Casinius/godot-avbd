@@ -1062,9 +1062,24 @@ struct Solver
         // step's barrier wait swings by an order of magnitude with what else the machine is doing,
         // so a mean over a few hundred is the only figure worth reading. Divide by `samples`.
         PhaseProfile phases[kPhaseCount];
-        double wall = 0.0; // whole substep, measured on the calling thread
+        double wall = 0.0; // whole substep (the region), measured on the calling thread
+        // The stages outside the iteration region, which its phase timers cannot see: broad phase,
+        // force warm-start (mostly collision detection inside initialize), and update-set selection.
+        // `step` is the whole tick, so these plus `wall` explain it.
+        double broad = 0.0;
+        // Broad phase, split: the candidate-pair search (Morton build + traversal + sort) and the
+        // manifold objects the surviving pairs become. The second half is the constraint lifecycle,
+        // not the tree, and it is charged here because that is where it runs.
+        double pairQuery = 0.0;
+        double bvhBuild = 0.0;
+        double pairSearch = 0.0;
+        double manifoldCreate = 0.0;
+        double forceInit = 0.0;
+        double selectStage = 0.0;
+        double step = 0.0;
         double rounds = 0.0; // rounds actually run (Newton + relaxation), total
         long long samples = 0; // substeps accumulated
+        long long samplesPerStep = 0; // ticks accumulated (the stage timings are per tick)
         void reset() noexcept;
     };
 
@@ -1148,6 +1163,11 @@ private:
     // The Jacobi primal solves one block system per body against the iteration-start
     // pose, holding the delta in the scratch columns below until the combine pass.
     std::vector<Rigid *> updateOrder;
+    // Load-balance scratch for the update set (see selectUpdateBodies): the per-body constraint count
+    // the sort reads, and the permutation it is applied through.
+    std::vector<int> updateCost;
+    std::vector<int> updateOrderIndex;
+    std::vector<Rigid *> updateOrderSorted;
 
     // The per-step, per-body working set, addressed by Rigid::updateSlot. One struct rather
     // than loose members so the columns that travel together are declared and sized
@@ -1228,7 +1248,8 @@ private:
     // the Chebyshev convex combination for a contact-only body, plus the derived pose state every
     // constraint reads. Shared by the assembly phase (a contact-only body applies its own delta
     // there) and the combine pass (the bodies a joint couples).
-    void applyDelta(int i, float gamma, float rho, float relax, float jointRelax) noexcept;
+    void applyDelta(int i, Rigid *body, float3 dLin, float3 dAng, float gamma, float rho, float relax,
+            float jointRelax) noexcept;
     // One body's BDF1 velocity update and idle detection (independent across the list).
     void finishBody(int i);
     // The position projection layer: two fenced passes, measure over forces then share and apply
