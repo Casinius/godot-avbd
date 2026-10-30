@@ -20,7 +20,6 @@
 #include "avbd/solver.h"
 
 #include "avbd/job_pool.hpp"
-#include "avbd/taskflow.hpp"
 #include "avbd/list_range.hpp"
 #include "avbd/fixed_stack.hpp"
 #include "avbd/spatial_hash.hpp"
@@ -200,11 +199,10 @@ void Solver::clear()
     forceAdjacency.clear();
 }
 
-// One tick, as a classified task flow. The broad phase / force warmstart / update-set
-// selection run once on the calling thread (they already parallelise their own stages),
-// then `runSubstep` runs the per-body warmstart, the colour-parallel iteration region and
-// the velocity finish. `runSubstep` builds the flow because interleaved substepping calls
-// it more than once per tick.
+// One tick. The broad phase / force warmstart / update-set selection run once on the
+// calling thread (they parallelise their own stages), then `runSubstep` runs the per-body
+// warmstart, the colour-parallel iteration region and the velocity finish. Interleaved
+// substepping calls `runSubstep` more than once per tick.
 void Solver::step()
 {
     ensurePool();
@@ -238,79 +236,35 @@ void Solver::step()
             msSince(t3, t4)};
 }
 
-// The flow stages read one substep's arguments and scratch through this context. It is
-// declared in solver.h and defined here so the storage and lifetime stay private to the
-// implementation; runSubstep owns it on the stack and the flow never outlives it.
-struct Solver::SubstepCtx {
-    Solver *solver = nullptr;
-    int forceCount = 0;
-    int targetIterations = 0;
-    bool idleDetection = false;
-    float prevResidual = 0.0f;
-    std::atomic<bool> converged{false};
-};
-
-int Solver::flowWarmstartCount(void *ctx) noexcept
-{
-    return static_cast<int>(static_cast<SubstepCtx *>(ctx)->solver->warmstartOrder.size());
-}
-
-void Solver::flowWarmstartItem(void *ctx, int i) noexcept
-{
-    static_cast<SubstepCtx *>(ctx)->solver->warmstartBody(i);
-}
-
-bool Solver::flowIterateInlineWhen(void *ctx) noexcept
-{
-    const SubstepCtx &c = *static_cast<SubstepCtx *>(ctx);
-    return static_cast<int>(c.solver->updateOrder.size()) < kMinBodiesPerDispatch
-            && c.forceCount + c.solver->manifolds.count() < kMinForcesPerDispatch;
-}
-
-void Solver::flowIterateInline(void *ctx) noexcept
-{
-    SubstepCtx &c = *static_cast<SubstepCtx *>(ctx);
-    c.solver->pool->runRegionInline([&c](int workerIndex, auto &sync) {
-        c.solver->iterateBody(workerIndex, sync, c.targetIterations, c.forceCount,
-                c.prevResidual, c.converged);
-    });
-}
-
-void Solver::flowIterateParallel(void *ctx) noexcept
-{
-    SubstepCtx &c = *static_cast<SubstepCtx *>(ctx);
-    c.solver->pool->runRegion([&c](int workerIndex, auto &sync) {
-        c.solver->iterateBody(workerIndex, sync, c.targetIterations, c.forceCount,
-                c.prevResidual, c.converged);
-    });
-}
-
-void Solver::flowFinishItem(void *ctx, int i) noexcept
-{
-    SubstepCtx &c = *static_cast<SubstepCtx *>(ctx);
-    c.solver->finishBody(i, c.idleDetection);
-}
-
 // One substep: body warmstart (independent), the colour-parallel Gauss-Seidel region,
 // then the BDF1 velocity finish (independent). Idle detection only runs on the tick's
 // final substep, so substeps cannot sleep bodies faster than ticks.
 void Solver::runSubstep(int forceCount, int targetIterations, bool idleDetection)
 {
-    SubstepCtx ctx;
-    ctx.solver = this;
-    ctx.forceCount = forceCount;
-    ctx.targetIterations = targetIterations;
-    ctx.idleDetection = idleDetection;
+    const int warmstartCount = static_cast<int>(warmstartOrder.size());
+    pool->forCount(warmstartCount, [this](int i) { warmstartBody(i); }, kMinBodiesPerDispatch);
 
-    flow->clear();
-    flow->independent(&Solver::flowWarmstartCount, &Solver::flowWarmstartItem, kMinBodiesPerDispatch,
-            &ctx);
-    flow->region(&Solver::flowIterateInline, &Solver::flowIterateParallel,
-            &Solver::flowIterateInlineWhen, &ctx);
-    flow->independent(&Solver::flowWarmstartCount, &Solver::flowFinishItem, kMinBodiesPerDispatch,
-            &ctx);
+    // Small scenes run the region inline: waking workers for a few dozen bodies costs
+    // more than the work itself.
+    const bool inlineNow = static_cast<int>(updateOrder.size()) < kMinBodiesPerDispatch
+            && forceCount + manifolds.count() < kMinForcesPerDispatch;
+    float prevResidual = 0.0f;
+    std::atomic<bool> converged{false};
+    if (inlineNow) {
+        pool->runRegionInline([this, forceCount, targetIterations, &prevResidual, &converged](
+                                      int workerIndex, auto &sync) {
+            iterateBody(workerIndex, sync, targetIterations, forceCount, prevResidual, converged);
+        });
+    } else {
+        pool->runRegion([this, forceCount, targetIterations, &prevResidual, &converged](
+                                int workerIndex, auto &sync) {
+            iterateBody(workerIndex, sync, targetIterations, forceCount, prevResidual, converged);
+        });
+    }
 
-    flow->run();
+    pool->forCount(warmstartCount, [this, idleDetection](int i) {
+        finishBody(i, idleDetection);
+    }, kMinBodiesPerDispatch);
 }
 
 // Interleaved substepping: collision/forces/update-set once per tick, then a small number
@@ -747,20 +701,16 @@ static void wakeSleeperPair(Rigid *a, Rigid *b) noexcept
     }
 }
 
-// Contact detection: hierarchical spatial hash (big-block screen + layered
-// hash), rebuilt every step.
+// Contact detection: the broad phase selected by `broadPhaseMode` (hierarchical hashed
+// grid by default, Morton LBVH as the alternative), rebuilt every step.
 //
-// The old x-axis sweep emitted 28k candidate pairs on a 40-layer resting wall,
-// and the Morton LBVH that replaced it partitioned in 3D at the cost of a tree
-// build and a recursive self-query. The hash bucketing also partitions in 3D,
-// but with none of either: bodies go into dyadic levels by tight-AABB size,
-// each level is a sorted key table, and candidate pairs come from a
-// 27-cell walk. The candidate set is a superset of the tight-AABB overlap set,
-// exactly as the tree's was.
+// Both index the same swept world AABBs and emit packed pair candidates; the hash walks
+// the 27-cell neighbourhood of each body's own level and tests the swept AABBs before
+// writing a pair, while the LBVH traverses its tree. The surrounding pipeline - pair
+// sort, layer/constraint filter, manifold creation - is shared and identical.
 //
-// Determinism: pair collection is integer-sorted and de-duplicated, and the
-// final (min-index, other) sort fixes the manifold creation order - the same
-// contract as the sweep and tree paths before it.
+// Determinism: pair collection is integer-sorted and de-duplicated, and the final
+// (min-index, other) sort fixes the manifold creation order.
 void Solver::broadPhase()
 {
     bodiesInOrder.clear();
@@ -967,9 +917,9 @@ int Solver::warmstartForces()
 // Compute one body's inertial position and warm-start it (Eq. 2 and the adaptive
 // warm-start of the original VBD paper).
 //
-// Per-body and independent, so the step's flow runs it as an Independent stage. It covers
-// static bodies as well: their poses do not move, but the constraint code reads their
-// cached `initialLin`/`initialAng`.
+// Per-body and independent, so `runSubstep` dispatches it as an independent batch. It
+// covers static bodies as well: their poses do not move, but the constraint code reads
+// their cached `initialLin`/`initialAng`.
 void Solver::warmstartBody(int i)
 {
     Rigid *body = warmstartOrder[i];
@@ -1180,9 +1130,9 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
     }
 }
 
-// One body's BDF1 velocity after the final iteration. Per-body and independent, so the
-// step's flow runs it as an Independent stage; it covers static bodies too, so their
-// bookkeeping matches, though only movable ones get a new velocity.
+// One body's BDF1 velocity after the final iteration. Per-body and independent, so
+// `runSubstep` dispatches it as an independent batch; it covers static bodies too, so
+// their bookkeeping matches, though only movable ones get a new velocity.
 void Solver::finishBody(int i, bool idleDetection)
 {
     Rigid *body = warmstartOrder[i];
@@ -1522,10 +1472,6 @@ void Solver::colourGraph()
     for (int c = 0; c < kMaxColours; c++)
         if (colourBegins[c + 1] > colourBegins[c])
             colourCount = c + 1;
-
-    // The overflow bucket's Jacobi round needs the delta buffers.
-    bodyDeltaLin.resize(updateOrder.size());
-    bodyDeltaAng.resize(updateOrder.size());
 }
 
 // Fill `forceOrder` with the solver's non-manifold forces, so the phases can address them
@@ -1552,7 +1498,6 @@ void Solver::ensurePool()
         return;
 
     pool = std::make_unique<detail::JobPool>(static_cast<unsigned>(requested));
-    flow = std::make_unique<detail::TaskFlow>(*pool);
     poolThreads = requested;
 }
 

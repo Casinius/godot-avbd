@@ -349,6 +349,12 @@ The default is now the LBVH (`broadPhaseMode = 1`, `physics/avbd/broad_phase_lbv
 demo's own scale (420 boxes) the difference is inside the noise: `test_load` 629.9 ms vs 626.8,
 `probe_engines` 1.43 ms/frame either way, penetration p50/p99 unchanged at 8.08/11.30 mm.
 
+> Later cleanup: the hashed grid was kept and optimized instead of removed. The walk now
+> emits a same-level pair once, skips empty levels, and tests the swept AABBs before
+> writing the candidate, so the candidate list matches LBVH exactly (4868 vs 45603 on
+> Pyramid XL). `broadPhaseMode` remains, with the hash as the default (`0`) and LBVH as
+> the `1` alternative. See README.md for the post-optimization numbers.
+
 # Step 5 result: the `(1-alpha)` contact damping is load-bearing
 
 `ManifoldStore::constraintError` returns `C = (1-alpha) * C0 + B * dq`, so at the default

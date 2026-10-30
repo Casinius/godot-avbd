@@ -84,6 +84,7 @@ static void register_avbd_settings() {
             {"physics/avbd/sleep_angular_threshold", Variant(0.05)},
             {"physics/avbd/sleep_time", Variant(1.0)},
             {"physics/avbd/contact_grace_ticks", Variant(0)},
+            {"physics/avbd/broad_phase_lbvh", Variant(false)},
             {"physics/avbd/speculative_margin", Variant(0.01)},
     };
     for (const auto &entry : entries) {

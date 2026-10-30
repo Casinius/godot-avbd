@@ -1,6 +1,7 @@
 /*
- * Morton LBVH broad phase - the implementation the hierarchical hashed grid replaced,
- * ported from `main:src/avbd/bvh/` so the two can be compared **on the same inputs**.
+ * Morton LBVH broad phase - the alternative to the hierarchical hashed grid
+ * (`SpatialHash`), ported from `main:src/avbd/bvh/`. Selected by `broadPhaseMode = 1`;
+ * both implementations are fed the same swept AABBs and feed the same downstream.
  *
  * The port keeps the algorithm and changes three things, all of which are needed for the
  * comparison to mean anything:

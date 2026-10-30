@@ -10,7 +10,7 @@
 #include <limits>
 
 #include "avbd/solver.h"
-#include "avbd/spatial_hash.hpp" // packPair
+#include "avbd/broadphase_pair.hpp"
 
 namespace avbd {
 

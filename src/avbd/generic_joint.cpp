@@ -23,6 +23,7 @@
  * stamped through both halves of the system at once - see stampAxis.
  */
 
+#include <algorithm>
 #include <cmath>
 
 #include "avbd/solver.h"

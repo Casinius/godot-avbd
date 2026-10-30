@@ -6,7 +6,7 @@
  * to us is the part no library can know: how many independent pieces of work there are,
  * which of them may overlap, and where the phase boundaries are.
  *
- * TASK CLASSES (see taskflow.hpp for the flow that sequences them):
+ * TASK CLASSES (the solver sequences them directly):
  * - Independent work: per-item functions with no internal synchronization. Any worker may
  *   run any item, and several independent tasks may be in flight at once. Joined by a
  *   per-dispatch latch, never by a global queue drain.
@@ -208,13 +208,6 @@ public:
     Scheduler &operator=(const Scheduler &) = delete;
 
     [[nodiscard]] BS::thread_pool<> &pool() { return workers; }
-
-    // Region participants that may be resident at once. Clamped to the semaphore bound so
-    // the reservation arithmetic never exceeds the template maximum.
-    [[nodiscard]] unsigned capacity() const {
-        return static_cast<unsigned>(std::min<std::ptrdiff_t>(
-                kMaxRegionSlots, static_cast<std::ptrdiff_t>(workers.get_thread_count())));
-    }
 
     // Reserve `count` region workers. Blocking: a region that cannot get its full width
     // waits for another region to finish instead of silently running serially. A region

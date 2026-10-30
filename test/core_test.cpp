@@ -2199,6 +2199,7 @@ static int runPyramid(int ticks) {
 
 int main(int argc, char **argv) {
     std::string scene;
+    std::string benchScene;
     int steps = 300;
     int threads = 0; // 0 = automatic
     bool pyramid = false;
@@ -2232,7 +2233,7 @@ int main(int argc, char **argv) {
         } else if (arg.rfind("--iters=", 0) == 0) {
             g_iterations = std::atoi(arg.c_str() + 8);
         } else if (arg == "--bench-scene" && i + 1 < argc) {
-            return run_bench_scene(argv[++i], threads);
+            benchScene = argv[++i];
         } else if (arg == "--bvh") {
             g_broadPhaseMode = 1;
         } else if (arg.rfind("--penmax=", 0) == 0) {
@@ -2247,12 +2248,15 @@ int main(int argc, char **argv) {
             threads = std::atoi(argv[++i]);
         } else {
             std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --bench-two | --shape |"
-                                 " --pyramid [--steps N] | --scene NAME [--steps N]] [--threads N]"
-                                 " [--bvh]\n", argv[0]);
+                                 " --pyramid [--steps N] | --scene NAME [--steps N] |"
+                                 " --bench-scene NAME [--threads N]] [--bvh]\n", argv[0]);
             return 2;
         }
     }
 
+    if (!benchScene.empty()) {
+        return run_bench_scene(benchScene, threads);
+    }
     if (!scene.empty()) {
         return run_scene(scene, steps, threads);
     }

@@ -10,27 +10,32 @@
  *
  * Hierarchical hashed-grid broad phase ("big-block screen + layered hash").
  *
- * Replaces the Morton LBVH. Bodies are bucketed by the largest full extent of
- * their world AABB (the solver passes swept bounds) into dyadic levels: level 0
- * has cells of `baseCell` (the big blocks), level l has cells of baseCell * 2^l,
- * and a body lives at the smallest level whose cell fits its AABB. Each level is
- * hashed as packed 20-bit integer coordinates; the level index rides in the sort
- * key's top four bits, so one radix sort produces both the per-level CSR ranges
- * and the bucketed cells.
+ * The default broad phase (`Solver::broadPhaseMode = 0`); the Morton LBVH is the
+ * alternative selected by `broadPhaseMode = 1`.
  *
- * Pair generation: a body walks the 27-cell neighbourhood of its AABB centre at
- * every level from its own up to the coarsest. Two bodies whose AABBs overlap
- * are at most one cell apart (Chebyshev) at any level that fits both AABBs, so
- * every overlapping pair is found from the smaller body's walk; same-level pairs
- * are found from both sides and de-duplicated by the caller's sort+unique.
+ * Bodies are bucketed by the largest full extent of their world AABB (the solver passes
+ * swept bounds) into dyadic levels: level 0 has cells of `baseCell` (the big blocks),
+ * level l has cells of baseCell * 2^l, and a body lives at the smallest level whose cell
+ * fits its AABB. Each level is hashed as packed 20-bit integer coordinates; the level
+ * index rides in the sort key's top four bits, so one radix sort produces both the
+ * per-level CSR ranges and the bucketed cells.
  *
- * Determinism: keys, bodies and pairs are sorted integers - the output order
- * does not depend on hash iteration or thread count. The per-body work (extent,
- * level, cell key) is written by index and runs on the job pool; the sequential
- * parts are the two O(n) scans that pick the big-block size and the top level.
+ * Pair generation: a body walks the 27-cell neighbourhood of its AABB centre at every
+ * non-empty level from its own up to the coarsest. Two bodies whose AABBs overlap are at
+ * most one cell apart (Chebyshev) at any level that fits both AABBs, so every overlapping
+ * pair is found from the smaller body's walk. A same-level pair is emitted only by the
+ * smaller body index, and the swept AABBs are tested before the pair is written, so the
+ * output is the exact AABB-overlap set rather than the 27-cell superset. The solver still
+ * applies its layer / constraint / both-static filter on top.
+ *
+ * Determinism: keys, bodies and pairs are sorted integers - the output order does not
+ * depend on hash iteration or thread count. The per-body work (extent, level, cell key)
+ * is written by index and runs on the job pool; the sequential parts are the two O(n)
+ * scans that pick the big-block size and the top level.
  */
 
 #pragma once
+#include "avbd/broadphase_pair.hpp"
 #include "avbd/job_pool.hpp"
 #include <array>
 #include <cstdint>
@@ -41,27 +46,6 @@ namespace avbd {
 
 struct Rigid;
 
-// A broad-phase candidate pair packed into one integer for the sort: the smaller body
-// index in the high 32 bits, the larger in the low 32. Lexicographic order over
-// `std::pair<int,int>` is therefore plain integer order, which is what lets the unlink
-// step use a real radix sort instead of a comparator sort.
-[[nodiscard]] inline constexpr uint64_t packPair(int p_a, int p_b) noexcept
-{
-    const uint64_t lo = static_cast<uint64_t>(static_cast<uint32_t>(p_a < p_b ? p_a : p_b));
-    const uint64_t hi = static_cast<uint64_t>(static_cast<uint32_t>(p_a < p_b ? p_b : p_a));
-    return (lo << 32) | hi;
-}
-
-[[nodiscard]] inline constexpr int pairFirst(uint64_t p_key) noexcept
-{
-    return static_cast<int>(p_key >> 32);
-}
-
-[[nodiscard]] inline constexpr int pairSecond(uint64_t p_key) noexcept
-{
-    return static_cast<int>(p_key & 0xFFFFFFFFu);
-}
-
 class SpatialHash
 {
 public:
@@ -69,13 +53,14 @@ public:
     // the largest body's AABB extent; build() grows maxLevel until it does.
     static constexpr int kMaxLevels = 16;
 
-    // Rebuild the hierarchy over `bodies` and emit every candidate pair whose
-    // world AABBs can overlap into `out`, packed by `packPair` (see above).
+    // Rebuild the hierarchy over `bodies` and emit every pair whose swept world AABBs
+    // overlap into `out`, packed by `packPair` (see above). The solver's exact filter
+    // re-checks layers and constraints but the geometric test is already done here.
     // `baseCell` <= 0 selects it automatically: the median largest AABB extent
     // of the scene, so half the bodies land in the level-0 big blocks.
     // `aabbHalfExt` / `aabbCenter` are the precomputed world AABB bounds per body
     // (the solver passes swept bounds, so a fast body is not missed). They are also
-    // the exact filter's inputs, so the bound is computed once per body per step.
+    // the overlap test's inputs, so the bound is computed once per body per step.
     void buildAndCollectPairs(std::span<Rigid *const> bodies, float baseCell,
                               std::vector<uint64_t> &out,
                               std::span<const float3> aabbHalfExt,

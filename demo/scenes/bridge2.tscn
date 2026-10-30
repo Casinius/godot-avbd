@@ -151,12 +151,11 @@ skeleton = NodePath("../..")
 shape = SubResource("ConvexPolygonShape3D_1q54l")
 
 [node name="RigidBody3D" type="RigidBody3D" parent="." unique_id=1023141720]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2.2418556, 3.888248, 0)
 
 [node name="MeshInstance3D3" type="MeshInstance3D" parent="RigidBody3D" unique_id=1652325206]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.7213982, 3.8400946, 0)
 mesh = SubResource("CylinderMesh_3lmon")
 skeleton = NodePath("../..")
 
 [node name="CollisionShape3D" type="CollisionShape3D" parent="RigidBody3D" unique_id=471350688]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.7213982, 3.8400946, 0)
 shape = SubResource("ConvexPolygonShape3D_7ct4w")

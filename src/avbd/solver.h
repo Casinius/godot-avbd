@@ -30,7 +30,6 @@ namespace avbd {
 // Defined in job_pool.hpp, which is only included by solver.cpp.
 namespace detail {
 class JobPool;
-class TaskFlow;
 }
 
 // Minimum penalty parameter
@@ -753,31 +752,18 @@ struct Solver
     // Base gap (metres), extended by predicted relative motion until the next collision refresh; 0 disables.
     float speculativeMargin = 0.01f;
 
-    // Which broad phase runs. Both take the same swept world AABBs and emit the same packed
-    // pair candidates, so this is the one switch that isolates the two algorithms.
-    //   1 = Morton LBVH with refit (LbvhBroadPhase) - the default
-    //   0 = hierarchical hashed grid (SpatialHash)
+    // Which broad phase runs. Both take the same swept world AABBs and emit packed pair
+    // candidates, so this is the one switch that isolates the two algorithms.
+    //   0 = hierarchical hashed grid (SpatialHash) - the default
+    //   1 = Morton LBVH with refit (LbvhBroadPhase)
     //
-    // The default used to be the hash, on the strength of a comparison against the `main`
-    // branch that also changed the solver. Isolated - same inputs, same downstream work,
-    // `--bvh` in the core bench - the LBVH wins everywhere and the simulation is bit-identical
-    // (`stack_300`, `interleaved_300`, `mixed_240` digests match either way):
-    //
-    //   scene        bodies  hash broad (index)   lbvh broad (index)   step hash -> lbvh
-    //   Pyramid         137   0.515 (0.200) ms     0.201 (0.029) ms     1.611 -> 1.345
-    //   Pyramid XL     1654   3.366 (1.185)        0.953 (0.582)        10.019 -> 8.243
-    //   Bridge           91   0.307 (0.090)        0.049 (0.017)         1.145 -> 0.841
-    //   Soft Body       193   1.067 (0.169)        0.623 (0.098)         2.518 -> 2.242
-    //   Stack            11   0.031 (0.020)        0.010 (0.000)         0.108 -> 0.091
-    //
-    // The cause is in the hash, not the tree: it walks the 27-cell neighbourhood at *every*
-    // level from the body's own up to the coarsest, so a scene with one huge body (the ground)
-    // makes every body report every neighbour in a ground-sized cell. Contact counts are
-    // identical, but the hash emits 6-9x the candidate pairs (45603 vs 4868 on Pyramid XL),
-    // and the exact filter and pair sort pay for all of them. Fixing that walk (own level only,
-    // with coarse bodies tested against the fine cell's parent) would be the way back; until
-    // then the tree is the better default.
-    int broadPhaseMode = 1;
+    // The hash walks the 27-cell neighbourhood at each non-empty level from the body's
+    // own up to the coarsest, emits a same-level pair only once, and tests the swept AABBs
+    // before writing the candidate. The earlier version emitted the full 27-cell superset
+    // from both sides and left the exact test to the solver, which inflated the candidate
+    // list 6-9x on a dense pile; the in-walk test removes that cost without changing which
+    // pairs are real. `--bvh` in the core bench selects the LBVH for comparison.
+    int broadPhaseMode = 0;
 
     // Position correction excludes resting contacts and does not feed displacement into velocity.
     bool positionProjection = true;
@@ -1028,15 +1014,13 @@ private:
     // Requested thread count the pool was built for; a change rebuilds it (a solver whose
     // `threads` is set after the first step otherwise keeps the old width forever).
     int poolThreads = -1;
-    // Classified stage sequence for the current step, rebuilt in place every frame.
-    std::unique_ptr<detail::TaskFlow> flow;
 
     // Create the pool on first use so that a serial solver never spawns threads.
     void ensurePool();
     // Fill `forceOrder` from the solver's force list and return the count.
     int collectForces();
 
-    // The phases of a step (see `step()`, which sequences them through `TaskFlow`).
+    // The phases of a step (see `step()`, which sequences them).
     void broadPhase();
     int warmstartForces();
     // One body's inertial/warm-start update (independent across the list).
@@ -1051,18 +1035,9 @@ private:
     // One body's BDF1 velocity update (independent across the list). Idle detection only
     // runs on the final substep, so substeps do not sleep bodies faster than ticks.
     void finishBody(int i, bool idleDetection);
-    // One substep's body warmstart, iteration region, and velocity finish, as a flow.
+    // One substep's body warmstart, iteration region, and velocity finish.
     void runSubstep(int forceCount, int targetIterations, bool idleDetection);
 
-    // Flow stage context. Lives on runSubstep's stack for the duration of flow->run(), so
-    // stage thunks take it as an opaque pointer with no allocation and no type erasure.
-    struct SubstepCtx;
-    static int flowWarmstartCount(void *ctx) noexcept;
-    static void flowWarmstartItem(void *ctx, int i) noexcept;
-    static void flowIterateInline(void *ctx) noexcept;
-    static void flowIterateParallel(void *ctx) noexcept;
-    static bool flowIterateInlineWhen(void *ctx) noexcept;
-    static void flowFinishItem(void *ctx, int i) noexcept;
     // Rebase every manifold's contact error at the current pose (parallel over slots).
     void rebaseContacts();
     // Brake approach velocities against the gap that is still open (`brakeWindow`, default:

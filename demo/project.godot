@@ -23,7 +23,7 @@ config/features=PackedStringArray("4.7")
 3d/run_on_separate_thread=true
 common/physics_ticks_per_second=240
 3d/physics_engine="AVBD"
-3d/solver/solver_iterations=4
+3d/solver/solver_iterations=6
 common/physics_interpolation=true
 avbd/beta_linear=100000.0
 avbd/beta_angular=100.0
@@ -36,8 +36,9 @@ avbd/substeps=1
 avbd/jacobian_rebuild_distance=0.02
 avbd/position_projection=true
 avbd/projection_beta=1.0
-avbd/projection_max_correction=0.1
+avbd/projection_max_correction=0.8
 avbd/internal_ticks_per_second=60
+avbd/adaptive_beta=true
 
 [rendering]
 

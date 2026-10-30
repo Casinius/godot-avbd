@@ -2142,7 +2142,7 @@ shape = SubResource("BoxShape_box")
 mesh = SubResource("BoxMesh_box")
 
 [node name="Camera3D" type="Camera3D" parent="." unique_id=1720599791]
-transform = Transform3D(1, 0, 0, 0, 0.8567594, -0.51571625, 0, 0.51571625, 0.8567594, 0.49371338, 5.0879, 10.171942)
+transform = Transform3D(1, 0, 0, 0, 0.99527335, -0.09711342, 0, 0.097113416, 0.99527335, 0.49371338, 22.476305, 43.982346)
 
 [node name="Box210" type="RigidBody3D" parent="." unique_id=1624202241]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -9.595, 12.063272, 0)

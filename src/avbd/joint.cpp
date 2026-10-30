@@ -9,6 +9,7 @@
 * It is provided "as is" without express or implied warranty.
 */
 
+#include <algorithm>
 #include <cmath>
 
 #include "avbd/solver.h"

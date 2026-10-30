@@ -202,9 +202,18 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
     // Pair walk. For body i, every level k from its own to the top: the
     // 27-cell neighbourhood at level k, each cell's bodies emitted as
     // (min(i,j), max(i,j)). A pair of overlapping AABBs is found when the
-    // smaller-at-coarser body walks their common level (same-level pairs are
-    // found from both sides); duplicates collapse in the caller's sort+unique.
-    // The caller applies the exact AABB overlap / layer / constraint filter.
+    // smaller-at-coarser body walks their common level.
+    //
+    // Three filters keep the candidate list close to the true overlap set:
+    //   - an empty level is skipped outright (a single large body grows `top`
+    //     without populating the levels below it);
+    //   - a same-level pair is emitted once, by the smaller body index;
+    //   - the swept AABBs are tested before a pair is written. The solver's
+    //     exact filter repeats that test, but doing it here keeps the 27-cell
+    //     superset out of the sort and out of the downstream candidate buffer.
+    //
+    // The caller applies the layer / constraint filter; this pass only decides
+    // geometric AABB overlap, so it can never drop a real contact.
     //
     // Emission is the phase's serial bottleneck (the per-body loops above and the
     // exact filter are already on the pool), so bodies are split into contiguous
@@ -222,14 +231,19 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
         std::vector<uint64_t> &buf = pairChunks[chunk];
         buf.clear();
         for (int i = firstBody; i < lastBody; i++) {
-            const float3 &pi = aabbCenter[i];
-            for (int l = levels[i]; l < levelCount; l++) {
+            const float3 pi = aabbCenter[i];
+            const float3 halfI = aabbHalfExt[i];
+            const int ownLevel = levels[i];
+            for (int l = ownLevel; l < levelCount; l++) {
+                const int first = levelStart[l];
+                const int last = levelStart[l + 1];
+                if (first == last)
+                    continue; // no body at this level: nothing to find here
+
                 const float invCell = 1.0f / (baseCell * (float)(1 << l));
                 const int cx = (int)std::floor(pi.x * invCell);
                 const int cy = (int)std::floor(pi.y * invCell);
                 const int cz = (int)std::floor(pi.z * invCell);
-                const int first = levelStart[l];
-                const int last = levelStart[l + 1];
 
                 // One z interval per column, or two when the window wraps through 0.
                 int zLo[2];
@@ -251,10 +265,11 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
                     zHi[zRanges++] = czMasked + 1;
                 }
 
+                const bool sameLevel = (l == ownLevel);
                 for (int dy = -1; dy <= 1; dy++) {
                     for (int dx = -1; dx <= 1; dx++) {
-                        const uint64_t columnStart = cellKey(cx + dx, cy + dy, 0);
-                        const uint64_t columnPrefix = columnStart >> kCellCoordBits;
+                        const uint64_t columnPrefix =
+                                cellKey(cx + dx, cy + dy, 0) >> kCellCoordBits;
                         for (int r = 0; r < zRanges; r++) {
                             // First cell in the column at or after the window's low end.
                             const uint64_t startKey = cellKey(cx + dx, cy + dy, zLo[r]);
@@ -275,8 +290,18 @@ void SpatialHash::buildAndCollectPairs(std::span<Rigid *const> bodies, float bas
                                     break;
                                 for (int s = cellStart[p]; s < cellStart[p + 1]; s++) {
                                     const int j = cellBodies[s];
-                                    if (j != i)
-                                        buf.push_back(packPair(i, j));
+                                    if (j == i)
+                                        continue;
+                                    // Same-level pairs are seen from both sides; keep one.
+                                    if (sameLevel && j < i)
+                                        continue;
+                                    const float3 cj = aabbCenter[j];
+                                    const float3 hj = aabbHalfExt[j];
+                                    if (std::fabs(pi.x - cj.x) > halfI.x + hj.x ||
+                                            std::fabs(pi.y - cj.y) > halfI.y + hj.y ||
+                                            std::fabs(pi.z - cj.z) > halfI.z + hj.z)
+                                        continue;
+                                    buf.push_back(packPair(i, j));
                                 }
                             }
                         }

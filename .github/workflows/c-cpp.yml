@@ -23,7 +23,7 @@ jobs:
         xmake f --asan=n --tsan=n --ubsan=n
     - name: make
       run: xmake build -y
-    - name: make check
-      run: xmake check
+    - name: run core solver tests
+      run: xmake run avbd_core_test
     - name: make distcheck
       run: echo "xmake not support"
