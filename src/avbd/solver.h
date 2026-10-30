@@ -16,6 +16,7 @@
 #include <memory>
 #include <vector>
 #include <array>
+#include <limits>
 #include <span>
 
 #include "avbd/bvh_broadphase.hpp"
@@ -318,7 +319,7 @@ struct Joint : Force
     float torqueArm;
     bool broken;
 
-    Joint(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, float3 p_rB, float p_stiffnessLin = INFINITY, float p_stiffnessAng = 0.0f, float p_fracture = INFINITY);
+    Joint(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, float3 p_rB, float p_stiffnessLin = std::numeric_limits<float>::infinity(), float p_stiffnessAng = 0.0f, float p_fracture = std::numeric_limits<float>::infinity());
 
     bool initialize() override;
     void updatePrimal(Rigid *body, float alpha, Block &block) override;

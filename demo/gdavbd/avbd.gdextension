@@ -9,3 +9,5 @@ reloadable = false
 
 linux.debug.x86_64 = "res://gdavbd/bin/libavbd.linux.x86_64.so"
 linux.release.x86_64 = "res://gdavbd/bin/libavbd.linux.x86_64.so"
+windows.debug.x86_64 = "res://gdavbd/bin/libavbd.windows.x86_64.dll"
+windows.release.x86_64 = "res://gdavbd/bin/libavbd.windows.x86_64.dll"

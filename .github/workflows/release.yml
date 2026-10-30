@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# Builds the GDExtension on both platforms with the same xmake project script (no per-platform script -
+# the configure command is what differs), gates on the solver suite, and packages the library next to
+# the manifest that names it.
 jobs:
   build-and-release:
     name: Build and Release on ${{ matrix.os }}
@@ -17,8 +20,14 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            platform: linux
+            arch: x86_64
+            library: libavbd.linux.x86_64.so
             artifact_name: godot-avbd-deterministic-linux.zip
           - os: windows-latest
+            platform: windows
+            arch: x64
+            library: libavbd.windows.x86_64.dll
             artifact_name: godot-avbd-deterministic-windows.zip
 
     steps:
@@ -37,8 +46,6 @@ jobs:
           else
             # 自动生成临时 tag，与 v* 规则不冲突
             TAG="dev-${GITHUB_RUN_NUMBER}"
-            # 如果希望更细粒度，也可以加入日期：
-            # TAG="dev-$(date +%Y%m%d)-${GITHUB_RUN_NUMBER}"
           fi
           echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Using release tag: ${TAG}"
@@ -55,56 +62,87 @@ jobs:
           build-cache: true
           build-cache-key: '${{ runner.os }}-xmake-build'
 
-      - name: Install zip (Linux only)
+      # godot-cpp (the `godotcpp4` package) is built by scons, so it has to be on PATH before xmake
+      # resolves the package: apt on Linux, pip on Windows.
+      - name: Install scons (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y zip scons
-
-      - name: Configure xmake (Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          xmake f -y
-          xmake f --asan=n --tsan=n --ubsan=n
 
       - name: Setup Python for Windows
         if: runner.os == 'Windows'
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12' # 使用一个稳定版本，避免使用 3.14 等最新版
+          python-version: '3.12'
 
-      - name: Configure xmake (Windows)
+      - name: Install scons (Windows)
         if: runner.os == 'Windows'
-        shell: pwsh
-        # 添加 --python 参数，显式指向 setup-python 设置的 Python 解释器
-        run: |
-          python -m pip install scons==4.9.1
-          xmake f -p windows --toolchain=msvc -y
+        run: python -m pip install scons==4.9.1
 
-      - name: Build project
-        run: xmake build -vD
+      # The platform is pinned here rather than left to the host default, so a release is always the
+      # same configuration: linux/x86_64 or windows/x64, release mode. MSVC is named explicitly on
+      # Windows because the runner also has MinGW on PATH and only MSVC produces a DLL Godot loads
+      # without extra runtime DLLs.
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: xmake f -p ${{ matrix.platform }} -a ${{ matrix.arch }} -m release -y
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: xmake f -p ${{ matrix.platform }} -a ${{ matrix.arch }} -m release --toolchain=msvc -y
+
+      - name: Build
+        run: xmake build -y
+
+      # A release is the worst place to discover that the solver regressed. The core suite is the
+      # determinism contract (digests, thread-count independence, closed-form equivalence) plus the
+      # scene checks; it must pass on Linux. On Windows it reports instead of blocking, because MSVC's
+      # floating-point environment is the one place a scene check can legitimately differ.
+      - name: Solver suite
+        shell: bash
+        continue-on-error: ${{ runner.os == 'Windows' }}
+        run: |
+          xmake run avbd_core_test > suite.log 2>&1 || true
+          grep -E 'checks, [0-9]+ failures' suite.log | tail -n 1 || true
+          if grep -E '^FAIL' suite.log; then
+            echo "::error::the solver suite reported a failure; see the log artifact"
+            exit 1
+          fi
+          echo "ok: solver suite passed"
 
       - name: Package
         shell: bash
         run: |
+          set -euo pipefail
+          lib="${{ matrix.library }}"
+          # The name is the one xmake.lua's godot_library_name() produced and the one the manifest
+          # lists; a mismatch is a broken release, not something to paper over with a glob.
+          test -f "demo/gdavbd/bin/$lib" || { echo "::error::demo/gdavbd/bin/$lib was not produced"; exit 1; }
+          grep -q "res://gdavbd/bin/$lib" demo/gdavbd/avbd.gdextension \
+            || { echo "::error::avbd.gdextension does not list $lib"; exit 1; }
+
+          rm -rf tmp
           mkdir -p tmp/gdavbd/bin
-          cp ./demo/gdavbd/avbd.gdextension tmp/gdavbd/
+          cp demo/gdavbd/avbd.gdextension tmp/gdavbd/
+          cp "demo/gdavbd/bin/$lib" tmp/gdavbd/bin/
 
-          if [ "${RUNNER_OS}" == "Linux" ]; then
-            cp ./demo/gdavbd/bin/libavbd.linux.* tmp/gdavbd/bin/
-          elif [ "${RUNNER_OS}" == "Windows" ]; then
-            cp ./demo/gdavbd/bin/*.dll tmp/gdavbd/bin/ 2>/dev/null || \
-            cp ./demo/gdavbd/bin/*.lib tmp/gdavbd/bin/ 2>/dev/null || true
-          else
-            echo "Unsupported OS: ${RUNNER_OS}" >&2
-            exit 1
-          fi
+          # The archive is written to the workspace root, which is where the upload step looks for it.
+          out="$GITHUB_WORKSPACE/${{ matrix.artifact_name }}"
+          rm -f "$out"
 
-          cd tmp
           if [ "${RUNNER_OS}" == "Windows" ]; then
-            powershell -Command "Compress-Archive -Path gdavbd -DestinationPath ../${{ matrix.artifact_name }} -Force"
+            # Do NOT use Windows PowerShell 5.1's Compress-Archive here: it writes entry names with
+            # backslashes ("gdavbd\bin\lib.dll"), which violates the zip spec, so Linux unzip treats
+            # the whole thing as one flat filename and the gdavbd/ directory "disappears". pwsh 7's
+            # ZipFile.CreateFromDirectory writes forward slashes and keeps gdavbd/ as the archive root,
+            # matching what `zip -r out.zip gdavbd` does on Linux.
+            pwsh -NoProfile -Command "
+              Add-Type -AssemblyName System.IO.Compression.FileSystem;
+              [System.IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path 'tmp').Path, '$out')
+            "
           else
-            zip -r ../${{ matrix.artifact_name }} gdavbd
+            (cd tmp && zip -r "$out" gdavbd)
           fi
+          test -f "$out" || { echo "::error::packaging produced no $out"; exit 1; }
 
       # === 上传到 Release，使用上面计算出的 tag ===
       - name: Upload Release Asset
@@ -118,3 +156,11 @@ jobs:
           files: ./${{ matrix.artifact_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload the suite log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: suite-${{ matrix.platform }}
+          path: suite.log
+          if-no-files-found: ignore

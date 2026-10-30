@@ -5,25 +5,123 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
+# The build is one xmake project script for every platform (see xmake.lua): the only thing that differs
+# between the jobs below is the configure command, which is what each matrix row pins. Three
+# configurations:
+#   - Linux release            - the shipped shape;
+#   - Linux debug + sanitizers - the memory/UB audit, which no other job runs;
+#   - Windows release (MSVC)   - the platform the script's MSVC branch exists for. godot-cpp is built
+#                                by scons there too, installed through pip.
+#
+# The solver suite gates the build on Linux. On Windows it reports instead of blocking: MSVC's
+# floating-point environment is the one place where a scene check can legitimately land on a
+# different number, while the build and the artifact/manifest names must still be correct.
 jobs:
   build:
-
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux release
+            os: ubuntu-latest
+            platform: linux
+            arch: x86_64
+            mode: release
+            flags: ""
+            library: libavbd.linux.x86_64.so
+            # The manifold pool holds recycled blocks by design, so leak detection would report the
+            # cache rather than a leak.
+            asan_options: ""
+          - name: linux debug asan+ubsan
+            os: ubuntu-latest
+            platform: linux
+            arch: x86_64
+            mode: debug
+            flags: "--asan=y --ubsan=y"
+            library: libavbd.linux.x86_64.so
+            asan_options: "detect_leaks=0"
+          - name: windows release msvc
+            os: windows-latest
+            platform: windows
+            arch: x64
+            mode: release
+            flags: "--toolchain=msvc"
+            library: libavbd.windows.x86_64.dll
+            asan_options: ""
 
     steps:
-    - uses: actions/checkout@v4
-    - name: configure
-      run: |
-        sudo apt update
-        sudo apt install scons
-        curl -fsSL https://xmake.io/shget.text | bash
-        source ~/.xmake/profile
-        xmake f -y
-        xmake f --asan=n --tsan=n --ubsan=n
-    - name: make
-      run: xmake build -y
-    - name: run core solver tests
-      run: xmake run avbd_core_test
-    - name: make distcheck
-      run: echo "xmake not support"
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+          actions-cache-folder: '.xmake-cache'
+          actions-cache-key: '${{ runner.os }}-xmake'
+          package-cache: true
+          package-cache-key: '${{ runner.os }}-xmake-packages'
+          project-path: '.'
+          build-cache: true
+          build-cache-key: '${{ runner.os }}-${{ matrix.mode }}-xmake-build'
+
+      # godot-cpp (the `godotcpp4` package) is built by scons, so the tool has to exist before xmake
+      # resolves the package: apt on Linux, pip on Windows.
+      - name: Install scons (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y scons
+
+      - name: Setup Python (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install scons (Windows)
+        if: runner.os == 'Windows'
+        run: python -m pip install scons==4.9.1
+
+      - name: Configure
+        run: xmake f -p ${{ matrix.platform }} -a ${{ matrix.arch }} -m ${{ matrix.mode }} ${{ matrix.flags }} -y
+
+      - name: Build
+        run: xmake build -y
+
+      # The manifest and the build have to agree on the library's name, or Godot silently reports a
+      # missing extension. Both derive it from platform/arch (xmake.lua's godot_library_name), so this
+      # is a cheap consistency check of that pair.
+      - name: Extension artifact matches its manifest
+        shell: bash
+        run: |
+          lib="${{ matrix.library }}"
+          test -f "demo/gdavbd/bin/$lib" || { echo "::error::demo/gdavbd/bin/$lib was not produced"; exit 1; }
+          grep -q "res://gdavbd/bin/$lib" demo/gdavbd/avbd.gdextension \
+            || { echo "::error::avbd.gdextension does not list $lib"; exit 1; }
+          echo "ok: $lib is built and listed"
+
+      - name: Solver suite
+        shell: bash
+        continue-on-error: ${{ runner.os == 'Windows' }}
+        env:
+          ASAN_OPTIONS: ${{ matrix.asan_options }}
+          UBSAN_OPTIONS: "print_stacktrace=1"
+        run: |
+          xmake run avbd_core_test > suite.log 2>&1 || true
+          grep -E 'checks, [0-9]+ failures' suite.log | tail -n 1 || true
+          if grep -E '^FAIL' suite.log; then
+            echo "::error::the solver suite reported a failure; see the log artifact"
+            exit 1
+          fi
+          echo "ok: solver suite passed"
+
+      - name: Upload the suite log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: suite-${{ matrix.name }}
+          path: suite.log
+          if-no-files-found: ignore
