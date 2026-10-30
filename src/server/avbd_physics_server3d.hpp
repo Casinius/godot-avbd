@@ -255,6 +255,13 @@ protected:
         // Ticks a separated manifold keeps its hot state (see Solver::contactGraceTicks).
         // 0 = reap on first separation, the historical behaviour.
         int contact_grace_ticks = 0;
+        // Route contact-only bodies through the coloured Gauss-Seidel instead of the
+        // block-Jacobi bucket (Solver::contactOnlyOverflow). Off by default: see the A/B in
+        // solver.h.
+        bool contact_gs = false;
+        // Broad phase: true = Morton LBVH (default), false = hierarchical hashed grid. See
+        // Solver::broadPhaseMode for the measured comparison.
+        bool broad_phase_lbvh = true;
 
         // Contact generation distance, in metres (see Solver::speculativeMargin). A contact
         // is created while the shapes are still separated by up to this much, and the

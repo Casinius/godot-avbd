@@ -1,0 +1,13 @@
+Godot Engine v4.7.2.stable.official.ed1daf0bf - https://godotengine.org
+
+AVBD physics server: factory invoked - the engine selected AVBD
+ok  AVBDPhysicsServer3D registered
+ok  PhysicsServerFactory registered
+ok  AVBDDirectBodyState3D registered
+ok  AVBDDirectSpaceState3D registered
+ok  AVBDSoftBody3D -> AVBDSoftBody3D
+ok  AVBDSoftWorld3D -> AVBDSoftWorld3D
+Total time: 2460.7 ms (2 runs)
+Per pyramid run: 626.1 ms
+ok  pyramid 2x200 boxes settled deterministically (2460.7 ms total)
+AVBD_LOAD_GATE: PASS

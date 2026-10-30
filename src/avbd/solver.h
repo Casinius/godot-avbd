@@ -18,6 +18,7 @@
 #include <array>
 #include <span>
 
+#include "avbd/bvh_broadphase.hpp"
 #include "avbd/maths.h"
 #include "avbd/spatial_hash.hpp"
 
@@ -42,10 +43,6 @@ inline constexpr float ADAPTIVE_BETA_MAX = 64.0f;
 // exact surface. It is deliberately small - the margin is added to the contact
 // error, so a large value is a resting penetration floor.
 inline constexpr float COLLISION_MARGIN_BASE = 0.001f;
-// Margin damping factor per iteration
-inline constexpr float COLLISION_MARGIN_DAMPING = 0.5f;
-// Cap on penetration margin
-inline constexpr float COLLISION_MARGIN_MAX = 0.02f;
 // Base collision margin for compatibility
 inline constexpr float COLLISION_MARGIN = COLLISION_MARGIN_BASE;
 // Position threshold for sticking contacts (ie static friction)
@@ -87,8 +84,9 @@ struct Solver;
 // `size` means different things per shape, and this documents it once:
 //   Box      - full extents in x, y and z
 //   Sphere   - size.x is the radius; y and z are ignored
-//   Cylinder - size.x and size.z are the radius, size.y is the full height, and the axis is the
-//              body's local +Y (matching Godot's CylinderMesh)
+//   Cylinder - size.x and size.y are the radius, size.z is the full height, and the axis is the
+//              body's local +Z. (Godot's CylinderShape3D is Y-up; the server rotates it into
+//              sim space, see godot_convert.hpp - the solver itself is always +Z.)
 enum class ShapeType : int
 {
     Box = 0,
@@ -112,7 +110,7 @@ struct Shape
     float3 half;          // box
     float radius = 0;     // sphere, cylinder
     float halfHeight = 0; // cylinder
-    float3 axis;          // cylinder axis, world space, unit length
+    float3 axis = float3{0, 0, 0}; // cylinder axis, world space, unit length
 };
 
 // Holds all the state for a single rigid body that is needed by AVBD
@@ -213,16 +211,30 @@ struct Block
     // Mass term of the system: M / dt^2, with the body's current error as the right-hand
     // side. `dtSq` is dt*dt: the division is kept as a division on purpose, since
     // multiplying by a reciprocal would not be bit-identical.
+    //
+    // The angular half is the *world* inertia R I R^T, not the body-frame diagonal I. The
+    // rest of the system is world-frame: the constraint angle Jacobians are `r x n` with r
+    // in world space (ManifoldStore::stampCached builds R S R^T, Joint stamps `r x jLin`),
+    // and the update `positionAng + dAng` is a world-frame rotation vector. Pairing that with
+    // a body-frame diagonal inertia makes the effective angular mass wrong by whatever
+    // rotation the body happens to have: only an isotropic inertia (a sphere, a cube) is
+    // unaffected, and the demo's own 1 x 0.5 x 1 box is not (0.104 / 0.167 / 0.104).
+    // projectContacts' angularCompliance/angularResponse already did this correctly.
     Block(float mass, float3 moment, float dtSq, float3 positionLin, float3 inertialLin,
           quat positionAng, quat inertialAng) noexcept {
         // The M/dt^2 diagonal is one value per matrix, then componentwise products.
         const float3 massOverDtSq = float3{mass, mass, mass} / dtSq;
-        const float3 momentOverDtSq = moment / dtSq;
         lhsLin = diagonal(massOverDtSq.x, massOverDtSq.y, massOverDtSq.z);
-        lhsAng = diagonal(momentOverDtSq.x, momentOverDtSq.y, momentOverDtSq.z);
         lhsCross = float3x3{}; // zero
         rhsLin = cmul(massOverDtSq, positionLin - inertialLin);
-        rhsAng = cmul(momentOverDtSq, positionAng - inertialAng);
+
+        // I_w = R diag(moment) R^T, then M_ang = I_w / dt^2 and the right-hand side is the
+        // same matrix acting on the world rotation vector since the step started.
+        const float3x3 rot = qmat(positionAng);
+        const float3x3 inertiaWorld = mul(rot,
+                mul(diagonal(moment.x, moment.y, moment.z), transpose(rot)));
+        lhsAng = inertiaWorld / dtSq;
+        rhsAng = mul(lhsAng, positionAng - inertialAng);
     }
 
     // Solve for the update without applying it (block-Jacobi path: each body stores its
@@ -646,6 +658,14 @@ struct Solver
     float betaAng = 100.0f;    // Penalty ramping for angular constraints
     float gamma = 0.999f;      // Warmstarting decay, < 1
 
+    // Primal rounds the current step actually runs (set by step()/stepInterleaved before
+    // any constraint is touched). A constraint penalty is only as stiff as the iteration
+    // budget can resolve, so the joint penalty cap reads this: the augmented-Lagrangian
+    // dual gains `penalty * C` every round, and a penalty that a long iteration set
+    // converges with makes a short one diverge into a launcher. See
+    // GenericJoint::penaltyLimit.
+    int roundsThisStep = 8;
+
     // Round split: the first ceil(newtonRatio * rounds) rounds run the full primal (the
     // dense 6x6 block solve); the rest skip the primal and run dual-only relaxation on the
     // existing forces, with contact stiffness decayed by `stiffnessDecay` per round so the
@@ -699,6 +719,18 @@ struct Solver
     // block-Jacobi overflow bucket instead of the coloured Gauss-Seidel. True in a pile of
     // boxes - which makes the bucket the whole primal for a contact-only scene, not an
     // exception. False runs those bodies through the colouring.
+    //
+    // A/B on the 420-box double pyramid (`test_penetration.gd --pen-seconds=30`, identical
+    // wall time, 626 ms / 600-frame pyramid run either way):
+    //                        p50 pen   p99 pen   worst *settled*   max speed
+    //   true  (Jacobi)        8.0 mm    11.3 mm        15.3 mm        17.9 m/s
+    //   false (colour GS)     7.4 mm     8.8 mm        36.3 mm        18.4 m/s
+    // Gauss-Seidel improves the median (it is the better solver) but leaves a systematic
+    // tail: a pair that the colour order revisits last settles 3.6 cm deep, because the
+    // update order is a property of the scene, not of the load. Jacobi averages those
+    // order effects away and has the better worst case, so it stays the default until the
+    // colouring gets an ordering pass (lowest body first, or a random sweep per round).
+    // Exposed as `physics/avbd/contact_gs` on the Godot side.
     bool contactOnlyOverflow = true;
 
     // Anchor drift (metres) at which a sticky contact's frozen arms are re-adopted from the
@@ -720,6 +752,32 @@ struct Solver
 
     // Base gap (metres), extended by predicted relative motion until the next collision refresh; 0 disables.
     float speculativeMargin = 0.01f;
+
+    // Which broad phase runs. Both take the same swept world AABBs and emit the same packed
+    // pair candidates, so this is the one switch that isolates the two algorithms.
+    //   1 = Morton LBVH with refit (LbvhBroadPhase) - the default
+    //   0 = hierarchical hashed grid (SpatialHash)
+    //
+    // The default used to be the hash, on the strength of a comparison against the `main`
+    // branch that also changed the solver. Isolated - same inputs, same downstream work,
+    // `--bvh` in the core bench - the LBVH wins everywhere and the simulation is bit-identical
+    // (`stack_300`, `interleaved_300`, `mixed_240` digests match either way):
+    //
+    //   scene        bodies  hash broad (index)   lbvh broad (index)   step hash -> lbvh
+    //   Pyramid         137   0.515 (0.200) ms     0.201 (0.029) ms     1.611 -> 1.345
+    //   Pyramid XL     1654   3.366 (1.185)        0.953 (0.582)        10.019 -> 8.243
+    //   Bridge           91   0.307 (0.090)        0.049 (0.017)         1.145 -> 0.841
+    //   Soft Body       193   1.067 (0.169)        0.623 (0.098)         2.518 -> 2.242
+    //   Stack            11   0.031 (0.020)        0.010 (0.000)         0.108 -> 0.091
+    //
+    // The cause is in the hash, not the tree: it walks the 27-cell neighbourhood at *every*
+    // level from the body's own up to the coarsest, so a scene with one huge body (the ground)
+    // makes every body report every neighbour in a ground-sized cell. Contact counts are
+    // identical, but the hash emits 6-9x the candidate pairs (45603 vs 4868 on Pyramid XL),
+    // and the exact filter and pair sort pay for all of them. Fixing that walk (own level only,
+    // with coarse bodies tested against the fine cell's parent) would be the way back; until
+    // then the tree is the better default.
+    int broadPhaseMode = 1;
 
     // Position correction excludes resting contacts and does not feed displacement into velocity.
     bool positionProjection = true;
@@ -840,6 +898,9 @@ struct Solver
     {
         return row(manifolds.basis[manifolds.live[static_cast<size_t>(index)]], 0);
     }
+    // Candidate pairs the last broad phase emitted (diagnostics: the two broad phases are
+    // compared on equal inputs, so their candidate counts must be close).
+    [[nodiscard]] int broadPhasePairCount() const { return static_cast<int>(sweepPairs.size()); }
     // Total contact points across live manifolds (statistics only).
     [[nodiscard]] int manifoldContactPoints() const
     {
@@ -868,12 +929,31 @@ struct Solver
     // Number of worker threads actually in use (1 when running inline).
     [[nodiscard]] int threadCount() const;
 
-    // Performance timing getters (ms). Timing is not wired up; the server exposes
-    // these as engine properties and they always report 0.
-    [[nodiscard]] static double get_broadPhase_time() { return 0.0; }
-    [[nodiscard]] static double get_colourGraph_time() { return 0.0; }
-    [[nodiscard]] static double get_solve_time() { return 0.0; }
-    [[nodiscard]] static double get_finish_time() { return 0.0; }
+    // Per-phase wall time of the last step, milliseconds. Diagnostics only - nothing in the
+    // solver reads it - and it is what the host's get_*_time() accessors report, so a profile
+    // can attribute a step without a second copy of the schedule. A host that reads it from
+    // another thread while a step runs gets the previous step's numbers.
+    struct PhaseTimes
+    {
+        double broadPhase = 0.0;  // broad phase: bounds, hash build, pair filter, manifold slots
+        // The algorithm under the broad phase alone: the index build plus candidate
+        // emission (SpatialHash or LbvhBroadPhase), excluding the bounds/AABB pass, the pair
+        // sort, the exact filter and manifold slot creation that both paths share. This is
+        // the only number that separates "hash vs LBVH" from "everything around them".
+        double broadIndex = 0.0;
+        double graph = 0.0;       // force warmstart + adjacency rebuild + update-set selection/colouring
+        double solve = 0.0;       // the iteration region (primal rounds + dual passes)
+        double finish = 0.0;      // velocity finish, position projection, contact rebase
+    };
+    PhaseTimes lastStepTimes;
+    // Set by broadPhase() so step()/stepInterleaved can fold it into lastStepTimes.
+    double lastBroadIndexMs = 0.0;
+
+    // Per-phase timings of the last step (ms).
+    [[nodiscard]] double get_broadPhase_time() const { return lastStepTimes.broadPhase; }
+    [[nodiscard]] double get_colourGraph_time() const { return lastStepTimes.graph; }
+    [[nodiscard]] double get_solve_time() const { return lastStepTimes.solve; }
+    [[nodiscard]] double get_finish_time() const { return lastStepTimes.finish; }
 
 private:
     // Every body in list order. The inertial/warmstart and BDF1 phases run over this,
@@ -892,6 +972,7 @@ private:
     std::vector<float3> bodyAabbHalf;
     std::vector<float3> bodyAabbCenter;
     SpatialHash broadHash;
+    LbvhBroadPhase broadLbvh;
     std::vector<uint64_t> sweepPairs;
     // Per-step scratch (reused capacity): exact-filter results for the candidate pairs and
     // the radix sort's ping-pong buffer.
@@ -949,17 +1030,6 @@ private:
     int poolThreads = -1;
     // Classified stage sequence for the current step, rebuilt in place every frame.
     std::unique_ptr<detail::TaskFlow> flow;
-
-    // Current collision margin for this frame (dynamically adjusted)
-    float currentCollisionMargin = COLLISION_MARGIN_BASE;
-
-    // Compute dynamic collision margin based on penetration depth and timestep
-    inline float computeCollisionMargin(float penetrationDepth, float timestep)
-    {
-        // Dynamically reduce penetration margin as solver converges
-        // Use penetration depth to avoid oscillation
-        return std::min(COLLISION_MARGIN_BASE + penetrationDepth * 0.1f *timestep, COLLISION_MARGIN_MAX);
-    }
 
     // Create the pool on first use so that a serial solver never spawns threads.
     void ensurePool();

@@ -296,7 +296,7 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
                     // Stick heal: a sticky pair's anchors are glued to each other, so their
                     // separation (what STICK_THRESH checks every dual update) stays ~zero no
                     // matter how far the pair has slid. Compare the frozen anchors against the
-                    // fresh contact geometry at the current pose instead: past STICK_DRIFT_HEAL
+                    // fresh contact geometry at the current pose instead: past Solver::stickDriftHeal (default STICK_DRIFT_HEAL)
                     // the "static" contact is really sliding, the old anchors no longer sit on
                     // the touching surfaces, and C0 measures anchor separation - phantom
                     // penetration the dual then answers with real force. Re-anchor from the
@@ -310,10 +310,10 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
                     const float3 newB = b->positionLin + qrot(b->positionAng, newRB);
                     const float drift = std::max(length(oldA - newA), length(oldB - newB));
 #ifdef AVBD_DIAG
-                    if (drift > STICK_DRIFT_HEAL)
+                    if (drift > solver.stickDriftHeal)
                         solver.diag.stickHeals++;
 #endif
-                    if (drift > STICK_DRIFT_HEAL)
+                    if (drift > solver.stickDriftHeal)
                     {
                         newContacts[i].rA = newRA;
                         newContacts[i].rB = newRB;

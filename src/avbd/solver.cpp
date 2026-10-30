@@ -9,6 +9,8 @@
  * It is provided "as is" without express or implied warranty.
  */
 
+#include <climits>
+#include <chrono>
 #include <cmath>
 #include <algorithm>
 #include <numeric>
@@ -46,16 +48,64 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
     Rigid *bestBody = 0;
     float3 bestLocal = {0, 0, 0};
 
-    // Exact per-body test: ray against the body's local box. The broad phase is
-    // a spatial hash rebuilt per step and not efficient to walk per ray, so
-    // picking scans the body list; the exact test decides.
+    // Exact per-body test against the body's own shape. The broad phase is a spatial hash
+    // rebuilt per step and not efficient to walk per ray, so picking scans the body list;
+    // the exact test decides.
+    //
+    // The local half extents are per shape, and this used to be `size * 0.5f` for all of
+    // them. For a sphere `size.x` is the *radius* (Rigid's constructor and aabbHalfExtent
+    // both read it that way, and the server stores {radius, 0, 0}), so a sphere was tested
+    // as a zero-thickness box of half-extent r/2 in y and z - a ray could not hit one at
+    // all. A cylinder had its radius halved the same way.
+    const auto localHalfExtent = [](const Rigid &body) noexcept {
+        switch (body.shape)
+        {
+            case ShapeType::Sphere:
+            {
+                const float r = body.size.x;
+                return float3{r, r, r};
+            }
+            case ShapeType::Cylinder:
+                // Local +Z is the axis: radius spans X/Y, half the height spans Z.
+                return float3{body.size.x, body.size.x, body.size.z * 0.5f};
+            case ShapeType::Box:
+            default:
+                return body.size * 0.5f;
+        }
+    };
+
     const auto testBody = [&](Rigid *body) {
         if ((body->collisionLayer & p_mask) == 0)
             return;
         quat invRot = qconj(body->positionAng);
         float3 o = qrot(invRot, origin - body->positionLin);
         float3 d = qrot(invRot, dir);
-        float3 half = body->size * 0.5f;
+
+        if (body->shape == ShapeType::Sphere)
+        {
+            // Exact ray/sphere. The box below would only be a proxy with corners that are
+            // not on the surface.
+            const float r = body->size.x;
+            const float b = dot(o, d);
+            const float c = length2(o) - r * r;
+            const float disc = b * b - c;
+            if (disc < 0.0f)
+                return;
+            const float sq = std::sqrt(disc);
+            float t = -b - sq;
+            if (t < 0.0f)
+                t = -b + sq;
+            if (t < 0.0f || t >= bestT)
+                return;
+            bestT = t;
+            bestBody = body;
+            bestLocal = o + d * t;
+            return;
+        }
+
+        // Box, and the box that bounds a cylinder. `dir` is not normalised by the callers,
+        // so `t` is in units of `dir` for every shape path.
+        const float3 half = localHalfExtent(*body);
 
         float tEnter = 0.0f;
         float tExit = INFINITY;
@@ -159,15 +209,33 @@ void Solver::step()
 {
     ensurePool();
     collisionDt = dt;
+
+    // Phase timings (diagnostics only, see Solver::PhaseTimes). Four clock reads per step are
+    // noise next to a step; the numbers are what get_broadPhase_time() and friends report.
+    using Clock = std::chrono::steady_clock;
+    const auto msSince = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const Clock::time_point t0 = Clock::now();
+
     broadPhase();
+    const Clock::time_point t1 = Clock::now();
     const int forceCount = warmstartForces();
     selectUpdateBodies();
     projectContacts(false);
+    const Clock::time_point t2 = Clock::now();
 
     int targetIterations = iterations;
+    roundsThisStep = std::max(1, targetIterations);
     runSubstep(forceCount, targetIterations, true);
+    const Clock::time_point t3 = Clock::now();
+
     projectContacts(positionProjection);
     rebaseContacts();
+    const Clock::time_point t4 = Clock::now();
+
+    lastStepTimes = PhaseTimes{msSince(t0, t1), lastBroadIndexMs, msSince(t1, t2), msSince(t2, t3),
+            msSince(t3, t4)};
 }
 
 // The flow stages read one substep's arguments and scratch through this context. It is
@@ -262,19 +330,35 @@ void Solver::stepInterleaved(int substeps, int roundsPerSubstep)
     diag = Diag{}; // warmstartForces fills reaped/soft/new below; reset first
 #endif
     collisionDt = dt * substeps;
+    using Clock = std::chrono::steady_clock;
+    const auto msSince = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const Clock::time_point t0 = Clock::now();
     broadPhase();
+    const Clock::time_point t1 = Clock::now();
     const int forceCount = warmstartForces();
     selectUpdateBodies();
+    const Clock::time_point t2 = Clock::now();
 
-    // The explicit budget is a FLOOR on the per-substep share of `iterations`,
-    // not a cap: a scene that asks for 2 rounds/substep must still get the share
-    // the tick's round count calls for.
+    // Rounds per substep. An explicit `roundsPerSubstep` is an override: the caller asked
+    // for exactly that many primal rounds in each substep, and honouring it is what makes
+    // the setting mean something (it used to be a floor, so asking for 2 while `iterations`
+    // implied 3 silently ran 3 and the knob could not be lowered below the split). 0 asks
+    // for the automatic split of the tick's `iterations` across the substeps.
+    //
+    // This number is a *stability* parameter, not just a cost one: at a fixed 12 rounds per
+    // tick a four-link welded chain settles with 1 or 2 substeps and diverges with 4 or more
+    // (measured, tools/repro_joint.cpp: |vz| = 0.07 / 0.06 / 0.31 / 140 / 413 / 1310 m/s for
+    // 1x12 / 2x6 / 3x4 / 4x3 / 6x2 / 12x1). Fewer substeps means more rounds inside one
+    // linearisation, and the augmented-Lagrangian dual converges inside that linearisation.
     const int rounds = roundsPerSubstep > 0
-            ? std::max(roundsPerSubstep, std::max(2, (iterations + substeps - 1) / substeps))
+            ? std::max(1, roundsPerSubstep)
             : std::max(2, (iterations + substeps - 1) / substeps);
 #ifdef AVBD_DIAG
     diag.actualRounds = rounds;
 #endif
+    roundsThisStep = rounds;
 
     for (int sub = 0; sub < substeps; ++sub) {
         if (sub > 0) {
@@ -286,6 +370,7 @@ void Solver::stepInterleaved(int substeps, int roundsPerSubstep)
         projectContacts(false, dt * (substeps - sub));
         runSubstep(forceCount, rounds, sub + 1 == substeps);
     }
+    const Clock::time_point t3 = Clock::now();
     // Once per tick, not per substep: the correction is positional and velocities are
     // already final, so a second pass inside the same tick would only re-fight the first.
     projectContacts(positionProjection, collisionDt);
@@ -295,6 +380,8 @@ void Solver::stepInterleaved(int substeps, int roundsPerSubstep)
     // not a one-tick-old pose. The next tick's initialize() replaces it from its own
     // collision pass either way; this only feeds the diagnostics and the host.
     rebaseContacts();
+    lastStepTimes = PhaseTimes{msSince(t0, t1), lastBroadIndexMs, msSince(t1, t2),
+            msSince(t2, t3), msSince(t3, Clock::now())};
 }
 
 // Rebase every manifold's constraint error at the current pose. Parallel over slots; a
@@ -615,6 +702,14 @@ static bool pairOverlaps(const ForceAdjacency &adjacency, const ManifoldStore &m
     const bool layersAllow = ((bodyA->collisionLayer & bodyB->collisionMask) != 0) ||
             ((bodyB->collisionLayer & bodyA->collisionMask) != 0);
     const bool constrained = pairConstrained(adjacency, manifolds, bodyA, bodyB);
+    // Two static bodies can never need a contact: neither can move, and the solver has no
+    // update for either. Without this the pair still got a manifold slot in broadPhase,
+    // and `ManifoldStore::frozen()` then reported it alive every step (both sides are
+    // immovable), so `warmstartForces` kept a zero-contact manifold forever - one store
+    // slot and eight contact records per overlapping pair of static bodies, on a terrain
+    // made of static boxes for instance. A pair that both *sleep* is a different thing: its
+    // manifold carries the state that has to survive until it wakes, so only mass 0 counts.
+    const bool bothStatic = bodyA->mass <= 0.0f && bodyB->mass <= 0.0f;
     if (verbose)
     {
         int heldBy = -1;
@@ -630,7 +725,26 @@ static bool pairOverlaps(const ForceAdjacency &adjacency, const ManifoldStore &m
                 aCenter.x, aCenter.y, aCenter.z, aHalf.x, aHalf.y, aHalf.z,
                 bCenter.x, bCenter.y, bCenter.z, bHalf.x, bHalf.y, bHalf.z);
     }
-    return boundsOverlap && layersAllow && !constrained;
+    return boundsOverlap && layersAllow && !constrained && !bothStatic;
+}
+
+// A sleeping body whose swept AABB touches a moving movable body wakes up. AABBs are
+// already grown by the speculative margin, so a touch here means "these two meet within the
+// tick"; no real contact is needed. Serial by construction (called from broadPhase's pair
+// loop): the fields are plain bools/ints and two pairs sharing a body used to write them
+// from two threads.
+static void wakeSleeperPair(Rigid *a, Rigid *b) noexcept
+{
+    if (a->sleeping && !b->sleeping && b->mass > 0.0f)
+    {
+        a->sleeping = false;
+        a->stillFrames = 0;
+    }
+    else if (b->sleeping && !a->sleeping && a->mass > 0.0f)
+    {
+        b->sleeping = false;
+        b->stillFrames = 0;
+    }
 }
 
 // Contact detection: hierarchical spatial hash (big-block screen + layered
@@ -690,8 +804,17 @@ void Solver::broadPhase()
                 + float3{grow, grow, grow};
     }, kMinBodiesPerCheapDispatch);
 
-    broadHash.buildAndCollectPairs(bodiesInOrder, 0.0f, sweepPairs,
-            bodyAabbHalf, bodyAabbCenter, *pool);
+    {
+        const std::chrono::steady_clock::time_point tIndex = std::chrono::steady_clock::now();
+        if (broadPhaseMode == 1)
+            broadLbvh.buildAndCollectPairs(bodiesInOrder, sweepPairs, bodyAabbHalf,
+                    bodyAabbCenter, *pool);
+        else
+            broadHash.buildAndCollectPairs(bodiesInOrder, 0.0f, sweepPairs, bodyAabbHalf,
+                    bodyAabbCenter, *pool);
+        lastBroadIndexMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - tIndex).count();
+    }
 
     // Pairs are packed (min<<32 | max), so integer order is lexicographic order over the
     // old std::pair and the sort takes the radix path instead of std::sort's comparator.
@@ -709,28 +832,21 @@ void Solver::broadPhase()
                                     bodyAabbCenter[i], bodiesInOrder[j], bodyAabbHalf[j],
                                     bodyAabbCenter[j], traced);
         broadPairValid[k] = overlaps;
-        if (!overlaps)
-            return;
-
-        // 睡眠 + awake 的 AABB 重叠就唤醒。不需要真实接触——AABB 已经含 margin，
-        // 重叠意味着"下几个 substep 内会碰"。写 sleeping=false 是幂等的，多个
-        // 线程对同一 body 写 false 是安全的。
-        if (bodiesInOrder[i]->sleeping && !bodiesInOrder[j]->sleeping && bodiesInOrder[j]->mass > 0.0f)
-        {
-            bodiesInOrder[i]->sleeping = false;
-            bodiesInOrder[i]->stillFrames = 0;
-        }
-        else if (bodiesInOrder[j]->sleeping && !bodiesInOrder[i]->sleeping && bodiesInOrder[i]->mass > 0.0f)
-        {
-            bodiesInOrder[j]->sleeping = false;
-            bodiesInOrder[j]->stillFrames = 0;
-        }
     }, kMinPairsPerDispatch);
 
     // 串行创建：manifold 顺序决定后续所有阶段的遍历顺序，必须单线程
     for (size_t k = 0; k < pairCount; k++) {
         if (!broadPairValid[k]) continue;
         const int i = pairFirst(sweepPairs[k]);
+
+        // 睡眠 + awake 的 AABB 重叠就唤醒。不需要真实接触——AABB 已经含 margin，
+        // 重叠意味着"下几个 substep 内会碰"。
+        //
+        // 这一步必须在串行阶段：`sleeping`/`stillFrames` 是普通字段，两个候选 pair
+        // 在并行 filter 里同时写同一个 body 是数据竞争（C++ 里就是 UB，TSAN 会报）。
+        // 放在这里还有一个好处：顺序由排好序的 pair 表决定，唤醒结果与线程数无关。
+        wakeSleeperPair(bodiesInOrder[pairFirst(sweepPairs[k])],
+                bodiesInOrder[pairSecond(sweepPairs[k])]);
         const int j = pairSecond(sweepPairs[k]);
         // A dormant manifold (contact grace) let this pair back into the candidate set
         // (pairConstrained skips dormant ones so overlap can wake sleepers); it will

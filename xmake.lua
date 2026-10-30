@@ -24,6 +24,7 @@ add_requires("thread-pool v5.1.0")
 local avbd_core = {
     "src/avbd/rigid.cpp",
     "src/avbd/spatial_hash.cpp",
+    "src/avbd/bvh_broadphase.cpp",
     "src/avbd/force.cpp",
     "src/avbd/joint.cpp",
     "src/avbd/generic_joint.cpp",

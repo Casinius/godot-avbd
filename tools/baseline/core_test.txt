@@ -1,0 +1,142 @@
+  ok  rest contact                   z=0.99932 (surface 0.5 + half 0.5), penetration=0.00068
+  ok  rest velocity                  vz=-0.00019
+  ok  rest finite                    bodies=2 contacts=4
+  ok  stack on ground                bottom box penetration = 0.00108 m
+  ok  stack interfaces               worst box-box penetration = 0.00128 m (size 1 m)
+  ok  stack drift                    max lateral = 0.00000
+  ok  stack finite                   bodies=11 contacts=40
+  ok  static friction (mu=0.5)       creep=0.00003 m in the last 0.5 s, speed=0.00018 m/s, total=0.2416 m
+  ok  stiction holds                 speed=0.00018 m/s on a 20 deg ramp with mu=0.5 (tan=0.364)
+  ok  dynamic friction (mu=0.05)     travel=5.0807 m in the last 0.5 s, total=22.4546 m
+  ok  sliding accumulates            total travel=22.4546 m in 4 s
+  ok  friction ordering              slide(mu=0.05)=5.0807 m vs 50 * creep(mu=0.5)=0.0015 m
+  ok  hard joint error               max anchor separation = 0.002640 m (link = 1 m)
+  ok  chain hangs                    tail z=5.9911 below anchor z=10.0000
+  ok  joints finite                  bodies=5 joints=4
+  ok  lattice joint error            max joint separation = 0.01045 m (rest length 0)
+  ok  lattice contained              max |position| = 2.485 m
+  ok  lattice finite                 bodies=28 joints=116 contacts=238
+  ok  scene: Empty                   bodies=0 forces=0 contacts=0 max|x|=0.00
+  ok  scene: Ground                  bodies=2 forces=1 contacts=4 max|x|=1.00
+  ok  scene: Dynamic Friction        bodies=12 forces=11 contacts=44 max|x|=30.00
+  ok  scene: Static Friction         bodies=13 forces=12 contacts=44 max|x|=10.00
+  ok  scene: Pyramid                 bodies=137 forces=336 contacts=1385 max|x|=8.00
+  ok  scene: Pyramid XL              bodies=1654 forces=4530 contacts=19581 max|x|=28.50
+  ok  scene: Rope                    bodies=21 forces=19 contacts=0 max|x|=20.00
+  ok  scene: Heavy Rope              bodies=21 forces=19 contacts=0 max|x|=20.00
+  ok  scene: Spring                  bodies=3 forces=1 contacts=0 max|x|=14.00
+  ok  scene: Spring Ratio            bodies=9 forces=7 contacts=0 max|x|=12.00
+  ok  scene: Stack                   bodies=11 forces=10 contacts=40 max|x|=10.00
+  ok  scene: Stack Ratio             bodies=5 forces=4 contacts=16 max|x|=11.30
+  ok  scene: Soft Body               bodies=193 forces=1427 contacts=1346 max|x|=9.57
+  ok  scene: Bridge                  bodies=91 forces=203 contacts=433 max|x|=20.00
+  ok  scene: Breakable               bodies=19 forces=18 contacts=26 max|x|=5.27
+  ok  in-process determinism         digest 0xfbac4f08cb1c977c vs 0xfbac4f08cb1c977c
+     digest stack_300 = 0xfbac4f08cb1c977c
+  ok  interleaved substeps deterministic 0xbf1ce46c667164f3 vs 0xbf1ce46c667164f3
+  ok  interleaved digest threads=8   0xbf1ce46c667164f3 vs serial 0xbf1ce46c667164f3
+     digest interleaved_300 = 0xbf1ce46c667164f3
+  ok  interleaved tight stack height max height error=0.01445 m
+  ok  interleaved tight stack penetration max interface=0.00279 m
+  ok  interleaved tight stack drift  max lateral=0.00000 m
+  ok  update set covers every awake constraint forces=2
+  ok  update set finite              bodies=3
+     digest mixed_240 (threads=1) = 0x521c838e09951796
+  ok  mixed digest threads=1         0x521c838e09951796 vs serial 0x521c838e09951796
+  ok  mixed digest threads=2         0x521c838e09951796 vs serial 0x521c838e09951796
+  ok  mixed digest threads=3         0x521c838e09951796 vs serial 0x521c838e09951796
+  ok  mixed digest threads=4         0x521c838e09951796 vs serial 0x521c838e09951796
+  ok  mixed digest threads=8         0x521c838e09951796 vs serial 0x521c838e09951796
+  ok  mixed digest threads=12        0x521c838e09951796 vs serial 0x521c838e09951796
+  ok  soft-body digest threads=4     0xbdf8ee1706e01184 vs serial 0xbdf8ee1706e01184
+  ok  soft-body digest threads=12    0xbdf8ee1706e01184 vs serial 0xbdf8ee1706e01184
+  ok  concurrent solver A            0x521c838e09951796 vs serial 0x521c838e09951796
+  ok  concurrent solver B            0x521c838e09951796 vs serial 0x521c838e09951796
+  ok  overflow bucket holds a 10-clique drift=0.8500 m, max|z|=5.050 m after 10 s mid-air
+     shape    Stack      bodies=  11 movable=  10 threads=12
+     shape    Pyramid    bodies= 137 movable= 136 threads=12
+     shape    Soft Body  bodies= 193 movable= 192 threads=12
+     shape    Bridge     bodies=  91 movable=  88 threads=12
+  ok  hinge locked axes hold through 24 turns worst |X| or |Z| deviation = 0.00000 rad over 24 revolutions
+  ok  hinge hub holds                worst anchor separation = 0.00788 m
+  ok  free axle keeps its spin       0.9959 rad/s of 1.0 after 2 s (99.6%)
+  ok  limit is reached               worst |angle| = 0.4697 rad at betaAng=100 (bound 0.4)
+  ok  limit is reached               worst |angle| = 0.4642 rad at betaAng=1000 (bound 0.4)
+  ok  default limit holds its bound  worst excursion past the ±0.4 rad bound = 0.06972 rad (8.7% of the range)
+  ok  stiffer limit also holds its bound worst excursion = 0.06423 rad at betaAng=1000 vs 0.06972 at 100 (penalty cap applies)
+  ok  neither stiffness runs away    excursions 0.06423 / 0.06972 rad against a 0.8 rad range
+  ok  prismatic spring equilibrium   travel = 0.02000 m, m*g/k = 0.02000 m (mass 1.000 kg, k 500 N/m)
+  ok  prismatic spring stays in range travel = 0.0200 m (limit ±2)
+  ok  socket anchors start together  initial separation = 0.0000000 m
+  ok  socket holds under a swinging moment worst anchor separation = 0.00873 m while swinging
+  ok  socket hangs the body below its hub body centre at z = -0.9658 (starts at -1)
+  ok  free axes are free             spin (0.3987 0.4984 0.5981) started at (0.4 0.5 0.6)
+  ok  spin decays monotonically with rate   1.0 rad/s -> 99.59% kept after 2 s (0.017 rad per step)
+  ok  spin decays monotonically with rate  10.0 rad/s -> 73.86% kept after 2 s (0.167 rad per step)
+  ok  slow spin is preserved         loss at 1 rad/s = 0.41% over 2 s
+  ok  rotated rest pose reads zero   locked axes at t=0 read 0.00000000 rad from a body turned 90 degrees
+  ok  locked axes stay bounded with a rotated rest pose (known limitation) worst locked-axis drift = 0.00002 rad over 10 s of spinning (unbounded before: NaN)
+  ok  locked axes do not inflate     peak penalty = 1.0 (unbounded it reached 41138 and tore the joint apart)
+  ok  rotated rest pose stays finite axle spin = 4.178 rad/s after 10 s
+  ok  sphere rests at its radius     centre z = 0.4920 (radius 0.5, penetration 0.0080)
+  ok  cylinder rests on its cap      centre z = 0.4921 (half height 0.5, penetration 0.0079)
+  ok  cylinder rests on its side     centre z = 0.4591 (radius 0.5, penetration 0.0409)
+  ok  sphere stacks on sphere        centre separation = 0.9898 (two radii = 1.0, penetration 0.0102)
+  ok  the ground resists the spin    spin fell from 20 to 12.546 rad/s
+  ok  a round shape rolls            travelled -3.9950 m in 2 s of spinning (rolling is -Y)
+  ok  rolling stays bounded          travelled -3.9950 m, spin 12.546 rad/s
+  ok  collideShapes matches (box-box) contacts=1/1 worst delta=0.00e+00
+  ok  collideShapes matches (box-sphere) contacts=1/1 worst delta=0.00e+00
+  ok  collideShapes matches (sphere-box, swapped) contacts=1/1 worst delta=0.00e+00
+  ok  speculative narrow phase       3 cm gap: margin 0 -> 0 contacts, margin 0.05 -> 4
+  ok  speculative gap contact        contacts=4 max normal C0=0.0310 (gap 0.03)
+  ok  speculative gap does not push  rest z=1.03000 from spawn 1.03
+  ok  speculative catches a closing body z=1.0000 after one 10 m/s step (surface at 1.0)
+  ok  speculative clamp stops at surface z=1.0000 after one 10 m/s step from gap 5 mm
+  ok  speculative face stays symmetric z=1.0000000 spin=0.0000000
+  ok  speculative clamp holds on second step z=0.9984 after two steps
+  ok  speculative full-tick interception substeps=1 projection=0 min z=0.05000 final z=0.14416
+  ok  speculative full-tick interception substeps=1 projection=1 min z=0.05000 final z=0.14416
+  ok  speculative full-tick interception substeps=4 projection=0 min z=0.05000 final z=0.15478
+  ok  speculative full-tick interception substeps=4 projection=1 min z=0.05000 final z=0.15478
+  ok  zero margin disables speculation z=-0.20000 contacts=0
+  ok  overlap projection preserves velocity reverse=0 spin=0.0000000 velocity delta=0.0000000
+  ok  face projection resolves in one pass z=1.00000 without projection=0.88335
+  ok  overlap projection preserves velocity reverse=1 spin=0.0000000 velocity delta=0.0000000
+  ok  face projection resolves in one pass z=1.00000 without projection=0.88335
+  ok  projection shared-plane response slabs=1 density=1 cap=0.00 z=1.00000 expected=1.00000
+  ok  projection shared-plane response slabs=1 density=1 cap=0.01 z=0.91000 expected=0.91000
+  ok  projection shared-plane response slabs=1 density=10 cap=0.00 z=1.00000 expected=1.00000
+  ok  projection shared-plane response slabs=1 density=10 cap=0.01 z=0.91000 expected=0.91000
+  ok  projection shared-plane response slabs=2 density=1 cap=0.00 z=1.00000 expected=1.00000
+  ok  projection shared-plane response slabs=2 density=1 cap=0.01 z=0.91000 expected=0.91000
+  ok  projection shared-plane response slabs=2 density=10 cap=0.00 z=1.00000 expected=1.00000
+  ok  projection shared-plane response slabs=2 density=10 cap=0.01 z=0.91000 expected=0.91000
+  ok  projection shared-plane response slabs=4 density=1 cap=0.00 z=1.00000 expected=1.00000
+  ok  projection shared-plane response slabs=4 density=1 cap=0.01 z=0.91000 expected=0.91000
+  ok  projection shared-plane response slabs=4 density=10 cap=0.00 z=1.00000 expected=1.00000
+  ok  projection shared-plane response slabs=4 density=10 cap=0.01 z=0.91000 expected=0.91000
+  ok  opposed projections stay symmetric centre offset=0.0000000
+  ok  cylinder-box speculative narrow phase 5 mm gap: margin 0 -> 0 contacts, margin 0.01 -> 8
+  ok  cylinder-cylinder speculative narrow phase 5 mm gap: margin 0 -> 0 contacts, margin 0.01 -> 8
+  ok  cylinder gap contact           contacts=8 max normal C0=0.0060 (gap 0.005)
+  ok  cylinder gap does not push     rest z=1.00500 from spawn 1.005
+  ok  cylinder does not tunnel at 15 m/s final z=1.4665 (bottom 0.9665 vs slab top 0.5)
+     impact: worst=0.01108 m at tick 3, max speed=18.489 m/s, striker z=1.9978 target z=0.9989
+  ok  impact overlap bounded         worst=0.01108 m at tick 3 (substep travel 0.075 m)
+  ok  impact does not amplify speed  max=18.49 m/s from 18 m/s arrival
+  ok  impact leaves the base placed  target z=0.9989 striker z=1.9978
+  ok  compatible layers collide      rest z=0.9993 (slab top 0.5 + half 0.5)
+  ok  incompatible layers pass through fallen to z=-76.3293 after 4 s (no contact possible: layer 2 vs 1)
+  ok  broadphase aabb contains shape largest shortfall=0.000000 (negative means the bound is roomy)
+  ok  qmat matches qrot              largest component diff=0.000000
+  ok  locked axis hovers             z=5.000000 (spawn 5.0, no fall in 4 s)
+  ok  locked axis no gravity         vz=0.000000
+  ok  unlocked control falls         control z=-75.3282
+  ok  locked angular axis resists spin qx=0.000000 wx=0.000000
+  ok  pick hits nearest              hit z=3.0000 (blocker at 3)
+  ok  pick mask skips                mask=1 hit z=0.0000 (ground at 0)
+  ok  idle bodies fall asleep        a=1 b=1
+  ok  sleeping stack stays finite    bodies=3
+
+132 checks, 0 failures

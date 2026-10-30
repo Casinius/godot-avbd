@@ -148,6 +148,12 @@ void Joint::updatePrimal(Rigid *body, float alpha, Block &block)
         // body-B half is diag(0, -1, -1) (the x row is carried by A's identity half);
         // changing it to diag(1, -1, -1) doubles the x correction and tears stiff
         // joint lattices apart, so keep the reference matrix.
+        //
+        // Known limitation: that split assumes A exists. With bodyA == nullptr (a joint to
+        // the world) nothing carries the x row, so the x component of the angular constraint
+        // produces no force while its multiplier keeps ramping. Use GenericJoint for
+        // world-anchored angular constraints - it reads the world frame as body A's frame
+        // and constrains all three axes. This class is kept for the core tests' joints.
         const float3x3 jAng = (body == bodyA ? identity3x3
                 : float3x3{float3{0, 0, 0}, float3{0, -1, 0}, float3{0, 0, -1}}) * torqueArm;
 
@@ -192,8 +198,11 @@ void Joint::updateDual(float alpha)
         // Update the penalty parameter and clamp to material stiffness if we are within the force bounds (Eq. 16)
         penaltyLin = min(penaltyLin + abs(C) * solver->betaLin, min(float3{stiffnessLin, stiffnessLin, stiffnessLin}, float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
 
-        // Angular
-        penaltyAng = min(penaltyAng + abs(C) * solver->betaAng, min(float3{stiffnessAng, stiffnessAng, stiffnessAng}, float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX}));
+        // The reference implementation also ramps penaltyAng here, with *this* block's C -
+        // a length in metres fed to the angular beta, and then the angular block below ramps
+        // it again with the real angular error, so a joint with both halves enabled grew its
+        // angular penalty at up to twice the rate and used the wrong units for the first
+        // half. Only the angular block may touch penaltyAng.
     }
     // Angular constraint
     if (length2(penaltyAng) > 0)

@@ -1,0 +1,23 @@
+Godot Engine v4.7.2.stable.official.ed1daf0bf - https://godotengine.org
+
+AVBD physics server: factory invoked - the engine selected AVBD
+
+== pyramid_dbl
+WARNING: res://scenes/pyramid_dbl.tscn:3 - ext_resource, invalid UID: uid://ckg0ecqiri7sc - using text path instead: res://scenes/demo.gd
+     at: load (scene/resources/resource_format_text.cpp:501)
+     GDScript backtrace (most recent call first):
+         [0] test_pyramid_dbl (res://tests/test_pyramid.gd:27)
+         [1] _run (res://tests/avbd_harness.gd:223)
+         [2] _boot (res://tests/avbd_harness.gd:204)
+  ok  body count                     found 420 (expected 420)
+  ok  pile stays finite              bodies=420
+  ok  no launched boxes              max y=19.757 m (settled max was 19.760)
+  ok  no boxes below the ground      min y=0.247 m
+  ok  pile stays on the slab         max |xz|=37.434 m
+  ok  no long-range drift            max settled body move=1.263 m in 10 s (any=20.093)
+  ok  centre of mass stays put       COM drift=0.238 m in 10 s
+  ok  pile speed bounded             max settled linear speed=2.325 m/s (any=2.325, Box289)
+  ok  pile spin bounded              max settled angular speed=3.522 rad/s (any=4.678)
+     evidence: { "max_delta": 20.0926265716553, "max_settled_delta": 1.26309478282928, "max_v": 2.32520127296448, "max_settled_v": 2.32520127296448, "max_ang": 4.67779922485352, "max_settled_ang": 3.52239918708801, "max_xz": 37.4335479736328, "max_y": 19.7572956085205, "min_y": 0.24696524441242, "com_drift": 0.23777441680431 }
+
+9 checks, 0 failures

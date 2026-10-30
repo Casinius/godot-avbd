@@ -1,0 +1,37 @@
+Godot Engine v4.7.2.stable.official.ed1daf0bf - https://godotengine.org
+
+AVBD physics server: factory invoked - the engine selected AVBD
+
+== joint_with_spring
+  ok  link holds at 1 m              pivot-bob distance = 1.0013 m
+  ok  spring+joint state finite      pos=(0.000000, 3.998732, 0.000000)
+     evidence: { "distance": 1.00126838684082 }
+
+== over_constrained_pin
+  ok  over-constrained stays bounded worst anchor error = 1.0000 m, pos=(0.000000, 2.999480, 0.000000)
+     evidence: { "error_a": 1.00000011920929, "error_b": 1.00000011920929 }
+
+== mixed_chain
+  ok  mixed chain joints hold        worst anchor separation = 0.1025 m
+  ok  mixed chain hangs              tail y=5.0926
+  ok  mixed chain finite             
+     evidence: { "worst": 0.10247039794922 }
+
+== collision_exceptions_pair
+  ok  excepted+jointed pair stays together separation = 0.1500 m
+  ok  pair finite                    
+     evidence: { "separation": 0.15000067651272 }
+
+== static_driver
+  ok  dragged body follows the driver lag = 0.2568 m (dragged x=-0.5432, driver x=-0.8200)
+     evidence: { "lag": 0.25678102970123 }
+
+== substeps_equivalence
+  ok  substeps agree                 worst pose difference = 0.00000 m
+     evidence: { "worst": 0.0 }
+
+== combination_determinism
+  ok  combination determinism        digest 4155809075 vs 4155809075
+     evidence: { "digest": 4155809075 }
+
+11 checks, 0 failures

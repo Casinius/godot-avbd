@@ -1,0 +1,40 @@
+Godot Engine v4.7.2.stable.official.ed1daf0bf - https://godotengine.org
+
+AVBD physics server: factory invoked - the engine selected AVBD
+== project
+  ok  physics/3d/physics_engine == AVBD              
+== registered classes
+  ok  class AVBDPhysicsServer3D registered           
+  ok  class PhysicsServerFactory registered          
+  ok  class AVBDDirectBodyState3D registered         
+  ok  class AVBDDirectSpaceState3D registered        
+  ok  class AVBDSoftBody3D registered                
+  ok  class AVBDSoftWorld3D registered               
+== retired node classes
+  ok  class AVBDWorld3D removed                      
+  ok  class AVBDRigidBody3D removed                  
+  ok  class AVBDJoint3D removed                      
+  ok  class AVBDGeneric6DOFJoint3D removed           
+  ok  class AVBDSpring3D removed                     
+  ok  class AVBDIgnoreCollision3D removed            
+  ok  class AVBDConstraint3D removed                 
+== soft body round-trips
+  ok  soft.dimensions round-trips                    (3, 4, 5)
+  ok  soft.box_size round-trips                      
+  ok  soft.density round-trips                       
+  ok  soft.friction round-trips                      
+  ok  soft.stiffness_linear round-trips              
+  ok  soft 4x4x4 cell count                          cells=64
+  ok  soft_world.gravity round-trips                 
+  ok  soft_world.threads round-trips                 
+== server handles
+  ok  space_create valid                             
+  ok  body_create valid                              
+  ok  body_get_space round-trips                     
+  ok  box shape type                                 3
+  ok  body_get_shape_count                           
+  ok  collision layer round-trips                    
+  ok  collision mask round-trips                     
+  ok  gravity scale round-trips                      
+
+30 checks, 0 failures

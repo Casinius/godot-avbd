@@ -192,6 +192,15 @@ func _initialize() -> void:
 			strict = true
 		elif arg.begins_with("--only="):
 			_only = arg.split("=")[1]
+	_boot()
+
+
+# The scene root is not inside the tree yet while SceneTree._initialize() runs (Godot 4.7),
+# so a node added here answers `get_global_transform()` with identity: `joint.global_position`
+# silently does nothing and every joint built by a scenario lands at the origin. One idle
+# frame later the root is live and the global transforms are real.
+func _boot() -> void:
+	await process_frame
 	_run()
 
 

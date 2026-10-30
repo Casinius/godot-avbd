@@ -1,0 +1,82 @@
+Godot Engine v4.7.2.stable.official.ed1daf0bf - https://godotengine.org
+
+AVBD physics server: factory invoked - the engine selected AVBD
+
+== rest_contact
+  ok  physics engine is AVBD         engine=AVBD
+  ok  rest contact                   y=0.99861, penetration=0.00139 m (slab top 0.5 + half box 0.5)
+  ok  rest velocity                  vy=0.00000
+  ok  state finite                   pos=(0.000000, 0.998612, 0.000000)
+     evidence: { "rest_y": 0.99861240386963, "penetration": 0.00138759613037 }
+
+== stack
+  ok  stack height                   max |y - expected| = 0.01679
+  ok  stack penetration              worst interface = 0.00239 m
+  ok  stack drift                    max lateral = 0.00000 m
+     evidence: { "height_error": 0.01678943634033, "penetration": 0.00238901376724, "drift": 0.0 }
+
+== friction
+  ok  static friction (mu=0.5)       creep=-0.00000 m in 0.5 s, speed=0.00000 m/s, total=0.3904 m
+  ok  dynamic friction (mu=0.05)     travel=4.6140 m in 0.5 s, total=27.8021 m
+  ok  friction ordering              4.6140 m vs -0.0000 m
+     evidence: { "stuck": { "late": 0.0, "total": 0.39041021466255, "speed": 0.0 }, "slid": { "late": 4.614013671875, "total": 27.8021392822266, "speed": 9.73045253753662 } }
+
+== hard_joint
+  ok  hard joint error               max anchor separation = 0.004623 m
+  ok  chain hangs                    tail y=5.9886 below anchor y=10.0000
+     evidence: { "worst_joint_error": 0.00462341308594, "tail_y": 5.98855829238892 }
+
+== world_joint
+  ok  world anchor holds             bob at (1.998667, 2.998789, 1.000000), anchor (2.000000, 3.000000, 1.000000), error 0.00180 m
+  ok  world anchor absorbs velocity  speed=0.00000 m/s from an initial 4 m/s
+     evidence: { "error": 0.00180088111665, "speed": 0.0 }
+
+== raycast
+  ok  ray hits dynamic body          hit=154937591280
+  ok  ray hit position               y=1.4985 (box top 1.4985)
+  ok  ray misses cleanly             keys=[]
+  ok  ray hits static body           hit=154870482412
+  ok  RayCast3D node hits            collider=Box:<RigidBody3D#154937591280>
+  ok  static body teleport adopted   hit y=11.0000 (moved slab top 11.0)
+     evidence: { "hit_y": 1.49854385852814 }
+
+== impulse_teleport
+  ok  impulse sets velocity          vx=10.00000 (10 N.s / 1 kg)
+  ok  offset impulse spins body      |w|=15.0404 rad/s
+  ok  impulse moves body             x=8.9337
+  ok  teleport moves node            x=-5.0000
+  ok  teleport holds                 x=-5.0000 on the next tick
+     evidence: { "x_after": -5.0 }
+
+== runtime_add
+  ok  rebuild keeps pose             settled y 0.9990 -> 0.9990 after adding a body
+  ok  added body rests               late y=0.9993
+     evidence: { "settled": 0.99897229671478, "after": 0.99897229671478, "late_y": 0.99930304288864 }
+
+== axis_lock
+  ok  locked axis hovers             y=5.000000 (spawn 5.0, no fall in 4 s)
+  ok  locked axis no velocity        vy=0.000000
+  ok  unlocked control falls         control y=1.0000
+     evidence: { "hover_y": 5.0 }
+
+== collision_layers
+  ok  incompatible layers pass through x=6.0000 (crossed the wall plane)
+  ok  compatible layers collide      x=3.3702 (stopped at the wall)
+     evidence: { "pass_x": 5.9999885559082, "blocked_x": 3.37023234367371 }
+
+== collision_exceptions
+  ok  exception pair keeps overlapping separation=0.2000 m (spawned at 0.2)
+  ok  control pair pushes apart further separation=1.0367 m
+     evidence: { "separation": 0.20000010728836, "control": 1.03671681880951 }
+
+== sleeping
+  ok  sleeping body freezes          y 6.7548 -> 6.7548 while asleep
+  ok  woken body falls               y=1.0002 after wake
+     evidence: { "y_at_sleep": 6.75481128692627, "y_end": 1.00018429756165 }
+
+== paused_follows_game
+  ok  paused simulation freezes      y 6.754811 -> 6.754811 during 30 paused frames
+  ok  resume continues the fall      y=1.0002 after unpause
+     evidence: { "y_before": 6.75481128692627, "y_paused": 6.75481128692627, "y_resumed": 1.00017333030701 }
+
+38 checks, 0 failures

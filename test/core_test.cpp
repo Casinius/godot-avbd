@@ -440,8 +440,10 @@ static void test_interleaved_substeps() {
 static float boxOverlap(const Rigid &a, const Rigid &b) {
     std::array<Manifold::Contact, 8> contacts;
     float3x3 basis{};
-    const Shape sa{ ShapeType::Box, a.positionLin, a.positionAng, a.size * 0.5f };
-    const Shape sb{ ShapeType::Box, b.positionLin, b.positionAng, b.size * 0.5f };
+    const Shape sa{ .type = ShapeType::Box, .center = a.positionLin, .rotation = a.positionAng,
+            .half = a.size * 0.5f };
+    const Shape sb{ .type = ShapeType::Box, .center = b.positionLin, .rotation = b.positionAng,
+            .half = b.size * 0.5f };
     const int found = collideShapes(sa, sb, contacts, basis);
     if (found <= 0)
         return 0.0f;
@@ -1557,6 +1559,63 @@ static void test_pick_mask() {
 }
 
 // ---------------------------------------------------------------------------
+// A ray must hit the round shapes. A sphere is stored as {radius, 0, 0} (Rigid's
+// constructor and aabbHalfExtent both read size.x as the radius, and the server stores
+// exactly that), and `pick` used to test every body as a box of `size * 0.5f`: a sphere
+// became a zero-thickness slab (so nothing could hit it) and a cylinder's radius was halved.
+// ---------------------------------------------------------------------------
+static void test_pick_round_shapes() {
+    Solver s;
+    Rigid *sphere = new Rigid(&s, {0.5f, 0, 0}, ShapeType::Sphere, 1.0f, 0.5f, {0, 0, 5});
+    Rigid *cylinder = new Rigid(&s, {0.5f, 0.5f, 2.0f}, ShapeType::Cylinder, 1.0f, 0.5f, {0, 0, -5});
+
+    float3 local{};
+    // 0.4 m above the sphere's centre: still inside the 0.5 radius, but outside the
+    // zero-thickness slab the old code tested it as (y/z half extent 0), so this is the
+    // case that used to miss.
+    Rigid *hitSphere = s.pick(float3{-5, 0, 5.4f}, float3{1, 0, 0}, local);
+    report(hitSphere == sphere, "pick hits a sphere off its centre", "hit=%s",
+            hitSphere == sphere ? "sphere" : (hitSphere == nullptr ? "nothing" : "another body"));
+    const float sphereRadius = hitSphere == sphere ? length(local) : 0.0f;
+    report(hitSphere == sphere && std::fabs(sphereRadius - 0.5f) < 0.01f,
+            "pick lands on the sphere surface", "|local|=%.4f (want the radius 0.5)", sphereRadius);
+
+    // 0.4 m off the cylinder's axis: outside the old (halved) 0.25 half extent, inside the
+    // real 0.5 radius.
+    Rigid *hitCyl = s.pick(float3{-5, 0.4f, -5}, float3{1, 0, 0}, local);
+    report(hitCyl == cylinder, "pick hits a cylinder off its axis", "hit=%s",
+            hitCyl == cylinder ? "cylinder" : (hitCyl == nullptr ? "nothing" : "another body"));
+
+    // And a real miss still misses: 0.6 m off the axis is outside the radius.
+    Rigid *missed = s.pick(float3{-5, 0.6f, -5}, float3{1, 0, 0}, local);
+    report(missed == nullptr, "pick misses outside the cylinder radius", "hit=%s",
+            missed == nullptr ? "nothing" : "a body");
+}
+
+// ---------------------------------------------------------------------------
+// Two static bodies that overlap can never need a contact: neither moves. Before the
+// broad phase filtered that pair, each overlapping static pair still got a manifold slot,
+// and `ManifoldStore::frozen()` (both bodies immovable) then reported it alive every step,
+// so a zero-contact manifold was never released - one slot plus eight contact records per
+// pair, forever, on any static-only geometry.
+// ---------------------------------------------------------------------------
+static void test_static_static_pairs() {
+    Solver s;
+    for (int i = 0; i < 4; i++)
+        new Rigid(&s, {1, 1, 1}, 0.0f, 0.5f, {(float)i * 0.5f, 0, 0}); // 4 overlapping statics
+
+    step_n(s, 2);
+    report(s.manifoldCount() == 0, "static-static pairs make no manifold", "manifolds=%d",
+            s.manifoldCount());
+
+    // A static body against a movable one must still collide.
+    new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0.5f, 0, 0.75f});
+    step_n(s, 2);
+    report(s.manifoldCount() > 0, "static-dynamic pairs still collide", "manifolds=%d",
+            s.manifoldCount());
+}
+
+// ---------------------------------------------------------------------------
 // Idle sleep: a settled stack of sleep-enabled boxes must fall asleep on its own
 // (Solver::sleepFrames idle detection), and sleeping must not corrupt state. The core
 // suite default keeps sleepFrames = 0, so this is opt-in behaviour.
@@ -1613,6 +1672,37 @@ static void build_bench_scene(Solver &s) {
     }
 }
 
+// Broad phase under test: 0 = hashed grid (default), 1 = Morton LBVH. Both are fed the same
+// swept AABBs and produce the same candidate contract; --bvh is the isolated A/B.
+static int g_broadPhaseMode = 0;
+// Bench over a named core scene (Pyramid, PyramidXL, Bridge, ...): the same phase
+// breakdown as --bench but on a scene the broad-phase comparison cares about.
+static int run_bench_scene(const std::string &name, int threads) {
+    const CoreScene *scene = find_scene(name);
+    if (scene == nullptr) {
+        std::fprintf(stderr, "unknown scene: %s\n", name.c_str());
+        return 2;
+    }
+    Solver s;
+    s.threads = threads;
+    s.broadPhaseMode = g_broadPhaseMode;
+    scene->build(&s);
+    const int warmup = 20;
+    const int timed = 120;
+    step_n(s, warmup);
+    const auto t0 = std::chrono::steady_clock::now();
+    step_n(s, timed);
+    const auto t1 = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / (double)timed;
+    const Solver::PhaseTimes &pt = s.lastStepTimes;
+    std::printf("bench-scene '%s': bodies=%d broadPhase=%s pairs=%d contacts=%d %.3f ms/step "
+                "(broad %.3f, index %.3f, solve %.3f, finish %.3f)\n",
+            name.c_str(), count_bodies(s), g_broadPhaseMode == 1 ? "lbvh" : "hash",
+            s.broadPhasePairCount(), count_contact_points(s), ms, pt.broadPhase, pt.broadIndex,
+            pt.solve, pt.finish);
+    return all_finite(s) ? 0 : 1;
+}
+
 static int run_bench(int threads) {
     Solver s;
     s.threads = threads;
@@ -1629,6 +1719,14 @@ static int run_bench(int threads) {
     const auto t1 = std::chrono::steady_clock::now();
 
     const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / (double)timed;
+    // Phase breakdown of the last step (Solver::lastStepTimes). This is the number that says
+    // whether the broad phase is worth replacing: on a contact scene the solver dominates.
+    const Solver::PhaseTimes &pt = s.lastStepTimes;
+    std::printf("bench: last step phases: broad=%.3f (index %.3f) graph=%.3f solve=%.3f "
+                "finish=%.3f (sum=%.3f)\n", pt.broadPhase, pt.broadIndex, pt.graph, pt.solve,
+            pt.finish, pt.broadPhase + pt.graph + pt.solve + pt.finish);
+    std::printf("bench: broadPhase=%s pairs=%d\n", g_broadPhaseMode == 1 ? "lbvh" : "hash",
+            s.broadPhasePairCount());
     std::printf("bench: threads=%d -> %.3f ms/step, contacts=%d, finite=%s\n", s.threadCount(),
             ms, count_contact_points(s), all_finite(s) ? "yes" : "NO");    return all_finite(s) ? 0 : 1;
 }
@@ -1807,6 +1905,7 @@ static int runPyramid(int ticks) {
     s.positionProjection = g_projection;
     s.projectionMaxCorrection = g_projectionCap;
     s.contactOnlyOverflow = !g_contactGs;
+    s.broadPhaseMode = g_broadPhaseMode;
     s.maxPenetration = g_maxPen;
     s.sleepFrames = 30;
     buildPyramidDouble(s);
@@ -1876,10 +1975,10 @@ static int runPyramid(int ticks) {
                     if (blind <= 4) {
                         std::array<Manifold::Contact, 8> fresh{};
                         float3x3 fb{};
-                        const Shape sa{ ShapeType::Box, a->positionLin, a->positionAng,
-                                a->size * 0.5f };
-                        const Shape sb{ ShapeType::Box, b->positionLin, b->positionAng,
-                                b->size * 0.5f };
+                        const Shape sa{ .type = ShapeType::Box, .center = a->positionLin,
+                                .rotation = a->positionAng, .half = a->size * 0.5f };
+                        const Shape sb{ .type = ShapeType::Box, .center = b->positionLin,
+                                .rotation = b->positionAng, .half = b->size * 0.5f };
                         const int found = collideShapes(sa, sb, fresh, fb);
                         const float3 gap = b->positionLin - a->positionLin;
                         const float3 ha = aabbHalfExtent(*a), hb = aabbHalfExtent(*b);
@@ -2036,8 +2135,10 @@ static int runPyramid(int ticks) {
             if (m < 0) {
                 std::array<Manifold::Contact, 8> fc{};
                 float3x3 fb{};
-                const Shape sa{ ShapeType::Box, a->positionLin, a->positionAng, a->size * 0.5f };
-                const Shape sb{ ShapeType::Box, b->positionLin, b->positionAng, b->size * 0.5f };
+                const Shape sa{ .type = ShapeType::Box, .center = a->positionLin,
+                        .rotation = a->positionAng, .half = a->size * 0.5f };
+                const Shape sb{ .type = ShapeType::Box, .center = b->positionLin,
+                        .rotation = b->positionAng, .half = b->size * 0.5f };
                 fresh = collideShapes(sa, sb, fc, fb, 0.0f);
                 swept = s.sweepHasPair(a, b) ? 1 : 0;
                 // Follow this pair through the solver for the next ticks: candidate, filter,
@@ -2130,6 +2231,10 @@ int main(int argc, char **argv) {
             g_contactGs = std::atoi(arg.c_str() + 5) != 0;
         } else if (arg.rfind("--iters=", 0) == 0) {
             g_iterations = std::atoi(arg.c_str() + 8);
+        } else if (arg == "--bench-scene" && i + 1 < argc) {
+            return run_bench_scene(argv[++i], threads);
+        } else if (arg == "--bvh") {
+            g_broadPhaseMode = 1;
         } else if (arg.rfind("--penmax=", 0) == 0) {
             g_maxPen = (float)std::atof(arg.c_str() + 9);
         } else if (arg.rfind("--eject=", 0) == 0) {
@@ -2142,7 +2247,8 @@ int main(int argc, char **argv) {
             threads = std::atoi(argv[++i]);
         } else {
             std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --bench-two | --shape |"
-                                 " --pyramid [--steps N] | --scene NAME [--steps N]] [--threads N]\n", argv[0]);
+                                 " --pyramid [--steps N] | --scene NAME [--steps N]] [--threads N]"
+                                 " [--bvh]\n", argv[0]);
             return 2;
         }
     }
@@ -2188,6 +2294,8 @@ int main(int argc, char **argv) {
     test_broadphase_bounds();
     test_axis_lock();
     test_pick_mask();
+    test_pick_round_shapes();
+    test_static_static_pairs();
     test_idle_sleep();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);

@@ -87,6 +87,8 @@ Contacts get two extras worth naming: the normal force may only push, never pull
 
 That is really the whole story: iterate the two passes until the energy settles, derive the new velocities from the positions, next frame. This repo runs the whole thing multithreaded and proves with bit-exact digests that the threaded result equals the serial one.
 
+The broad phase is a **Morton LBVH with refit** (`src/avbd/bvh_broadphase.*`), ported back from `main`. The repo used to claim the hierarchical hashed grid that replaced it was faster; that comparison crossed branches that also differed by the Eigen-to-linalg port and a full solver rewrite, so it did not hold. Isolated - same swept AABBs, same downstream work, bit-identical results - the LBVH is 1.5-6x faster in the broad phase (3.366 -> 0.953 ms on 1654 bodies) because the hash walks 27 cells at *every* level up to the coarsest, so one large ground body inflates the candidate list 6-9x. See [`tools/baseline/README.md`](tools/baseline/README.md) for what is actually measured (per-phase step cost, the penetration distribution on a 420-box pyramid, raw suite output) and the known limitations.
+
 This is not one of those tutorial articles, so that is all I want to show you. If you are a physics engine dev, you know what I know.
 
 [If you really really want to know](v2-6e8c45cac4eb0cacfc6b952955f36cae_1440w.jpg)
@@ -181,8 +183,41 @@ $$
 
 到这里整个算法已经完整：两个 pass 反复迭代直到能量收敛，再由位置差分出新的速度，进入下一帧。这个仓库把整套流程跑在多线程上，并用位级一致的 digest 验证了多线程结果与串行实现完全相同。
 
-并且这个引擎实现了动态BVH和SAH Renit等特性 , 所以无需担心成熟度
+宽相现在默认是 **Morton LBVH + refit**（`src/avbd/bvh_broadphase.*`，从 `main` 分支移植）。仓库原先的说法是"分层哈希网格比动态 LBVH 快"——那个比较跨了 `main` 分支，而那个分支同时差了 Eigen→linalg 移植和整套求解器重写，所以不成立。把 LBVH 移植过来、喂**同一份 swept AABB**、跑**同一套下游**之后，隔离对照的结果正好相反：
+
+| 场景 | 刚体 | 候选对 hash / lbvh | 宽相 hash (其中索引) | 宽相 lbvh (其中索引) | 整步 hash → lbvh |
+|---|---|---|---|---|---|
+| Bridge | 91 | 1295 / 180 | 0.307 (0.090) ms | **0.049 (0.017)** | 1.145 → 0.841 |
+| Pyramid | 137 | 2865 / 374 | 0.515 (0.200) | **0.201 (0.029)** | 1.611 → 1.345 |
+| Soft Body | 193 | 12099 / 3772 | 1.067 (0.169) | **0.623 (0.098)** | 2.518 → 2.242 |
+| Pyramid XL | 1654 | 45603 / 4868 | 3.366 (1.185) | **0.953 (0.582)** | 10.019 → 8.243 |
+
+两种宽相产出的接触数完全相同（最终 digest 逐位一致：`stack_300 = 0xfbac4f08cb1c977c` 等），LBVH **即便是单线程**也快 1.5–6 倍。原因不是树好，而是哈希有个缺陷：它对每个刚体都从自身层级一路 27 邻域走到最粗层，只要场景里有一个大物体（地面），所有细物体在最粗层都会命中"地面大小"的格子，候选对被放大 6–9 倍，后面的精确过滤和排序全在为它买单。要修就得只走自身层级（大物体通过父格解析）。
+
+所以默认改成 LBVH；哈希保留为 `broadPhaseMode = 0`（`physics/avbd/broad_phase_lbvh=false`）。在 demo 自己的规模（420 盒）上两者差异落在噪声里（`test_load` 629.9 vs 626.8 ms，穿透 p50/p99 都是 8.08/11.30 mm）。
+
+引擎的实际状态、测出来的数字和已知限制见 [`tools/baseline/README.md`](tools/baseline/README.md)（包括 529 刚体一步里各阶段的耗时、420 盒金字塔的穿透分布、以及一轮回归测试的原始输出）。
 
 这不是一篇教程式的文章，能展示的就到这里。如果你也是做物理引擎的，你懂的。
 
 [如果你真的很想知道的话](v2-6e8c45cac4eb0cacfc6b952955f36cae_1440w.jpg)
+
+## 已知限制（Known limitations）
+
+以下全部是**实测**结论，不是估计。数据、复现命令和原始输出在 [`tools/baseline/README.md`](tools/baseline/README.md)。
+
+| 项目 | 现状 |
+|---|---|
+| 恢复系数 | **不模拟**。`body_set_param(BODY_PARAM_BOUNCE)` 只保存、只回读，碰撞完全非弹性 |
+| 软体 | 节点层 API 在，物理服务器侧**全部是 stub**（`_soft_body_*` 返回空值） |
+| Area3D | RID/参数可存取，但**没有 overlap 检测**（不会有 `area_entered` 回调） |
+| 每刚体形状 | **只支持一个** collision shape（多于一个 `WARN_PRINT` 后丢弃） |
+| 形状类型 | box / sphere / cylinder 原生；capsule 用 cylinder 代理（半球帽变平）；凸包用它自己的 AABB 当盒子；concave / heightmap / world_boundary / separation_ray **排除出仿真**并告警 |
+| 关节轴 | 只能沿**主轴**：非轴对齐的 hinge/slider/cone-twist 会被吸附到最近主轴（静默错误） |
+| CCD | 没有。只有 speculative contact + `maxPenetration`=2 cm 兜底；5.3 m/s 落地实测最大瞬时穿透 **60 mm** |
+| 静止穿透 | 420 盒双金字塔：p50 **8.0 mm**、p95 10.5 mm、p99 **11.3 mm**、最差稳定值 15.3 mm（盒子 1×1×0.5 m） |
+| 冲击能量 | 5.3 m/s 落地的场景观测到 17.9 m/s 的弹飞速度：非弹性碰撞却在加速，冲击瞬间仍有过冲 |
+| 刚性链预算 | 焊接/关节链每个 substep **至少 6 轮**才收敛；3 轮会自激发散（`tools/repro_joint.cpp`：140 m/s）。**总预算相同的情况下，substep 越多越不稳定** |
+| 多线程 | 位级可复现（digest 在 1/2/3/4/8/12 线程下一致），但 **12 线程比 8 线程慢**（barrier 开销 > 并行收益），`physics/avbd/threads` 必须实测 |
+| 宽相 | 默认 LBVH，单线程构建+遍历；不随线程扩展（529 刚体：1.27→1.75 ms），占一步的 16–38%。哈希（`broad_phase_lbvh=false`）候选对多 6–9 倍 |
+| CI | **不跑任何测试**：只 `xmake build` + 一个不存在的 `xmake check`；README 顶部的 Test 徽章是编译徽章 |
