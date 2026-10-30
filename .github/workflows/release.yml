@@ -129,26 +129,31 @@ jobs:
         run: |
           set -euo pipefail
           lib="${{ matrix.library }}"
-          # The name is the one xmake.lua's godot_library_name() produced and the one the manifest
-          # lists; a mismatch is a broken release, not something to paper over with a glob.
           test -f "demo/gdavbd/bin/$lib" || { echo "::error::demo/gdavbd/bin/$lib was not produced"; exit 1; }
           grep -q "res://gdavbd/bin/$lib" demo/gdavbd/avbd.gdextension \
             || { echo "::error::avbd.gdextension does not list $lib"; exit 1; }
-
+      
+          rm -rf tmp
           mkdir -p tmp/gdavbd/bin
           cp demo/gdavbd/avbd.gdextension tmp/gdavbd/
           cp "demo/gdavbd/bin/$lib" tmp/gdavbd/bin/
-
-          # The archive is written to the workspace root, which is where the upload step looks for it.
+      
           out="$GITHUB_WORKSPACE/${{ matrix.artifact_name }}"
-          cd tmp
+          rm -f "$out"
+      
           if [ "${RUNNER_OS}" == "Windows" ]; then
-            powershell -Command "Compress-Archive -Path gdavbd -DestinationPath '$out' -Force"
+            powershell -NoProfile -Command "
+              Add-Type -AssemblyName System.IO.Compression.FileSystem;
+              [System.IO.Compression.ZipFile]::CreateFromDirectory(
+                (Resolve-Path 'tmp').Path,
+                '$out'
+              )
+            "
           else
-            zip -r "$out" gdavbd
+            (cd tmp && zip -r "$out" gdavbd)
           fi
+      
           test -f "$out" || { echo "::error::packaging produced no $out"; exit 1; }
-
       # === 上传到 Release，使用上面计算出的 tag ===
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
