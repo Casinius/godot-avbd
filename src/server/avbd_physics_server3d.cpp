@@ -389,7 +389,7 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     p_space.contact_grace_ticks = static_cast<int>(settings->get_setting(
             "physics/avbd/contact_grace_ticks", 0.0));
     p_space.contact_gs = settings->get_setting("physics/avbd/contact_gs", false);
-    p_space.broad_phase_lbvh = settings->get_setting("physics/avbd/broad_phase_lbvh", true);
+    p_space.broad_phase_lbvh = settings->get_setting("physics/avbd/broad_phase_lbvh", false);
     p_space.speculative_margin = settings->get_setting("physics/avbd/speculative_margin", 0.01);
 }
 
