@@ -947,6 +947,160 @@ static float restHeight(ShapeType shape, float3 size, quat orientation, int step
     return body->positionLin.z();
 }
 
+
+// ---------------------------------------------------------------------------
+// The per-contact assembly is written in closed form now: the constraint error from one bracket the
+// basis rotates (Manifold's constraintError), and the stamp from the shared linear Hessian S = B^T K B
+// (Manifold::BasisHessian) with R S and R S R^T for the angular and cross blocks. That kind of rewrite
+// is exactly what a sign or a transpose error survives: a wrong transpose still produces a symmetric
+// looking block, and a stack absorbs it for a few hundred steps before falling over. This compares both
+// against the dense assembly they replaced - generic 3x3 products through explicit Jacobian matrices -
+// on random geometry, penalties and forces, for both bodies of the manifold.
+// ---------------------------------------------------------------------------
+namespace {
+
+// A tiny reproducible LCG: the test must not depend on a standard library's distribution order.
+struct Lcg
+{
+    uint32_t state = 0x9E3779B9u;
+    float unit() { state = state * 1664525u + 1013904223u; return static_cast<float>((state >> 8) & 0xFFFFFFu) / 16777216.0f; }
+    float sym(float radius) { return unit() * 2.0f * radius - radius; }
+    float3 unitVector() {
+        for (;;) {
+            const float3 v{sym(1.0f), sym(1.0f), sym(1.0f)};
+            const float n2 = v.squaredNorm();
+            if (n2 > 0.01f && n2 <= 1.0f)
+                return v / std::sqrt(n2);
+        }
+    }
+};
+
+} // namespace
+
+static void test_closed_form_assembly() {
+    Solver s;
+    s.threads = 1;
+    Rigid *a = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 0});
+    Rigid *b = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {1, 0, 0});
+    Manifold m(&s, a, b);
+    m.friction = 0.6f;
+
+    Lcg rng;
+    float worstForce = 0.0f;
+    float worstBlock = 0.0f;
+    const float alpha = 0.99f;
+
+    for (int trial = 0; trial < 200; trial++) {
+        // A random orthonormal frame with the normal in row 0, as collide() builds one.
+        m.basis = orthonormal(rng.unitVector());
+        m.numContacts = 1 + static_cast<int>(rng.unit() * 7.0f);
+
+        // The bodies' derived pose state, which the solver would have refreshed.
+        a->rot = float3x3(quat(Eigen::AngleAxisf(rng.sym(3.0f), rng.unitVector())));
+        b->rot = float3x3(quat(Eigen::AngleAxisf(rng.sym(3.0f), rng.unitVector())));
+        a->dqLin = float3{rng.sym(0.05f), rng.sym(0.05f), rng.sym(0.05f)};
+        b->dqLin = float3{rng.sym(0.05f), rng.sym(0.05f), rng.sym(0.05f)};
+        a->dqAng = float3{rng.sym(0.05f), rng.sym(0.05f), rng.sym(0.05f)};
+        b->dqAng = float3{rng.sym(0.05f), rng.sym(0.05f), rng.sym(0.05f)};
+
+        for (int i = 0; i < m.numContacts; i++) {
+            m.contacts[i].rA = rng.unitVector() * (0.05f + rng.unit() * 0.5f);
+            m.contacts[i].rB = rng.unitVector() * (0.05f + rng.unit() * 0.5f);
+            m.contacts[i].C0 = float3{rng.sym(0.02f), rng.sym(0.02f), rng.sym(0.02f)};
+            m.contacts[i].penalty = float3{0.5f + rng.unit() * 200.0f, 0.5f + rng.unit() * 200.0f,
+                    0.5f + rng.unit() * 200.0f};
+            m.contacts[i].lambda = float3{rng.sym(20.0f), rng.sym(20.0f), rng.sym(20.0f)};
+            m.contacts[i].betaScale = 1.0f;
+            m.contacts[i].stick = false;
+
+            // The closed-form linear Hessian, built here from its definition so the test does not
+            // trust the solver's own copy of the same sum.
+            const float3 k = m.contacts[i].penalty;
+            const float3 b0 = m.basis.row(0);
+            const float3 b1 = m.basis.row(1);
+            const float3 b2 = m.basis.row(2);
+            m.linHessian[i] = Manifold::BasisHessian{
+                    k[0] * b0.x() * b0.x() + k[1] * b1.x() * b1.x() + k[2] * b2.x() * b2.x(),
+                    k[0] * b0.x() * b0.y() + k[1] * b1.x() * b1.y() + k[2] * b2.x() * b2.y(),
+                    k[0] * b0.x() * b0.z() + k[1] * b1.x() * b1.z() + k[2] * b2.x() * b2.z(),
+                    k[0] * b0.y() * b0.y() + k[1] * b1.y() * b1.y() + k[2] * b2.y() * b2.y(),
+                    k[0] * b0.y() * b0.z() + k[1] * b1.y() * b1.z() + k[2] * b2.y() * b2.z(),
+                    k[0] * b0.z() * b0.z() + k[1] * b1.z() * b1.z() + k[2] * b2.z() * b2.z()};
+        }
+
+        // --- the constraint value and the clamped force the primal caches ---------------------
+        m.preCompute(alpha);
+
+        for (int i = 0; i < m.numContacts; i++) {
+            // Dense reference: build both angular Jacobians and multiply through.
+            const float3 rAWorld = m.jacobianCache[i].rAWorld;
+            const float3 rBWorld = m.jacobianCache[i].rBWorld;
+            const float3x3 jALin = m.basis;
+            const float3x3 jBLin = -m.basis;
+            float3x3 jAAng;
+            float3x3 jBAng;
+            for (int r = 0; r < 3; r++) {
+                jAAng.row(r) = rAWorld.cross(jALin.row(r));
+                jBAng.row(r) = rBWorld.cross(jBLin.row(r));
+            }
+            const float3 C = m.contacts[i].C0 * (1.0f - alpha) + jALin * a->dqLin + jBLin * b->dqLin +
+                    jAAng * a->dqAng + jBAng * b->dqAng;
+            const float3 K = m.contacts[i].penalty;
+            float3 F{K[0] * C[0] + m.contacts[i].lambda[0], K[1] * C[1] + m.contacts[i].lambda[1],
+                    K[2] * C[2] + m.contacts[i].lambda[2]};
+            F[0] = std::min(F[0], 0.0f);
+            const float bounds = std::fabs(F[0]) * m.friction;
+            const float scale = float2{F[1], F[2]}.norm();
+            if (scale > bounds && scale > 0) {
+                F[1] *= bounds / scale;
+                F[2] *= bounds / scale;
+            }
+            worstForce = std::max(worstForce, (F - m.contactForceCache[i]).cwiseAbs().maxCoeff());
+        }
+
+        // --- the block each body stamps -------------------------------------------------------
+        for (int side = 0; side < 2; side++) {
+            Rigid *body = side == 0 ? a : b;
+            Block block(body->mass, body->moment, s.dt * s.dt, body->positionLin, body->inertialLin,
+                    body->positionAng, body->inertialAng);
+            const Block reference = block;
+            m.stampCached(body, block);
+
+            float3x3 dLin = float3x3::Zero();
+            float3x3 dAng = float3x3::Zero();
+            float3x3 dCross = float3x3::Zero();
+            float3 dRhsLin = float3::Zero();
+            float3 dRhsAng = float3::Zero();
+            for (int i = 0; i < m.numContacts; i++) {
+                const float3x3 K = m.contacts[i].penalty.asDiagonal();
+                const float3x3 jLin = side == 0 ? m.basis : float3x3(-m.basis);
+                const float3 arm = side == 0 ? m.jacobianCache[i].rAWorld : m.jacobianCache[i].rBWorld;
+                float3x3 jAng;
+                for (int r = 0; r < 3; r++)
+                    jAng.row(r) = arm.cross(jLin.row(r));
+                const float3x3 jAngTk = jAng.transpose() * K;
+                dLin += jLin.transpose() * K * jLin;
+                dAng += jAngTk * jAng;
+                dCross += jAngTk * jLin;
+                dRhsLin += jLin.transpose() * m.contactForceCache[i];
+                dRhsAng += jAng.transpose() * m.contactForceCache[i];
+            }
+            worstBlock = std::max(worstBlock, (block.lhsLin - (reference.lhsLin + dLin)).cwiseAbs().maxCoeff());
+            worstBlock = std::max(worstBlock, (block.lhsAng - (reference.lhsAng + dAng)).cwiseAbs().maxCoeff());
+            worstBlock = std::max(worstBlock, (block.lhsCross - (reference.lhsCross + dCross)).cwiseAbs().maxCoeff());
+            worstBlock = std::max(worstBlock, (block.rhsLin - (reference.rhsLin + dRhsLin)).cwiseAbs().maxCoeff());
+            worstBlock = std::max(worstBlock, (block.rhsAng - (reference.rhsAng + dRhsAng)).cwiseAbs().maxCoeff());
+        }
+    }
+
+    // The closed forms are the same arithmetic in a different order, so the tolerance is float noise on
+    // products of order 200 (penalty) x 0.05 (arm) x 20 (force), not a modelling difference.
+    report(worstForce < 1e-3f, "closed-form contact force matches the dense assembly",
+            "worst |dF| = %.2e over 200 random manifolds", worstForce);
+    report(worstBlock < 1e-2f, "closed-form stamp matches the dense assembly",
+            "worst |dBlock| = %.2e over 200 random manifolds", worstBlock);
+}
+
 static void test_round_shapes_rest() {
     // Sphere: centre one radius above the ground (ground top is z = 0).
     const float sphere = restHeight(ShapeType::Sphere, {0.5f, 0, 0}, quat::Identity());
@@ -1926,6 +2080,7 @@ int main(int argc, char **argv) {
     test_generic_free_axis();
     test_spin_retention();
     test_generic_rotated_rest_pose();
+    test_closed_form_assembly();
     test_round_shapes_rest();
     test_round_shape_rolls();
     test_collide_shapes_equivalence();

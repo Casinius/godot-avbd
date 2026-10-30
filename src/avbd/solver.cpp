@@ -530,6 +530,16 @@ int Solver::warmstartForces()
     return forceCount;
 }
 
+// Refresh a body's derived pose state (Rigid::rot / dqLin / dqAng). Every pose-writing phase calls
+// this - the warmstart, the combine pass and the projection - so a constraint reading them never has
+// to convert a quaternion or subtract a pose itself, and a new phase cannot forget to.
+static inline void refreshDerivedPose(Rigid *body)
+{
+    body->rot = float3x3(body->positionAng);
+    body->dqLin = body->positionLin - body->initialLin;
+    body->dqAng = body->positionAng - body->initialAng;
+}
+
 // Compute one body's inertial position and warm-start it (Eq. 2 and the adaptive
 // warm-start of the original VBD paper).
 //
@@ -584,6 +594,7 @@ void Solver::warmstartBody(int i)
         body->positionLin = body->positionLin + body->velocityLin * dt + float3{0, 0, g} * (accelWeight * dt * dt);
         body->positionAng = body->positionAng + body->velocityAng * dt;
     }
+    refreshDerivedPose(body);
 
     // The projection's running total starts the step empty. It is summed over every pass of the
     // step rather than reset per pass, because what `finishBody` has to take back out of the BDF1
@@ -632,42 +643,28 @@ void Solver::computeIterations(int &r_targetIterations, int &r_newtonRounds)
 // fence the phases relied on when they were called directly.
 void Solver::runSubstep(int forceCount, int targetIterations, int newtonRounds)
 {
-    float prevResidual = 0.0f;
-    std::atomic<bool> converged{false};
-
 #ifdef AVBD_PROFILE
     const auto profileStart = std::chrono::steady_clock::now();
 #endif
 
+    // One stage: the whole substep inside a single region.
+    //
+    // It used to be four dispatched stages - body warmstart, the iteration set, the closing
+    // projection (two more) and the velocity finish - and at eight threads the dispatches themselves
+    // costed ~340 us per substep regardless of scene size, which is 75% of a 137-body step: waking
+    // the pool, joining on a latch, reserving the region's slots. Every one of those stages is
+    // per-body work with no cross-item dependency, so they are phases of one region instead, fenced
+    // by the same LoopSync the rounds already use.
+    std::atomic<bool> converged{false};
     flow->clear();
-    flow->independent([this] { return static_cast<int>(warmstartOrder.size()); },
-            kMinBodiesPerDispatch, [this](int i) { warmstartBody(i); });
-
     flow->region(
-            [this, forceCount, targetIterations, newtonRounds, &prevResidual, &converged](int workerIndex, auto &sync) {
-                iterateBody(workerIndex, sync, targetIterations, forceCount, newtonRounds, prevResidual, converged);
+            [this, forceCount, targetIterations, newtonRounds, &converged](int workerIndex, auto &sync) {
+                substepBody(workerIndex, sync, forceCount, targetIterations, newtonRounds, converged);
             },
             [this, forceCount] {
                 return static_cast<int>(updateOrder.size()) < kMinBodiesPerDispatch
                         && forceCount < kMinForcesPerDispatch;
             });
-
-    // The closing projection, as two stages: the fence between them is what the flow's stage
-    // boundary gives for free. It runs whether or not the iteration set finished, finished early
-    // on convergence or never projected at all, and it is the pass that makes the promise of the
-    // layer true of the pose actually handed to the host: what `finishBody` then measures the
-    // velocity from is feasible.
-    if (params.projection.rounds > 0)
-    {
-        flow->independent([forceCount] { return forceCount; }, kMinForcesPerDispatch,
-                [this](int i) { projectForce(i); });
-        flow->independent([this] { return static_cast<int>(updateOrder.size()); },
-                kMinBodiesPerDispatch, [this](int i) { projectBody(i); });
-    }
-
-    flow->independent([this] { return static_cast<int>(warmstartOrder.size()); },
-            kMinBodiesPerDispatch, [this](int i) { finishBody(i); });
-
     flow->run();
 
 #ifdef AVBD_PROFILE
@@ -676,15 +673,56 @@ void Solver::runSubstep(int forceCount, int targetIterations, int newtonRounds)
 #endif
 }
 
-// One worker-loop body for the whole iteration set: `iterations` rounds of the block
-// Jacobi primal (one full block solve per body against the iteration-start pose, then a
-// combine pass) followed by a dual pass, with a barrier fence at every phase boundary.
+// One substep, on the region's participants: the body warmstart, the iteration set, the closing
+// projection and the BDF1 velocity finish. The order is the one the dispatched stages had, so the
+// inline path (NullSync) is still exactly the serial reference the digest tests compare against.
+template <typename Sync>
+void Solver::substepBody(int workerIndex, Sync &sync, int forceCount, int targetIterations,
+        int newtonRounds, std::atomic<bool> &converged)
+{
+    PhaseTimer warmTimer(phaseSlot(kPhaseWarmstart, workerIndex));
+    sync.forItems(static_cast<int>(warmstartOrder.size()), [this](int i) { warmstartBody(i); });
+    warmTimer.workDone();
+    sync.arriveAndWait();
+    warmTimer.syncDone();
+
+    // The iteration set. Its convergence probe carries a residual across rounds, which is why it
+    // lives here rather than in the round loop.
+    float prevResidual = 0.0f;
+    iterateBody(workerIndex, sync, targetIterations, forceCount, newtonRounds, prevResidual, converged);
+
+    // The closing projection. It runs whether or not the iteration set finished, finished early on
+    // convergence or never projected at all, and it is the pass that makes the promise of the layer
+    // true of the pose actually handed to the host: what `finishBody` then measures the velocity
+    // from is feasible.
+    if (params.projection.rounds > 0)
+        projectPass(sync, forceCount, workerIndex);
+
+    PhaseTimer finishTimer(phaseSlot(kPhaseFinish, workerIndex));
+    sync.forItems(static_cast<int>(warmstartOrder.size()), [this](int i) { finishBody(i); });
+    finishTimer.workDone();
+    sync.arriveAndWait();
+    finishTimer.syncDone();
+}
+
+// One worker-loop body for the whole iteration set: `iterations` rounds of the block Jacobi primal
+// (one full block solve per body against the iteration-start pose, applied immediately for a body
+// whose forces are all contacts) followed by a dual pass, with a barrier fence at every phase
+// boundary.
 //
-// The shape matters more than the phases: one dispatch arms the workers once per step and
-// each boundary costs a ~1-3 us barrier. The Jacobi primal needs two fences per round
-// regardless of how entangled the constraint graph is - the old colour-parallel
-// Gauss-Seidel needed one per colour, which is why dense stacking scenes starved it (and
-// why the incremental colouring's correctness was so fragile).
+// The shape matters more than the phases: one dispatch arms the workers once per step and each
+// boundary costs a ~1-3 us barrier. A round is two fences - one after the per-body assembly, one
+// after the dual - regardless of how entangled the constraint graph is; the old colour-parallel
+// Gauss-Seidel needed one per colour, which is why dense stacking scenes starved it (and why the
+// incremental colouring's correctness was so fragile). Three shapes keep it at two:
+//   * the assembly pass (per-contact world arms and clamped forces) runs only for the first round:
+//     every later round reads what the previous round's dual emitted, and the dual measures exactly
+//     the pose the next primal solves against;
+//   * a body with no joint on it applies its delta in the same item that solved it, because a joint
+//     is the only force that reads its partner's pose - and a joint makes both of its bodies
+//     non-contactOnly, so those deltas are the only ones that need a fence between solve and apply;
+//   * the combine pass therefore exists only for the bodies a joint or spring couples, and not at
+//     all in a scene that has none.
 //
 // Both sync types run the identical body: NullSync (small scenes, or another solver
 // holding the region) executes it inline in list order, which is exactly the threads=1
@@ -702,63 +740,42 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
     // the pass stop being paired.
     const int projectionRounds = params.projection.rounds;
     const bool projectNewtonOnly = params.projection.trailingNewtonOnly;
+    // Whether the next round has to assemble its manifolds from scratch: yes for the first round
+    // (nothing has been measured yet) and after a projection pass, which moves poses in between the
+    // dual that filled the cache and the stamps that read it.
+    bool needAssemble = true;
+
     for (int it = 0; it < targetIterations; it++)
     {
         roundsRun++;
         const bool newton = it < newtonRounds;
         if (newton)
         {
-            // Block projected Jacobi in three phases. Phase A precomputes each
-            // manifold's shared per-contact assembly (world arms, angular jacobians,
-            // clamped forces) once from the round's pose snapshot - work the two
-            // body stamps used to duplicate. Nobody writes a pose until the combine
-            // pass, so every phase reads the same frozen snapshot: race-free by
-            // construction, no colours, and no thread-count dependence.
-            PhaseTimer preTimer(phaseSlot(kPhasePrecompute, workerIndex));
-            sync.forItems(forceCount, [this](int i) {
-                Force *f = forceOrder[i];
-                if (f->kind != ForceKind::Contact)
-                    return;
-                Manifold *manifold = f->asManifold();
-                if (manifold->bodyA->updateSlot < 0 && manifold->bodyB->updateSlot < 0)
-                    return; // frozen: neither side moves this round
-                manifold->preCompute(params.dual.alpha);
-            });
-            preTimer.workDone();
-            sync.arriveAndWait();
-            preTimer.syncDone();
+            if (needAssemble)
+            {
+                // Block projected Jacobi, assembly pass: each manifold evaluates the shared
+                // per-contact state (world arms, clamped forces) once from the round's pose
+                // snapshot, work the two body stamps used to duplicate. Only the first round of a
+                // step needs it - every later round reads what the previous round's dual emitted,
+                // because the dual measures exactly the pose the next primal solves against. That
+                // is one phase and one barrier per round that the old layout spent here.
+                PhaseTimer preTimer(phaseSlot(kPhasePrecompute, workerIndex));
+                sync.forItems(forceCount, [this](int i) {
+                    Force *f = forceOrder[i];
+                    if (f->kind != ForceKind::Contact)
+                        return;
+                    Manifold *manifold = f->asManifold();
+                    if (manifold->bodyA->updateSlot < 0 && manifold->bodyB->updateSlot < 0)
+                        return; // frozen: neither side moves this round
+                    manifold->preCompute(params.dual.alpha);
+                });
+                preTimer.workDone();
+                sync.arriveAndWait();
+                preTimer.syncDone();
+                needAssemble = false;
+            }
 
-            // Phase B: each body assembles its full block system (own inertia plus
-            // every incident constraint - manifolds stamped from the phase-A cache,
-            // other forces stamping directly) and solves for its delta.
-            PhaseTimer stampTimer(phaseSlot(kPhaseStamp, workerIndex));
-            sync.forItems(static_cast<int>(updateOrder.size()), [this](int i) {
-                Rigid *body = updateOrder[i];
-                Block block(body->mass, body->moment, dt * dt, body->positionLin, body->inertialLin,
-                        body->positionAng, body->inertialAng);
-                for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
-                {
-                    if (f->kind == ForceKind::Contact)
-                        f->asManifold()->stampCached(body, block);
-                    else
-                        f->updatePrimal(body, params.dual.alpha, block);
-                }
-                block.solveDelta(scratch.deltaLin[i], scratch.deltaAng[i]);
-            });
-            stampTimer.workDone();
-            sync.arriveAndWait();
-            stampTimer.syncDone();
-
-            // Combine: each body applies its own delta. With chebyshevRho > 0 the
-            // plain Jacobi estimate x + delta is convex-combined with the previous
-            // iterate through the Chebyshev weights (semi-iteration); otherwise the
-            // constant jacobiRelaxation scales it. The angular delta gets the same
-            // gamma but no prev-mixing: positions are a vector space, rotations are
-            // not, and the first-order quat integration stays exact as written. A
-            // body with no constraints solves to exactly its inertial pose - free
-            // flight falls out of the same path.
-            // Read once per round: all three are loop-invariant inside the combine pass, where
-            // every body in the update set reads them.
+            // The combine schedule, read once per round: loop-invariant inside both phases below.
             const float relax = params.primal.jacobiRelaxation;
             const float jointRelax = params.primal.jointRelaxation;
             const float rho = params.primal.chebyshevRho;
@@ -775,66 +792,89 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                 chebGammaPrev = gamma;
             }
             chebRound++;
-            PhaseTimer combineTimer(phaseSlot(kPhaseCombine, workerIndex));
-            sync.forItems(static_cast<int>(updateOrder.size()), [this, gamma, rho, relax, jointRelax](int i) {
-                Rigid *body = updateOrder[i];
-                if (rho <= 0.0f || !body->contactOnly)
-                {
-                    // Plain relaxed Jacobi - the constant, or the safe fallback for bodies coupled
-                    // by joints (extrapolation diverges those). Which constant depends on what the
-                    // body's rows are: a contact-only body's map tolerates the full relaxation, a
-                    // body on a stiffness-coupled chain needs the damping for its block-Jacobi
-                    // spectral radius to stay inside the unit circle (see jointRelaxation).
-                    const float step = body->contactOnly ? relax : jointRelax;
-                    body->positionLin = body->positionLin + scratch.deltaLin[i] * step;
-                    body->positionAng = body->positionAng + scratch.deltaAng[i] * step;
-                    return;
-                }
-                // x_{k+1} = gamma * (x_k + delta_k) + (1 - gamma) * x_{k-1}
-                const float3 xLin = body->positionLin;
-                body->positionLin = gamma * (xLin + scratch.deltaLin[i]) + (1.0f - gamma) * scratch.prevLin[i];
-                scratch.prevLin[i] = xLin;
-                body->positionAng = body->positionAng + scratch.deltaAng[i] * gamma;
-            });
-            combineTimer.workDone();
+
+            // Phase B: each body assembles its full block system (own inertia plus every incident
+            // constraint - manifolds stamped from the cache, other forces stamping directly), solves
+            // it, and - when everything on it is a contact - applies the delta right here. A joint is
+            // the only force that reads its partner's pose, and a joint makes both of its bodies
+            // non-contactOnly, so a contact-only body's move is invisible to every other item in this
+            // phase: the result still does not depend on how the items were split.
+            PhaseTimer stampTimer(phaseSlot(kPhaseStamp, workerIndex));
+            sync.forItems(static_cast<int>(updateOrder.size()),
+                    [this, gamma, rho, relax, jointRelax](int i) {
+                        Rigid *body = updateOrder[i];
+                        Block block(body->mass, body->moment, dt * dt, body->positionLin,
+                                body->inertialLin, body->positionAng, body->inertialAng);
+                        for (Force *f = body->forces; f != 0;
+                                f = (f->bodyA == body) ? f->nextA : f->nextB)
+                        {
+                            if (f->kind == ForceKind::Contact)
+                            {
+                                Manifold *manifold = f->asManifold();
+                                // Safety net for a manifold the previous round's dual skipped
+                                // (frozen then, mobile now). A manifold the dual skipped is one no
+                                // body stamps, so this cannot be reached from two threads at once.
+                                if (!manifold->primalReady)
+                                    manifold->preCompute(params.dual.alpha);
+                                manifold->stampCached(body, block);
+                            }
+                            else
+                            {
+                                f->updatePrimal(body, params.dual.alpha, block);
+                            }
+                        }
+                        block.solveDelta(scratch.deltaLin[i], scratch.deltaAng[i]);
+                        if (body->contactOnly)
+                            applyDelta(i, gamma, rho, relax, jointRelax);
+                    });
+            stampTimer.workDone();
             sync.arriveAndWait();
-            combineTimer.syncDone();
+            stampTimer.syncDone();
+
+            // The combine pass: only the bodies a joint or spring couples. Their stamps read each
+            // other's poses, so their deltas have to land together after everything is assembled.
+            // With no such body in the scene the pass does not exist, and a round is two barriers.
+            if (hasJointedBodies)
+            {
+                PhaseTimer combineTimer(phaseSlot(kPhaseCombine, workerIndex));
+                sync.forItems(static_cast<int>(updateOrder.size()),
+                        [this, gamma, rho, relax, jointRelax](int i) {
+                            if (updateOrder[i]->contactOnly)
+                                return; // applied in the assembly phase
+                            applyDelta(i, gamma, rho, relax, jointRelax);
+                        });
+                combineTimer.workDone();
+                sync.arriveAndWait();
+                combineTimer.syncDone();
+            }
         }
 
-        // Dual update: one item per force, and each force only reads the (frozen)
-        // body poses and writes its own dual state, so the whole pass is independent.
-        // Frozen constraints have nothing to update: every input they read is parked.
-        // In the impulse tail, decay the contact penalties first (stiffnessDecay < 1):
-        // relaxation converges poorly against a stiff ramp, softening lets the cheap
-        // rounds finish the job the Newton rounds started.
-        if (!newton && params.primal.stiffnessDecay < 1.0f)
-        {
-            const float decay = params.primal.stiffnessDecay;
-            const float cap = PENALTY_MAX;
-            sync.forItems(forceCount, [this, decay, cap](int i) {
-                Force *f = forceOrder[i];
-                // Contacts only: joints and springs keep their own penalty ramp untouched.
-                if (f->kind == ForceKind::Contact) {
-                    Manifold *m = f->asManifold();
-                    for (int ci = 0, n = m->numContacts; ci < n; ++ci)
-                        m->contacts[ci].penalty = (m->contacts[ci].penalty * decay).cwiseMin(float3{cap, cap, cap});
-                }
-            });
-            sync.arriveAndWait();
-        }
+        // Dual update: one item per force, and each force only reads the (frozen) body poses and
+        // writes its own dual state, so the whole pass is independent. Frozen constraints have
+        // nothing to update: every input they read is parked. The relaxation tail's penalty decay
+        // is folded into the same item - it touches the state the dual is about to read and nothing
+        // else, so it does not need a phase (and a barrier) of its own.
+        const bool decay = !newton && params.primal.stiffnessDecay < 1.0f;
+        const float decayFactor = params.primal.stiffnessDecay;
         PhaseTimer dualTimer(phaseSlot(kPhaseDual, workerIndex));
-        sync.forItems(forceCount, [this, newton](int i) {
+        sync.forItems(forceCount, [this, newton, decay, decayFactor](int i) {
             Force *f = forceOrder[i];
             if (constraintFrozen(f))
                 return;
-            // A dual-only round relaxes a multiplier against a pose nothing is going to change. For
-            // a contact row that is dual ascent on a clamped convex constraint, which is what the
-            // tail is for. For a bilateral row it is pure windup: C cannot move, so lambda grows by
-            // K*C every round and the next step's primal inherits a force no displacement ever paid
-            // for. Joints therefore keep the multiplier the last Newton round gave them, and the
-            // tail stays what it claims to be - a cheap relaxation of the contact impulses.
+            // A dual-only round relaxes a multiplier against a pose nothing is going to change. For a
+            // contact row that is dual ascent on a clamped convex constraint, which is what the tail is
+            // for. For a bilateral row it is pure windup: C cannot move, so lambda grows by K*C every
+            // round and the next step's primal inherits a force no displacement ever paid for. Joints
+            // therefore keep the multiplier the last Newton round gave them.
             if (!newton && f->kind != ForceKind::Contact)
                 return;
+            if (decay)
+            {
+                Manifold *manifold = f->asManifold();
+                for (int ci = 0, n = manifold->numContacts; ci < n; ++ci)
+                    manifold->contacts[ci].penalty =
+                            (manifold->contacts[ci].penalty * decayFactor).cwiseMin(float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX});
+            }
             f->updateDual(params.dual.alpha);
         });
         dualTimer.workDone();
@@ -855,7 +895,12 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
         {
             const int lastProjected = projectNewtonOnly ? newtonRounds : targetIterations;
             if (it < lastProjected && it >= lastProjected - projectionRounds)
+            {
                 projectPass(sync, forceCount, workerIndex);
+                // The pass moved poses after the dual filled this round's cache, so the next round
+                // has to measure again instead of stamping what is now last round's news.
+                needAssemble = true;
+            }
         }
 
         // Convergence probe after a Newton round: a full primal pass is expensive, so
@@ -888,6 +933,31 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
 #else
     (void)roundsRun;
 #endif
+}
+
+// Apply one body's solved delta with the combine pass's schedule. The relaxation constant depends on
+// what the body's rows are (see SolverParams::Primal::jointRelaxation), and the derived pose state
+// every constraint reads is refreshed here, which is the only place a pose change can be observed.
+void Solver::applyDelta(int i, float gamma, float rho, float relax, float jointRelax) noexcept
+{
+    Rigid *body = updateOrder[i];
+    if (rho <= 0.0f || !body->contactOnly)
+    {
+        const float step = body->contactOnly ? relax : jointRelax;
+        body->positionLin = body->positionLin + scratch.deltaLin[i] * step;
+        body->positionAng = body->positionAng + scratch.deltaAng[i] * step;
+    }
+    else
+    {
+        // Chebyshev semi-iteration: x_{k+1} = gamma (x_k + delta) + (1 - gamma) x_{k-1}. The angular
+        // half gets the same gamma but no prev-mixing: positions are a vector space, rotations are
+        // not, and the first-order quat integration stays exact as written.
+        const float3 xLin = body->positionLin;
+        body->positionLin = gamma * (xLin + scratch.deltaLin[i]) + (1.0f - gamma) * scratch.prevLin[i];
+        scratch.prevLin[i] = xLin;
+        body->positionAng = body->positionAng + scratch.deltaAng[i] * gamma;
+    }
+    refreshDerivedPose(body);
 }
 
 // The position projection's measure half: one constraint, reading the poses every other pass has
@@ -934,6 +1004,7 @@ void Solver::projectBody(int i)
 
     body->positionLin = body->positionLin + deltaLin;
     body->positionAng = body->positionAng + deltaAng;
+    refreshDerivedPose(body);
     scratch.projLin[i] = scratch.projLin[i] + deltaLin;
     scratch.projAng[i] = scratch.projAng[i] + deltaAng;
 }
@@ -1352,6 +1423,13 @@ void Solver::selectUpdateBodies()
         if (f->bodyB != 0)
             f->bodyB->contactOnly = false;
     }
+
+    // Whether the combine pass has to exist this step. `contactOnly` is exactly the predicate the
+    // assembly phase uses to decide if a body may apply its own delta, so both sides of that decision
+    // read the same flag - a body it defers is a body the combine pass applies, always.
+    hasJointedBodies = false;
+    for (const Rigid *body : updateOrder)
+        hasJointedBodies = hasJointedBodies || !body->contactOnly;
 }
 
 // Fill `forceOrder` with the solver's forces, so the phases can address them by index.

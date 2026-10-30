@@ -34,7 +34,7 @@
  *   solvers on an 8-thread machine lets both run at once.
  *
  * MEMORY MODEL:
- * - `std::latch` release/acquire covers the dispatch join; `std::barrier` covers every
+ * - `std::latch` release/acquire covers the dispatch join; the LoopSync spin barrier covers every
  *   region phase boundary. Work items are disjoint by contract, so no floating-point
  *   reduction happens across threads and the result is independent of the split.
  */
@@ -69,34 +69,56 @@ inline constexpr std::ptrdiff_t kMaxRegionSlots = 256;
 // loop so the Gauss-Seidel structure reads plainly.
 
 // Real barrier: participants pull items from a shared cursor, then rendezvous.
+//
+// The rendezvous is a sense-reversing spin barrier rather than `std::barrier`. A region's
+// participants are dedicated to it for the region's lifetime - the pool reserves the slots - so
+// there is nothing else for a waiting worker to run, and a futex round trip costs more than the
+// phase it fences. Measured on a 1654-body scene at 8 threads: `std::barrier`'s arrive-and-wait was
+// ~10 us per fence, which at two fences per round and eight rounds came to 17% of the substep. The
+// spin parks with a pause and falls back to yielding after a few hundred iterations, so a machine
+// that oversubscribes its cores still makes progress instead of burning a quantum.
+//
+// The work cursor is rearmed by the last participant to arrive, before it releases the others: every
+// pull of the finished phase is done by then, and every pull of the next phase sees zero.
 class LoopSync {
-    // Rearm the work cursor for the next phase. Runs exactly once per completed phase,
-    // after every participant has arrived (so every pull of the finished phase is done)
-    // and before any participant is released (so every pull of the next phase sees 0).
-    struct CursorReset {
-        LoopSync *self;
-        void operator()() noexcept { self->cursor.store(0, std::memory_order_relaxed); }
-    };
-
 public:
     explicit LoopSync(unsigned count) :
-            participants(count),
-            barrier(static_cast<std::ptrdiff_t>(count), CursorReset{this}) {}
+            participants(count) {}
 
     LoopSync(const LoopSync &) = delete;
     LoopSync &operator=(const LoopSync &) = delete;
 
-    // Fence: every write any worker made before its arrival is visible to every worker
-    // after the fence.
+    // Fence: every write any worker made before its arrival is visible to every worker after the
+    // fence. Release/acquire on `generation` is what carries that guarantee.
     void arriveAndWait() {
-        barrier.arrive_and_wait();
+        const unsigned observed = generation.load(std::memory_order_acquire);
+        const unsigned earlier = waiting.fetch_add(1, std::memory_order_acq_rel);
+        if (earlier + 1 == participants) {
+            cursor.store(0, std::memory_order_relaxed);
+            waiting.store(0, std::memory_order_relaxed);
+            generation.store(observed + 1, std::memory_order_release);
+            return;
+        }
+        // Spin, then yield. The pause keeps the pipeline from thrashing on the shared load and lets
+        // an SMT sibling run; the yield handles a machine that scheduled more participants than it
+        // has physical cores, which is the one configuration where pure spinning is a loss (measured
+        // at 12 participants on a 6-core/12-thread part: 1.90 ms/step at 8 threads, 2.47 at 12).
+        // Set `threads` to the physical core count on such a machine.
+        unsigned spins = 0;
+        while (generation.load(std::memory_order_acquire) == observed) {
+            if (++spins < 512) {
+                relaxCpu();
+            } else {
+                std::this_thread::yield();
+            }
+        }
     }
 
     // Run `fn(i)` for every i in [0, count), self-balanced: workers grab chunks from the
     // shared cursor until this phase's range is drained. Items must be independent - the
-    // split varies with timing by design. The cursor is rearmed by the barrier's
-    // completion, so consecutive phases must be separated by `arriveAndWait()`, which is
-    // the loop contract anyway.
+    // split varies with timing by design, which is why every phase that uses it is built out
+    // of items whose result does not depend on the split. Consecutive phases must be separated
+    // by `arriveAndWait()`, which rearms the cursor.
     template <typename F>
     void forItems(int count, F &&fn) {
         if (count <= 0) {
@@ -115,9 +137,22 @@ public:
     }
 
 private:
+    // The architectural "I am spinning" hint: keeps the core's pipeline from thrashing on the
+    // shared load, and on a hyperthreaded core lets the sibling run.
+    static void relaxCpu() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+        asm volatile("yield" ::: "memory");
+#else
+        std::this_thread::yield();
+#endif
+    }
+
     unsigned participants;
     std::atomic<int> cursor{0};
-    std::barrier<CursorReset> barrier;
+    std::atomic<unsigned> waiting{0};
+    std::atomic<unsigned> generation{0};
 };
 
 // Inline stand-in for a single participant: phases already run sequentially on the

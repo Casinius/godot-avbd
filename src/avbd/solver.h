@@ -120,6 +120,15 @@ struct Rigid
     quat initialAng;
     float3 inertialLin;
     quat inertialAng;
+    // Derived per-body state: the rotation as a matrix, and the offset from the pose this step
+    // started at. Every constraint reads both, once per contact, and both follow from the pose - so
+    // they are refreshed wherever the pose changes (Solver::warmstartBody, the combine pass, the
+    // projection) instead of being recomputed by every constraint that needs them. Per body, not per
+    // constraint: a manifold's eight contacts used to convert the same two quaternions eight times.
+    // Solver state, not host state: never read across a step.
+    float3x3 rot;
+    float3 dqLin; // positionLin - initialLin
+    float3 dqAng; // positionAng - initialAng, as a rotation vector
     float3 velocityLin;
     float3 velocityAng;
     float3 prevVelocityLin;
@@ -634,21 +643,18 @@ struct Manifold : Force
     int numContacts;
     float friction;
 
-    // Incremental jacobian cache: world-space moment arms + angular jacobians captured
-    // at the last full assembly, plus the body rotations at capture time. The drift test
-    // is per BODY (rotations are loop-invariant across a manifold's contacts): rebuild
-    // everything when either rotation moved more than jacobianRebuildDistance (unit-
-    // column distance ~ 2 sin(angle/2)). Invalidated by initialize() (new contact set).
+    // Per-contact cache of what the primal and the dual both need, refreshed once per round by
+    // preCompute.
     //
-    // Step-scoped state, the other half of the split documented on Contact: a field that
-    // only means something inside the current iteration set goes here, not into the
-    // eight-slot persistent array.
+    // Step-scoped state, the other half of the split documented on Contact: a field that only means
+    // something inside the current iteration set goes here, not into the eight-slot persistent
+    // array. The angular Jacobians used to live here as two 3x3 matrices per contact; they do not
+    // any more, because the stamp is computed from the closed form (see stampCached) and the only
+    // thing either half needs from the arms is the arms themselves.
     struct JacobianCache
     {
         float3 rAWorld;
         float3 rBWorld;
-        float3x3 jAAng;
-        float3x3 jBAng;
         // Position projection (SolverParams::Projection): the correction the measure pass worked
         // out for each row of this contact, as a multiplier in the contact basis, and which rows
         // it actually corrected. Step-scoped for the same reason the arms are - it describes the
@@ -661,9 +667,24 @@ struct Manifold : Force
     float3x3 rotACaptured = float3x3::Identity(); // body rotations at capture
     float3x3 rotBCaptured = float3x3::Identity();
     bool jacobiansCached = false;
-    // Clamped contact forces from the primal's shared precompute pass; the two body
-    // stamps read these instead of each recomputing the same C/F from the snapshot.
+    // The symmetric linear Hessian B^T K B of one contact, as its six independent entries. The basis
+    // is orthonormal and the penalty diagonal, so the linear half of every stamp is a weighted sum of
+    // the three basis-row outer products - the same six numbers for both bodies of the manifold, and
+    // the same six for every round whose penalty did not change. initialize() and updateDual() are
+    // the only places a penalty changes, so they are the only places this is recomputed.
+    struct BasisHessian
+    {
+        float s00, s01, s02, s11, s12, s22;
+    };
+    std::array<BasisHessian, 8> linHessian;
+    // Clamped contact forces for the round's stamps, plus the arms and the linear Hessians they need.
+    // Written by preCompute for the first round of a step and by updateDual from then on - the dual
+    // measures the same pose the next round's primal will, so it can hand it the forces directly and
+    // the assembly pass disappears from every round after the first. `primalReady` says whether what
+    // is in the cache belongs to the current pose; a projection pass moves poses after the dual that
+    // filled it, so the round after one assembles again.
     std::array<float3, 8> contactForceCache;
+    bool primalReady = false;
 
     Manifold(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB);
 
@@ -1019,11 +1040,13 @@ struct Solver
     // GDExtension: `xmake f --profile=y --diag=y`.
     enum PhaseId : int
     {
-        kPhasePrecompute = 0, // A: manifold assembly, parallel over forces
-        kPhaseStamp,          // B: per-body block assembly and solve
-        kPhaseCombine,        // per-body delta application
-        kPhaseDual,           // per-force dual update
-        kPhaseProject,        // projection measure + share (+ rebase)
+        kPhaseWarmstart = 0, // body warmstart: inertial prediction + derived pose state
+        kPhasePrecompute,    // manifold assembly over forces (first round of a step only)
+        kPhaseStamp,         // per-body block assembly, solve, and apply for a contact-only body
+        kPhaseCombine,       // delta application for the bodies a joint couples
+        kPhaseDual,          // per-force dual update, and the tail's penalty decay
+        kPhaseProject,       // projection measure + share
+        kPhaseFinish,        // BDF1 velocity finish
         kPhaseCount,
     };
 
@@ -1193,13 +1216,19 @@ private:
     void computeIterations(int &r_targetIterations, int &r_newtonRounds);
     // Convert the seconds-based idle window into steps for the dt of this tick.
     void computeSleepFrames();
-    // The whole iteration set as one persistent-worker region: `targetIterations` rounds of
-    // the block-Jacobi primal (one full block solve per body against the iteration-start
-    // pose, then a combine pass) plus dual passes, fenced by LoopSync barriers. Both sync
-    // types run the identical body; NullSync is the inline/reference path.
+    // The whole iteration set as one persistent-worker region: `targetIterations` rounds of the
+    // block-Jacobi primal (one full block solve per body against the iteration-start pose, applied
+    // on the spot when the body has no joint on it) plus dual passes, fenced by LoopSync barriers.
+    // Two fences per round, and the combine pass only exists for the bodies a joint couples.
+    // Both sync types run the identical body; NullSync is the inline/reference path.
     template <typename Sync>
     void iterateBody(int workerIndex, Sync &sync, int targetIterations, int forceCount,
             int newtonRounds, float &r_prevResidual, std::atomic<bool> &r_converged);
+    // Apply one body's solved delta with the combine pass's schedule: the per-kind relaxation, or
+    // the Chebyshev convex combination for a contact-only body, plus the derived pose state every
+    // constraint reads. Shared by the assembly phase (a contact-only body applies its own delta
+    // there) and the combine pass (the bodies a joint couples).
+    void applyDelta(int i, float gamma, float rho, float relax, float jointRelax) noexcept;
     // One body's BDF1 velocity update and idle detection (independent across the list).
     void finishBody(int i);
     // The position projection layer: two fenced passes, measure over forces then share and apply
@@ -1215,8 +1244,17 @@ private:
     void projectRebase(int i);
     // Per-phase wall clock, filled only under AVBD_PROFILE (see Instrumentation above).
     StepProfile profileData;
-    // One step's body warmstart, iteration region, and velocity finish, as a flow.
+    // True when the update set holds a body with a non-contact force. Those are the bodies whose
+    // stamp reads another body's pose (a joint measures both anchors), so they are the ones that
+    // cannot apply their delta inside the assembly phase; when there are none, the combine pass does
+    // not exist and a round is two barriers instead of three.
+    bool hasJointedBodies = false;
+    // One substep, as a flow: a single region holding every phase (see runSubstep).
     void runSubstep(int forceCount, int targetIterations, int newtonRounds);
+    // The substep's phases, on the region's participants.
+    template <typename Sync>
+    void substepBody(int workerIndex, Sync &sync, int forceCount, int targetIterations,
+            int newtonRounds, std::atomic<bool> &converged);
 
     // Island-wide sleep bookkeeping, and the only thing that changes `sleeping` on the solver's own
     // authority (it runs when sleeping is enabled): movable sleep-enabled bodies are grouped into
