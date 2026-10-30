@@ -52,9 +52,17 @@ namespace builder {
 
 class Builder {
 public:
+    // The bounding boxes are the caller's: the broad phase has to compute them anyway to decide which
+    // bodies moved, and a second traversal of the same shapes inside the builder is pure duplication.
+    // `scratch` is the caller's (code, body) buffer, reused across steps: the leaves are sorted by
+    // Morton code every tick, so a per-tick allocation for ~1600 entries is a measurable slice of a
+    // build that has to stay well under a millisecond.
     Builder(bvh::nodes::NodeStorage& nodes, std::span<const int> bodyIndices,
-            std::span<const avbd::Rigid* const> bodies, int maxDepth = 64) noexcept
-        : nodes_(nodes), bodyIndices_(bodyIndices), bodies_(bodies), maxDepth_(maxDepth) {}
+            std::span<const avbd::Rigid* const> bodies, std::span<const float3> aabbMin,
+            std::span<const float3> aabbMax, std::vector<std::pair<uint64_t, int>>& scratch,
+            int maxDepth = 64) noexcept
+        : nodes_(nodes), bodyIndices_(bodyIndices), bodies_(bodies), aabbMin_(aabbMin), aabbMax_(aabbMax),
+          coded_(scratch), maxDepth_(maxDepth) {}
 
     // Morton LBVH: implicit heap layout in `nodes` (children of i are 2i+1 / 2i+2),
     // balanced by construction. Returns the number of leaves stored (also the offset of
@@ -65,6 +73,9 @@ private:
     bvh::nodes::NodeStorage& nodes_;
     std::span<const int> bodyIndices_;
     std::span<const avbd::Rigid* const> bodies_;
+    std::span<const float3> aabbMin_;
+    std::span<const float3> aabbMax_;
+    std::vector<std::pair<uint64_t, int>>& coded_;
     int maxDepth_;
 };
 

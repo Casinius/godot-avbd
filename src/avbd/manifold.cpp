@@ -112,45 +112,86 @@ bool Manifold::initialize()
     jacobiansCached = false;
     primalReady = false;
 
-    // Compute new contacts
-    std::array<Contact, 8> newContacts = {};
-    int newNumContacts = collide(bodyA, bodyB, std::span<Contact>(newContacts), basis);
-
-    // Merge old contact data with new contacts. prevErr[i] carries the matched
-    // contact's error from the previous step so the adaptive-beta update below can
-    // compare it against the fresh error.
+    // prevErr[i] carries the matched contact's error from the previous step so the adaptive-beta
+    // update below can compare it against the fresh error.
     std::array<float, 8> prevErr{};
     prevErr.fill(-1.0f);
-    for (int i = 0; i < newNumContacts; i++)
-    {
-        for (int j = 0; j < numContacts; j++)
-        {
-            if (newContacts[i].feature.key == contacts[j].feature.key)
-            {
-                float3 newRA = newContacts[i].rA;
-                float3 newRB = newContacts[i].rB;
-                newContacts[i] = contacts[j];
-                // Penetration depth, not |C0|: C0's normal component carries the collision
-                // margin, so a resting contact would otherwise look like a constant error.
-                prevErr[i] = std::max(0.0f, COLLISION_MARGIN - contacts[j].C0.x());
 
-                // If no static friction in last frame, use the new contact point locations
-                if (!contacts[j].stick)
-                {
-                    newContacts[i].rA = newRA;
-                    newContacts[i].rB = newRB;
-                    newContacts[i].lambda = contacts[j].lambda;   // Keep lambda from prev frame
-                    newContacts[i].penalty = contacts[j].penalty; // Keep penalty from prev frame
-                }
-                break;
-            }
-        }
+    // The motion gate (SolverParams::Collision): a pair that has not moved since the pass that
+    // generated its contacts keeps them, and skips the narrow phase entirely. What is re-used is the
+    // local geometry - the feature ids and the two local anchors - and both are still re-measured
+    // against the current pose below, so the contact stays where the bodies actually are. A pair whose
+    // last constraint value had drifted out of contact is not gated: noticing that separation is
+    // exactly what the collision pass is for, and a stale contact pressing on a pair that has already
+    // parted is worse than the SAT it saves.
+    const SolverParams::Collision &collision = solver->params.collision;
+    const bool gateOpen = collision.motionGateLin > 0.0f || collision.motionGateAng > 0.0f;
+    bool reuseContacts = false;
+    if (gateOpen && numContacts > 0 && contacts[0].C0.x() <= 2.0f * COLLISION_MARGIN)
+    {
+        const float movedA = (bodyA->positionLin - collideLinA).norm() +
+                (bodyA->positionAng - collideAngA).norm();
+        const float movedB = (bodyB->positionLin - collideLinB).norm() +
+                (bodyB->positionAng - collideAngB).norm();
+        reuseContacts = movedA <= collision.motionGateLin + collision.motionGateAng &&
+                movedB <= collision.motionGateLin + collision.motionGateAng;
     }
 
-    // Copy new contacts to the manifold
-    numContacts = newNumContacts;
-    for (int i = 0; i < numContacts; i++)
-        contacts[i] = newContacts[i];
+    if (reuseContacts)
+    {
+        // The contact set is unchanged; only the previous errors are needed, for the ramp rule.
+        for (int i = 0; i < numContacts; ++i)
+            prevErr[i] = std::max(0.0f, COLLISION_MARGIN - contacts[i].C0.x());
+    }
+    else
+    {
+        // Compute new contacts. Value-initialised on purpose: collide() fills the geometry (feature,
+        // arms, C0) and the merge below copies a warm-start record over it, so the dual state of a
+        // contact whose feature did not match anything has to start at zero - that is what makes
+        // `lambda * alpha * gamma` and the penalty floor below mean "a fresh contact", and it is the
+        // only place a new contact's multiplier is seeded. (Removing the zeroing as "dead stores"
+        // measured 24 failing checks: the multiplier started at whatever the stack held.)
+        std::array<Contact, 8> newContacts = {};
+        int newNumContacts = collide(bodyA, bodyB, std::span<Contact>(newContacts), basis);
+
+        // Merge old contact data with new contacts.
+        for (int i = 0; i < newNumContacts; i++)
+        {
+            for (int j = 0; j < numContacts; j++)
+            {
+                if (newContacts[i].feature.key == contacts[j].feature.key)
+                {
+                    float3 newRA = newContacts[i].rA;
+                    float3 newRB = newContacts[i].rB;
+                    newContacts[i] = contacts[j];
+                    // Penetration depth, not |C0|: C0's normal component carries the collision
+                    // margin, so a resting contact would otherwise look like a constant error.
+                    prevErr[i] = std::max(0.0f, COLLISION_MARGIN - contacts[j].C0.x());
+
+                    // If no static friction in last frame, use the new contact point locations
+                    if (!contacts[j].stick)
+                    {
+                        newContacts[i].rA = newRA;
+                        newContacts[i].rB = newRB;
+                        newContacts[i].lambda = contacts[j].lambda;   // Keep lambda from prev frame
+                        newContacts[i].penalty = contacts[j].penalty; // Keep penalty from prev frame
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Copy new contacts to the manifold
+        numContacts = newNumContacts;
+        for (int i = 0; i < numContacts; i++)
+            contacts[i] = newContacts[i];
+
+        // The pose this set describes, for the next step's gate.
+        collideLinA = bodyA->positionLin;
+        collideLinB = bodyB->positionLin;
+        collideAngA = bodyA->positionAng;
+        collideAngB = bodyB->positionAng;
+    }
 
     // Compute error at q- and update penalty and lambdas
     for (int i = 0; i < numContacts; i++)

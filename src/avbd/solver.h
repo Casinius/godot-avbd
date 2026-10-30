@@ -217,6 +217,12 @@ struct Rigid
         resetRestWindow();
     }
 
+    // Stable identity, handed out by the solver on creation and recycled on destruction. It is what the
+    // broad phase's incremental pair set is keyed by: the body list is in creation order and shifts when
+    // a body is deleted, so an index into it cannot identify a pair across steps, and a pointer can but
+    // costs a cache miss per cached pair. Ids are small integers packed into one key.
+    int32_t id = -1;
+
     // Scratch-set membership, rewritten by Solver::selectUpdateBodies() and
     // Solver::updateSleepIslands() each step. These are handles into the solver's per-step arrays,
     // not state of the body: `updateSlot` is the index of this body in `Solver::updateOrder`
@@ -664,6 +670,10 @@ struct Manifold : Force
         uint8_t projectedRows = 0;
     };
     std::array<JacobianCache, 8> jacobianCache;
+    // The pose each body was in when this manifold's contacts were last generated, for the motion
+    // gate (SolverParams::Collision::motionGateLin/Ang).
+    float3 collideLinA, collideLinB;
+    quat collideAngA = quat::Identity(), collideAngB = quat::Identity();
     float3x3 rotACaptured = float3x3::Identity(); // body rotations at capture
     float3x3 rotBCaptured = float3x3::Identity();
     bool jacobiansCached = false;
@@ -800,6 +810,20 @@ struct SolverParams
         // ends early - remaining rounds would polish float noise at full price. 0 disables
         // the check (default: bit-identical iteration counts). Realistic value ~1e-5.
         float convergenceThreshold = 0.0f;
+
+        // Bodies below which the assembly phase (per-body block assembly, solve and apply) runs on one
+        // worker instead of being split across the region's participants. 0 always splits, and that is
+        // the measured default: the crossover sits far below the smallest scene that uses the region at
+        // all. With the threshold at 2000 the phase runs serially on 137 and 1654 bodies, and the substep
+        // goes 144 -> 485 us and 640 -> 4139 us at 8 threads - one worker carrying the whole phase while
+        // the others wait at its barrier. The knob is here because a machine that cannot run the
+        // participants (an oversubscribed host, a debugger) may still prefer it.
+        int parallelStampMinBodies = 0;
+
+        // Bodies below which the whole substep runs on the calling thread: no region, no participants,
+        // no barriers. This is the switch for making a small scene fully serial; it gates the same
+        // break-even the dispatch constants below were written for.
+        int parallelMinBodies = kMinBodiesPerDispatch;
 
         // Combine-pass relaxation for the block-Jacobi primal. Every body solves its full
         // block system against the iteration-start pose snapshot (Jacobi, not Gauss-Seidel),
@@ -941,6 +965,46 @@ struct SolverParams
         bool contacts = true;
     } projection;
 
+    // Collision detection, as the solver's own filter on top of it.
+    struct Collision
+    {
+        // Pose change (per body, since the last collision pass) under which a resting pair keeps its
+        // contact set instead of re-running the narrow phase. SAT plus manifold generation is ~300 ns
+        // per pair and a settled scene runs it on every pair every tick for nothing: the geometry has
+        // not moved. Below these thresholds the previous contacts are re-used as they are - their
+        // world positions and their constraint values are re-measured either way - and a pair that has
+        // drifted out of contact is excluded from the gate so the pass that notices separation still
+        // runs. 0 disables the gate (full SAT every tick).
+        // Measured on the settled Pyramid XL: at a threshold small enough to trust (<= 1 mm) the gate
+        // almost never fires and buys nothing; at 3 mm it saves 22% of the narrow phase but starts
+        // moving contact points that should have been regenerated. Off by default, on for a scene whose
+        // bodies genuinely stop moving.
+        float motionGateLin = 0.0f; // metres
+        float motionGateAng = 0.0f; // radians
+
+        // Incremental pair set: only re-query the bodies whose bounding box changed since the last
+        // broad phase, and carry the previous candidate pairs for the rest. A pair's boxes can only
+        // start overlapping when one of them moved, so a pair between two unchanged bodies that was
+        // not a candidate cannot have become one - and the moved bodies are queried with the union of
+        // their old and new boxes, which cannot miss what they swept through either. Off, every step
+        // runs the whole self-collision; a step where more than a quarter of the bodies moved falls
+        // back to it anyway, because per-body queries stop being the cheaper side.
+        bool incrementalPairs = true;
+
+        // Drift, in metres, that a body's bounding box may accumulate before the incremental pair set
+        // has to look at it again. The reference is the box the last query ran from - not the previous
+        // step's box - so a body creeping steadily is re-queried once per epsilon of travel instead of
+        // never: the distance a missed pair can be separated by is bounded by this, not by the sum of
+        // the steps it went unnoticed. It sits well under the collision margin (5 mm), so a pair it
+        // delays is a pair that is about to touch anyway. 0 disables the gate (every box change counts
+        // as movement, which on a resting pile is every body every step).
+        float incrementalPairEpsilon = 1.0e-3f;
+        // Fraction of the scene that may have moved before the incremental path gives up and runs the
+        // whole self-collision. Per-body queries cost about what a small subtree does, so the crossover
+        // is early; a quarter is measured, and 1.0 forces the incremental path for A/B runs.
+        float incrementalPairFraction = 0.25f;
+    } collision;
+
     // Idle detection: a movable body whose recent travel (see Rigid::sleepRefLin) stays under the
     // tolerances falls asleep - velocity zeroed, Godot semantics - once that has held for
     // `timeToSleep` seconds. 0 disables automatic sleeping, which is the default the core tests
@@ -1016,8 +1080,14 @@ struct Solver
         p.primal.stiffnessDecay = std::clamp(p.primal.stiffnessDecay, 0.0f, 1.0f);
         p.primal.jacobiRelaxation = std::clamp(p.primal.jacobiRelaxation, 0.0f, 1.0f);
         p.primal.jointRelaxation = std::clamp(p.primal.jointRelaxation, 0.0f, 1.0f);
+        p.primal.parallelStampMinBodies = std::max(p.primal.parallelStampMinBodies, 0);
+        p.primal.parallelMinBodies = std::max(p.primal.parallelMinBodies, 0);
         p.primal.jacobianRebuildDistance = std::max(p.primal.jacobianRebuildDistance, 0.0f);
         p.primal.chebyshevRho = std::max(p.primal.chebyshevRho, 0.0f);
+        p.collision.motionGateLin = std::max(p.collision.motionGateLin, 0.0f);
+        p.collision.motionGateAng = std::max(p.collision.motionGateAng, 0.0f);
+        p.collision.incrementalPairFraction = std::clamp(p.collision.incrementalPairFraction, 0.0f, 1.0f);
+        p.collision.incrementalPairEpsilon = std::max(p.collision.incrementalPairEpsilon, 0.0f);
         p.projection.rounds = std::clamp(p.projection.rounds, 0, 8);
         p.projection.scale = std::clamp(p.projection.scale, 0.0f, 1.0f);
         p.projection.maxCorrection = std::max(p.projection.maxCorrection, 0.0f);
@@ -1073,6 +1143,21 @@ struct Solver
         double pairQuery = 0.0;
         double bvhBuild = 0.0;
         double pairSearch = 0.0;
+        // How much of the pair search is the tree doing its job: node-pair tests issued, and how many
+        // survived into the candidate list. A test count that dwarfs the pair count is a tree problem
+        // (bad bounds, or a split that separates nothing); a pair count that dwarfs the manifold count
+        // is a filtering problem, which is the exact-filter's business instead.
+        double pairTests = 0.0;
+        double pairCandidates = 0.0;
+        // Bodies the broad phase re-queried, and how many there were to consider: the fraction is what
+        // decides between the incremental pair set and the whole self-collision.
+        double constrainedRebuilds = 0.0;
+        double movedBodies = 0.0;
+        double totalBodies = 0.0;
+        double incrementalSteps = 0.0; // steps whose pair set was built incrementally
+        // Collision detection inside initialize(), which is what the force warm-start phase spends
+        // its time on when a scene is resting.
+        double collide = 0.0;
         double manifoldCreate = 0.0;
         double forceInit = 0.0;
         double selectStage = 0.0;
@@ -1147,6 +1232,12 @@ struct Solver
     [[nodiscard]] int threadCount() const;
 
 private:
+    // Bodies take their stable id in the constructor and give it back in the destructor (Rigid::id), and
+    // both bodies and forces bump the structure generation that gates the broad phase's
+    // already-constrained set.
+    friend struct Rigid;
+    friend struct Force;
+
     // Every body in list order. The inertial/warmstart and BDF1 phases run over this,
     // because they also have to keep the cached state of static bodies current: contact
     // and joint code reads `initialLin`/`initialAng` of *both* bodies of a constraint, and
@@ -1158,6 +1249,68 @@ private:
     std::vector<Rigid *> bodiesInOrder;
     bvh::nodes::NodeStorage bvhNodes;
     std::vector<std::pair<int, int>> sweepPairs;
+    // Broad-phase scratch, reused every step: the body-index list the builder walks, the body pointer
+    // list it reads, and the (Morton code, body) sort buffer. They were three per-step allocations.
+    std::vector<int> broadIndices;
+    std::vector<const Rigid *> broadBodies;
+    std::vector<std::pair<uint64_t, int>> broadCoded;
+    // Bounding boxes of the last broad phase, per body id: the broad phase compares them to find the
+    // bodies that moved, and unions them with the current box to get the region a moved body has to
+    // query. Indexed by id, grown with it.
+    std::vector<float3> broadAabbMin;
+    std::vector<float3> broadAabbMax;
+    // Union of a moved body's current and previous box: the region it re-queries, which cannot miss
+    // anything it swept through between the two poses.
+    std::vector<float3> broadSweepMin;
+    std::vector<float3> broadSweepMax;
+    // This step's boxes, indexed by position in `bodiesInOrder` - which is the index the builder's leaf
+    // records, so it can take the boxes from here instead of walking the shapes again.
+    std::vector<float3> broadStepMin;
+    std::vector<float3> broadStepMax;
+    // This step's candidate pairs and the previous step's, as packed (min id, max id) keys.
+    std::vector<uint64_t> broadPairKeys;
+    // Every body pair that already carries a constraint, in the same key space as the candidates, rebuilt
+    // once per step from the force list. The broad phase re-finds every overlapping pair every tick and has
+    // to skip the ones that are already constrained; asking each candidate by walking one body's force
+    // list costs a pointer chase per constraint of that body, which on a settled pile (ten forces on each
+    // body, thousand-odd candidates) was most of the broad phase. One pass over the forces and a sorted
+    // merge answers the same question linearly.
+    std::vector<uint64_t> constrainedPairKeys;
+    // Pair-set assembly scratch: the carried-over candidates (already sorted), the ones derived this step,
+    // and the merged result. Sorting only the new keys and merging is what the broad phase's sort stage
+    // spends its time on.
+    // Bumped by every force and body creation and destruction. The broad phase's "already constrained"
+    // set is only rebuilt when this changes: in a settled scene the constraint topology stands still, so
+    // the per-step cost of that set collapses to one comparison instead of a pass over every force.
+    uint64_t structureGeneration = 1;
+    uint64_t constrainedPairGeneration = 0;
+    std::vector<uint64_t> newPairKeys;
+    std::vector<uint64_t> broadPairKeysCarried;
+    std::vector<uint64_t> broadPairMerged;
+    // Ping-pong buffers for the radix sorts (see radixSortPairKeys).
+    std::vector<uint64_t> pairSortScratch;
+    std::vector<uint64_t> constrainedSortScratch;
+    std::vector<uint64_t> broadPairCache;
+    std::vector<uint8_t> bodyMoved;
+    // id -> body, for turning a pair key back into the two bodies. A deleted body leaves a null.
+    std::vector<Rigid *> bodiesById;
+    std::vector<int32_t> freeBodyIds;
+    int32_t nextBodyId = 0;
+
+    // Stable body id, from the free list or the end of the id space. Called by the Rigid constructor.
+    int32_t acquireBodyId();
+    void releaseBodyId(int32_t id) noexcept;
+    static uint64_t packPairIds(int32_t a, int32_t b) noexcept
+    {
+        const uint32_t lo = static_cast<uint32_t>(a < b ? a : b);
+        const uint32_t hi = static_cast<uint32_t>(a < b ? b : a);
+        return (static_cast<uint64_t>(lo) << 32) | hi;
+    }
+    static void unpackPairIds(uint64_t key, int32_t &r_a, int32_t &r_b) noexcept
+    {
+        r_a = static_cast<int32_t>(key >> 32);
+        r_b = static_cast<int32_t>(key & 0xffffffffu);
+    }
 
     // Bodies that take part in the primal update (movable, awake ones), in list order.
     // The Jacobi primal solves one block system per body against the iteration-start

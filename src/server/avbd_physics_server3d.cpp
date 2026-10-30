@@ -65,6 +65,10 @@ struct StepProfile {
     double max_total_ns = 0.0;
     double max_solver_ns = 0.0;
     double max_sync_ns = 0.0;
+    // Bodies whose state callback was skipped because nothing changed, and how many there were to
+    // consider: the ratio is what a settled scene is saving.
+    uint64_t sync_skipped = 0;
+    uint64_t sync_bodies = 0;
     double max_contacts_ns = 0.0;
     double max_rebuild_ns = 0.0;
     double max_params_ns = 0.0;
@@ -235,7 +239,10 @@ void AVBDPhysicsServer3D::_flush_queries() {
             return array;
         }();
 
-        for (auto &[body_id, body] : bodies) {
+        size_t skipped = 0;
+        for (BodyData *body_ptr : flush_bodies) {
+            BodyData &body = *body_ptr;
+            const uint64_t body_id = body.server_id;
             if (body.rigid == nullptr) {
                 continue;
             }
@@ -251,10 +258,36 @@ void AVBDPhysicsServer3D::_flush_queries() {
             if (blend) {
                 shown = delivered_transform(body, *space);
             }
-            body_state->bind(this, body.rigid, make_rid(body_id), blend ? &shown : nullptr);
-            if (body.sync.is_valid()) {
-                one_arg[0] = body_state;
-                body.sync.callv(one_arg);
+            // Nothing has changed since the last delivery: the engine already holds this exact pose and
+            // velocity, so the callback (Variant marshalling per body per tick) has nothing to say. An
+            // interpolating space always differs, so it always delivers.
+            const avbd::Rigid &rigid = *body.rigid;
+            const bool unchanged = !blend && body.sync_cache_valid &&
+                    rigid.positionLin == body.sync_lin &&
+                    rigid.positionAng.coeffs() == body.sync_ang.coeffs() &&
+                    rigid.velocityLin == body.sync_vel_lin && rigid.velocityAng == body.sync_vel_ang;
+            if (body.sync.is_valid() && !unchanged) {
+                body_state->bind(this, body.rigid, make_rid(body_id), blend ? &shown : nullptr);
+                // `call` with the argument directly: `callv` needs a one-element Array, and building and
+                // marshalling that array per body per tick is part of what makes this loop cost hundreds of
+                // nanoseconds a body. The Variant wrapping the shared state object is built once per flush
+                // rather than once per body - it is the same object for every body of the loop.
+                static thread_local Variant state_arg;
+                if (state_arg.get_type() != Variant::OBJECT)
+                    state_arg = body_state;
+                // AVBD_SYNC_DRY leaves the state push out, so the profile can attribute the flush
+                // between this server's own bookkeeping (hash-map iteration over fat records) and the
+                // engine's callback.
+                static const bool sync_dry = std::getenv("AVBD_SYNC_DRY") != nullptr;
+                if (!sync_dry)
+                    body.sync.call(state_arg);
+                body.sync_lin = rigid.positionLin;
+                body.sync_ang = rigid.positionAng;
+                body.sync_vel_lin = rigid.velocityLin;
+                body.sync_vel_ang = rigid.velocityAng;
+                body.sync_cache_valid = true;
+            } else if (body.sync.is_valid()) {
+                ++skipped;
             }
             if (body.force_integration_callback.is_valid()) {
                 // Re-aim the shared instance at the solver's real pose: a script that reads the
@@ -276,6 +309,8 @@ void AVBDPhysicsServer3D::_flush_queries() {
             const double sync_elapsed = seconds_since(prof_t_sync);
             prof.sync_ns += sync_elapsed;
             prof.max_sync_ns = std::max(prof.max_sync_ns, sync_elapsed);
+            prof.sync_skipped += skipped;
+            prof.sync_bodies += bodies.size();
         }
     }
     flushing_queries = false;
@@ -353,6 +388,14 @@ void AVBDPhysicsServer3D::_free_rid(const RID &p_rid) {
         // query paths skip it instead of naming a record that is gone.
         if (body_found->second.rigid != nullptr) {
             body_found->second.rigid->host = nullptr;
+        }
+        // Swap-and-pop out of the dense flush list before the record goes: an erased record would leave
+        // the list pointing at freed storage.
+        BodyData &body = body_found->second;
+        if (body.flush_index < flush_bodies.size() && flush_bodies[body.flush_index] == &body) {
+            flush_bodies[body.flush_index] = flush_bodies.back();
+            flush_bodies[body.flush_index]->flush_index = body.flush_index;
+            flush_bodies.pop_back();
         }
         bodies.erase(body_found);
         return;
@@ -461,6 +504,10 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
             static_cast<float>(settings->get_setting("physics/avbd/jacobi_relaxation", 0.7));
     params.primal.jointRelaxation =
             static_cast<float>(settings->get_setting("physics/avbd/joint_relaxation", 0.5));
+    params.primal.parallelStampMinBodies =
+            static_cast<int>(settings->get_setting("physics/avbd/parallel_stamp_min_bodies", 0));
+    params.primal.parallelMinBodies =
+            static_cast<int>(settings->get_setting("physics/avbd/parallel_min_bodies", 48));
 
     // The position projection layer. Off by default here as well: it changes every delivered pose,
     // and the two halves of the constraint set buy different things with it - see the
@@ -1690,7 +1737,7 @@ void AVBDPhysicsServer3D::_step(float p_step) {
             std::fprintf(stdout,
                     "[avbd-profile] calls=%llu total=%.1fus max=%.1fus solver=%.1fus(max %.1fus) sync=%.1fus(max %.1fus) "
                     "contacts=%.1fus rebuild=%.1fus(max %.1fus x%u) params=%.1fus forces=%.1fus over2ms=%u "
-                    "threads=%d ticks/call=%d dropped=%llu iterations=%d\n",
+                    "threads=%d ticks/call=%d dropped=%llu iterations=%d syncskipped=%llu/%llu\n",
                     static_cast<unsigned long long>(prof.ticks), prof.total_ns * to_us,
                     prof.max_total_ns * to_us,
                     prof.solver_ns * to_us, prof.max_solver_ns * to_us,
@@ -1699,11 +1746,15 @@ void AVBDPhysicsServer3D::_step(float p_step) {
                     prof.rebuild_ns * to_us, prof.max_rebuild_ns * to_us, prof.rebuilds,
                     prof.params_ns * to_us, prof.forces_ns * to_us, prof.over_2ms_ticks,
                     prof.threads_used, prof.ticks_run,
-                    static_cast<unsigned long long>(prof.ticks_dropped), prof.iterations);
+                    static_cast<unsigned long long>(prof.ticks_dropped), prof.iterations,
+                    static_cast<unsigned long long>(prof.sync_skipped),
+                    static_cast<unsigned long long>(prof.sync_bodies));
             std::fflush(stdout);
             prof.ticks = 0;
             prof.ticks_run = 0;
             prof.ticks_dropped = 0;
+            prof.sync_skipped = 0;
+            prof.sync_bodies = 0;
             prof.total_ns = 0.0;
             prof.solver_ns = 0.0;
             prof.sync_ns = 0.0;
@@ -2117,8 +2168,12 @@ bool AVBDPhysicsServer3D::_generic_6dof_joint_get_flag(const RID &p_joint, Vecto
 
 RID AVBDPhysicsServer3D::_body_create() {
     const uint64_t id = next_id++;
-    bodies.emplace(std::piecewise_construct, std::forward_as_tuple(id), std::forward_as_tuple());
-    bodies.find(id)->second.server_id = id;
+    BodyData &body = bodies.emplace(std::piecewise_construct, std::forward_as_tuple(id),
+            std::forward_as_tuple())
+                             .first->second;
+    body.server_id = id;
+    body.flush_index = flush_bodies.size();
+    flush_bodies.push_back(&body);
     return make_rid(id);
 }
 

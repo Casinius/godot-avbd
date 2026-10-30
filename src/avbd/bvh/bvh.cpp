@@ -16,44 +16,6 @@
 namespace bvh::builder {
 
 // ============================================
-// Helper: Calculate bounding-sphere center and AABB for a body
-// ============================================
-static inline float3 computeAABBCenter(const avbd::Rigid* body) noexcept {
-    return body->positionLin;
-}
-static inline float computeAABBRadius(const avbd::Rigid* body) noexcept {
-    return body->radius;
-}
-// Tight world-space AABB of the oriented shape (AABB-of-OBB), not of its bounding
-// sphere. The sphere-based box fattened every body by up to ~2.7x per axis (a
-// 1 x 0.5 x 0.5 box carried a 1.4^3 bound), which in dense stacking scenes turned the
-// candidate list into near-all-pairs; the oriented extent is what actually bounds the
-// shape, so broad-phase pruning has something to prune.
-static inline void computeAABB(const avbd::Rigid* body, float3& min, float3& max) noexcept {
-    float3 half;
-    switch (body->shape) {
-        case avbd::ShapeType::Sphere:
-            half = float3{body->radius, body->radius, body->radius};
-            break;
-        case avbd::ShapeType::Cylinder:
-            // Local half extents: radius in x/z, half height along the local Z axis.
-            half = float3{body->size.x(), body->size.z() * 0.5f, body->size.x()};
-            break;
-        case avbd::ShapeType::Box:
-        default:
-            half = body->size * 0.5f;
-            break;
-    }
-    const float3x3 rot(body->positionAng);
-    const float3 wx{
-        std::abs(rot(0, 0)) * half.x() + std::abs(rot(0, 1)) * half.y() + std::abs(rot(0, 2)) * half.z(),
-        std::abs(rot(1, 0)) * half.x() + std::abs(rot(1, 1)) * half.y() + std::abs(rot(1, 2)) * half.z(),
-        std::abs(rot(2, 0)) * half.x() + std::abs(rot(2, 1)) * half.y() + std::abs(rot(2, 2)) * half.z()};
-    min = body->positionLin - wx;
-    max = body->positionLin + wx;
-}
-
-// ============================================
 // Morton LBVH Builder: implicit heap layout, balanced by construction
 // ============================================
 //
@@ -104,9 +66,10 @@ int Builder::buildLBVH()
 
     // Morton codes per body index, then sort body indices by code. The builder's index
     // contract is "bodyIndices_[k] selects bodies_[k]"; the leaf records that value so a
-    // caller passing a filtered or reordered subset maps back to the right bodies.
-    std::vector<std::pair<uint64_t, int>> coded;
-    coded.reserve(n);
+    // caller passing a filtered or reordered subset maps back to the right bodies. The buffer is the
+    // caller's, reused across steps.
+    std::vector<std::pair<uint64_t, int>>& coded = coded_;
+    coded.clear();
     for (int i = 0; i < n; ++i) {
         const int bodyIndex = bodyIndices_[i];
         const float3 c = bodies_[bodyIndex]->positionLin;
@@ -127,9 +90,10 @@ int Builder::buildLBVH()
     float3 allMin = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
     float3 allMax = {std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
     for (int i = 0; i < n; ++i) {
-        const avbd::Rigid *body = bodies_[coded[i].second];
-        float3 mn, mx;
-        computeAABB(body, mn, mx);
+        // The caller's boxes, indexed by the same body index the leaf records.
+        const size_t bodySlot = static_cast<size_t>(coded[i].second);
+        const float3 mn = aabbMin_[bodySlot];
+        const float3 mx = aabbMax_[bodySlot];
         nodes_.setImplicitLeaf(padded - 1 + i, mn, mx, coded[i].second);
         allMin = rmin(allMin, mn);
         allMax = rmax(allMax, mx);
@@ -138,10 +102,10 @@ int Builder::buildLBVH()
     // Aggregate internal nodes bottom-up, right-to-left so children always exist first.
     for (int slot = padded - 2; slot >= 0; --slot) {
         const int l = 2 * slot + 1, r = 2 * slot + 2;
-        const float3 lmn = l < padded * 2 - 1 ? nodes_.boundsMin()[l] : allMin;
-        const float3 lmx = l < padded * 2 - 1 ? nodes_.boundsMax()[l] : allMax;
-        const float3 rmn = r < padded * 2 - 1 ? nodes_.boundsMin()[r] : allMin;
-        const float3 rmx = r < padded * 2 - 1 ? nodes_.boundsMax()[r] : allMax;
+        const float3 lmn = l < padded * 2 - 1 ? nodes_.boundsMin(l) : allMin;
+        const float3 lmx = l < padded * 2 - 1 ? nodes_.boundsMax(l) : allMax;
+        const float3 rmn = r < padded * 2 - 1 ? nodes_.boundsMin(r) : allMin;
+        const float3 rmx = r < padded * 2 - 1 ? nodes_.boundsMax(r) : allMax;
         // Empty child slots (beyond n) carry max/lowest bounds; skip them in the union
         // so a mostly-empty tree does not poison its ancestors with inverted boxes.
         float3 mn, mx;

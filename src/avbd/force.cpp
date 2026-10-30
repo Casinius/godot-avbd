@@ -20,6 +20,8 @@ Force::Force(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, ForceKind p_kind)
     // Add to the solver's linked list
     next = p_solver->forces;
     p_solver->forces = this;
+    // The constraint topology changed: the broad phase's cached "already constrained" set is stale.
+    ++p_solver->structureGeneration;
 
     // Add to body linked lists
     if (p_bodyA)
@@ -37,6 +39,9 @@ Force::Force(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, ForceKind p_kind)
 
 Force::~Force()
 {
+    // The constraint topology changed (see the constructor).
+    ++solver->structureGeneration;
+
     // Remove from solver linked list
     Force** p = &solver->forces;
     while (*p != this)

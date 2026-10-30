@@ -37,6 +37,18 @@ Rigid::Rigid(Solver *p_solver, float3 p_size, ShapeType p_shape, float p_density
     next = p_solver->bodies;
     p_solver->bodies = this;
 
+    // Stable identity for the broad phase's incremental pair set (see Rigid::id).
+    id = p_solver->acquireBodyId();
+    // A new body id can appear in a cached pair key, so the broad phase's constrained-pair cache is stale.
+    ++p_solver->structureGeneration;
+
+    // The derived pose state starts consistent with the spawn pose: the broad phase refreshes it at the
+    // top of every step, but a caller that reads a body outside a step (a space query, a test comparing
+    // the collision entry points) must not see uninitialised memory here.
+    rot = float3x3(positionAng);
+    dqLin = float3{0, 0, 0};
+    dqAng = float3{0, 0, 0};
+
     // Mass properties and bounding radius, per shape. The caller sets `shape` before this
     // runs, so switch on it here rather than on a separate "set shape" call afterwards.
     switch (shape)
@@ -86,6 +98,9 @@ Rigid::~Rigid()
     while (*p != this)
         p = &(*p)->next;
     *p = next;
+
+    ++solver->structureGeneration;
+    solver->releaseBodyId(id);
 }
 
 bool Rigid::constrainedTo(Rigid* other) const

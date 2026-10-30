@@ -79,6 +79,22 @@ inline OBB makeOBB(const Shape& shape)
     return box;
 }
 
+// The same box, with the body's rotation supplied as a matrix. The solver already has one per body
+// (Rigid::rot, refreshed wherever a pose changes), so the box-box path takes it instead of converting
+// the quaternion once here and then three more times for the axes - four quaternion rotations per body
+// per pair, on a path that runs once per candidate pair per tick.
+inline OBB makeOBB(const Shape& shape, const float3x3& rotation)
+{
+    OBB box{};
+    box.center = shape.center;
+    box.rotation = shape.rotation;
+    box.half = shape.half;
+    box.axis[0] = rotation.col(0);
+    box.axis[1] = rotation.col(1);
+    box.axis[2] = rotation.col(2);
+    return box;
+}
+
 inline float absDot(float3 a, float3 b)
 {
     return std::fabs(a.dot(b));
@@ -514,7 +530,10 @@ inline Shape makeShape(const Rigid* body)
     shape.half = body->size * 0.5f;
     shape.radius = body->size.x();
     shape.halfHeight = body->size.z() * 0.5f;
-    shape.axis = body->positionAng * float3{0, 0, 1};
+    // Only the cylinder paths read `axis`, and they are the ones that need the local +Z in world space.
+    // Rotating it for a box would be a quaternion rotation per body per pair whose result is never used.
+    if (shape.type == ShapeType::Cylinder)
+        shape.axis = body->positionAng * float3{0, 0, 1};
     return shape;
 }
 
@@ -905,6 +924,10 @@ inline int collideCylinderCylinder(const Shape& a, const Shape& b,
 }
 } // namespace
 
+// The box-box SAT and manifold generation, shared by the quaternion entry point and the matrix one.
+static int collideBoxBox(const Shape& a, const Shape& b, OBB boxA, OBB boxB,
+                         std::span<Manifold::Contact> contacts, float3x3& basisOut);
+
 int collideShapes(const Shape& a, const Shape& b,
                   std::span<Manifold::Contact> contacts,
                   float3x3& basisOut)
@@ -935,8 +958,24 @@ int collideShapes(const Shape& a, const Shape& b,
         return collideCylinderBox(a, b, cylinderIsA, contacts, basisOut);
     }
 
-    OBB boxA = makeOBB(a);
-    OBB boxB = makeOBB(b);
+    return collideBoxBox(a, b, makeOBB(a), makeOBB(b), contacts, basisOut);
+}
+
+int collideShapes(const Shape& a, const float3x3& rotA, const Shape& b, const float3x3& rotB,
+                  std::span<Manifold::Contact> contacts,
+                  float3x3& basisOut)
+{
+    // The solver's path: it has both bodies' rotation matrices already, so the box-box SAT (the one
+    // that runs in a stacking scene) does not pay for converting them again. Every other shape pair
+    // keeps the quaternion route, where the conjugate multiplications are the natural form.
+    if (a.type == ShapeType::Box && b.type == ShapeType::Box)
+        return collideBoxBox(a, b, makeOBB(a, rotA), makeOBB(b, rotB), contacts, basisOut);
+    return collideShapes(a, b, contacts, basisOut);
+}
+
+static int collideBoxBox(const Shape& a, const Shape& b, OBB boxA, OBB boxB,
+                         std::span<Manifold::Contact> contacts, float3x3& basisOut)
+{
     float3 delta = boxB.center - boxA.center;
 
     // Frame table for the specialised SAT axes: m[i][j] = axisA_i·axisB_j, plus delta
@@ -1005,8 +1044,10 @@ int Manifold::collide(Rigid* bodyA, Rigid* bodyB,
                       std::span<Manifold::Contact> contacts,
                       float3x3& basisOut)
 {
-    // Thin wrapper: flatten both bodies into shape queries and reuse the solver-free path.
-    return collideShapes(makeShape(bodyA), makeShape(bodyB), contacts, basisOut);
+    // Thin wrapper: flatten both bodies into shape queries and reuse the solver-free path, handing it
+    // the rotation matrices the solver maintains per body (Rigid::rot) so the narrow phase does not
+    // derive them again.
+    return collideShapes(makeShape(bodyA), bodyA->rot, makeShape(bodyB), bodyB->rot, contacts, basisOut);
 }
 
 } // namespace avbd

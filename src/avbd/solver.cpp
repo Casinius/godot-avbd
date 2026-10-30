@@ -10,6 +10,7 @@
  */
 
 #include <cmath>
+#include <limits>
 #include <algorithm>
 #include <numeric>
 #include <span>
@@ -104,6 +105,13 @@ void Solver::StepProfile::reset() noexcept
     pairQuery = 0.0;
     bvhBuild = 0.0;
     pairSearch = 0.0;
+    pairTests = 0.0;
+    pairCandidates = 0.0;
+    constrainedRebuilds = 0.0;
+    movedBodies = 0.0;
+    totalBodies = 0.0;
+    incrementalSteps = 0.0;
+    collide = 0.0;
     manifoldCreate = 0.0;
     forceInit = 0.0;
     selectStage = 0.0;
@@ -213,8 +221,8 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
         // whole subtrees; pruning by the current best hit keeps the query output-
         // sensitive. The exact per-body test above decides at the leaves.
         const auto rayOverNode = [&](int slot, float &r_tEnter) {
-            const float3 &bmin = bvhNodes.boundsMin()[slot];
-            const float3 &bmax = bvhNodes.boundsMax()[slot];
+            const float3 &bmin = bvhNodes.boundsMin(slot);
+            const float3 &bmax = bvhNodes.boundsMax(slot);
             float tEnter = 0.0f;
             float tExit = bestT; // prune against the closest hit so far
             for (int i = 0; i < 3; ++i)
@@ -262,7 +270,7 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
                 stack.push(2 * slot + 2);
                 continue;
             }
-            const int bodyIndex = bvhNodes.bodyIndex()[slot];
+            const int bodyIndex = bvhNodes.bodyIndex(slot);
             if (bodyIndex < 0)
                 continue;
             testBody(bodiesInOrder[bodyIndex]);
@@ -317,8 +325,8 @@ void Solver::collectAABB(float3 min, float3 max, uint32_t p_mask, std::vector<Ri
     }
 
     const auto overlaps = [&](int slot) {
-        const float3 &bmin = bvhNodes.boundsMin()[slot];
-        const float3 &bmax = bvhNodes.boundsMax()[slot];
+        const float3 &bmin = bvhNodes.boundsMin(slot);
+        const float3 &bmax = bvhNodes.boundsMax(slot);
         return !(bmin.x() > max.x() || bmin.y() > max.y() || bmin.z() > max.z() ||
                 min.x() > bmax.x() || min.y() > bmax.y() || min.z() > bmax.z());
     };
@@ -336,7 +344,7 @@ void Solver::collectAABB(float3 min, float3 max, uint32_t p_mask, std::vector<Ri
             stack.push(2 * slot + 2);
             continue;
         }
-        const int bodyIndex = bvhNodes.bodyIndex()[slot];
+        const int bodyIndex = bvhNodes.bodyIndex(slot);
         if (bodyIndex < 0)
             continue;
         Rigid *body = bodiesInOrder[bodyIndex];
@@ -395,7 +403,11 @@ void Solver::step()
 
 // A broad-phase candidate test: bounding spheres plus Godot's layer/mask pair rule,
 // minus pairs already joined by a force (IgnoreCollision, joints).
-static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
+// The cheap exact filter: bounding spheres and Godot's layer/mask rule. Whether the pair is already
+// constrained is a separate question, answered once per step for all candidates together (see
+// Solver::constrainedPairKeys) - walking a body's force list per candidate is what made a settled pile's
+// broad phase expensive.
+static bool pairOverlaps(const Rigid *bodyA, const Rigid *bodyB)
 {
     const float3 dp = bodyA->positionLin - bodyB->positionLin;
     const float reach = bodyA->radius + bodyB->radius;
@@ -403,7 +415,126 @@ static bool pairOverlaps(Rigid *bodyA, Rigid *bodyB)
     // mask (defaults 1/1 keep every pair, as before these fields existed).
     const bool layersAllow = ((bodyA->collisionLayer & bodyB->collisionMask) != 0) ||
             ((bodyB->collisionLayer & bodyA->collisionMask) != 0);
-    return dp.squaredNorm() <= reach * reach && layersAllow && !bodyA->constrainedTo(bodyB);
+    return dp.squaredNorm() <= reach * reach && layersAllow;
+}
+
+// LSD radix sort for the broad phase's pair keys. A key is (smaller body id in the high 32 bits, larger
+// in the low 32), so the bytes that can be nonzero are the low few of each half: ids are dense, which
+// makes those passes a handful of linear passes over a few thousand keys. The comparison sort this
+// replaces spent ~200 us a step on the constrained set alone. Stable, so the result is deterministic.
+static void radixSortPairKeys(std::vector<uint64_t> &r_keys, std::vector<uint64_t> &scratch,
+        uint32_t maxId) noexcept
+{
+    const size_t count = r_keys.size();
+    if (count < 2)
+        return;
+
+    uint32_t significantBytes = 4;
+    if (maxId < (1u << 8))
+        significantBytes = 1;
+    else if (maxId < (1u << 16))
+        significantBytes = 2;
+    else if (maxId < (1u << 24))
+        significantBytes = 3;
+
+    scratch.resize(count);
+    std::vector<uint64_t> *source = &r_keys;
+    std::vector<uint64_t> *target = &scratch;
+    for (uint32_t half = 0; half < 2; ++half)
+    {
+        for (uint32_t byte = 0; byte < significantBytes; ++byte)
+        {
+            const uint32_t shift = half * 32 + byte * 8;
+            size_t bucketCount[256] = {};
+            for (size_t i = 0; i < count; ++i)
+                ++bucketCount[(*source)[i] >> shift & 0xffu];
+            size_t offset[256];
+            size_t running = 0;
+            for (size_t b = 0; b < 256; ++b)
+            {
+                offset[b] = running;
+                running += bucketCount[b];
+            }
+            for (size_t i = 0; i < count; ++i)
+                (*target)[offset[(*source)[i] >> shift & 0xffu]++] = (*source)[i];
+            std::swap(source, target);
+        }
+    }
+    if (source != &r_keys)
+        r_keys.swap(scratch);
+}
+
+// Stable body ids for the broad phase's incremental pair set (see Rigid::id). Handed out on creation
+// and recycled on destruction, so the id space stays dense even in a scene that streams bodies.
+int32_t Solver::acquireBodyId()
+{
+    int32_t id;
+    if (!freeBodyIds.empty())
+    {
+        id = freeBodyIds.back();
+        freeBodyIds.pop_back();
+    }
+    else
+    {
+        id = nextBodyId++;
+        bodiesById.resize(static_cast<size_t>(nextBodyId), nullptr);
+        // An invalid sentinel box, so a fresh body's first comparison says "moved" whatever the epsilon
+        // is (and a NaN never reads as "unmoved").
+        constexpr float inf = std::numeric_limits<float>::infinity();
+        broadAabbMin.resize(static_cast<size_t>(nextBodyId), float3{inf, inf, inf});
+        broadAabbMax.resize(static_cast<size_t>(nextBodyId), float3{-inf, -inf, -inf});
+        broadSweepMin.resize(static_cast<size_t>(nextBodyId));
+        broadSweepMax.resize(static_cast<size_t>(nextBodyId));
+        bodyMoved.resize(static_cast<size_t>(nextBodyId), 0);
+    }
+    bodiesById[static_cast<size_t>(id)] = nullptr; // the caller links it once it is constructed
+    // A recycled id must not inherit the previous body's broad-phase reference, or the drift test would
+    // measure the new body's box against a stranger's and could call an unchanged one "moved" - or, worse,
+    // a moved one "settled" and never query it. The invalid sentinel forces the first comparison to say
+    // "moved".
+    constexpr float inf = std::numeric_limits<float>::infinity();
+    broadAabbMin[static_cast<size_t>(id)] = float3{inf, inf, inf};
+    broadAabbMax[static_cast<size_t>(id)] = float3{-inf, -inf, -inf};
+    bodyMoved[static_cast<size_t>(id)] = 1;
+    return id;
+}
+
+void Solver::releaseBodyId(int32_t id) noexcept
+{
+    if (id < 0 || static_cast<size_t>(id) >= bodiesById.size())
+        return;
+    bodiesById[static_cast<size_t>(id)] = nullptr;
+    freeBodyIds.push_back(id);
+}
+
+// Tight world-space AABB of a body's shape at its current pose. The broad phase needs it for the tree,
+// for the motion test and for the region a moved body has to re-query, and the builder takes it from
+// here rather than walking the shapes again.
+static inline void bodyAabb(Rigid &body, float3 &r_min, float3 &r_max) noexcept
+{
+    float3 half;
+    switch (body.shape)
+    {
+        case ShapeType::Sphere:
+            half = float3{body.radius, body.radius, body.radius};
+            break;
+        case ShapeType::Cylinder:
+            half = float3{body.size.x(), body.size.z() * 0.5f, body.size.x()};
+            break;
+        case ShapeType::Box:
+        default:
+            half = body.size * 0.5f;
+            break;
+    }
+    // The rotation is the body's cached one: the broad phase refreshes it from the pose just before
+    // this call, and the narrow phase reads the same value later in the step.
+    const float3x3 &rot = body.rot;
+    const float3 wx{
+            std::abs(rot(0, 0)) * half.x() + std::abs(rot(0, 1)) * half.y() + std::abs(rot(0, 2)) * half.z(),
+            std::abs(rot(1, 0)) * half.x() + std::abs(rot(1, 1)) * half.y() + std::abs(rot(1, 2)) * half.z(),
+            std::abs(rot(2, 0)) * half.x() + std::abs(rot(2, 1)) * half.y() + std::abs(rot(2, 2)) * half.z()};
+    r_min = body.positionLin - wx;
+    r_max = body.positionLin + wx;
 }
 
 // Contact detection: Morton LBVH (implicit heap layout), rebuilt every step.
@@ -430,16 +561,60 @@ void Solver::broadPhase()
 #ifdef AVBD_PROFILE
     const auto pairStart = std::chrono::steady_clock::now();
 #endif
-    std::vector<int> indices(count);
+    broadIndices.resize(static_cast<size_t>(count));
+    broadBodies.resize(static_cast<size_t>(count));
+    broadStepMin.resize(static_cast<size_t>(count));
+    broadStepMax.resize(static_cast<size_t>(count));
+    // Boxes, and which bodies moved since the last broad phase. A body's box is compared bit for bit:
+    // an unchanged box means every overlap this body has is one it had last step, which is what lets the
+    // previous candidate set stand for it. `broadMin/broadMax` is the box as of the last step; the union
+    // of the two is the region a moved body has to re-query, so nothing it swept through is missed.
+    int movedCount = 0;
     for (int i = 0; i < count; ++i)
-        indices[i] = i;
+    {
+        Rigid *body = bodiesInOrder[static_cast<size_t>(i)];
+        broadIndices[static_cast<size_t>(i)] = i;
+        broadBodies[static_cast<size_t>(i)] = body;
 
-    std::vector<const Rigid *> bodiesPtr;
-    bodiesPtr.reserve(count);
-    for (Rigid *b : bodiesInOrder)
-        bodiesPtr.push_back(b);
+        // Rotation first: the box needs it, the narrow phase reads it later in this same step, and a
+        // body's pose is final from here until the warm start predicts the next one.
+        body->rot = float3x3(body->positionAng);
+        float3 mn, mx;
+        bodyAabb(*body, mn, mx);
+        broadStepMin[static_cast<size_t>(i)] = mn;
+        broadStepMax[static_cast<size_t>(i)] = mx;
+        const size_t id = static_cast<size_t>(body->id);
+        bodiesById[id] = body;
+        // Movement, measured against the box the last *query* ran from. Keeping that reference until
+        // the drift exceeds the epsilon is what bounds what a missed pair can be: the box the carried-over
+        // pairs were found with is never more than epsilon away from the live one, so a pair that closes
+        // within the epsilon is looked at again within one epsilon of travel. Updating the reference every
+        // step instead would let a slow body drift arbitrarily far without ever being re-queried.
+        const float3 refMin = broadAabbMin[id];
+        const float3 refMax = broadAabbMax[id];
+        const float drift = std::max((mn - refMin).cwiseAbs().maxCoeff(), (mx - refMax).cwiseAbs().maxCoeff());
+        const bool moved = !(drift <= params.collision.incrementalPairEpsilon);
+        if (moved)
+        {
+            ++movedCount;
+            bodyMoved[id] = 1;
+            // The query covers where the body is and where its previous box was, so nothing it swept
+            // through since the last look can be missed.
+            broadSweepMin[id] = float3{std::min(mn.x(), refMin.x()), std::min(mn.y(), refMin.y()),
+                    std::min(mn.z(), refMin.z())};
+            broadSweepMax[id] = float3{std::max(mx.x(), refMax.x()), std::max(mx.y(), refMax.y()),
+                    std::max(mx.z(), refMax.z())};
+            broadAabbMin[id] = mn;
+            broadAabbMax[id] = mx;
+        }
+        else
+        {
+            bodyMoved[id] = 0;
+        }
+    }
 
-    bvh::builder::Builder builder(bvhNodes, indices, bodiesPtr);
+    bvh::builder::Builder builder(bvhNodes, broadIndices, broadBodies, broadStepMin, broadStepMax,
+            broadCoded);
     const int leafCount = builder.buildLBVH();
 #ifdef AVBD_PROFILE
     const auto afterBuild = std::chrono::steady_clock::now();
@@ -464,23 +639,30 @@ void Solver::broadPhase()
     // and pruned before their uninitialized bounds are read. The body-index minmax and
     // the final sort keep the (min-index, other) manifold order.
     sweepPairs.clear();
-    const auto boundsOverlap = [&](int sa, int sb) {
-        const float3 &aMin = bvhNodes.boundsMin()[sa];
-        const float3 &aMax = bvhNodes.boundsMax()[sa];
-        const float3 &bMin = bvhNodes.boundsMin()[sb];
-        const float3 &bMax = bvhNodes.boundsMax()[sb];
-        // Same touching-counts-as-overlapping semantics as the old pairwise sweep.
-        return !(bMin.x() > aMax.x() || bMin.y() > aMax.y() || bMin.z() > aMax.z() ||
-                aMin.x() > bMax.x() || aMin.y() > bMax.y() || aMin.z() > bMax.z());
-    };
+#ifdef AVBD_PROFILE
+    long long pairTests = 0;
+#endif
+    // The nodes are packed (bounds and liveness in one record), so a test is one line per node rather
+    // than three parallel-array reads, and the empty-subtree case - the right tail when the leaf count
+    // is not a power of two - is answered by the same six compares instead of a fourth array.
+    const std::span<const bvh::nodes::Node> nodes = bvhNodes.nodes();
     const auto collideSubtrees = [&](auto &&self, int sa, int sb) -> void {
-        if (!bvhNodes.valid(sa) || !bvhNodes.valid(sb) || !boundsOverlap(sa, sb))
+        const bvh::nodes::Node &na = nodes[sa];
+        const bvh::nodes::Node &nb = nodes[sb];
+#ifdef AVBD_PROFILE
+        ++pairTests;
+#endif
+        if (!na.valid() || !nb.valid())
+            return;
+        // Touching counts as overlapping, as it did in the pairwise sweep this replaced.
+        if (nb.min.x() > na.max.x() || nb.min.y() > na.max.y() || nb.min.z() > na.max.z() ||
+                na.min.x() > nb.max.x() || na.min.y() > nb.max.y() || na.min.z() > nb.max.z())
             return;
         const bool aLeaf = sa >= firstLeaf;
         const bool bLeaf = sb >= firstLeaf;
         if (aLeaf && bLeaf)
         {
-            sweepPairs.emplace_back(std::minmax(bvhNodes.bodyIndex()[sa], bvhNodes.bodyIndex()[sb]));
+            sweepPairs.emplace_back(std::minmax(bvhNodes.bodyIndex(sa), bvhNodes.bodyIndex(sb)));
             return;
         }
         if (!aLeaf)
@@ -494,6 +676,10 @@ void Solver::broadPhase()
             self(self, sa, 2 * sb + 2);
         }
     };
+    // Self-collision: test the two children of every internal node once. Each internal-node pair is
+    // tested exactly once, which is what makes this the cheap shape - the alternative (walk each leaf up
+    // to the root and collide it with each ancestor's sibling) re-tests the same subtree once per
+    // ancestor level and measured 2x the node tests for the same pair set on a dense pile.
     const auto selfTraverse = [&](auto &&self, int slot) -> void {
         if (slot >= firstLeaf)
             return;
@@ -503,22 +689,168 @@ void Solver::broadPhase()
         self(self, l);
         self(self, r);
     };
-    selfTraverse(selfTraverse, 0);
+    // The pair set, incremental when most of the scene stood still.
+    //
+    // A pair's boxes can only start overlapping when one of the pair moved, so a pair between two
+    // unchanged bodies that was not a candidate last step cannot have become one - those candidates
+    // simply carry over. Every pair involving a body that moved is re-derived by querying that body's
+    // swept box against the tree, which covers both where it was and where it is. Above a quarter of the
+    // scene moving, the per-body queries stop being the cheaper side and the whole self-collision runs
+    // instead, which is also what the first step does (there is nothing to carry over yet).
+    broadPairKeys.clear();
+    newPairKeys.clear();
+    const float movedFraction =
+            count > 0 ? static_cast<float>(movedCount) / static_cast<float>(count) : 1.0f;
+    const bool incremental = params.collision.incrementalPairs && !broadPairCache.empty() &&
+            movedFraction <= params.collision.incrementalPairFraction;
+    broadPairKeysCarried.clear();
+    if (incremental)
+    {
+        for (uint64_t key : broadPairCache)
+        {
+            int32_t ia, ib;
+            unpackPairIds(key, ia, ib);
+            const size_t ida = static_cast<size_t>(ia);
+            const size_t idb = static_cast<size_t>(ib);
+            if (ida >= bodiesById.size() || idb >= bodiesById.size())
+                continue;
+            if (bodiesById[ida] == nullptr || bodiesById[idb] == nullptr)
+                continue; // one of them has been deleted
+            if (bodyMoved[ida] != 0 || bodyMoved[idb] != 0)
+                continue; // re-derived below
+            broadPairKeysCarried.push_back(key);
+        }
+#ifdef AVBD_PROFILE
+        ++profileData.incrementalSteps;
+#endif
+        // One query per moved body: descend the tree with its swept box and emit every leaf whose box
+        // overlaps. Leaf slots are the only place a body index is worth reading, so this reads one per
+        // emitted pair rather than one per test.
+        const auto queryBody = [&](auto &&self, int slot, const float3 &qmin, const float3 &qmax,
+                                           int32_t queryId) -> void {
+            const bvh::nodes::Node &node = nodes[slot];
+#ifdef AVBD_PROFILE
+            ++pairTests;
+#endif
+            if (!node.valid())
+                return;
+            if (qmin.x() > node.max.x() || qmin.y() > node.max.y() || qmin.z() > node.max.z() ||
+                    node.min.x() > qmax.x() || node.min.y() > qmax.y() || node.min.z() > qmax.z())
+                return;
+            if (slot >= firstLeaf)
+            {
+                Rigid *other = bodiesInOrder[static_cast<size_t>(bvhNodes.bodyIndex(slot))];
+                newPairKeys.push_back(packPairIds(queryId, other->id));
+                return;
+            }
+            self(self, 2 * slot + 1, qmin, qmax, queryId);
+            self(self, 2 * slot + 2, qmin, qmax, queryId);
+        };
+        for (Rigid *body : bodiesInOrder)
+        {
+            if (bodyMoved[static_cast<size_t>(body->id)] == 0)
+                continue;
+            queryBody(queryBody, 0, broadSweepMin[static_cast<size_t>(body->id)],
+                    broadSweepMax[static_cast<size_t>(body->id)], body->id);
+        }
+    }
+    else
+    {
+        selfTraverse(selfTraverse, 0);
+        newPairKeys.reserve(sweepPairs.size());
+        for (const auto &[i, j] : sweepPairs)
+            newPairKeys.push_back(packPairIds(bodiesInOrder[static_cast<size_t>(i)]->id,
+                    bodiesInOrder[static_cast<size_t>(j)]->id));
+    }
+
 #ifdef AVBD_PROFILE
     const auto afterTraverse = std::chrono::steady_clock::now();
     profileData.pairSearch += std::chrono::duration<double>(afterTraverse - afterBuild).count();
 #endif
 
-    std::sort(sweepPairs.begin(), sweepPairs.end());
-    sweepPairs.erase(std::unique(sweepPairs.begin(), sweepPairs.end()), sweepPairs.end());
+    // Only the newly derived keys need sorting: the carried-over ones are the previous step's list, which
+    // was already in order and was only filtered. Sorting the whole set meant a comparison sort of several
+    // thousand 64-bit keys every step (~170 us on a settled pile) where the new keys are a few hundred and
+    // the two lists merge in one linear pass. The merge deduplicates as it goes, which is what `unique`
+    // was for.
+    radixSortPairKeys(newPairKeys, pairSortScratch, static_cast<uint32_t>(bodiesById.size()));
+    broadPairKeys.swap(broadPairKeysCarried); // broadPairKeys now holds the carried list, in order
+    broadPairMerged.clear();
+    broadPairMerged.reserve(broadPairKeys.size() + newPairKeys.size());
+    {
+        size_t carried = 0;
+        size_t fresh = 0;
+        while (carried < broadPairKeys.size() && fresh < newPairKeys.size())
+        {
+            const uint64_t a = broadPairKeys[carried];
+            const uint64_t b = newPairKeys[fresh];
+            if (a < b)
+            {
+                broadPairMerged.push_back(a);
+                ++carried;
+            }
+            else
+            {
+                if (a == b)
+                    ++carried; // the same pair from both lists: emit once
+                broadPairMerged.push_back(b);
+                ++fresh;
+            }
+        }
+        for (; carried < broadPairKeys.size(); ++carried)
+            broadPairMerged.push_back(broadPairKeys[carried]);
+        for (; fresh < newPairKeys.size(); ++fresh)
+            broadPairMerged.push_back(newPairKeys[fresh]);
+    }
+    broadPairKeys.swap(broadPairMerged);
+    broadPairCache = broadPairKeys;
 #ifdef AVBD_PROFILE
+    profileData.pairTests += static_cast<double>(pairTests);
+    profileData.pairCandidates += static_cast<double>(broadPairKeys.size());
+    profileData.movedBodies += static_cast<double>(movedCount);
+    profileData.totalBodies += static_cast<double>(count);
     const auto afterPairs = std::chrono::steady_clock::now();
     profileData.pairQuery += std::chrono::duration<double>(afterPairs - pairStart).count();
 #endif
-    for (const auto &[i, j] : sweepPairs)
+    // Pairs that already carry a constraint (a manifold, a joint, an ignore pair), in one sorted list:
+    // the candidates come sorted by the same key, so the creation loop is a merge and each candidate costs
+    // a comparison instead of a walk over a body's force list.
+    // Rebuilt only when a force or body has been created or destroyed since the last time. On a settled
+    // scene that is nothing, so the set costs a comparison per step instead of a pass over every force
+    // plus a sort of the result - which was the largest single item left in the broad phase.
+    if (constrainedPairGeneration != structureGeneration)
     {
-        Rigid *bodyA = bodiesInOrder[i];
-        Rigid *bodyB = bodiesInOrder[j];
+        constrainedPairKeys.clear();
+        for (const Force *f = forces; f != nullptr; f = f->next)
+        {
+            if (f->bodyA == nullptr || f->bodyB == nullptr)
+                continue;
+            constrainedPairKeys.push_back(packPairIds(f->bodyA->id, f->bodyB->id));
+        }
+        radixSortPairKeys(constrainedPairKeys, constrainedSortScratch,
+                static_cast<uint32_t>(bodiesById.size()));
+        constrainedPairGeneration = structureGeneration;
+#ifdef AVBD_PROFILE
+        ++profileData.constrainedRebuilds;
+#endif
+    }
+
+    size_t constrainedBase = 0;
+    for (uint64_t key : broadPairKeys)
+    {
+        // Both lists are ascending, and the candidate list is strictly increasing (it was deduplicated),
+        // so the cursor only moves forward.
+        while (constrainedBase < constrainedPairKeys.size() && constrainedPairKeys[constrainedBase] < key)
+            ++constrainedBase;
+        if (constrainedBase < constrainedPairKeys.size() && constrainedPairKeys[constrainedBase] == key)
+            continue; // already constrained
+
+        int32_t ia, ib;
+        unpackPairIds(key, ia, ib);
+        Rigid *bodyA = bodiesById[static_cast<size_t>(ia)];
+        Rigid *bodyB = bodiesById[static_cast<size_t>(ib)];
+        if (bodyA == nullptr || bodyB == nullptr || bodyA == bodyB)
+            continue;
         if (pairOverlaps(bodyA, bodyB))
             new Manifold(this, bodyA, bodyB);
     }
@@ -708,7 +1040,9 @@ void Solver::runSubstep(int forceCount, int targetIterations, int newtonRounds)
                 substepBody(workerIndex, sync, forceCount, targetIterations, newtonRounds, converged);
             },
             [this, forceCount] {
-                return static_cast<int>(updateOrder.size()) < kMinBodiesPerDispatch
+                // Small scene: the region's barrier and participant setup cost more than the phases they
+                // fence, so the identical body runs inline on the calling thread.
+                return static_cast<int>(updateOrder.size()) < params.primal.parallelMinBodies
                         && forceCount < kMinForcesPerDispatch;
             });
     flow->run();
@@ -846,8 +1180,7 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
             // non-contactOnly, so a contact-only body's move is invisible to every other item in this
             // phase: the result still does not depend on how the items were split.
             PhaseTimer stampTimer(phaseSlot(kPhaseStamp, workerIndex));
-            sync.forItems(static_cast<int>(updateOrder.size()),
-                    [this, gamma, rho, relax, jointRelax](int i) {
+            const auto stampBody = [this, gamma, rho, relax, jointRelax](int i) {
                         Rigid *body = updateOrder[i];
                         Block block(body->mass, body->moment, dt * dt, body->positionLin,
                                 body->inertialLin, body->positionAng, body->inertialAng);
@@ -883,7 +1216,20 @@ void Solver::iterateBody(int workerIndex, Sync &sync, int targetIterations, int 
                             scratch.deltaLin[i] = dLin;
                             scratch.deltaAng[i] = dAng;
                         }
-                    });
+            };
+            // Split across the participants only when there is enough work to pay for the fence; below
+            // the threshold one worker walks the whole update set. The barrier is outside either way, so
+            // every participant still arrives at the same points.
+            const int bodyCount = static_cast<int>(updateOrder.size());
+            if (bodyCount >= params.primal.parallelStampMinBodies)
+            {
+                sync.forItems(bodyCount, stampBody);
+            }
+            else if (workerIndex == 0)
+            {
+                for (int i = 0; i < bodyCount; ++i)
+                    stampBody(i);
+            }
             stampTimer.workDone();
             sync.arriveAndWait();
             stampTimer.syncDone();

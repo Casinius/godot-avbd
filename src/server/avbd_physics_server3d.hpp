@@ -86,6 +86,9 @@ protected:
         // and the id is what turns it into a RID again - the query paths and the contact reports
         // both need it, and neither should have to look a record up by address.
         uint64_t server_id = 0;
+        // Position in `flush_bodies`, the dense list the per-tick state push walks. Kept in the record so
+        // erasing a body is a swap-and-pop rather than a search.
+        size_t flush_index = 0;
         RID space;
         uint64_t instance_id = 0;
         PhysicsServer3D::BodyMode mode = PhysicsServer3D::BODY_MODE_RIGID;
@@ -101,6 +104,17 @@ protected:
         std::optional<Transform3D> pose_prev;
         Vector3 linear_velocity;
         Vector3 angular_velocity;
+
+        // The solver state the last state-callback delivery carried. The callback is Variant
+        // marshalling per body - ~1 us, which on a settled scene of a few thousand bodies is a fifth of
+        // the frame - and a body whose pose and velocity are bit-identical to what the engine already has
+        // has nothing to say. Exact comparison, not a threshold: a body that moved by any amount is
+        // delivered. `sync_cache_valid` starts false so the first flush always delivers.
+        avbd::float3 sync_lin{};
+        avbd::quat sync_ang = avbd::quat::Identity();
+        avbd::float3 sync_vel_lin{};
+        avbd::float3 sync_vel_ang{};
+        bool sync_cache_valid = false;
 
         // Body parameters the engine sets through _body_set_param. Mass decides the density the
         // solver is built with; friction is passed through; bounce has no AVBD counterpart (the
@@ -287,6 +301,10 @@ protected:
     // rather than a reinterpretation.
     std::unordered_map<uint64_t, SpaceData> spaces;
     std::unordered_map<uint64_t, BodyData> bodies;
+    // The same bodies, addressable in one dense pass. The per-tick state push visits every body and
+    // touches a handful of fields in each; walking the hash map instead means a pointer chase per body
+    // through records that are hundreds of bytes wide, which measured as a third of the flush's cost.
+    std::vector<BodyData *> flush_bodies;
     std::unordered_map<uint64_t, ShapeData> shapes;
     std::unordered_map<uint64_t, JointData> joints;
     std::unordered_map<uint64_t, AreaData> areas;

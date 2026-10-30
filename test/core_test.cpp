@@ -84,6 +84,41 @@ static void step_n(Solver &s, int n) {
         const char *env = std::getenv("AVBD_JOINT_RELAX");
         return env != nullptr ? static_cast<float>(std::atof(env)) : -1.0f;
     }();
+    // The collision motion gate: 0 disables it, a large value shows its ceiling (every pair whose
+    // pose barely changed re-uses its contacts), which is how the knob was tuned.
+    static const float gateLin = []() {
+        const char *env = std::getenv("AVBD_COLLIDE_GATE_LIN");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : -1.0f;
+    }();
+    static const float gateAng = []() {
+        const char *env = std::getenv("AVBD_COLLIDE_GATE_ANG");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : -1.0f;
+    }();
+    // Seconds of stillness before a body sleeps, for the settled-scene measurements (the core suite
+    // keeps sleeping off so its digests do not depend on it).
+    static const float sleepSeconds = []() {
+        const char *env = std::getenv("AVBD_SLEEP");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : -1.0f;
+    }();
+    // Bodies below which the assembly phase runs on one worker (SolverParams::Primal).
+    static const int stampMinBodies = []() {
+        const char *env = std::getenv("AVBD_STAMP_MIN_BODIES");
+        return env != nullptr ? std::atoi(env) : 0;
+    }();
+    // Bodies below which the whole substep runs inline (no region, no barriers).
+    static const int regionMinBodies = []() {
+        const char *env = std::getenv("AVBD_REGION_MIN_BODIES");
+        return env != nullptr ? std::atoi(env) : -1;
+    }();
+    // Drift a body's box may accumulate before the incremental pair set re-queries it.
+    static const float incrementalEpsilon = []() {
+        const char *env = std::getenv("AVBD_INC_EPS");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : -1.0f;
+    }();
+    static const float incrementalFraction = []() {
+        const char *env = std::getenv("AVBD_INC_FRACTION");
+        return env != nullptr ? static_cast<float>(std::atof(env)) : -1.0f;
+    }();
     static const float betaLin = []() {
         const char *env = std::getenv("AVBD_BETA_LIN");
         return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0f;
@@ -150,6 +185,20 @@ static void step_n(Solver &s, int n) {
         s.params.primal.newtonRatio = newtonRatio;
     if (jointRelax >= 0.0f)
         s.params.primal.jointRelaxation = jointRelax;
+    if (gateLin >= 0.0f)
+        s.params.collision.motionGateLin = gateLin;
+    if (gateAng >= 0.0f)
+        s.params.collision.motionGateAng = gateAng;
+    if (sleepSeconds >= 0.0f)
+        s.params.sleep.timeToSleep = sleepSeconds;
+    if (stampMinBodies > 0)
+        s.params.primal.parallelStampMinBodies = stampMinBodies;
+    if (regionMinBodies >= 0)
+        s.params.primal.parallelMinBodies = regionMinBodies;
+    if (incrementalEpsilon >= 0.0f)
+        s.params.collision.incrementalPairEpsilon = incrementalEpsilon;
+    if (incrementalFraction >= 0.0f)
+        s.params.collision.incrementalPairFraction = incrementalFraction;
     if (betaLin > 0.0f)
         s.params.dual.betaLin = betaLin;
     if (stiffnessDecay)
@@ -1176,6 +1225,10 @@ static void shape_of(const Rigid *b, Shape &s) {
 }
 
 static void check_pair_equivalent(Rigid *a, Rigid *b, const char *name) {
+    // The body path reads Rigid::rot, the rotation matrix the broad phase refreshes at the top of every
+    // step; outside a step the test has to refresh it, exactly as the step would.
+    a->rot = float3x3(a->positionAng);
+    b->rot = float3x3(b->positionAng);
     Manifold::Contact viaBody[8];
     Manifold::Contact viaShape[8];
     float3x3 basisBody{};
@@ -1578,6 +1631,11 @@ static int run_scene(const std::string &name, int steps, int threads, bool adapt
             (prof.pairQuery - prof.bvhBuild - prof.pairSearch) * 1.0e6 * ns,
             prof.manifoldCreate * 1.0e6 * ns, prof.forceInit * 1.0e6 * ns, prof.selectStage * 1.0e6 * ns,
             prof.wall * 1.0e6 * ns);
+    std::printf("  broad: tests=%.0f candidates=%.0f moved=%.0f/%.0f incremental=%.0f/%.0f steps"
+                " constrainedRebuilds=%.1f\n",
+            prof.pairTests * ns, prof.pairCandidates * ns, prof.movedBodies * ns, prof.totalBodies * ns,
+            prof.incrementalSteps * ns, static_cast<double>(prof.samplesPerStep),
+            prof.constrainedRebuilds * ns);
     std::printf("  profile(n=%lld substeps): wall=%.1fus rounds=%.1f | work pre=%.1f stamp=%.1f"
                 " comb=%.1f dual=%.1f proj=%.1f | sync pre=%.1f stamp=%.1f comb=%.1f dual=%.1f proj=%.1f\n",
             prof.samples, prof.wall * us, prof.rounds * n,

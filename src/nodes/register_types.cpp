@@ -93,6 +93,14 @@ static void register_avbd_settings() {
             // diverges at 0.7 and holds at 0.5). See SolverParams::Primal::jointRelaxation.
             {"physics/avbd/jacobi_relaxation", Variant(0.7)},
             {"physics/avbd/joint_relaxation", Variant(0.5)},
+            // Bodies below which the per-body assembly phase runs on one worker instead of being split.
+            // That phase is the largest in a step, so splitting it is what makes a large scene scale;
+            // below this many bodies the barrier and the shared-cache traffic cost more than they buy.
+            // 0 always splits. See SolverParams::Primal::parallelStampMinBodies for the measurement.
+            {"physics/avbd/parallel_stamp_min_bodies", Variant(0)},
+            // Bodies below which the whole substep runs on one thread: no worker region, no barriers.
+            // The switch for a small scene that is faster serial than split.
+            {"physics/avbd/parallel_min_bodies", Variant(48)},
             {"physics/avbd/adaptive_beta", Variant(false)},
             // The position projection layer: a positional pass over the constraints that declares
             // itself hard (contacts, locked and limited joint axes), so a delivered pose is legal

@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2026 Chris Giles
  *
- * Permission to use, copy, modify, distribute and sell this software
+ * Permission to use, copy, modify, and distribute this software
  * and its documentation for any purpose is hereby granted without fee,
  * provided that the above copyright notice appear in all copies.
  * Chris Giles makes no representations about the suitability
@@ -11,8 +11,9 @@
 
 #pragma once
 
-#include <vector>
+#include <limits>
 #include <span>
+#include <vector>
 
 #include "avbd/maths.h"
 
@@ -20,94 +21,85 @@ namespace bvh {
 
 using avbd::float3;
 
-// Forward declarations
-namespace nodes { class NodeStorage; }
-
 namespace nodes {
 
-class NodeStorage {
-private:
-    // Contiguous arrays for cache locality (SafeC++: no raw pointers)
-    std::vector<float3> boundsMin_;
-    std::vector<float3> boundsMax_;
-    std::vector<int> left_;
-    std::vector<int> right_;
-    std::vector<int> parent_;
-    std::vector<int> bodyIndex_;
+// One node of the implicit-heap LBVH.
+//
+// The bounds and the liveness of the subtree live together on purpose. The pair traversal issues tens
+// of thousands of node-pair tests per step and it is the single hottest loop outside the solver, and
+// the old layout spread each node over three parallel arrays (boundsMin, boundsMax, a validity byte)
+// - three cache streams per test, where this is one line per node. An empty subtree (the right tail
+// when the leaf count is not a power of two) is encoded in the bounds themselves, min > max on every
+// axis, so there is no fourth field and no separate array to keep in step with it.
+struct Node
+{
+    float3 min{emptyMin()};
+    float3 max{emptyMax()};
 
+    // One compare, not six: an empty subtree is written with min = +inf / max = -inf on *every* axis,
+    // so the x pair decides it, and a real box always satisfies min.x <= max.x (degenerate boxes are
+    // equal, never inverted). The traversal runs this twice per test, tens of thousands of times a
+    // step, which is exactly why it is one compare.
+    [[nodiscard]] bool valid() const noexcept { return min.x() <= max.x(); }
+
+    // +inf / -inf, so `valid()` is false and any union with a live node is the live node's bounds.
+    [[nodiscard]] static float3 emptyMin() noexcept
+    {
+        constexpr float inf = std::numeric_limits<float>::infinity();
+        return float3{inf, inf, inf};
+    }
+    [[nodiscard]] static float3 emptyMax() noexcept
+    {
+        constexpr float inf = std::numeric_limits<float>::infinity();
+        return float3{-inf, -inf, -inf};
+    }
+};
+
+class NodeStorage {
 public:
-    // Clear and reserve
     void clear() noexcept {
-        boundsMin_.clear();
-        boundsMax_.clear();
-        left_.clear();
-        right_.clear();
-        parent_.clear();
+        nodes_.clear();
         bodyIndex_.clear();
     }
 
     void reserve(int capacity) noexcept {
-        boundsMin_.reserve(capacity);
-        boundsMax_.reserve(capacity);
-        left_.reserve(capacity);
-        right_.reserve(capacity);
-        parent_.reserve(capacity);
-        bodyIndex_.reserve(capacity);
+        nodes_.reserve(static_cast<size_t>(capacity));
+        bodyIndex_.reserve(static_cast<size_t>(capacity));
     }
 
-    // Getters using std::span (zero-copy, SafeC++)
-    [[nodiscard]] std::span<const float3> boundsMin() const noexcept { return boundsMin_; }
-    [[nodiscard]] std::span<const float3> boundsMax() const noexcept { return boundsMax_; }
-    [[nodiscard]] std::span<const int> left() const noexcept { return left_; }
-    [[nodiscard]] std::span<const int> right() const noexcept { return right_; }
-    [[nodiscard]] std::span<const int> parent() const noexcept { return parent_; }
-    [[nodiscard]] std::span<const int> bodyIndex() const noexcept { return bodyIndex_; }
+    [[nodiscard]] int size() const noexcept { return static_cast<int>(nodes_.size()); }
 
-    // Node operations
-    [[nodiscard]] int size() const noexcept { return static_cast<int>(boundsMin_.size()); }
-    [[nodiscard]] const float3& boundsMin(int index) const noexcept { return boundsMin_[index]; }
-    [[nodiscard]] const float3& boundsMax(int index) const noexcept { return boundsMax_[index]; }
-    [[nodiscard]] const int& bodyIndex(int index) const noexcept { return bodyIndex_[index]; }
-    // Whether the node's subtree contains at least one real leaf. Empty subtrees exist
-    // in the implicit layout whenever the leaf count is not a power of two (the right
-    // tail), and their bounds are left uninitialized by design - traversals must skip
-    // them instead of testing garbage floats.
-    [[nodiscard]] bool valid(int index) const noexcept { return valid_[index] != 0; }
-    [[nodiscard]] int countLeaves() const noexcept;
+    // The whole node array, for a traversal that hoists the pointer out of its inner loop.
+    [[nodiscard]] std::span<const Node> nodes() const noexcept { return nodes_; }
+    [[nodiscard]] const Node &node(int index) const noexcept { return nodes_[static_cast<size_t>(index)]; }
+    [[nodiscard]] const float3 &boundsMin(int index) const noexcept { return nodes_[static_cast<size_t>(index)].min; }
+    [[nodiscard]] const float3 &boundsMax(int index) const noexcept { return nodes_[static_cast<size_t>(index)].max; }
+    [[nodiscard]] bool valid(int index) const noexcept { return nodes_[static_cast<size_t>(index)].valid(); }
+    [[nodiscard]] const int &bodyIndex(int index) const noexcept { return bodyIndex_[static_cast<size_t>(index)]; }
     [[nodiscard]] int root() const noexcept { return 0; }
 
     // Implicit (heap) layout support: resize to an exact node count and write nodes by
     // index. Children of node i are 2i+1 / 2i+2 by construction - no left/right arrays.
     void resizeImplicit(int nodeCount) noexcept {
-        boundsMin_.resize(nodeCount);
-        boundsMax_.resize(nodeCount);
-        bodyIndex_.resize(nodeCount, -1);
-        valid_.assign(nodeCount, 0);
+        nodes_.resize(static_cast<size_t>(nodeCount)); // value-initialised: every node starts invalid
+        bodyIndex_.assign(static_cast<size_t>(nodeCount), -1);
     }
-    void setImplicitLeaf(int slot, const float3& min, const float3& max, int bodyIndex) noexcept {
-        boundsMin_[slot] = min;
-        boundsMax_[slot] = max;
-        bodyIndex_[slot] = bodyIndex;
-        valid_[slot] = 1;
+    void setImplicitLeaf(int slot, const float3 &min, const float3 &max, int bodyIndex) noexcept {
+        const size_t index = static_cast<size_t>(slot);
+        nodes_[index].min = min;
+        nodes_[index].max = max;
+        bodyIndex_[index] = bodyIndex;
     }
-    void setImplicitInternalBounds(int slot, const float3& min, const float3& max, bool subtreeValid) noexcept {
-        boundsMin_[slot] = min;
-        boundsMax_[slot] = max;
-        valid_[slot] = subtreeValid ? 1 : 0;
+    void setImplicitInternalBounds(int slot, const float3 &min, const float3 &max, bool subtreeValid) noexcept {
+        const size_t index = static_cast<size_t>(slot);
+        nodes_[index].min = subtreeValid ? min : Node::emptyMin();
+        nodes_[index].max = subtreeValid ? max : Node::emptyMax();
     }
 
 private:
-    std::vector<uint8_t> valid_;
-
-public:
-
-    // Node creation (SafeC++: returns int, no nullptr)
-    int createLeaf(const float3& min, const float3& max, int bodyIndex) noexcept;
-    int createInternal(const float3& min, const float3& max, int left, int right, int parent = -1) noexcept;
-    void updateBounds(int nodeId, const float3& min, const float3& max) noexcept;
-
-private:
-    int addNode(const float3& min, const float3& max, int left, int right, int parent, int bodyIndex) noexcept;
+    std::vector<Node> nodes_;
+    // Leaf payload, read once per emitted pair rather than per test, so it stays in its own array.
+    std::vector<int> bodyIndex_;
 };
 
 } // namespace nodes
