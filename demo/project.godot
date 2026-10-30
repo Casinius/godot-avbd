@@ -23,17 +23,20 @@ config/features=PackedStringArray("4.7")
 3d/run_on_separate_thread=true
 common/physics_ticks_per_second=240
 3d/physics_engine="AVBD"
-3d/solver/solver_iterations=6
+3d/solver/solver_iterations=8
 common/physics_interpolation=true
-avbd/iterations=6
-avbd/substeps=1
-avbd/stiffness_decay=1.0
+avbd/iterations=8
+avbd/substeps=2
+avbd/stiffness_decay=0.98
 avbd/jacobian_rebuild_distance=0.05
-avbd/chebyshev_rho=0.05
 avbd/threads=8
 avbd/adaptive_beta=true
-avbd/beta_linear=1000000.0
+avbd/beta_linear=80000.0
 avbd/projection_rounds=2
+avbd/tick_rate=60.0
+avbd/projection_trailing_newton_only=true
+avbd/chebyshev_rho=0.1
+avbd/jacobi_relaxation=0.1
 
 [rendering]
 
