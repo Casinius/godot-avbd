@@ -120,10 +120,11 @@ local function avbd_toolchain(target)
         -- against. Cross-platform bit-exact digests are a hard constraint (see the GCC branch), so the
         -- floating-point mode is spelled out instead of left to the toolchain default: /fp:precise is
         -- the mode that keeps expressions in source order and /fp:contract- keeps `a*b + c` from
-        -- collapsing into an fma. _USE_MATH_DEFINES is what MSVC needs for M_PI (the test scenes use
-        -- it) and NOMINMAX keeps windows.h's min/max macros out of std::min/std::max.
+        -- collapsing into an fma. NOMINMAX keeps windows.h's min/max macros out of
+        -- std::min/std::max. The math constants come from <numbers>/<limits>, so the MSVC
+        -- M_PI workaround (_USE_MATH_DEFINES) is not needed.
         target:add("cxflags", "/permissive-", "/fp:precise", "/fp:contract-", { force = true })
-        target:add("defines", "_USE_MATH_DEFINES", "NOMINMAX")
+        target:add("defines", "NOMINMAX")
     else
         target:add("cxflags", "-Wshadow", "-Wnon-virtual-dtor")
         -- Floating-point contraction is the one default that silently breaks the digest guarantee: a

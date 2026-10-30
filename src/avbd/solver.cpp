@@ -142,7 +142,7 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local)
 Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
 {
     const float epsilon = 1.0e-6f;
-    float bestT = INFINITY;
+    float bestT = std::numeric_limits<float>::infinity();
     Rigid *bestBody = 0;
     float3 bestLocal = {0, 0, 0};
 
@@ -157,7 +157,7 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
         float3 half = body->size * 0.5f;
 
         float tEnter = 0.0f;
-        float tExit = INFINITY;
+        float tExit = std::numeric_limits<float>::infinity();
         bool hit = true;
 
         for (int i = 0; i < 3; ++i)

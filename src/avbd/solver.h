@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <vector>
 #include <array>
@@ -457,7 +458,9 @@ struct Joint : Force
     // have not moved between the two passes, so nothing else has to be stored.
     float3 projLin = float3{0, 0, 0};
 
-    Joint(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, float3 p_rB, float p_stiffnessLin = INFINITY, float p_stiffnessAng = 0.0f, float p_fracture = INFINITY);
+    Joint(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, float3 p_rB,
+            float p_stiffnessLin = std::numeric_limits<float>::infinity(), float p_stiffnessAng = 0.0f,
+            float p_fracture = std::numeric_limits<float>::infinity());
 
     bool initialize() override;
     void updatePrimal(Rigid *body, float alpha, Block &block) override;

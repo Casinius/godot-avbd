@@ -25,6 +25,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <limits>
+#include <numbers>
 #include <string>
 #include <thread>
 #include <utility>
@@ -375,7 +377,7 @@ static RampResult ramp_run(float mu, float seconds) {
     Solver s;
     new Rigid(&s, {100, 100, 1}, 0.0f, mu, {0, 0, 0});
 
-    const float angle = 20.0f * float(M_PI) / 180.0f;
+    const float angle = 20.0f * std::numbers::pi_v<float> / 180.0f;
     Rigid *ramp = new Rigid(&s, {40, 24, 1}, 0.0f, mu, {0, 0, 6});
     ramp->positionAng = quat(Eigen::AngleAxisf(angle, float3::UnitY()));
 
@@ -424,7 +426,7 @@ static void test_hard_joints() {
     Rigid *prev = anchor;
     for (int i = 0; i < 4; i++) {
         Rigid *link = new Rigid(&s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 9.0f - (float)i});
-        joints.push_back(new Joint(&s, prev, link, {0, 0, -0.5f}, {0, 0, 0.5f}, INFINITY, 0.0f));
+        joints.push_back(new Joint(&s, prev, link, {0, 0, -0.5f}, {0, 0, 0.5f}, std::numeric_limits<float>::infinity(), 0.0f));
         links.push_back(link);
         prev = link;
     }

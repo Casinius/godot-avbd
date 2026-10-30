@@ -19,6 +19,7 @@
 #define AVBD_GODOT_CONVERT_HPP
 
 #include <cmath>
+#include <limits>
 
 #include <godot_cpp/classes/node3d.hpp>
 #include <godot_cpp/variant/basis.hpp>
@@ -117,10 +118,10 @@ inline bool poses_match(const godot::Transform3D &p_a, const godot::Transform3D 
 }
 
 // Property value to solver stiffness: strictly negative means "infinitely stiff"
-// (a hard constraint). Godot floats and scene files cannot carry INFINITY, so the
+// (a hard constraint). Godot floats and scene files cannot carry infinity, so the
 // sentinel keeps the property serialisable. Zero disables the constraint.
 inline float stiffness_from_property(double p_value) {
-    return p_value < 0.0 ? INFINITY : (float)p_value;
+    return p_value < 0.0 ? std::numeric_limits<float>::infinity() : (float)p_value;
 }
 
 } // namespace avbd_godot

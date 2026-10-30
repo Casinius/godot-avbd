@@ -16,6 +16,9 @@
 
 #include "core_scenes.hpp"
 
+#include <limits>
+#include <numbers>
+
 #include "avbd/maths.h"
 #include "avbd/solver.h"
 #include "avbd/bvh/node_storage.hpp"
@@ -48,7 +51,7 @@ void sceneStaticFriction(Solver *solver)
     solver->clear();
     new Rigid(solver, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
 
-    const float angle = 30.0f * float(M_PI) / 180.0f;
+    const float angle = 30.0f * std::numbers::pi_v<float> / 180.0f;
     Rigid *ramp = new Rigid(solver, {40, 24, 1}, 0.0f, 1.0f, {0, 0, 3});
     ramp->positionAng = quat(Eigen::AngleAxisf(angle, float3::UnitY()));
 
@@ -285,8 +288,8 @@ void sceneBridge(Solver *solver)
         Rigid *curr = new Rigid(solver, {plankLength, plankWidth, plankHeight}, i == 0 || i == N - 1 ? 0.0f : 1.0f, 0.5f, {(float)i - N / 2.0f, 0.0f, 10.0f});
         if (prev)
         {
-            new Joint(solver, prev, curr, {halfLength, halfWidth, 0}, {-halfLength, halfWidth, 0}, INFINITY, 0.0f);
-            new Joint(solver, prev, curr, {halfLength, -halfWidth, 0}, {-halfLength, -halfWidth, 0}, INFINITY, 0.0f);
+            new Joint(solver, prev, curr, {halfLength, halfWidth, 0}, {-halfLength, halfWidth, 0}, std::numeric_limits<float>::infinity(), 0.0f);
+            new Joint(solver, prev, curr, {halfLength, -halfWidth, 0}, {-halfLength, -halfWidth, 0}, std::numeric_limits<float>::infinity(), 0.0f);
         }
         prev = curr;
     }
@@ -314,7 +317,7 @@ void sceneBreakable(Solver *solver)
     {
         Rigid *curr = new Rigid(solver, {1, 1, 0.5f}, 1.0f, 0.5f, {(float)i - N / 2.0f, 0.0f, 6.0f});
         if (prev)
-            new Joint(solver, prev, curr, {0.5f, 0, 0}, {-0.5f, 0, 0}, INFINITY, INFINITY, breakForce);
+            new Joint(solver, prev, curr, {0.5f, 0, 0}, {-0.5f, 0, 0}, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity(), breakForce);
         prev = curr;
     }
 
