@@ -202,6 +202,8 @@ $$
 
 小场景上 LBVH 的宽相索引明显更快（哈希有固定层级/排序开销），大场景两者整步差距落在噪声里；默认保留哈希，LBVH 作为可切换的对照实现保留。
 
+空间查询走 `World3D.direct_space_state` / `PhysicsServer3D.body_test_motion`：`RayCast3D`、`ShapeCast3D`、`intersect_ray` / `intersect_point` / `intersect_shape` / `collide_shape` / `get_rest_info` / `cast_motion`，以及 `CharacterBody3D.move_and_slide`。查询和求解器共用同一套 `avbd::Shape` 代理（capsule 仍是 cylinder、convex 仍是 AABB box），支持 body + area、exclude 列表、`ray_pickable`、`hit_from_inside` 和 swept `cast_motion`。几何实现放在 `src/avbd/query/`，只调用核心的 `collideShapes()`，不改 `solver.h` / `solver.cpp` / `collide.cpp`。
+
 引擎的实际状态、测出来的数字和已知限制见 [`tools/baseline/README.md`](tools/baseline/README.md)（包括 529 刚体一步里各阶段的耗时、420 盒金字塔的穿透分布、以及一轮回归测试的原始输出）。
 
 这不是一篇教程式的文章，能展示的就到这里。如果你也是做物理引擎的，你懂的。
@@ -216,7 +218,8 @@ $$
 |---|---|
 | 恢复系数 | **不模拟**。`body_set_param(BODY_PARAM_BOUNCE)` 只保存、只回读，碰撞完全非弹性 |
 | 软体 | 自定义节点 `AVBDSoftBody3D` / `AVBDSoftWorld3D` 可用（刚体 + 关节格，见 `demo/scenes/soft_body.tscn`）；Godot 原生 `SoftBody3D` 的服务器侧 `_soft_body_*` 仍是 stub |
-| Area3D | overlap 检测与 `body_entered` / `area_entered` 回调已实现（每步按形状做一次窄相，见 `_monitor_areas`）；RID / 参数 / layer / mask 可存取 |
+| Area3D | overlap 检测与 `body_entered` / `area_entered` 回调已实现（每步按形状做一次窄相，见 `_monitor_areas`）；ray / shape / point / rest 查询在 `collide_with_areas=true` 时也会命中 Area3D；RID / 参数 / layer / mask 可存取 |
+| 空间查询 | `RayCast3D` / `ShapeCast3D` / `intersect_ray` / `intersect_point` / `intersect_shape` / `collide_shape` / `get_rest_info` / `cast_motion` / `body_test_motion` 已实现；支持 body + area、exclude 列表、`ray_pickable`、`hit_from_inside`、swept `cast_motion`。Capsule 仍按 cylinder 代理、convex 按 AABB box 代理，concave / heightmap 不参与查询（无代理） |
 | 每刚体形状 | **只支持一个** collision shape（多于一个 `WARN_PRINT` 后丢弃） |
 | 形状类型 | box / sphere / cylinder 原生；capsule 用 cylinder 代理（半球帽变平）；凸包用它自己的 AABB 当盒子；concave / heightmap / world_boundary / separation_ray **排除出仿真**并告警 |
 | 关节轴 | 只能沿**主轴**：非轴对齐的 hinge/slider/cone-twist 会被吸附到最近主轴（静默错误） |
@@ -226,4 +229,4 @@ $$
 | 刚性链预算 | 焊接/关节链每个 substep **至少 6 轮**才收敛；3 轮会自激发散（`tools/repro_joint.cpp`：140 m/s）。**总预算相同的情况下，substep 越多越不稳定** |
 | 多线程 | 位级可复现（digest 在 1/2/3/4/8/12 线程下一致），但 **12 线程比 8 线程慢**（barrier 开销 > 并行收益），`physics/avbd/threads` 必须实测 |
 | 宽相 | 默认分层哈希网格（`broad_phase_lbvh=false`），LBVH 可选；walk 内已做精确 AABB 过滤，候选对与 LBVH 相同。索引本身仍比 LBVH 慢（Pyramid XL 1.18 vs 0.59 ms），大场景整步差距落在噪声内，小场景约慢 8–10% |
-| CI | 现在运行 `xmake run avbd_core_test`（138 checks）；README 顶部的 Test 徽章仍是编译徽章，不是测试徽章 |
+| CI | 现在运行 `xmake run avbd_core_test`（138 checks）和 `xmake run avbd_query_test`（26 checks）；Godot 侧查询套件用 `xmake run avbd_query_tests`（27 checks）。README 顶部的 Test 徽章仍是编译徽章，不是测试徽章 |

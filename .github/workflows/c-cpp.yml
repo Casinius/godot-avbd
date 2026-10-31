@@ -111,17 +111,21 @@ jobs:
           UBSAN_OPTIONS: "print_stacktrace=1"
         run: |
           xmake run avbd_core_test > suite.log 2>&1 || true
+          xmake run avbd_query_test > query_suite.log 2>&1 || true
           grep -E 'checks, [0-9]+ failures' suite.log | tail -n 1 || true
-          if grep -E '^FAIL' suite.log; then
-            echo "::error::the solver suite reported a failure; see the log artifact"
+          grep -E 'checks, [0-9]+ failures' query_suite.log | tail -n 1 || true
+          if grep -E '^FAIL' suite.log query_suite.log; then
+            echo "::error::a C++ suite reported a failure; see the log artifacts"
             exit 1
           fi
-          echo "ok: solver suite passed"
+          echo "ok: solver and query suites passed"
 
       - name: Upload the suite log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: suite-${{ matrix.name }}
-          path: suite.log
+          path: |
+            suite.log
+            query_suite.log
           if-no-files-found: ignore

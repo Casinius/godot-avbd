@@ -14,9 +14,10 @@
 #include "server/avbd_direct_space_state3d.hpp"
 
 #include <algorithm>
-#include <ranges>
+#include <limits>
 #include <vector>
 
+#include "avbd/query/query_shape.hpp"
 #include "nodes/godot_convert.hpp"
 #include "server/avbd_physics_server3d.hpp"
 
@@ -32,85 +33,20 @@ namespace {
 
 // The solver-side Shape for one body (the same flatten Manifold::collide performs).
 avbd::Shape shape_of(const avbd::Rigid &b) {
-    avbd::Shape s;
-    s.type = b.shape;
-    s.center = b.positionLin;
-    s.rotation = b.positionAng;
-    s.half = b.size * 0.5f;
-    s.radius = b.size.x;
-    s.halfHeight = b.size.z * 0.5f;
-    s.axis = qrot(b.positionAng, avbd::float3{0, 0, 1});
-    return s;
+    return AVBDPhysicsServer3D::query_shape_from_rigid(b);
 }
 
-// The solver-side Shape for one server ShapeData record, posed in sim space.
-avbd::Shape query_shape_of(const AVBDPhysicsServer3D::ShapeData &data, const Transform3D &p_transform) {
-    avbd::Shape s;
-    switch (data.type) {
-        case PhysicsServer3D::SHAPE_SPHERE:
-            s.type = avbd::ShapeType::Sphere;
-            s.radius = static_cast<float>(data.radius);
-            break;
-        case PhysicsServer3D::SHAPE_CYLINDER: {
-            s.type = avbd::ShapeType::Cylinder;
-            s.radius = static_cast<float>(data.radius);
-            s.halfHeight = static_cast<float>(data.height) * 0.5f;
-            break;
-        }
-        default:
-            s.type = avbd::ShapeType::Box;
-            s.half = to_sim_extents(data.extents) * 0.5f;
-            break;
-    }
-    s.center = to_sim(p_transform.origin);
-    s.rotation = to_sim(p_transform.basis.get_rotation_quaternion());
-    s.axis = avbd::qrot(s.rotation, avbd::float3{0, 0, 1});
-    return s;
+// The solver-side Shape for one server ShapeData record, posed in sim space. The
+// conversion lives on the server so bodies, areas and queries cannot drift apart.
+bool query_shape_of(const AVBDPhysicsServer3D::ShapeData &data, const Transform3D &p_transform,
+        avbd::Shape &r_shape) {
+    return AVBDPhysicsServer3D::query_shape_from_data(data, p_transform, r_shape);
 }
 
-// Tight world-space (sim frame) AABB of a query shape - the same AABB-of-OBB the
-// broad phase builds its leaves with, so the BVH can prune the query instead of the
-// query scanning every body.
+// Tight world-space (sim frame) AABB of a query shape - the same bound the broad phase
+// builds its leaves with, so the candidate list prunes the query.
 void shape_aabb(const avbd::Shape &s, avbd::float3 &r_min, avbd::float3 &r_max) {
-    avbd::float3 half;
-    switch (s.type) {
-        case avbd::ShapeType::Sphere:
-            half = avbd::float3{s.radius, s.radius, s.radius};
-            break;
-        case avbd::ShapeType::Cylinder:
-            // Shape's cylinder axis is its local Z (see the axis field above).
-            half = avbd::float3{s.radius, s.radius, s.halfHeight};
-            break;
-        case avbd::ShapeType::Box:
-        default:
-            half = s.half;
-            break;
-    }
-    const avbd::float3x3 rot = avbd::qmat(s.rotation);
-    const avbd::float3 wx{
-            std::abs(rot[0][0]) * half.x + std::abs(rot[1][0]) * half.y + std::abs(rot[2][0]) * half.z,
-            std::abs(rot[0][1]) * half.x + std::abs(rot[1][1]) * half.y + std::abs(rot[2][1]) * half.z,
-            std::abs(rot[0][2]) * half.x + std::abs(rot[1][2]) * half.y + std::abs(rot[2][2]) * half.z};
-    r_min = s.center - wx;
-    r_max = s.center + wx;
-}
-
-// Deepest contact of a pair, or false when separated. Returns the deepest contact by
-// penetration depth - the one rest info and collide shape want.
-bool deepest_contact(const avbd::Shape &a, const avbd::Shape &b, avbd::Manifold::Contact &r_contact,
-        avbd::float3x3 &r_basis) {
-    avbd::Manifold::Contact contacts[8];
-    const int count = avbd::collideShapes(a, b, contacts, r_basis);
-    if (count <= 0) {
-        return false;
-    }
-    // Local anchors span the penetration; the longest span is the deepest point.
-    // max_element keeps the first of ties, matching the strict > scan it replaced.
-    const std::span span(contacts, static_cast<size_t>(count));
-    const auto best = std::ranges::max_element(span, {},
-            [](const avbd::Manifold::Contact &c) { return avbd::length(c.rA - c.rB); });
-    r_contact = *best;
-    return true;
+    avbd::query::shapeAabb(s, r_min, r_max);
 }
 
 // // World-space (solver frame) position of body A's contact anchor.
@@ -128,18 +64,59 @@ Vector3 contact_normal_godot(const avbd::float3x3 &basis) {
 
 } // namespace
 
+std::vector<AVBDDirectSpaceState3D::QueryTarget> AVBDDirectSpaceState3D::collect_targets(
+        const avbd::float3 &p_min, const avbd::float3 &p_max, uint32_t p_mask, bool p_bodies,
+        bool p_areas, bool p_pick_ray) const {
+    std::vector<QueryTarget> out;
+    if (server == nullptr) {
+        return out;
+    }
+
+    if (p_bodies) {
+        for (const AVBDPhysicsServer3D::QueryCandidate &candidate :
+                server->query_candidates_aabb(space, p_min, p_max, p_mask)) {
+            const RID rid = server->solver_pick_rid(space, candidate.rigid);
+            if (is_body_excluded_from_query(rid)) {
+                continue;
+            }
+            if (p_pick_ray && !candidate.ray_pickable) {
+                continue;
+            }
+            out.push_back(QueryTarget{shape_of(*candidate.rigid), rid,
+                    server->body_instance_id(space, candidate.rigid), 0,
+                    server->body_velocity_of(space, candidate.rigid), false});
+        }
+    }
+
+    if (p_areas) {
+        for (const AVBDPhysicsServer3D::QueryAreaCandidate &candidate :
+                server->query_area_candidates_aabb(space, p_min, p_max, p_mask)) {
+            if (is_body_excluded_from_query(candidate.rid)) {
+                continue;
+            }
+            if (p_pick_ray && !candidate.ray_pickable) {
+                continue;
+            }
+            out.push_back(QueryTarget{candidate.shape, candidate.rid, candidate.instance_id,
+                    candidate.shape_index, Vector3(), true});
+        }
+    }
+    return out;
+}
+
 bool AVBDDirectSpaceState3D::_intersect_ray(const Vector3 &p_from, const Vector3 &p_to, uint32_t p_collision_mask,
         bool p_collide_with_bodies, bool p_collide_with_areas, bool p_hit_from_inside,
         bool p_hit_back_faces, bool p_pick_ray, PhysicsServer3DExtensionRayResult *r_result) {
-    if (server == nullptr || r_result == nullptr || !p_collide_with_bodies) {
+    (void)p_hit_back_faces; // every query shape is a solid, so faces are hit from both sides
+    if (server == nullptr || r_result == nullptr) {
         return false;
     }
-    (void)p_collide_with_areas; // areas are not in the solver; documented
-    (void)p_hit_back_faces;     // every solver shape is a solid, so faces are hit from both sides
-    (void)p_pick_ray;
+    if (!p_collide_with_bodies && !p_collide_with_areas) {
+        return false;
+    }
 
-    avbd::float3 origin = to_sim(p_from);
-    avbd::float3 end = to_sim(p_to);
+    const avbd::float3 origin = to_sim(p_from);
+    const avbd::float3 end = to_sim(p_to);
     avbd::float3 dir = end - origin;
     const float max_distance = avbd::length(dir);
     if (max_distance <= 1.0e-6f) {
@@ -147,104 +124,134 @@ bool AVBDDirectSpaceState3D::_intersect_ray(const Vector3 &p_from, const Vector3
     }
     dir = dir * (1.0f / max_distance);
 
-    avbd::float3 local{};
-    // Solver::pick already walks every body and tests layer & mask; it returns the closest
-    // hit along the whole ray, so clamp by the segment length afterwards.
-    avbd::Rigid *hit = server->solver_pick(space, origin, dir, p_collision_mask, local);
-    if (hit == nullptr) {
-        return false;
-    }
+    // Candidate broad phase: the segment's AABB. The exact ray test decides.
+    const float pad = 1.0e-4f;
+    const avbd::float3 seg_min{std::min(origin.x, end.x) - pad, std::min(origin.y, end.y) - pad,
+            std::min(origin.z, end.z) - pad};
+    const avbd::float3 seg_max{std::max(origin.x, end.x) + pad, std::max(origin.y, end.y) + pad,
+            std::max(origin.z, end.z) + pad};
 
-    const avbd::float3 world_hit = hit->positionLin + qrot(hit->positionAng, local);
-    const float distance = avbd::length(world_hit - origin);
-    if (distance > max_distance) {
-        return false;
-    }
+    struct Hit {
+        float t = 0.0f;
+        avbd::float3 point{0, 0, 0};
+        avbd::float3 normal{0, 0, 1};
+        RID rid;
+        uint64_t collider_id = 0;
+        int shape = 0;
+        bool inside = false;
+        bool valid = false;
+    } best;
 
-    // hit_from_inside: Godot reports the origin body itself when the ray starts inside a
-    // shape. Probe with a 1 mm sphere at the origin; the deepest match wins.
-    avbd::Manifold::Contact contact{};
-    avbd::float3x3 basis{};
-    Vector3 normal(0, 1, 0);
-    if (p_hit_from_inside) {
-        avbd::Shape probe;
-        probe.type = avbd::ShapeType::Sphere;
-        probe.radius = 1.0e-3f;
-        probe.center = origin;
-        probe.rotation = avbd::quatIdentity;
-        probe.axis = avbd::float3{0, 0, 1};
-        const avbd::float3 probe_min = origin - avbd::float3{probe.radius, probe.radius, probe.radius};
-        const avbd::float3 probe_max = origin + avbd::float3{probe.radius, probe.radius, probe.radius};
+    const avbd::query::Ray ray{origin, dir, max_distance};
+    const auto consider = [&](const avbd::Shape &shape, const RID &p_rid, uint64_t p_collider_id,
+            int p_shape_index, bool p_ray_pickable) {
+        if (p_pick_ray && !p_ray_pickable) {
+            return;
+        }
+        avbd::query::RayHit hit{};
+        if (!avbd::query::intersectRay(shape, ray, hit)) {
+            return;
+        }
+        if (hit.inside && !p_hit_from_inside) {
+            return;
+        }
+        if (hit.inside) {
+            // The engine wants the origin itself when the ray starts inside a solid.
+            best.t = 0.0f;
+            best.point = origin;
+            best.normal = dir * -1.0f;
+            best.rid = p_rid;
+            best.collider_id = p_collider_id;
+            best.shape = p_shape_index;
+            best.inside = true;
+            best.valid = true;
+            return;
+        }
+        if (hit.t > max_distance || (best.valid && hit.t >= best.t)) {
+            return;
+        }
+        best.t = hit.t;
+        best.point = hit.point;
+        best.normal = hit.normal;
+        best.rid = p_rid;
+        best.collider_id = p_collider_id;
+        best.shape = p_shape_index;
+        best.inside = false;
+        best.valid = true;
+    };
+
+    if (p_collide_with_bodies) {
         for (const AVBDPhysicsServer3D::QueryCandidate &candidate :
-                server->query_candidates_aabb(space, probe_min, probe_max, p_collision_mask)) {
-            if (!deepest_contact(probe, shape_of(*candidate.rigid), contact, basis)) {
+                server->query_candidates_aabb(space, seg_min, seg_max, p_collision_mask)) {
+            const RID rid = server->make_rid(candidate.body_id);
+            if (is_body_excluded_from_query(rid)) {
                 continue;
             }
-            // The ray starts inside this body: report the origin as the hit.
-            r_result->position = p_from;
-            r_result->normal = -to_godot(dir);
-            r_result->rid = server->solver_pick_rid(space, candidate.rigid);
-            r_result->collider_id = server->body_instance_id(space, candidate.rigid);
-            r_result->collider = nullptr;
-            r_result->shape = 0;
-            return true;
+            consider(shape_of(*candidate.rigid), rid, server->body_instance_id(space, candidate.rigid), 0,
+                    candidate.ray_pickable);
+            if (best.valid && best.inside) {
+                break;
+            }
         }
     }
 
-    // Normal: probe a 1 mm sphere pushed into the surface at the hit point, which recovers
-    // the exact surface frame collideShapes would produce there.
-    avbd::Shape probe;
-    probe.type = avbd::ShapeType::Sphere;
-    probe.radius = 1.0e-3f;
-    probe.center = world_hit - dir * 1.0e-3f;
-    probe.rotation = hit->positionAng;
-    probe.axis = qrot(hit->positionAng, avbd::float3{0, 0, 1});
-    if (deepest_contact(probe, shape_of(*hit), contact, basis)) {
-        normal = to_godot(avbd::float3{-basis[0][0], -basis[1][0], -basis[2][0]});
-        if (normal.dot(p_to - p_from) > 0.0) {
-            normal = -normal; // face the query origin
+    if (p_collide_with_areas && !(best.valid && best.inside)) {
+        for (const AVBDPhysicsServer3D::QueryAreaCandidate &candidate :
+                server->query_area_candidates_aabb(space, seg_min, seg_max, p_collision_mask)) {
+            if (is_body_excluded_from_query(candidate.rid)) {
+                continue;
+            }
+            consider(candidate.shape, candidate.rid, candidate.instance_id, candidate.shape_index,
+                    candidate.ray_pickable);
+            if (best.valid && best.inside) {
+                break;
+            }
         }
     }
 
-    r_result->position = to_godot(world_hit);
+    if (!best.valid) {
+        return false;
+    }
+
+    r_result->position = to_godot(best.point);
+    Vector3 normal = to_godot(best.normal);
+    if (!best.inside && normal.dot(p_to - p_from) > 0.0) {
+        normal = -normal; // face the query origin
+    }
     r_result->normal = normal;
-    r_result->rid = server->solver_pick_rid(space, hit);
-    r_result->collider_id = server->body_instance_id(space, hit);
+    r_result->rid = best.rid;
+    r_result->collider_id = best.collider_id;
     r_result->collider = nullptr;
-    r_result->shape = 0;
+    r_result->shape = best.shape;
     return true;
 }
 
 int32_t AVBDDirectSpaceState3D::_intersect_point(const Vector3 &p_position, uint32_t p_collision_mask,
         bool p_collide_with_bodies, bool p_collide_with_areas,
         PhysicsServer3DExtensionShapeResult *r_results, int32_t p_max_results) {
-    (void)p_collide_with_areas;
-    if (server == nullptr || r_results == nullptr || !p_collide_with_bodies || p_max_results <= 0) {
+    if (server == nullptr || r_results == nullptr || p_max_results <= 0) {
+        return 0;
+    }
+    if (!p_collide_with_bodies && !p_collide_with_areas) {
         return 0;
     }
 
-    // A point query is a tiny sphere sweep with zero radius margin: use a 1 mm probe.
-    avbd::Shape probe;
-    probe.type = avbd::ShapeType::Sphere;
-    probe.radius = 1.0e-3f;
-    probe.center = to_sim(p_position);
-    probe.rotation = avbd::quatIdentity;
-    probe.axis = avbd::float3{0, 0, 1};
+    const avbd::float3 point = to_sim(p_position);
+    const float pad = 1.0e-4f;
+    const avbd::float3 probe_min = point - avbd::float3{pad, pad, pad};
+    const avbd::float3 probe_max = point + avbd::float3{pad, pad, pad};
 
-    const avbd::float3 probe_min = probe.center - avbd::float3{probe.radius, probe.radius, probe.radius};
-    const avbd::float3 probe_max = probe.center + avbd::float3{probe.radius, probe.radius, probe.radius};
     int32_t count = 0;
-    for (const AVBDPhysicsServer3D::QueryCandidate &candidate :
-            server->query_candidates_aabb(space, probe_min, probe_max, p_collision_mask)) {
-        avbd::Manifold::Contact contact{};
-        avbd::float3x3 basis{};
-        if (!deepest_contact(probe, shape_of(*candidate.rigid), contact, basis)) {
+    for (const QueryTarget &target :
+            collect_targets(probe_min, probe_max, p_collision_mask, p_collide_with_bodies,
+                    p_collide_with_areas)) {
+        if (!avbd::query::containsPoint(target.shape, point)) {
             continue;
         }
-        r_results[count].rid = server->solver_pick_rid(space, candidate.rigid);
-        r_results[count].collider_id = server->body_instance_id(space, candidate.rigid);
+        r_results[count].rid = target.rid;
+        r_results[count].collider_id = target.collider_id;
         r_results[count].collider = nullptr;
-        r_results[count].shape = 0;
+        r_results[count].shape = target.shape_index;
         count++;
         if (count >= p_max_results) {
             break;
@@ -256,33 +263,45 @@ int32_t AVBDDirectSpaceState3D::_intersect_point(const Vector3 &p_position, uint
 int32_t AVBDDirectSpaceState3D::_intersect_shape(const RID &p_shape_rid, const Transform3D &p_transform,
         const Vector3 &p_motion, float p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies,
         bool p_collide_with_areas, PhysicsServer3DExtensionShapeResult *r_results, int32_t p_max_results) {
-    (void)p_collide_with_areas;
-    if (server == nullptr || r_results == nullptr || !p_collide_with_bodies || p_max_results <= 0) {
+    if (server == nullptr || r_results == nullptr || p_max_results <= 0) {
+        return 0;
+    }
+    if (!p_collide_with_bodies && !p_collide_with_areas) {
         return 0;
     }
     const AVBDPhysicsServer3D::ShapeData *data = server->shape_data(p_shape_rid);
     if (data == nullptr) {
         return 0;
     }
-
-    avbd::Shape query = query_shape_of(*data, p_transform);
+    avbd::Shape query;
+    if (!query_shape_of(*data, p_transform, query)) {
+        return 0;
+    }
     query.center = query.center + to_sim(p_motion); // the query pose is transform moved by motion
-    (void)p_margin; // the solver's COLLISION_MARGIN already keeps contacts stable
 
     avbd::float3 qmin, qmax;
     shape_aabb(query, qmin, qmax);
+    const float margin = std::max(0.0f, p_margin);
+    if (margin > 0.0f) {
+        const avbd::float3 m{margin, margin, margin};
+        qmin -= m;
+        qmax += m;
+    }
+
     int32_t count = 0;
-    for (const AVBDPhysicsServer3D::QueryCandidate &candidate :
-            server->query_candidates_aabb(space, qmin, qmax, p_collision_mask)) {
-        avbd::Manifold::Contact contact{};
+    for (const QueryTarget &target :
+            collect_targets(qmin, qmax, p_collision_mask, p_collide_with_bodies,
+                    p_collide_with_areas)) {
+        avbd::Manifold::Contact contacts[8];
         avbd::float3x3 basis{};
-        if (!deepest_contact(query, shape_of(*candidate.rigid), contact, basis)) {
+        if (avbd::query::shapeContacts(query, target.shape,
+                    std::span<avbd::Manifold::Contact>(contacts, 8), basis, margin) <= 0) {
             continue;
         }
-        r_results[count].rid = server->solver_pick_rid(space, candidate.rigid);
-        r_results[count].collider_id = server->body_instance_id(space, candidate.rigid);
+        r_results[count].rid = target.rid;
+        r_results[count].collider_id = target.collider_id;
         r_results[count].collider = nullptr;
-        r_results[count].shape = 0;
+        r_results[count].shape = target.shape_index;
         count++;
         if (count >= p_max_results) {
             break;
@@ -295,34 +314,27 @@ bool AVBDDirectSpaceState3D::_cast_motion(const RID &p_shape_rid, const Transfor
         const Vector3 &p_motion, float p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies,
         bool p_collide_with_areas, float *r_closest_safe, float *r_closest_unsafe,
         PhysicsServer3DExtensionShapeRestInfo *r_info) {
-    (void)p_margin;
-    (void)p_collide_with_areas;
-    (void)r_info;
-    if (server == nullptr || !p_collide_with_bodies) {
-        if (r_closest_safe != nullptr) {
-            *r_closest_safe = 1.0f;
-        }
-        if (r_closest_unsafe != nullptr) {
-            *r_closest_unsafe = 1.0f;
-        }
+    if (r_closest_safe != nullptr) {
+        *r_closest_safe = 1.0f;
+    }
+    if (r_closest_unsafe != nullptr) {
+        *r_closest_unsafe = 1.0f;
+    }
+    if (server == nullptr || (!p_collide_with_bodies && !p_collide_with_areas)) {
         return false;
     }
     const AVBDPhysicsServer3D::ShapeData *data = server->shape_data(p_shape_rid);
     if (data == nullptr) {
-        if (r_closest_safe != nullptr) {
-            *r_closest_safe = 1.0f;
-        }
-        if (r_closest_unsafe != nullptr) {
-            *r_closest_unsafe = 1.0f;
-        }
+        return false;
+    }
+    avbd::Shape base;
+    if (!query_shape_of(*data, p_transform, base)) {
         return false;
     }
 
     const avbd::float3 motion = to_sim(p_motion);
-    const avbd::Shape base = query_shape_of(*data, p_transform);
+    const float margin = std::max(0.0f, p_margin);
 
-    // The sweep's candidate box: the query shape's bound swept over the motion (a
-    // translation, so the union is per-axis min/max of the two endpoint bounds).
     avbd::float3 swept_min, swept_max;
     shape_aabb(base, swept_min, swept_max);
     for (int i = 0; i < 3; i++) {
@@ -330,100 +342,108 @@ bool AVBDDirectSpaceState3D::_cast_motion(const RID &p_shape_rid, const Transfor
         swept_min[i] = std::min(swept_min[i], swept_min[i] + m);
         swept_max[i] = std::max(swept_max[i], swept_max[i] + m);
     }
+    if (margin > 0.0f) {
+        const avbd::float3 pad{margin, margin, margin};
+        swept_min -= pad;
+        swept_max += pad;
+    }
 
-    // Binary search the motion fraction for the first colliding pose (8 iterations is
-    // 1/256 precision - finer than any gameplay use).
-    const auto collides = [&](float t) {
-        avbd::Shape posed = base;
-        posed.center = posed.center + motion * t;
-        for (const AVBDPhysicsServer3D::QueryCandidate &candidate :
-                server->query_candidates_aabb(space, swept_min, swept_max, p_collision_mask)) {
-            avbd::Manifold::Contact contact{};
-            avbd::float3x3 basis{};
-            if (deepest_contact(posed, shape_of(*candidate.rigid), contact, basis)) {
-                return true;
-            }
+    bool found = false;
+    avbd::query::SweepHit best;
+    QueryTarget best_target{};
+    for (const QueryTarget &target :
+            collect_targets(swept_min, swept_max, p_collision_mask, p_collide_with_bodies,
+                    p_collide_with_areas)) {
+        const avbd::query::SweepHit hit = avbd::query::sweepShape(base, motion, target.shape, margin);
+        if (!hit.hit) {
+            continue;
         }
+        if (!found || hit.safe < best.safe) {
+            found = true;
+            best = hit;
+            best_target = target;
+        }
+    }
+
+    if (!found) {
         return false;
-    };
-
-    if (!collides(1.0f)) {
-        // The whole motion is safe.
-        if (r_closest_safe != nullptr) {
-            *r_closest_safe = 1.0f;
-        }
-        if (r_closest_unsafe != nullptr) {
-            *r_closest_unsafe = 1.0f;
-        }
-        return false; // false = no collision along the motion
     }
 
-    float low = 0.0f;
-    float high = 1.0f;
-    for (int i = 0; i < 8; i++) {
-        const float mid = (low + high) * 0.5f;
-        if (collides(mid)) {
-            high = mid;
-        } else {
-            low = mid;
-        }
-    }
     if (r_closest_safe != nullptr) {
-        *r_closest_safe = low;
+        *r_closest_safe = best.safe;
     }
     if (r_closest_unsafe != nullptr) {
-        *r_closest_unsafe = high;
+        *r_closest_unsafe = best.unsafe;
     }
-    return true; // true = the motion would collide
+    if (r_info != nullptr) {
+        r_info->point = to_godot(best.point);
+        r_info->normal = to_godot(best.normal);
+        r_info->rid = best_target.rid;
+        r_info->collider_id = best_target.collider_id;
+        r_info->shape = best_target.shape_index;
+        r_info->linear_velocity = best_target.linear_velocity;
+    }
+    return true;
 }
 
 bool AVBDDirectSpaceState3D::_collide_shape(const RID &p_shape_rid, const Transform3D &p_transform,
         const Vector3 &p_motion, float p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies,
         bool p_collide_with_areas, void *r_results, int32_t p_max_results, int32_t *r_result_count) {
-    (void)p_collide_with_areas;
-    
-    if (server == nullptr || r_result_count == nullptr || !p_collide_with_bodies) {
-        if (r_result_count != nullptr) {
-            *r_result_count = 0;
-        }
+    if (r_result_count != nullptr) {
+        *r_result_count = 0;
+    }
+    if (server == nullptr || r_results == nullptr || r_result_count == nullptr) {
+        return false;
+    }
+    if (!p_collide_with_bodies && !p_collide_with_areas) {
         return false;
     }
     const AVBDPhysicsServer3D::ShapeData *data = server->shape_data(p_shape_rid);
     if (data == nullptr) {
-        *r_result_count = 0;
         return false;
     }
-
-    avbd::Shape query = query_shape_of(*data, p_transform);
+    avbd::Shape query;
+    if (!query_shape_of(*data, p_transform, query)) {
+        return false;
+    }
     query.center = query.center + to_sim(p_motion);
-    (void)p_margin;
-
-    // The results buffer is pairs of Vector3 (Godot's convention: contact point on the
-    // query shape, then on the collider, alternating).
-    Vector3 *points = static_cast<Vector3 *>(r_results);
-    const int32_t max_pairs = p_max_results / 2;
 
     avbd::float3 qmin, qmax;
     shape_aabb(query, qmin, qmax);
+    const float margin = std::max(0.0f, p_margin);
+    if (margin > 0.0f) {
+        const avbd::float3 m{margin, margin, margin};
+        qmin -= m;
+        qmax += m;
+    }
+
+    // Godot's convention: pairs of Vector3, first on the query shape, then on the collider.
+    Vector3 *points = static_cast<Vector3 *>(r_results);
+    const int32_t max_pairs = p_max_results / 2;
     int32_t pairs = 0;
     bool any = false;
-    for (const AVBDPhysicsServer3D::QueryCandidate &candidate :
-            server->query_candidates_aabb(space, qmin, qmax, p_collision_mask)) {
-        avbd::Manifold::Contact contact{};
+    for (const QueryTarget &target :
+            collect_targets(qmin, qmax, p_collision_mask, p_collide_with_bodies,
+                    p_collide_with_areas)) {
+        avbd::Manifold::Contact contacts[8];
         avbd::float3x3 basis{};
-        if (!deepest_contact(query, shape_of(*candidate.rigid), contact, basis)) {
+        const int count = avbd::query::shapeContacts(query, target.shape,
+                std::span<avbd::Manifold::Contact>(contacts, 8), basis, margin);
+        if (count <= 0) {
             continue;
         }
         any = true;
-        if (pairs < max_pairs) {
+        for (int i = 0; i < count && pairs < max_pairs; i++) {
+            const avbd::Manifold::Contact &contact = contacts[i];
             const avbd::float3 world_a = query.center + avbd::qrot(query.rotation, contact.rA);
-            const avbd::Rigid &b = *candidate.rigid;
-            const avbd::float3 world_b = b.positionLin + qrot(b.positionAng, contact.rB);
+            const avbd::float3 world_b = target.shape.center + avbd::qrot(target.shape.rotation, contact.rB);
             points[pairs * 2 + 0] = to_godot(world_a);
             points[pairs * 2 + 1] = to_godot(world_b);
             pairs++;
         }
-        break; // the engine takes the first colliding pair set
+        if (pairs >= max_pairs) {
+            break;
+        }
     }
     *r_result_count = pairs * 2;
     return any;
@@ -432,50 +452,109 @@ bool AVBDDirectSpaceState3D::_collide_shape(const RID &p_shape_rid, const Transf
 bool AVBDDirectSpaceState3D::_rest_info(const RID &p_shape_rid, const Transform3D &p_transform,
         const Vector3 &p_motion, float p_margin, uint32_t p_collision_mask, bool p_collide_with_bodies,
         bool p_collide_with_areas, PhysicsServer3DExtensionShapeRestInfo *r_rest_info) {
-    (void)p_collide_with_areas;
-    if (server == nullptr || r_rest_info == nullptr || !p_collide_with_bodies) {
+    if (server == nullptr || r_rest_info == nullptr) {
+        return false;
+    }
+    if (!p_collide_with_bodies && !p_collide_with_areas) {
         return false;
     }
     const AVBDPhysicsServer3D::ShapeData *data = server->shape_data(p_shape_rid);
     if (data == nullptr) {
         return false;
     }
-
-    avbd::Shape query = query_shape_of(*data, p_transform);
+    avbd::Shape query;
+    if (!query_shape_of(*data, p_transform, query)) {
+        return false;
+    }
     query.center = query.center + to_sim(p_motion);
-    (void)p_margin;
 
-    // The deepest contact over all bodies wins.
-    bool found = false;
-    float best_depth = -1.0f;
     avbd::float3 qmin, qmax;
     shape_aabb(query, qmin, qmax);
-    for (const AVBDPhysicsServer3D::QueryCandidate &candidate :
-            server->query_candidates_aabb(space, qmin, qmax, p_collision_mask)) {
-        avbd::Manifold::Contact contact{};
-        avbd::float3x3 basis{};
-        if (!deepest_contact(query, shape_of(*candidate.rigid), contact, basis)) {
-            continue;
-        }
-        const float depth = avbd::length(contact.rA - contact.rB);
-        if (depth <= best_depth) {
-            continue;
-        }
-        best_depth = depth;
-        found = true;
-        const avbd::float3 world_a = query.center + avbd::qrot(query.rotation, contact.rA);
-        r_rest_info->point = to_godot(world_a);
-        r_rest_info->normal = contact_normal_godot(basis);
-        r_rest_info->rid = server->solver_pick_rid(space, candidate.rigid);
-        r_rest_info->collider_id = server->body_instance_id(space, candidate.rigid);
-        r_rest_info->shape = 0;
-        r_rest_info->linear_velocity = server->body_velocity_of(space, candidate.rigid);
+    const float margin = std::max(0.0f, p_margin);
+    if (margin > 0.0f) {
+        const avbd::float3 m{margin, margin, margin};
+        qmin -= m;
+        qmax += m;
     }
-    return found;
+
+    bool found = false;
+    float best_depth = -1.0f;
+    avbd::float3 best_point{0, 0, 0};
+    avbd::float3x3 best_basis{};
+    QueryTarget best_target{};
+    for (const QueryTarget &target :
+            collect_targets(qmin, qmax, p_collision_mask, p_collide_with_bodies,
+                    p_collide_with_areas)) {
+        avbd::Manifold::Contact contacts[8];
+        avbd::float3x3 basis{};
+        const int count = avbd::query::shapeContacts(query, target.shape,
+                std::span<avbd::Manifold::Contact>(contacts, 8), basis, margin);
+        for (int i = 0; i < count; i++) {
+            const avbd::float3 normal = avbd::row(basis, 0);
+            const float depth = avbd::query::penetrationDepth(query, target.shape, normal);
+            if (depth <= best_depth) {
+                continue;
+            }
+            best_depth = depth;
+            best_basis = basis;
+            best_point = query.center + avbd::qrot(query.rotation, contacts[i].rA);
+            best_target = target;
+            found = true;
+        }
+    }
+
+    if (!found) {
+        return false;
+    }
+    r_rest_info->point = to_godot(best_point);
+    r_rest_info->normal = contact_normal_godot(best_basis);
+    r_rest_info->rid = best_target.rid;
+    r_rest_info->collider_id = best_target.collider_id;
+    r_rest_info->shape = best_target.shape_index;
+    r_rest_info->linear_velocity = best_target.linear_velocity;
+    return true;
 }
 
 Vector3 AVBDDirectSpaceState3D::_get_closest_point_to_object_volume(const RID &p_object, const Vector3 &p_point) const {
-    // Approximation used by the editor's selection; not needed for gameplay queries.
-    (void)p_object;
-    return p_point;
+    if (server == nullptr) {
+        return p_point;
+    }
+    const avbd::float3 point = to_sim(p_point);
+    bool found = false;
+    float best_distance = std::numeric_limits<float>::infinity();
+    avbd::float3 best_point = point;
+
+    const auto consider = [&](const avbd::Shape &shape) {
+        const avbd::float3 candidate = avbd::query::closestPoint(shape, point);
+        const float distance = avbd::length2(candidate - point);
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_point = candidate;
+            found = true;
+        }
+    };
+
+    if (const AVBDPhysicsServer3D::BodyData *body = server->find_body(p_object)) {
+        if (body->rigid != nullptr) {
+            consider(AVBDPhysicsServer3D::query_shape_from_rigid(*body->rigid));
+        } else if (!body->shapes.empty()) {
+            avbd::Shape shape;
+            if (AVBDPhysicsServer3D::query_shape_from_data(body->shapes.front(), body->transform, shape)) {
+                consider(shape);
+            }
+        }
+    }
+    if (const AVBDPhysicsServer3D::AreaData *area = server->find_area(p_object)) {
+        for (size_t i = 0; i < area->shapes.size(); i++) {
+            if (area->shape_disabled[i]) {
+                continue;
+            }
+            const Transform3D posed = area->transform * area->shape_transforms[i];
+            avbd::Shape shape;
+            if (AVBDPhysicsServer3D::query_shape_from_data(area->shapes[i], posed, shape)) {
+                consider(shape);
+            }
+        }
+    }
+    return found ? to_godot(best_point) : p_point;
 }

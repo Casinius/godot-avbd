@@ -9,6 +9,7 @@
 #include "server/avbd_direct_space_state3d.hpp"
 
 #include "avbd/list_range.hpp"
+#include "avbd/query/query_shape.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -389,7 +390,7 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     p_space.contact_grace_ticks = static_cast<int>(settings->get_setting(
             "physics/avbd/contact_grace_ticks", 0.0));
     p_space.contact_gs = settings->get_setting("physics/avbd/contact_gs", false);
-    p_space.broad_phase_lbvh = settings->get_setting("physics/avbd/broad_phase_lbvh", false);
+    p_space.broad_phase_lbvh = settings->get_setting("physics/avbd/broad_phase_lbvh", true);
     p_space.speculative_margin = settings->get_setting("physics/avbd/speculative_margin", 0.01);
 }
 
@@ -648,16 +649,120 @@ void AVBDPhysicsServer3D::_soft_body_update_rendering_server(const RID &p_body,
 bool AVBDPhysicsServer3D::_body_test_motion(const RID &p_body, const Transform3D &p_from, const Vector3 &p_motion,
         float p_margin, int32_t p_max_collisions, bool p_collide_separation_ray, bool p_recovery_as_collision,
         PhysicsServer3DExtensionMotionResult *p_result) const {
-    // Motion queries are documented unsupported: the neutral answer is "no hit".
-    (void)p_body;
-    (void)p_from;
-    (void)p_motion;
-    (void)p_margin;
-    (void)p_max_collisions;
-    (void)p_collide_separation_ray;
-    (void)p_recovery_as_collision;
-    (void)p_result;
-    return false;
+    (void)p_collide_separation_ray; // separation-ray shapes are outside the supported set
+    (void)p_recovery_as_collision;  // initial overlap is reported as a safe=0 collision
+
+    if (p_result != nullptr) {
+        p_result->travel = p_motion;
+        p_result->remainder = Vector3();
+        p_result->collision_depth = 0.0f;
+        p_result->collision_safe_fraction = 1.0f;
+        p_result->collision_unsafe_fraction = 1.0f;
+        p_result->collision_count = 0;
+    }
+
+    const auto moving_it = bodies.find(id_of(p_body));
+    if (moving_it == bodies.end() || moving_it->second.space.is_valid() == false) {
+        return false;
+    }
+    const BodyData &moving = moving_it->second;
+    const uint64_t moving_id = id_of(p_body);
+
+    avbd::Shape base;
+    if (moving.rigid != nullptr) {
+        base = query_shape_from_rigid(*moving.rigid);
+    } else if (!moving.shapes.empty()) {
+        if (!query_shape_from_data(moving.shapes.front(), p_from, base)) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    // The engine passes the pose to test from, which may differ from the body's current pose.
+    base.center = to_sim(p_from.origin);
+    base.rotation = to_sim(p_from.basis.get_rotation_quaternion());
+    base.axis = avbd::qrot(base.rotation, avbd::float3{0, 0, 1});
+
+    const avbd::float3 motion = to_sim(p_motion);
+    const float margin = std::max(0.0f, p_margin);
+    avbd::float3 swept_min, swept_max;
+    avbd::query::shapeAabb(base, swept_min, swept_max);
+    for (int i = 0; i < 3; i++) {
+        const float m = motion[i];
+        swept_min[i] = std::min(swept_min[i], swept_min[i] + m);
+        swept_max[i] = std::max(swept_max[i], swept_max[i] + m);
+    }
+    if (margin > 0.0f) {
+        const avbd::float3 pad{margin, margin, margin};
+        swept_min -= pad;
+        swept_max += pad;
+    }
+
+    struct Hit {
+        avbd::query::SweepHit sweep;
+        uint64_t body_id = 0;
+        uint64_t instance_id = 0;
+        Vector3 linear_velocity;
+        Vector3 angular_velocity;
+    };
+    std::vector<Hit> hits;
+    for (const QueryCandidate &candidate :
+            query_candidates_aabb(moving.space, swept_min, swept_max, moving.collision_mask)) {
+        if (candidate.rigid == nullptr || candidate.body_id == moving_id) {
+            continue;
+        }
+        if (body_is_excepted(moving_id, candidate.body_id)) {
+            continue;
+        }
+        const avbd::Shape target = query_shape_from_rigid(*candidate.rigid);
+        avbd::query::SweepHit sweep = avbd::query::sweepShape(base, motion, target, margin);
+        if (!sweep.hit) {
+            continue;
+        }
+        const auto other = bodies.find(candidate.body_id);
+        Hit hit;
+        hit.sweep = sweep;
+        hit.body_id = candidate.body_id;
+        if (other != bodies.end()) {
+            hit.instance_id = other->second.instance_id;
+            hit.linear_velocity = other->second.linear_velocity;
+            hit.angular_velocity = other->second.angular_velocity;
+        }
+        hits.push_back(hit);
+    }
+
+    if (hits.empty()) {
+        return false;
+    }
+    std::sort(hits.begin(), hits.end(), [](const Hit &a, const Hit &b) {
+        return a.sweep.safe < b.sweep.safe;
+    });
+
+    const Hit &nearest = hits.front();
+    if (p_result != nullptr) {
+        p_result->travel = p_motion * nearest.sweep.safe;
+        p_result->remainder = p_motion * (1.0f - nearest.sweep.safe);
+        p_result->collision_depth = nearest.sweep.depth;
+        p_result->collision_safe_fraction = nearest.sweep.safe;
+        p_result->collision_unsafe_fraction = nearest.sweep.unsafe;
+        const int32_t max_collisions = std::clamp(p_max_collisions, 0, 32);
+        const int32_t count = std::min<int32_t>(static_cast<int32_t>(hits.size()), max_collisions);
+        p_result->collision_count = count;
+        for (int32_t i = 0; i < count; i++) {
+            const Hit &hit = hits[static_cast<size_t>(i)];
+            PhysicsServer3DExtensionMotionCollision &collision = p_result->collisions[i];
+            collision.position = to_godot(hit.sweep.point);
+            collision.normal = to_godot(hit.sweep.normal);
+            collision.collider_velocity = hit.linear_velocity;
+            collision.collider_angular_velocity = hit.angular_velocity;
+            collision.depth = hit.sweep.depth;
+            collision.local_shape = 0;
+            collision.collider_id = hit.instance_id;
+            collision.collider = make_rid(hit.body_id);
+            collision.collider_shape = 0;
+        }
+    }
+    return true;
 }
 
 void AVBDPhysicsServer3D::_shape_set_data(const RID &p_shape, const Variant &p_data) {
@@ -765,6 +870,62 @@ Variant AVBDPhysicsServer3D::_shape_get_data(const RID &p_shape) const {
             // Proxied and excluded shapes round-trip the engine's own payload.
             return shape.data;
     }
+}
+
+bool AVBDPhysicsServer3D::query_shape_from_data(const ShapeData &p_data, const Transform3D &p_transform,
+        avbd::Shape &r_shape) {
+    avbd::Shape s;
+    switch (p_data.type) {
+        case PhysicsServer3D::SHAPE_SPHERE:
+            s.type = avbd::ShapeType::Sphere;
+            s.radius = static_cast<float>(p_data.radius);
+            break;
+        case PhysicsServer3D::SHAPE_CYLINDER:
+            s.type = avbd::ShapeType::Cylinder;
+            s.radius = static_cast<float>(p_data.radius);
+            s.halfHeight = static_cast<float>(p_data.height) * 0.5f;
+            break;
+        case PhysicsServer3D::SHAPE_CAPSULE:
+            // The solver's capsule proxy is a cylinder over the capsule's radius and
+            // full height (the same dimensions rebuild_space stamps into the body).
+            s.type = avbd::ShapeType::Cylinder;
+            s.radius = static_cast<float>(p_data.radius);
+            s.halfHeight = static_cast<float>(p_data.height) * 0.5f;
+            break;
+        case PhysicsServer3D::SHAPE_CONVEX_POLYGON:
+            // The solver rotates the points' local AABB as an OBB, so the query does too.
+            s.type = avbd::ShapeType::Box;
+            s.half = to_sim_extents(p_data.extents) * 0.5f;
+            break;
+        case PhysicsServer3D::SHAPE_BOX:
+            s.type = avbd::ShapeType::Box;
+            s.half = to_sim_extents(p_data.extents) * 0.5f;
+            break;
+        case PhysicsServer3D::SHAPE_CONCAVE_POLYGON:
+        case PhysicsServer3D::SHAPE_HEIGHTMAP:
+        case PhysicsServer3D::SHAPE_WORLD_BOUNDARY:
+        case PhysicsServer3D::SHAPE_SEPARATION_RAY:
+        case PhysicsServer3D::SHAPE_CUSTOM:
+        default:
+            return false;
+    }
+    s.center = to_sim(p_transform.origin);
+    s.rotation = to_sim(p_transform.basis.get_rotation_quaternion());
+    s.axis = avbd::qrot(s.rotation, avbd::float3{0, 0, 1});
+    r_shape = s;
+    return true;
+}
+
+avbd::Shape AVBDPhysicsServer3D::query_shape_from_rigid(const avbd::Rigid &p_body) {
+    avbd::Shape s;
+    s.type = p_body.shape;
+    s.center = p_body.positionLin;
+    s.rotation = p_body.positionAng;
+    s.half = p_body.size * 0.5f;
+    s.radius = p_body.size.x;
+    s.halfHeight = p_body.size.z * 0.5f;
+    s.axis = avbd::qrot(p_body.positionAng, avbd::float3{0, 0, 1});
+    return s;
 }
 
 // Godot BodyAxis bits (linear X/Y/Z = 1/2/4, angular X/Y/Z = 8/16/32) to the solver's
@@ -2473,7 +2634,7 @@ std::vector<AVBDPhysicsServer3D::QueryCandidate> AVBDPhysicsServer3D::query_cand
                           && (body.rigid->collisionLayer & p_mask) != 0;
               })
             | std::views::transform([](const auto &entry) {
-                  return QueryCandidate{entry.second.rigid, entry.first};
+                  return QueryCandidate{entry.second.rigid, entry.first, entry.second.ray_pickable};
               })
     );
 }
@@ -2496,9 +2657,61 @@ std::vector<AVBDPhysicsServer3D::QueryCandidate> AVBDPhysicsServer3D::query_cand
         if (id == space.rigid_ids.end()) {
             continue;
         }
-        out.push_back(QueryCandidate{const_cast<avbd::Rigid *>(rigid), id->second});
+        const auto body = bodies.find(id->second);
+        const bool pickable = body != bodies.end() ? body->second.ray_pickable : true;
+        out.push_back(QueryCandidate{const_cast<avbd::Rigid *>(rigid), id->second, pickable});
     }
     return out;
+}
+
+std::vector<AVBDPhysicsServer3D::QueryAreaCandidate> AVBDPhysicsServer3D::query_area_candidates_aabb(
+        const RID &p_space, avbd::float3 p_min, avbd::float3 p_max, uint32_t p_mask) const {
+    const auto found = spaces.find(id_of(p_space));
+    if (found == spaces.end()) {
+        return {};
+    }
+    const uint64_t space_id = id_of(p_space);
+
+    std::vector<QueryAreaCandidate> out;
+    for (const auto &[area_id, area] : areas) {
+        if (!area.space.is_valid() || id_of(area.space) != space_id) {
+            continue;
+        }
+        if ((area.collision_layer & p_mask) == 0) {
+            continue;
+        }
+        for (size_t i = 0; i < area.shapes.size(); i++) {
+            if (area.shape_disabled[i]) {
+                continue;
+            }
+            const Transform3D posed = area.transform * area.shape_transforms[i];
+            avbd::Shape shape;
+            if (!query_shape_from_data(area.shapes[i], posed, shape)) {
+                continue;
+            }
+            avbd::float3 shape_min, shape_max;
+            avbd::query::shapeAabb(shape, shape_min, shape_max);
+            if (shape_min.x > p_max.x || shape_min.y > p_max.y || shape_min.z > p_max.z
+                    || p_min.x > shape_max.x || p_min.y > shape_max.y || p_min.z > shape_max.z) {
+                continue;
+            }
+            out.push_back(QueryAreaCandidate{shape, make_rid(area_id), area.instance_id,
+                    static_cast<int>(i), area.ray_pickable});
+        }
+    }
+    return out;
+}
+
+bool AVBDPhysicsServer3D::body_is_excepted(uint64_t p_body_a, uint64_t p_body_b) const {
+    const auto a = bodies.find(p_body_a);
+    const auto b = bodies.find(p_body_b);
+    if (a == bodies.end() || b == bodies.end()) {
+        return false;
+    }
+    const auto lists = [](const BodyData &from, uint64_t other) {
+        return std::find(from.exceptions.begin(), from.exceptions.end(), other) != from.exceptions.end();
+    };
+    return lists(a->second, p_body_b) || lists(b->second, p_body_a);
 }
 
 avbd::Rigid *AVBDPhysicsServer3D::solver_pick(const RID &p_space, avbd::float3 p_origin, avbd::float3 p_dir,
@@ -3249,36 +3462,18 @@ void AVBDPhysicsServer3D::_monitor_areas() {
             continue;
         }
 
-        // The area's shapes in sim space, once per area.
+        // The area's shapes in sim space, once per area. Unsupported shapes (concave,
+        // heightmap, ...) have no query proxy and are skipped, matching the body path.
         std::vector<avbd::Shape> area_shapes;
         for (size_t i = 0; i < area.shapes.size(); i++) {
             if (area.shape_disabled[i]) {
                 continue;
             }
             const Transform3D posed = area.transform * area.shape_transforms[i];
-            area_shapes.push_back([this, &area, i, posed]() {
-                avbd::Shape s;
-                const ShapeData &data = area.shapes[i];
-                switch (data.type) {
-                    case PhysicsServer3D::SHAPE_SPHERE:
-                        s.type = avbd::ShapeType::Sphere;
-                        s.radius = static_cast<float>(data.radius);
-                        break;
-                    case PhysicsServer3D::SHAPE_CYLINDER:
-                        s.type = avbd::ShapeType::Cylinder;
-                        s.radius = static_cast<float>(data.radius);
-                        s.halfHeight = static_cast<float>(data.height) * 0.5f;
-                        break;
-                    default:
-                        s.type = avbd::ShapeType::Box;
-                        s.half = to_sim_extents(data.extents) * 0.5f;
-                        break;
-                }
-                s.center = to_sim(posed.origin);
-                s.rotation = to_sim(posed.basis.get_rotation_quaternion());
-                s.axis = avbd::qrot(s.rotation, avbd::float3{0, 0, 1});
-                return s;
-            }());
+            avbd::Shape shape;
+            if (query_shape_from_data(area.shapes[i], posed, shape)) {
+                area_shapes.push_back(shape);
+            }
         }
         if (area_shapes.empty()) {
             continue;
@@ -3295,17 +3490,7 @@ void AVBDPhysicsServer3D::_monitor_areas() {
                 if ((body.rigid->collisionLayer & area.collision_mask) == 0) {
                     continue;
                 }
-                const avbd::Shape body_shape = [r = body.rigid]() {
-                    avbd::Shape s;
-                    s.type = r->shape;
-                    s.center = r->positionLin;
-                    s.rotation = r->positionAng;
-                    s.half = r->size * 0.5f;
-                    s.radius = r->size.x;
-                    s.halfHeight = r->size.z * 0.5f;
-                    s.axis = qrot(r->positionAng, avbd::float3{0, 0, 1});
-                    return s;
-                }();
+                const avbd::Shape body_shape = query_shape_from_rigid(*body.rigid);
                 for (const avbd::Shape &shape : area_shapes) {
                     avbd::Manifold::Contact contact{};
                     avbd::float3x3 basis{};
@@ -3376,26 +3561,10 @@ void AVBDPhysicsServer3D::_monitor_areas() {
                             continue;
                         }
                         const Transform3D posed = other.transform * other.shape_transforms[i];
-                        const ShapeData &data = other.shapes[i];
                         avbd::Shape other_shape;
-                        switch (data.type) {
-                            case PhysicsServer3D::SHAPE_SPHERE:
-                                other_shape.type = avbd::ShapeType::Sphere;
-                                other_shape.radius = static_cast<float>(data.radius);
-                                break;
-                            case PhysicsServer3D::SHAPE_CYLINDER:
-                                other_shape.type = avbd::ShapeType::Cylinder;
-                                other_shape.radius = static_cast<float>(data.radius);
-                                other_shape.halfHeight = static_cast<float>(data.height) * 0.5f;
-                                break;
-                            default:
-                                other_shape.type = avbd::ShapeType::Box;
-                                other_shape.half = to_sim_extents(data.extents) * 0.5f;
-                                break;
+                        if (!query_shape_from_data(other.shapes[i], posed, other_shape)) {
+                            continue;
                         }
-                        other_shape.center = to_sim(posed.origin);
-                        other_shape.rotation = to_sim(posed.basis.get_rotation_quaternion());
-                        other_shape.axis = avbd::qrot(other_shape.rotation, avbd::float3{0, 0, 1});
 
                         for (const avbd::Shape &shape : area_shapes) {
                             avbd::Manifold::Contact contact{};

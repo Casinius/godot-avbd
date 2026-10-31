@@ -37,6 +37,7 @@ local avbd_core = {
     "src/avbd/joint.cpp",
     "src/avbd/generic_joint.cpp",
     "src/avbd/spring.cpp",
+    "src/avbd/query/query_shape.cpp",
     "src/avbd/manifold.cpp",
     "src/avbd/collide.cpp",
     "src/avbd/solver.cpp",
@@ -166,6 +167,15 @@ target("avbd_core_test")
     avbd_common()
     on_config(avbd_toolchain)
 
+-- Query-extension geometry tests: no engine, no solver step.
+target("avbd_query_test")
+    set_kind("binary")
+    add_files(table.join(avbd_core, "test/query_test.cpp"))
+    add_includedirs("src")
+    add_packages("thread-pool")
+    avbd_common()
+    on_config(avbd_toolchain)
+
 -- Constraint composition tests (Godot headless, inside the demo project).
 target("avbd_constraint_tests")
     set_kind("phony")
@@ -178,6 +188,13 @@ target("avbd_solver_tests")
     set_kind("phony")
     on_run(function (target)
         import("scripts.run_godot_tests", {rootdir = "xmake"}).main("res://tests/test_solver.gd")
+    end)
+
+-- Space-query behaviour (Godot headless, inside the demo project).
+target("avbd_query_tests")
+    set_kind("phony")
+    on_run(function (target)
+        import("scripts.run_godot_tests", {rootdir = "xmake"}).main("res://tests/test_queries.gd")
     end)
 
 -- API compliance audit (Godot headless, inside the demo project).
@@ -218,7 +235,9 @@ target("run_all_tests")
     on_run(function (target)
         local runner = import("scripts.run_godot_tests", {rootdir = "xmake"})
         os.exec("xmake run avbd_core_test")
+        os.exec("xmake run avbd_query_test")
         runner.main("res://tests/test_solver.gd")
+        runner.main("res://tests/test_queries.gd")
         runner.main("res://tests/test_constraints.gd")
         runner.main("res://tests/test_server.gd")
         runner.main("res://tests/test_pyramid.gd")

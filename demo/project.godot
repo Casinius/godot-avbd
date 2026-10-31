@@ -39,6 +39,7 @@ avbd/projection_beta=1.0
 avbd/projection_max_correction=0.8
 avbd/internal_ticks_per_second=60
 avbd/adaptive_beta=true
+avbd/broad_phase_lbvh=true
 
 [rendering]
 

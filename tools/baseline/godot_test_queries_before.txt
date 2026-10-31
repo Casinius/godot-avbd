@@ -1,0 +1,59 @@
+# Space-query suite before the query work (plan step 1).
+# Command: xmake run avbd_query_tests
+# Godot: 4.7.1.stable.official, host: Linux x86_64
+#
+# Existing suites at this baseline:
+#   avbd_core_test   138 checks, 0 failures
+#   avbd_solver_tests 38 checks, 1 failure (pre-existing: hard joint error)
+#   check_api         30 checks, 0 failures
+#   avbd_load_tests   PASS
+#
+# Expected query failures: 11.
+#
+# Call-pattern notes from the probe:
+#   * Godot 4.7 ShapeCast3D calls cast_motion once, then rest_info repeatedly with a
+#     growing exclusion set. Because the server ignores exclusions, the same collider is
+#     returned max_results times (the "count=4" duplicate above).
+#   * PhysicsDirectSpaceState3D in 4.7 does not expose get_closest_point_to_object_volume
+#     in ClassDB; the extension virtual is still present in the godot-cpp header.
+#   * cast_motion currently tests only the final pose, so a fast cast that ends past the
+#     target returns no hit (direct_cast_motion_sweep).
+
+[godot] res://tests/test_queries.gd
+Godot Engine v4.7.1.stable.official.a13da4feb - https://godotengine.org
+
+AVBD physics server: factory invoked - the engine selected AVBD
+
+== ray_exclusions
+  ok  direct ray still hits after exclusion excluded box at y=3, ground below
+FAIL  direct ray exclusion skips box hit=27028096472
+FAIL  RayCast3D.add_exception skips box collider=Box:<RigidBody3D#27028096472>
+FAIL  RayCast3D.exclude_parent skips parent collider=Parent:<StaticBody3D#27095205340>
+     evidence: { "direct_collider": 27028096472, "ray_collider": <Freed Object>, "parent_collider": <Freed Object> }
+
+== shapecast_exclusions
+  ok  shapecast hits something after excluding box ground below
+  ok  shapecast reports a collision  count=4
+FAIL  shapecast exclusion skips box  collider=Box:<RigidBody3D#31507613144>
+FAIL  shapecast does not repeat the collider count=4 max_results=4
+  ok  ShapeCast3D.exclude_parent skips parent collider=<null> count=0
+     evidence: { "count": 4, "first": <Freed Object>, "parent_count": 0 }
+
+== shapecast_capsule
+  ok  capsule cast_motion reports a hit result=[0.8984375, 0.90234375]
+FAIL  capsule cast uses the capsule depth safe=0.8984 (want ~0.85, box proxy would be ~0.90)
+  ok  ShapeCast3D capsule hits ground collider=Ground:<StaticBody3D#35920020963>
+     evidence: { "safe": 0.8984375, "collider": <Freed Object> }
+
+== area_queries
+FAIL  intersect_ray hits Area3D      hit={  }
+FAIL  intersect_shape hits Area3D    hits=[]
+FAIL  cast_motion hits Area3D        result=[]
+     evidence: { "ray": {  }, "shape_count": 0, "cast": [] }
+
+== direct_cast_motion_sweep
+FAIL  cast_motion sweeps past the endpoint result=[] (sphere at y=20 moving to y=-10)
+FAIL  cast_motion safe fraction is inside the motion safe=-1.0000
+     evidence: { "safe": -1.0, "motion": [] }
+
+17 checks, 11 failures

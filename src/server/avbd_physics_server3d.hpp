@@ -26,10 +26,11 @@
  * - Stepping follows the game: `_set_active(false)` (what SceneTree pause triggers) stops the
  *   simulation until the game resumes.
  *
- * Unsupported this round (README has the full list and the reasons): motion queries
- * (`move_and_collide`/`test_move`), the soft-body server API, capsule/convex/concave shapes, CCD,
- * damping, automatic sleeping, area gravity overrides. Where the engine asks for one of those the
- * server returns a neutral answer (no hit, no motion) instead of fabricating one.
+ * Unsupported this round (README has the full list and the reasons): exact capsule/convex/
+ * concave geometry (queries use the same cylinder/AABB proxies the solver simulates), the
+ * soft-body server API, CCD, damping, automatic sleeping, area gravity overrides. Motion
+ * queries (`body_test_motion`, `move_and_collide`, `test_move`) and space queries are
+ * implemented through the shared `src/avbd/query/` extension.
  */
 
 #ifndef AVBD_PHYSICS_SERVER3D_HPP
@@ -82,6 +83,15 @@ public:
         float margin = 0.0f;
         Variant data; // the engine's payload, round-tripped for _shape_get_data
     };
+
+    // --- query shape conversion -------------------------------------------------
+    // One place decides how a Godot shape becomes a solver query shape. Bodies and
+    // areas use the same proxy the solver simulates: capsule -> cylinder, convex ->
+    // the hull's local AABB box, unsupported -> false. Keeping this shared is what
+    // keeps ray/shape-cast results consistent with contact behaviour.
+    static bool query_shape_from_data(const ShapeData &p_data, const Transform3D &p_transform,
+            avbd::Shape &r_shape);
+    static avbd::Shape query_shape_from_rigid(const avbd::Rigid &p_body);
 
 protected:
     struct BodyData {
@@ -402,6 +412,15 @@ public:
     struct QueryCandidate {
         avbd::Rigid *rigid;
         uint64_t body_id; // server map id
+        bool ray_pickable = true;
+    };
+    // One enabled area shape a query may hit. `shape` is already posed in sim space.
+    struct QueryAreaCandidate {
+        avbd::Shape shape;
+        RID rid; // the area's server RID
+        uint64_t instance_id = 0;
+        int shape_index = 0;
+        bool ray_pickable = true;
     };
     // Every simulated body of the space whose layer survives the query mask.
     std::vector<QueryCandidate> query_candidates(const RID &p_space, uint32_t p_mask) const;
@@ -410,6 +429,11 @@ public:
     // answers from the body list with per-body bounds.
     std::vector<QueryCandidate> query_candidates_aabb(const RID &p_space, avbd::float3 p_min,
             avbd::float3 p_max, uint32_t p_mask) const;
+    // Area shapes whose world bound overlaps the query AABB, posed in sim space.
+    std::vector<QueryAreaCandidate> query_area_candidates_aabb(const RID &p_space, avbd::float3 p_min,
+            avbd::float3 p_max, uint32_t p_mask) const;
+    // True when either body lists the other as a collision exception.
+    bool body_is_excepted(uint64_t p_body_a, uint64_t p_body_b) const;
 
     // Solver::pick with a mask, on one space's solver.
     avbd::Rigid *solver_pick(const RID &p_space, avbd::float3 p_origin, avbd::float3 p_dir, uint32_t p_mask,

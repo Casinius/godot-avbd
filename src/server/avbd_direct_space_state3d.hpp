@@ -6,18 +6,25 @@
  * The engine reaches this through World3D.direct_space_state (RayCast3D, intersect_*,
  * ShapeCast3D, ...). One instance per space, created lazily by the server.
  *
- * Queries walk the space's solver bodies, coarse-filter by bounding radius and test
- * pairs with the same collideShapes() the solver uses, so query results and contact
- * behaviour cannot disagree.
+ * Queries walk the space's solver bodies and areas, coarse-filter by the query AABB and
+ * answer with the same collideShapes() the solver uses, so query results and contact
+ * behaviour cannot disagree. Exclusion lists (`params.exclude`) are honoured through
+ * PhysicsDirectSpaceState3DExtension::is_body_excluded_from_query(); `ray_pickable` is
+ * read for body and area hits. `cast_motion` sweeps a shape instead of testing only its
+ * final pose; `_body_test_motion` uses the same sweep for CharacterBody3D/test_move.
  */
 
 #ifndef AVBD_DIRECT_SPACE_STATE3D_HPP
 #define AVBD_DIRECT_SPACE_STATE3D_HPP
 
+#include <vector>
+
 #include <godot_cpp/classes/physics_direct_space_state3d_extension.hpp>
 #include <godot_cpp/variant/rid.hpp>
 #include <godot_cpp/variant/transform3d.hpp>
 #include <godot_cpp/variant/vector3.hpp>
+
+#include "avbd/solver.h"
 
 namespace godot {
 
@@ -28,6 +35,18 @@ class AVBDDirectSpaceState3D : public PhysicsDirectSpaceState3DExtension {
 
     AVBDPhysicsServer3D *server = nullptr;
     RID space;
+
+    // One body or area shape a query may hit, resolved from RID to a pure avbd::Shape.
+    struct QueryTarget {
+        avbd::Shape shape;
+        RID rid;
+        uint64_t collider_id = 0;
+        int shape_index = 0;
+        Vector3 linear_velocity;
+        bool is_area = false;
+    };
+    std::vector<QueryTarget> collect_targets(const avbd::float3 &p_min, const avbd::float3 &p_max,
+            uint32_t p_mask, bool p_bodies, bool p_areas, bool p_pick_ray = false) const;
 
 protected:
     static void _bind_methods() {}

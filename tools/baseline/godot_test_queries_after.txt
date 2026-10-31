@@ -1,0 +1,59 @@
+# Space-query suite after the query work (plan step 7).
+# Command: xmake run avbd_query_tests
+# Godot: 4.7.1.stable.official
+# Result: 27 checks, 0 failures.
+
+[godot] res://tests/test_queries.gd
+Godot Engine v4.7.1.stable.official.a13da4feb - https://godotengine.org
+
+AVBD physics server: factory invoked - the engine selected AVBD
+
+== ray_exclusions
+  ok  direct ray still hits after exclusion excluded box at y=3, ground below
+  ok  direct ray exclusion skips box hit=26960987604
+  ok  RayCast3D.add_exception skips box collider=Ground:<StaticBody3D#26960987604>
+  ok  RayCast3D.exclude_parent skips parent collider=Ground:<StaticBody3D#26960987604>
+     evidence: { "direct_collider": 26960987604, "ray_collider": <Freed Object>, "parent_collider": <Freed Object> }
+
+== shapecast_exclusions
+  ok  shapecast hits something after excluding box ground below
+  ok  shapecast reports a collision  count=1
+  ok  shapecast exclusion skips box  collider=Ground:<StaticBody3D#31440504284>
+  ok  shapecast does not repeat the collider count=1 max_results=4
+  ok  ShapeCast3D.exclude_parent skips parent collider=<null> count=0
+     evidence: { "count": 1, "first": <Freed Object>, "parent_count": 0 }
+
+== shapecast_capsule
+  ok  capsule cast_motion reports a hit result=[0.85000002384186, 0.85000115633011]
+  ok  capsule cast uses the capsule depth safe=0.8500 (want ~0.85, box proxy would be ~0.90)
+  ok  ShapeCast3D capsule hits ground collider=Ground:<StaticBody3D#35920020963>
+     evidence: { "safe": 0.85000002384186, "collider": <Freed Object> }
+
+== area_queries
+  ok  intersect_ray hits Area3D      hit={ "position": (0.0, 4.0, 0.0), "normal": (0.0, 1.0, 0.0), "face_index": -1, "collider_id": 36373005795, "collider": <Object#null>, "shape": 0, "rid": RID(19) }
+  ok  intersect_shape hits Area3D    hits=[{ "rid": RID(19), "collider_id": 36373005795, "collider": <Object#null>, "shape": 0 }]
+  ok  cast_motion hits Area3D        result=[0.58000004291534, 0.58000004291534]
+     evidence: { "ray": { "position": (0.0, 4.0, 0.0), "normal": (0.0, 1.0, 0.0), "face_index": -1, "collider_id": 36373005795, "collider": <Object#null>, "shape": 0, "rid": RID(19) }, "shape_count": 1, "cast": [0.58000004291534, 0.58000004291534] }
+
+== direct_cast_motion_sweep
+  ok  cast_motion sweeps past the endpoint result=[0.61009126901627, 0.61009156703949] (sphere at y=20 moving to y=-10)
+  ok  cast_motion safe fraction is inside the motion safe=0.6101
+     evidence: { "safe": 0.61009126901627, "motion": [0.61009126901627, 0.61009156703949] }
+
+== shape_queries
+  ok  intersect_point finds the box  hits=[{ "rid": RID(30), "collider_id": 41322284520, "collider": <Object#null>, "shape": 0 }]
+  ok  intersect_shape finds the box  hits=[{ "rid": RID(30), "collider_id": 41322284520, "collider": <Object#null>, "shape": 0 }]
+  ok  collide_shape returns point pairs points=4
+  ok  get_rest_info finds the box    rest={ "point": (0.0, 0.947262, 0.0), "normal": (0.0, 1.0, 0.0), "rid": RID(30), "collider_id": 41322284520, "shape": 0, "linear_velocity": (0.0, 0.001055, 0.0) }
+  ok  get_rest_info reports a normal normal=(0.0, 1.0, 0.0)
+  ok  intersect_shape honours exclude hits=[]
+  ok  get_rest_info honours exclude  rest={  }
+     evidence: { "shape_count": 1, "point_count": 4, "rest_rid": RID(30), "excluded_count": 0 }
+
+== motion_query
+  ok  test_move sees the wall        motion=(10,0,0), wall left face x=2.5
+  ok  move_and_slide stops at the wall x=2.2490 (wall face 2.5, body half 0.25)
+  ok  move_and_slide keeps the walker up y=1.0000
+     evidence: { "blocked": true, "x": 2.24900007247925, "y": 1.0 }
+
+27 checks, 0 failures
