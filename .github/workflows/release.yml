@@ -74,9 +74,6 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install scons (Windows)
-        if: runner.os == 'Windows'
-        run: python -m pip install scons==4.9.1
 
       # The platform is pinned here rather than left to the host default, so a release is always the
       # same configuration: linux/x86_64 or windows/x64, release mode. MSVC is named explicitly on
