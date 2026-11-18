@@ -1,27 +1,27 @@
 /*
- * Morton LBVH broad phase - the alternative to the hierarchical hashed grid
- * (`SpatialHash`), ported from `main:src/avbd/bvh/`. Selected by `broadPhaseMode = 1`;
- * both implementations are fed the same swept AABBs and feed the same downstream.
+ * Morton LBVH broad phase, ported from `main:src/avbd/bvh/`. It is the solver's only
+ * broad phase; the hierarchical hashed grid it used to share the pipeline with has been
+ * removed.
  *
- * The port keeps the algorithm and changes three things, all of which are needed for the
- * comparison to mean anything:
+ * The port keeps the algorithm and changes three things, all of which were needed for the
+ * comparison that selected it:
  *
  *   1. Eigen -> linalg (the `main` tree is the pre-port branch).
- *   2. Leaves are sized from the solver's **swept world AABBs** (`half`/`centre`, the same
- *      spans `SpatialHash::buildAndCollectPairs` takes) instead of `body->radius` bounding
- *      spheres. A sphere-vs-AABB difference is a bigger effect than the tree-vs-grid
- *      difference, so sharing the input is the whole point.
+ *   2. Leaves are sized from the solver's **swept world AABBs** (`half`/`centre`) instead
+ *      of `body->radius` bounding spheres. A sphere-vs-AABB difference is a bigger effect
+ *      than the tree-vs-grid difference, so sharing the input keeps the broad phase honest
+ *      about the bodies it is given.
  *   3. `NodeStorage` is folded into one class. The original spread the arrays over a
  *      separate translation unit with accessors per node; that costs nothing measurable but
  *      makes the file count four instead of two.
  *
- * Output contract matches the hash: packed `packPair(i, j)` candidates, unsorted and with
- * each overlapping pair emitted once. The caller sorts, dedupes and applies the exact
- * AABB/layer/constraint filter, so both broad phases feed the identical downstream work.
+ * Output contract: packed `packPair(i, j)` candidates, unsorted and with each overlapping
+ * pair emitted once. The caller sorts, dedupes and applies the exact AABB/layer/constraint
+ * filter.
  *
  * Determinism: the build sorts by (morton code, body index), the traversal pushes children
- * in a fixed order, and the pair list is integer-sorted by the caller. Unlike the hash's
- * walk, this one is serial - that is a real property of the two designs, not an oversight.
+ * in a fixed order, and the pair list is integer-sorted by the caller. The build and walk
+ * are serial - the `pool` parameter is reserved for future parallel work.
  */
 
 #pragma once

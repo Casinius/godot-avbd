@@ -1,10 +1,10 @@
 /*
  * Shared broad-phase pair encoding.
  *
- * Both the hierarchical hash and the Morton LBVH emit the same packed candidate key, so
- * the sort/dedupe/filter downstream is one implementation rather than two. The key is
- * (smaller body index << 32) | larger body index: lexicographic order over std::pair is
- * plain integer order, which is what lets the pair list use a radix sort.
+ * The Morton LBVH emits this packed candidate key, and the sort/dedupe/filter downstream
+ * consumes it. The key is (smaller body index << 32) | larger body index: lexicographic
+ * order over std::pair is plain integer order, which is what lets the pair list use a radix
+ * sort.
  */
 
 #pragma once

@@ -1,11 +1,10 @@
 /*
  * Conservative OBB overlap test for the broad phase.
  *
- * The spatial hash still buckets bodies by their tight world AABB (a cell must fit the
- * AABB at its level), but the exact candidate filter uses an oriented box instead of the
- * world AABB: a rotated box's AABB can be several times its true footprint, and every
- * false positive becomes a Manifold that collide() has to reject and warmstartForces()
- * has to delete.
+ * The broad phase buckets bodies by their tight world AABB, but the exact candidate
+ * filter uses an oriented box instead of the world AABB: a rotated box's AABB can be
+ * several times its true footprint, and every false positive becomes a Manifold that
+ * collide() has to reject and warmstartForces() has to delete.
  *
  * Spheres are represented by an axis-aligned cube of half extent = radius (a sphere is
  * rotation invariant, so this is its exact AABB). Cylinders use their local enclosing box.

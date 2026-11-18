@@ -22,7 +22,6 @@
 #include "avbd/job_pool.hpp"
 #include "avbd/list_range.hpp"
 #include "avbd/fixed_stack.hpp"
-#include "avbd/spatial_hash.hpp"
 #include "radixsort.hpp"
 namespace avbd {
 
@@ -47,9 +46,8 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
     Rigid *bestBody = 0;
     float3 bestLocal = {0, 0, 0};
 
-    // Exact per-body test against the body's own shape. The broad phase is a spatial hash
-    // rebuilt per step and not efficient to walk per ray, so picking scans the body list;
-    // the exact test decides.
+    // Exact per-body test against the body's own shape. Picking scans the body list rather
+    // than walking the broad phase; the exact test decides.
     //
     // The local half extents are per shape, and this used to be `size * 0.5f` for all of
     // them. For a sphere `size.x` is the *radius* (Rigid's constructor and aabbHalfExtent
@@ -170,9 +168,8 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
 
 void Solver::collectAABB(float3 min, float3 max, uint32_t p_mask, std::vector<Rigid *> &out) const
 {
-    // The broad phase is a spatial hash rebuilt per step, so shape/point queries
-    // walk the body list: each body's bound is centre plus its tight world
-    // half-extent (the same formula the hash's spheres derive from).
+    // Shape/point queries walk the body list: each body's bound is centre plus its tight
+    // world half-extent (the same formula the broad phase derives its leaves from).
     for (Rigid *body = bodies; body != 0; body = body->next)
     {
         if ((body->collisionLayer & p_mask) == 0)
@@ -405,25 +402,39 @@ void Solver::projectContacts(bool projectPositions, float brakeWindow)
     const float cap = projectionMaxCorrection;
     const float window = brakeWindow > 0.0f ? brakeWindow : collisionDt;
 
+    // Only manifolds whose pair can still move are worth walking. A parked or sleeping
+    // pair cannot change velocity or pose this step, so every contact test against it
+    // would be a no-op; compacting the live set once keeps the brake and all projection
+    // iterations over the same small list instead of re-filtering every slot.
+    projectionActive.clear();
+    for (uint32_t slot : manifolds.live)
+    {
+        if (manifolds.contactCount(slot) == 0)
+            continue;
+        const Rigid *A = manifolds.bodyA[slot];
+        const Rigid *B = manifolds.bodyB[slot];
+        if (!(A->mass > 0.0f && A->inUpdateSet) && !(B->mass > 0.0f && B->inUpdateSet))
+            continue;
+        projectionActive.push_back(slot);
+    }
+    if (projectionActive.empty())
+        return;
+
     // Interception. A pair may only close the gap it has at this pose within the time left
     // before the contact set is refreshed again; otherwise a fast body travels a whole
     // substep into its neighbour and the solver spends the next round undoing that overlap,
     // which is what converts a collision into a launch.
     if (speculativeMargin > 0.0f)
     {
-        for (uint32_t slot : manifolds.live)
+        for (uint32_t slot : projectionActive)
         {
             Rigid *A = manifolds.bodyA[slot];
             Rigid *B = manifolds.bodyB[slot];
             const int first = ManifoldStore::base(slot);
             const int contactCount = manifolds.contactCount(slot);
-            if (contactCount == 0)
-                continue;
 
             const bool moveA = A->mass > 0.0f && A->inUpdateSet;
             const bool moveB = B->mass > 0.0f && B->inUpdateSet;
-            if (!moveA && !moveB)
-                continue;
             const float invMassA = moveA ? 1.0f / A->mass : 0.0f;
             const float invMassB = moveB ? 1.0f / B->mass : 0.0f;
 
@@ -493,25 +504,28 @@ void Solver::projectContacts(bool projectPositions, float brakeWindow)
     projDeltaAng.resize(updateOrder.size());
     projManifoldCount.resize(updateOrder.size());
 
+    // Nothing below this residual is worth another full pass: the depth is already
+    // measured past the slop, so a fraction of the slop is a correction that cannot
+    // show up above float noise in the next pose. Resting and sleeping piles therefore
+    // stop after the first pass that has nothing left to move.
+    const float depthTolerance = std::max(slop * 0.01f, 1.0e-6f);
+
     for (int iter = 0; iter < projectionIterations; iter++)
     {
         std::fill(projManifoldCount.begin(), projManifoldCount.end(), 0);
         std::fill(projDeltaLin.begin(), projDeltaLin.end(), float3{0, 0, 0});
         std::fill(projDeltaAng.begin(), projDeltaAng.end(), float3{0, 0, 0});
 
-        for (uint32_t slot : manifolds.live)
+        float maxDepth = 0.0f;
+        for (uint32_t slot : projectionActive)
         {
             Rigid *A = manifolds.bodyA[slot];
             Rigid *B = manifolds.bodyB[slot];
             const int first = ManifoldStore::base(slot);
             const int contactCount = manifolds.contactCount(slot);
-            if (contactCount == 0)
-                continue;
 
             const bool moveA = A->mass > 0.0f && A->inUpdateSet;
             const bool moveB = B->mass > 0.0f && B->inUpdateSet;
-            if (!moveA && !moveB)
-                continue;
             const float invMassA = moveA ? 1.0f / A->mass : 0.0f;
             const float invMassB = moveB ? 1.0f / B->mass : 0.0f;
 
@@ -524,10 +538,14 @@ void Solver::projectContacts(bool projectPositions, float brakeWindow)
             float patchDepth = 0.0f;
             int corrected = 0;
 
+            // Body rotations are loop-invariant across the contact patch, so one matrix
+            // per body replaces a quaternion rotation per contact point.
+            const float3x3 rotA = qmat(A->positionAng);
+            const float3x3 rotB = qmat(B->positionAng);
             for (int k = 0; k < contactCount; k++)
             {
-                const float3 rA = qrot(A->positionAng, manifolds.contacts[first + k].rA);
-                const float3 rB = qrot(B->positionAng, manifolds.contacts[first + k].rB);
+                const float3 rA = mul(rotA, manifolds.contacts[first + k].rA);
+                const float3 rB = mul(rotB, manifolds.contacts[first + k].rB);
                 const float rawDepth = -dot(n, (A->positionLin + rA) - (B->positionLin + rB));
 
                 const float depth = rawDepth - slop;
@@ -544,6 +562,7 @@ void Solver::projectContacts(bool projectPositions, float brakeWindow)
                 continue;
 
             const float invN = 1.0f / corrected;
+            maxDepth = std::max(maxDepth, patchDepth * invN);
             const float3 tALocal = moveA ? qrot(qconj(A->positionAng), cross(patchRA * invN, n)) : float3{};
             const float3 tBLocal = moveB ? qrot(qconj(B->positionAng), cross(patchRB * invN, n)) : float3{};
             const float K = invMassA + invMassB
@@ -586,6 +605,11 @@ void Solver::projectContacts(bool projectPositions, float brakeWindow)
             body->positionLin = body->positionLin + dLin;
             body->positionAng = body->positionAng + dAng;
         }
+
+        // The applied corrections were below the tolerance: another pass would only
+        // re-measure float noise, so the remaining iterations are skipped.
+        if (maxDepth <= depthTolerance)
+            break;
     }
 }
 
@@ -701,13 +725,10 @@ static void wakeSleeperPair(Rigid *a, Rigid *b) noexcept
     }
 }
 
-// Contact detection: the broad phase selected by `broadPhaseMode` (hierarchical hashed
-// grid by default, Morton LBVH as the alternative), rebuilt every step.
+// Contact detection: the Morton LBVH broad phase, rebuilt or refit every step.
 //
-// Both index the same swept world AABBs and emit packed pair candidates; the hash walks
-// the 27-cell neighbourhood of each body's own level and tests the swept AABBs before
-// writing a pair, while the LBVH traverses its tree. The surrounding pipeline - pair
-// sort, layer/constraint filter, manifold creation - is shared and identical.
+// It indexes the swept world AABBs and emits packed pair candidates. The surrounding
+// pipeline - pair sort, layer/constraint filter, manifold creation - is shared.
 //
 // Determinism: pair collection is integer-sorted and de-duplicated, and the final
 // (min-index, other) sort fixes the manifold creation order.
@@ -756,12 +777,8 @@ void Solver::broadPhase()
 
     {
         const std::chrono::steady_clock::time_point tIndex = std::chrono::steady_clock::now();
-        if (broadPhaseMode == 1)
-            broadLbvh.buildAndCollectPairs(bodiesInOrder, sweepPairs, bodyAabbHalf,
-                    bodyAabbCenter, *pool);
-        else
-            broadHash.buildAndCollectPairs(bodiesInOrder, 0.0f, sweepPairs, bodyAabbHalf,
-                    bodyAabbCenter, *pool);
+        broadLbvh.buildAndCollectPairs(bodiesInOrder, sweepPairs, bodyAabbHalf,
+                bodyAabbCenter, *pool);
         lastBroadIndexMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - tIndex).count();
     }

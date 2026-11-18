@@ -390,7 +390,6 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     p_space.contact_grace_ticks = static_cast<int>(settings->get_setting(
             "physics/avbd/contact_grace_ticks", 0.0));
     p_space.contact_gs = settings->get_setting("physics/avbd/contact_gs", false);
-    p_space.broad_phase_lbvh = settings->get_setting("physics/avbd/broad_phase_lbvh", true);
     p_space.speculative_margin = settings->get_setting("physics/avbd/speculative_margin", 0.01);
 }
 
@@ -1563,7 +1562,6 @@ void AVBDPhysicsServer3D::_step(float p_step) {
                 static_cast<float>(std::max(space.sleep_angular_threshold, 0.0));
         space.solver.contactGraceTicks = std::max(space.contact_grace_ticks, 0);
         space.solver.contactOnlyOverflow = !space.contact_gs;
-        space.solver.broadPhaseMode = space.broad_phase_lbvh ? 1 : 0;
         space.solver.speculativeMargin = static_cast<float>(std::max(space.speculative_margin, 0.0));
 
         for (int tick = 0; tick < tickCount; ++tick) {

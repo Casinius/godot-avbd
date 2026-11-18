@@ -2,7 +2,7 @@
 [configuration]
 
 entry_symbol = "avbd_library_init"
-compatibility_minimum = "4.1"
+compatibility_minimum = "4.5"
 reloadable = false
 
 [libraries]

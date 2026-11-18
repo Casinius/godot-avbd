@@ -319,7 +319,9 @@ instead of `body->radius` bounding spheres. Both broad phases now emit the same 
 candidates into the same `sweepPairs`, and everything downstream (radix sort, unique, exact
 AABB/layer/constraint filter, manifold slot creation) is shared.
 
-`Solver::broadPhaseMode` selects one; `--bvh` in the core test does the same from the CLI.
+`Solver::broadPhaseMode` selected one at the time; `--bvh` in the core test did the same
+from the CLI. Both the switch and the hashed grid have since been removed (branch `bvh`),
+leaving the LBVH as the only broad phase.
 
 **The simulation is bit-identical either way** - `stack_300 = 0xfbac4f08cb1c977c`,
 `interleaved_300 = 0xb03adeb37742850a`, `mixed_240 = 0xef9ebb5b27a25c27` with both - and the
@@ -345,15 +347,15 @@ candidate list inflates 6-9x (45603 vs 4868 on Pyramid XL) and the exact filter 
 sort pay for all of it. Fixing the walk (own level only, with coarse bodies resolved through
 the fine cell's parent) is the way back to the grid.
 
-The default is now the LBVH (`broadPhaseMode = 1`, `physics/avbd/broad_phase_lbvh`). At the
+The default was then switched to the LBVH (`broadPhaseMode = 1` at the time,
+`physics/avbd/broad_phase_lbvh`). At the
 demo's own scale (420 boxes) the difference is inside the noise: `test_load` 629.9 ms vs 626.8,
 `probe_engines` 1.43 ms/frame either way, penetration p50/p99 unchanged at 8.08/11.30 mm.
 
-> Later cleanup: the hashed grid was kept and optimized instead of removed. The walk now
-> emits a same-level pair once, skips empty levels, and tests the swept AABBs before
-> writing the candidate, so the candidate list matches LBVH exactly (4868 vs 45603 on
-> Pyramid XL). `broadPhaseMode` remains, with the hash as the default (`0`) and LBVH as
-> the `1` alternative. See README.md for the post-optimization numbers.
+> Final cleanup: the hashed grid was later removed entirely on branch `bvh`. The walk
+> optimizations described here were kept in the tree until the deletion, but
+> `broadPhaseMode`, `physics/avbd/broad_phase_lbvh` and `--bvh` are gone now;
+> `src/avbd/bvh_broadphase.*` is the only broad phase.
 
 # Step 5 result: the `(1-alpha)` contact damping is load-bearing
 

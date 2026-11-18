@@ -10,6 +10,8 @@
  *   xmake run avbd_core_test --list          # names of the ported scenes
  *   xmake run avbd_core_test --scene Stack --steps 300
  *   xmake run avbd_core_test --bench         # 512-box pyramid timing
+ *   xmake run avbd_core_test --bench-scene "Pyramid XL" --threads 8 --sleep=30 --warmup=600
+ *                                            # same, with the host's idle-sleep settings
  */
 
 #include <algorithm>
@@ -64,6 +66,26 @@ static int count_bodies(const Solver &s) {
     int n = 0;
     for (const Rigid *b = s.bodies; b != nullptr; b = b->next) {
         n++;
+    }
+    return n;
+}
+
+// Movable and sleeping body counts, for the bench lines. The core tests never sleep, so
+// the sleeping number is only meaningful when --sleep enables it.
+static int count_movable(const Solver &s) {
+    int n = 0;
+    for (const Rigid *b = s.bodies; b != nullptr; b = b->next) {
+        if (b->mass > 0.0f)
+            n++;
+    }
+    return n;
+}
+
+static int count_sleeping(const Solver &s) {
+    int n = 0;
+    for (const Rigid *b = s.bodies; b != nullptr; b = b->next) {
+        if (b->mass > 0.0f && b->sleeping)
+            n++;
     }
     return n;
 }
@@ -1672,9 +1694,29 @@ static void build_bench_scene(Solver &s) {
     }
 }
 
-// Broad phase under test: 0 = hashed grid (default), 1 = Morton LBVH. Both are fed the same
-// swept AABBs and produce the same candidate contract; --bvh is the isolated A/B.
-static int g_broadPhaseMode = 0;
+// Broad phase is the Morton LBVH; both bench paths report its candidate contract so a
+// regression in pair emission is visible in the same line as the timing.
+//
+// Bench sleep knobs. The core defaults leave sleepFrames at 0 so the pinned digests are
+// stable, but a real host sleeps idle piles; --sleep lets a bench measure that case.
+// --warmup is the pre-timing run, which has to be long enough for a settled scene to
+// actually fall asleep before the clock starts.
+static int g_benchSleep = 0;
+static int g_benchWarmup = -1; // -1: the bench's own default
+
+// Sleeping needs both the solver horizon and each body's host flag: the core defaults
+// leave sleep_mode at NEVER so no test ever sleeps, while the Godot server sets it per
+// body from the node's sleep setting. Call after the scene is built.
+static void configure_bench_sleep(Solver &s) {
+    s.sleepFrames = g_benchSleep;
+    if (g_benchSleep <= 0)
+        return;
+    for (Rigid *b = s.bodies; b != nullptr; b = b->next) {
+        if (b->mass > 0.0f)
+            b->sleep_mode = 1;
+    }
+}
+
 // Bench over a named core scene (Pyramid, PyramidXL, Bridge, ...): the same phase
 // breakdown as --bench but on a scene the broad-phase comparison cares about.
 static int run_bench_scene(const std::string &name, int threads) {
@@ -1685,9 +1727,9 @@ static int run_bench_scene(const std::string &name, int threads) {
     }
     Solver s;
     s.threads = threads;
-    s.broadPhaseMode = g_broadPhaseMode;
     scene->build(&s);
-    const int warmup = 20;
+    configure_bench_sleep(s);
+    const int warmup = g_benchWarmup >= 0 ? g_benchWarmup : 20;
     const int timed = 120;
     step_n(s, warmup);
     const auto t0 = std::chrono::steady_clock::now();
@@ -1696,10 +1738,13 @@ static int run_bench_scene(const std::string &name, int threads) {
     const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / (double)timed;
     const Solver::PhaseTimes &pt = s.lastStepTimes;
     std::printf("bench-scene '%s': bodies=%d broadPhase=%s pairs=%d contacts=%d %.3f ms/step "
-                "(broad %.3f, index %.3f, solve %.3f, finish %.3f)\n",
-            name.c_str(), count_bodies(s), g_broadPhaseMode == 1 ? "lbvh" : "hash",
+                "(broad %.3f, index %.3f, solve %.3f, finish %.3f)",
+            name.c_str(), count_bodies(s), "lbvh",
             s.broadPhasePairCount(), count_contact_points(s), ms, pt.broadPhase, pt.broadIndex,
             pt.solve, pt.finish);
+    if (g_benchSleep > 0)
+        std::printf(" sleeping=%d/%d movable, warmup=%d", count_sleeping(s), count_movable(s), warmup);
+    std::printf("\n");
     return all_finite(s) ? 0 : 1;
 }
 
@@ -1707,9 +1752,10 @@ static int run_bench(int threads) {
     Solver s;
     s.threads = threads;
     build_bench_scene(s);
+    configure_bench_sleep(s);
     std::printf("bench: %d boxes, %d iterations\n", count_bodies(s), s.iterations);
 
-    const int warmup = 30;
+    const int warmup = g_benchWarmup >= 0 ? g_benchWarmup : 30;
     const int timed = 120;
     step_n(s, warmup);
 
@@ -1725,8 +1771,10 @@ static int run_bench(int threads) {
     std::printf("bench: last step phases: broad=%.3f (index %.3f) graph=%.3f solve=%.3f "
                 "finish=%.3f (sum=%.3f)\n", pt.broadPhase, pt.broadIndex, pt.graph, pt.solve,
             pt.finish, pt.broadPhase + pt.graph + pt.solve + pt.finish);
-    std::printf("bench: broadPhase=%s pairs=%d\n", g_broadPhaseMode == 1 ? "lbvh" : "hash",
-            s.broadPhasePairCount());
+    std::printf("bench: broadPhase=lbvh pairs=%d\n", s.broadPhasePairCount());
+    if (g_benchSleep > 0)
+        std::printf("bench: sleeping=%d/%d movable after %d warmup steps\n", count_sleeping(s),
+                count_movable(s), warmup);
     std::printf("bench: threads=%d -> %.3f ms/step, contacts=%d, finite=%s\n", s.threadCount(),
             ms, count_contact_points(s), all_finite(s) ? "yes" : "NO");    return all_finite(s) ? 0 : 1;
 }
@@ -1741,8 +1789,10 @@ static int run_bench_two(int threads) {
     b.threads = threads;
     build_bench_scene(a);
     build_bench_scene(b);
+    configure_bench_sleep(a);
+    configure_bench_sleep(b);
 
-    const int warmup = 30;
+    const int warmup = g_benchWarmup >= 0 ? g_benchWarmup : 30;
     const int timed = 120;
     step_n(a, warmup);
     step_n(b, warmup);
@@ -1764,7 +1814,7 @@ static int run_bench_two(int threads) {
 // Sweep the thread count over the same scene so the speedup (and where it stops) is
 // visible rather than claimed.
 static int run_bench_sweep() {
-    const int warmup = 30;
+    const int warmup = g_benchWarmup >= 0 ? g_benchWarmup : 30;
     const int timed = 120;
     double serialMs = 0.0;
 
@@ -1772,6 +1822,7 @@ static int run_bench_sweep() {
         Solver s;
         s.threads = threads;
         build_bench_scene(s);
+        configure_bench_sleep(s);
         step_n(s, warmup);
         const auto t0 = std::chrono::steady_clock::now();
         step_n(s, timed);
@@ -1905,7 +1956,6 @@ static int runPyramid(int ticks) {
     s.positionProjection = g_projection;
     s.projectionMaxCorrection = g_projectionCap;
     s.contactOnlyOverflow = !g_contactGs;
-    s.broadPhaseMode = g_broadPhaseMode;
     s.maxPenetration = g_maxPen;
     s.sleepFrames = 30;
     buildPyramidDouble(s);
@@ -2204,20 +2254,30 @@ int main(int argc, char **argv) {
     int threads = 0; // 0 = automatic
     bool pyramid = false;
 
+    // Bench modes are dispatched after parsing so --sleep and --warmup can follow them
+    // on the command line instead of having to precede the mode.
+    bool bench = false;
+    bool benchSweep = false;
+    bool benchTwo = false;
+    bool shape = false;
+
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--list") {
             list_scenes();
             return 0;
         } else if (arg == "--bench") {
-            return run_bench(threads);
+            bench = true;
         } else if (arg == "--bench-sweep") {
-            return run_bench_sweep();
+            benchSweep = true;
         } else if (arg == "--bench-two") {
-            return run_bench_two(threads == 0 ? 4 : threads);
+            benchTwo = true;
         } else if (arg == "--shape") {
-            report_parallel_shape();
-            return 0;
+            shape = true;
+        } else if (arg.rfind("--sleep=", 0) == 0) {
+            g_benchSleep = std::atoi(arg.c_str() + 8);
+        } else if (arg.rfind("--warmup=", 0) == 0) {
+            g_benchWarmup = std::atoi(arg.c_str() + 9);
         } else if (arg == "--pyramid") {
             pyramid = true;
         } else if (arg.rfind("--substeps=", 0) == 0) {
@@ -2234,8 +2294,6 @@ int main(int argc, char **argv) {
             g_iterations = std::atoi(arg.c_str() + 8);
         } else if (arg == "--bench-scene" && i + 1 < argc) {
             benchScene = argv[++i];
-        } else if (arg == "--bvh") {
-            g_broadPhaseMode = 1;
         } else if (arg.rfind("--penmax=", 0) == 0) {
             g_maxPen = (float)std::atof(arg.c_str() + 9);
         } else if (arg.rfind("--eject=", 0) == 0) {
@@ -2249,11 +2307,22 @@ int main(int argc, char **argv) {
         } else {
             std::fprintf(stderr, "usage: %s [--list | --bench | --bench-sweep | --bench-two | --shape |"
                                  " --pyramid [--steps N] | --scene NAME [--steps N] |"
-                                 " --bench-scene NAME [--threads N]] [--bvh]\n", argv[0]);
+                                 " --bench-scene NAME [--threads N]]"
+                                 " [--sleep=N] [--warmup=N]\n", argv[0]);
             return 2;
         }
     }
 
+    if (bench)
+        return run_bench(threads);
+    if (benchSweep)
+        return run_bench_sweep();
+    if (benchTwo)
+        return run_bench_two(threads == 0 ? 4 : threads);
+    if (shape) {
+        report_parallel_shape();
+        return 0;
+    }
     if (!benchScene.empty()) {
         return run_bench_scene(benchScene, threads);
     }

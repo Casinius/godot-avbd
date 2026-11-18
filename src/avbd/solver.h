@@ -19,9 +19,9 @@
 #include <limits>
 #include <span>
 
+#include "avbd/broadphase_pair.hpp"
 #include "avbd/bvh_broadphase.hpp"
 #include "avbd/maths.h"
-#include "avbd/spatial_hash.hpp"
 
 namespace avbd {
 
@@ -753,22 +753,11 @@ struct Solver
     // Base gap (metres), extended by predicted relative motion until the next collision refresh; 0 disables.
     float speculativeMargin = 0.01f;
 
-    // Which broad phase runs. Both take the same swept world AABBs and emit packed pair
-    // candidates, so this is the one switch that isolates the two algorithms.
-    //   0 = hierarchical hashed grid (SpatialHash) - the default
-    //   1 = Morton LBVH with refit (LbvhBroadPhase)
-    //
-    // The hash walks the 27-cell neighbourhood at each non-empty level from the body's
-    // own up to the coarsest, emits a same-level pair only once, and tests the swept AABBs
-    // before writing the candidate. The earlier version emitted the full 27-cell superset
-    // from both sides and left the exact test to the solver, which inflated the candidate
-    // list 6-9x on a dense pile; the in-walk test removes that cost without changing which
-    // pairs are real. `--bvh` in the core bench selects the LBVH for comparison.
-    int broadPhaseMode = 0;
-
     // Position correction excludes resting contacts and does not feed displacement into velocity.
     bool positionProjection = true;
     // Jacobi passes measure all contacts before moving bodies, avoiding manifold-order pose bias.
+    // `projectionIterations` is an upper bound: a pass whose worst remaining depth is below
+    // 1% of projectionSlop stops the loop, and sleeping/parked pairs are not walked at all.
     int projectionIterations = 4;
     float projectionBeta = 1.0f;
     // Leave millimetre-scale resting penetration to the penalty solve.
@@ -922,11 +911,11 @@ struct Solver
     // another thread while a step runs gets the previous step's numbers.
     struct PhaseTimes
     {
-        double broadPhase = 0.0;  // broad phase: bounds, hash build, pair filter, manifold slots
-        // The algorithm under the broad phase alone: the index build plus candidate
-        // emission (SpatialHash or LbvhBroadPhase), excluding the bounds/AABB pass, the pair
-        // sort, the exact filter and manifold slot creation that both paths share. This is
-        // the only number that separates "hash vs LBVH" from "everything around them".
+        double broadPhase = 0.0;  // broad phase: bounds, LBVH build, pair filter, manifold slots
+        // The algorithm under the broad phase alone: the LBVH build/refit plus candidate
+        // emission, excluding the bounds/AABB pass, the pair sort, the exact filter and
+        // manifold slot creation. This separates the broad-phase index cost from the
+        // shared pipeline around it.
         double broadIndex = 0.0;
         double graph = 0.0;       // force warmstart + adjacency rebuild + update-set selection/colouring
         double solve = 0.0;       // the iteration region (primal rounds + dual passes)
@@ -950,15 +939,14 @@ private:
     std::vector<Rigid *> warmstartOrder;
 
     // Broad-phase: the body list flattened to index-addressable order (rebuilt every
-    // step), the hierarchical spatial hash over those bodies, and the candidate
-    // pair list (sorted unique (min index, other), the manifold creation order).
+    // step), the Morton LBVH over those bodies, and the candidate pair list (sorted
+    // unique (min index, other), the manifold creation order).
     std::vector<Rigid *> bodiesInOrder;
     // Swept AABBs per bodiesInOrder: the tight bounds grown by this step's linear
     // displacement, the rotation sweep and the speculative margin. center is the
     // current position plus half the displacement; half is the matching extent.
     std::vector<float3> bodyAabbHalf;
     std::vector<float3> bodyAabbCenter;
-    SpatialHash broadHash;
     LbvhBroadPhase broadLbvh;
     std::vector<uint64_t> sweepPairs;
     // Per-step scratch (reused capacity): exact-filter results for the candidate pairs and
@@ -978,6 +966,9 @@ private:
     std::vector<float3> projDeltaLin;
     std::vector<float3> projDeltaAng;
     std::vector<int> projManifoldCount;
+    // Slots whose pair can still move this step, rebuilt by projectContacts. The brake
+    // pass and every projection iteration walk this instead of the full live list.
+    std::vector<uint32_t> projectionActive;
 
     // Constraint-graph colouring, rebuilt by colourGraph() every step. Bodies of
     // one colour share no force, so a colour's whole set can solve and apply in

@@ -183,24 +183,9 @@ $$
 
 到这里整个算法已经完整：两个 pass 反复迭代直到能量收敛，再由位置差分出新的速度，进入下一帧。这个仓库把整套流程跑在多线程上，并用位级一致的 digest 验证了多线程结果与串行实现完全相同。
 
-宽相默认是 **分层哈希网格**（`src/avbd/spatial_hash.*`），`broadPhaseMode = 1`（`physics/avbd/broad_phase_lbvh=true`）可切到 **Morton LBVH + refit**（`src/avbd/bvh_broadphase.*`）。两个实现吃同一份 swept AABB，产出的线序也相同（最终 digest 逐位一致：`stack_300 = 0xfbac4f08cb1c977c` 等）。
+宽相是 **Morton LBVH + refit**（`src/avbd/bvh_broadphase.*`），从 `main` 移植回来，现在是唯一的宽相实现。早先的分层哈希网格已在 `bvh` 分支删除：隔离测量（同一份 swept AABB、同一套下游、位级一致的 digest）显示 LBVH 在宽相快 1.5–6 倍（Pyramid XL 上 3.366 → 0.953 ms 的宽相耗时），因为哈希在每一层都走 27 邻格，一个大地面就会把候选对放大 6–9 倍。删除前哈希经过优化，候选对已经和 LBVH 相同（Pyramid XL 上 4868 对），两者的最终 digest 逐位一致（`stack_300 = 0xfbac4f08cb1c977c`、`interleaved_300 = 0xb03adeb37742850a`、`mixed_240 = 0xef9ebb5b27a25c27`）。
 
-哈希之前的问题不是“树更好”，而是候选对放大：每个刚体把所有 27 个邻格都发出去、同层配对从两侧各发一次，把精确过滤和排序的活全留给了下游——Pyramid XL 上 45603 个候选对，而真实 AABB 重叠只有 4868 个。现在的 walk 做了三件事：
-
-* 同层配对只由较小 body index 发一次；
-* 在 walk 内先做 swept AABB 精确重叠测试，再写入候选（下游的 layer / constraint 过滤照旧）；
-* 空层直接跳过（一个大地面会把 `top` 抬高，但不会填充中间层）。
-
-结果是候选对与 LBVH 完全相同，Pyramid XL 的整步从优化前 **10.019 ms → 8.70 ms**（`--bench-scene "Pyramid XL" --threads 8`，120 步平均；同一台机器上 LBVH 约 8.35 ms，落在噪声内）。隔离看宽相索引本身，哈希仍比 LBVH 慢（1.18 vs 0.59 ms），但下游已经不再为 9 倍假阳性买单：
-
-| 场景 | 刚体 | 候选对 hash / lbvh | 宽相 hash (其中索引) | 宽相 lbvh (其中索引) | 整步 hash → lbvh |
-|---|---|---|---|---|---|
-| Bridge | 91 | 180 / 180 | 0.116 (0.078) ms | **0.047 (0.016)** | 0.95 → 0.88 |
-| Pyramid | 137 | 374 / 374 | 0.384 (0.143) | **0.285 (0.028)** | 1.75 → 1.64 |
-| Soft Body | 193 | 3772 / 3772 | 0.790 (0.200) | **0.748 (0.108)** | 2.80 → 2.92（噪声内） |
-| Pyramid XL | 1654 | 4868 / 4868 | 1.98 (1.18) | **1.40 (0.59)** | 8.70 → 8.35（噪声内） |
-
-小场景上 LBVH 的宽相索引明显更快（哈希有固定层级/排序开销），大场景两者整步差距落在噪声里；默认保留哈希，LBVH 作为可切换的对照实现保留。
+LBVH 每步从 swept AABB 生成 Morton code，按需重建拓扑，其余步只做 refit；树只负责产生候选对，精确的 AABB / layer / constraint 过滤、排序去重和 manifold 创建仍在下游共用。
 
 空间查询走 `World3D.direct_space_state` / `PhysicsServer3D.body_test_motion`：`RayCast3D`、`ShapeCast3D`、`intersect_ray` / `intersect_point` / `intersect_shape` / `collide_shape` / `get_rest_info` / `cast_motion`，以及 `CharacterBody3D.move_and_slide`。查询和求解器共用同一套 `avbd::Shape` 代理（capsule 仍是 cylinder、convex 仍是 AABB box），支持 body + area、exclude 列表、`ray_pickable`、`hit_from_inside` 和 swept `cast_motion`。几何实现放在 `src/avbd/query/`，只调用核心的 `collideShapes()`，不改 `solver.h` / `solver.cpp` / `collide.cpp`。
 
@@ -228,5 +213,5 @@ $$
 | 冲击能量 | 5.3 m/s 落地的场景观测到 17.9 m/s 的弹飞速度：非弹性碰撞却在加速，冲击瞬间仍有过冲 |
 | 刚性链预算 | 焊接/关节链每个 substep **至少 6 轮**才收敛；3 轮会自激发散（`tools/repro_joint.cpp`：140 m/s）。**总预算相同的情况下，substep 越多越不稳定** |
 | 多线程 | 位级可复现（digest 在 1/2/3/4/8/12 线程下一致），但 **12 线程比 8 线程慢**（barrier 开销 > 并行收益），`physics/avbd/threads` 必须实测 |
-| 宽相 | 默认分层哈希网格（`broad_phase_lbvh=false`），LBVH 可选；walk 内已做精确 AABB 过滤，候选对与 LBVH 相同。索引本身仍比 LBVH 慢（Pyramid XL 1.18 vs 0.59 ms），大场景整步差距落在噪声内，小场景约慢 8–10% |
+| 宽相 | **Morton LBVH + refit** 是唯一实现（分层哈希网格已删除）；每步共用 swept AABB，候选对再经精确 AABB / layer / constraint 过滤 |
 | CI | 现在运行 `xmake run avbd_core_test`（138 checks）和 `xmake run avbd_query_test`（26 checks）；Godot 侧查询套件用 `xmake run avbd_query_tests`（27 checks）。README 顶部的 Test 徽章仍是编译徽章，不是测试徽章 |

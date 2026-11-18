@@ -269,9 +269,6 @@ protected:
         // block-Jacobi bucket (Solver::contactOnlyOverflow). Off by default: see the A/B in
         // solver.h.
         bool contact_gs = false;
-        // Broad phase: false = hierarchical spatial hash (default), true = Morton LBVH.
-        // See Solver::broadPhaseMode.
-        bool broad_phase_lbvh = false;
 
         // Contact generation distance, in metres (see Solver::speculativeMargin). A contact
         // is created while the shapes are still separated by up to this much, and the
