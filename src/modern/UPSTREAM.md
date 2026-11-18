@@ -3,17 +3,20 @@
 This tree is a snapshot of `/home/cyan/avbd-mo/src`, imported to replace the legacy
 `src/avbd` solver on the `modernize` branch.
 
-- Source HEAD: `4450b74` (`manifold`) — "add collision layer: compound shapes, convex
-  meshes, digests, pair filter". The earlier snapshot was taken from `a3d9930` plus its
-  staged collision work; that work is now committed upstream, so this tree corresponds
-  to a clean commit.
+- Source HEAD: `04d2833` (`manifold`) — "fix block assembly symmetry; configurable
+  AVBD k0; expose convex mesh store". Earlier snapshots were `4450b74` (pair filter)
+  and `a3d9930` plus staged collision work; this tree corresponds to a clean commit.
 - Snapshot tree SHA-256 (everything under `src/modern` except this file):
-  `99d1ecb823736ee01ebe1722ef9af1c52c8d2b8b0f996276fbfed333ab77f711`
+  `b5f2d64e029a36e5904be8a0017d6929575a751b432f77ec026deceee7ce77f9`
 - Baseline data copied to `src/modern/tests/`:
   `baseline.txt`, `collision_observable.txt` (the solver/collision digests this snapshot
   was verified against).
-- The snapshot builds with `-Wshadow` warnings at `phys_core/state.hpp:518` (an `int r`
-  shadowing a parameter). Left as-is: it is upstream's code and the warning is harmless.
+- The snapshot builds with `-Wshadow` warnings in `phys_core/state.hpp` (an `int r`
+  shadowing a parameter in `solve_body`). Left as-is: it is upstream's code and the
+  warning is harmless.
+- `phys_core/policy.hpp` now exposes `AVBDStep::k0`; the Godot adapter maps its
+  `physics/avbd/beta_linear` setting onto it. Defaults are unchanged, so the pinned
+  baselines still match.
 
 ## Rules
 

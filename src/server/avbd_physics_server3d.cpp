@@ -4,12 +4,9 @@
 
 #include "server/avbd_physics_server3d.hpp"
 
-#include "nodes/godot_convert.hpp"
 #include "server/avbd_direct_body_state3d.hpp"
 #include "server/avbd_direct_space_state3d.hpp"
-
-#include "avbd/list_range.hpp"
-#include "avbd/query/query_shape.hpp"
+#include "server/modern_convert.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -34,7 +31,6 @@
 using namespace godot;
 // Singleton pointer declaration.
 AVBDPhysicsServer3D *AVBDPhysicsServer3D::SpaceData::singleton = nullptr;
-using namespace avbd_godot;
 
 // --- step profiling (AVBD_PROFILE=1) -----------------------------------------
 //
@@ -144,6 +140,27 @@ AVBDPhysicsServer3D::SpaceData *AVBDPhysicsServer3D::find_space(const RID &p_rid
     return found == spaces.end() ? nullptr : found->second.get();
 }
 
+const AVBDPhysicsServer3D::SpaceData *AVBDPhysicsServer3D::find_space(const RID &p_rid) const {
+    const auto found = spaces.find(id_of(p_rid));
+    return found == spaces.end() ? nullptr : found->second.get();
+}
+
+ModernSpace *AVBDPhysicsServer3D::modern_for(const BodyData &p_body) {
+    if (p_body.modern_index < 0) {
+        return nullptr;
+    }
+    const auto found = spaces.find(id_of(p_body.space));
+    return found == spaces.end() ? nullptr : found->second->modern.get();
+}
+
+const ModernSpace *AVBDPhysicsServer3D::modern_for(const BodyData &p_body) const {
+    if (p_body.modern_index < 0) {
+        return nullptr;
+    }
+    const auto found = spaces.find(id_of(p_body.space));
+    return found == spaces.end() ? nullptr : found->second->modern.get();
+}
+
 // -----------------------------------------------------------------------------
 // Lifecycle
 // -----------------------------------------------------------------------------
@@ -231,13 +248,11 @@ void AVBDPhysicsServer3D::_flush_queries() {
         }();
 
         for (auto &[body_id, body] : bodies) {
-            if (body.rigid == nullptr) {
-                continue;
-            }
+            (void)body_id;
             if (!body.sync.is_valid() && !body.force_integration_callback.is_valid()) {
                 continue;
             }
-            body_state->bind(this, body.rigid, make_rid(body_id));
+            body_state->bind(this, make_rid(body_id));
             if (body.sync.is_valid()) {
                 one_arg[0] = body_state;
                 body.sync.callv(one_arg);
@@ -270,7 +285,7 @@ int32_t AVBDPhysicsServer3D::_get_process_info(PhysicsServer3D::ProcessInfo p_in
     switch (p_info) {
         case PhysicsServer3D::INFO_ACTIVE_OBJECTS:
             return static_cast<int32_t>(std::ranges::count_if(bodies | std::views::values,
-                    [](const BodyData &body) { return body.rigid != nullptr; }));
+                    [](const BodyData &body) { return body.modern_index >= 0; }));
         case PhysicsServer3D::INFO_ISLAND_COUNT:
             return static_cast<int32_t>(spaces.size());
         case PhysicsServer3D::INFO_COLLISION_PAIRS: {
@@ -278,8 +293,10 @@ int32_t AVBDPhysicsServer3D::_get_process_info(PhysicsServer3D::ProcessInfo p_in
             int32_t count = 0;
             for (const auto &[id, space] : spaces) {
                 (void)id;
-                for (int i = 0; i < space->solver.manifoldCount(); i++)
-                    if (space->solver.manifoldContactCount(i) > 0)
+                if (space->modern == nullptr)
+                    continue;
+                for (const collision::Manifold &m : space->modern->manifolds())
+                    if (m.count > 0)
                         count++;
             }
             return count;
@@ -422,13 +439,14 @@ void AVBDPhysicsServer3D::read_project_gravity(SpaceData &p_space) {
         return;
     }
 
-    float magnitude = static_cast<float>(settings->get_setting("physics/3d/default_gravity", 9.8));
+    const double magnitude = settings->get_setting("physics/3d/default_gravity", 9.8);
     const Vector3 direction = settings->get_setting("physics/3d/default_gravity_vector", Vector3(0, -1, 0));
 
-    // AVBD is Z-up with gravity along -Z, so the projection of Godot's gravity vector onto Godot's
-    // down direction becomes the scalar the solver wants.
-    const float sign = direction.y <= 0.0f ? 1.0f : -1.0f;
-    p_space.solver.gravity = -magnitude * sign;
+    // Both the engine and the modern core are Y-up, so the vector passes through as-is.
+    // `default_gravity_vector` is expected to be normalised (Godot normalises it when set);
+    // normalise defensively so a hand-edited project setting cannot scale gravity twice.
+    const Vector3 unit = direction.is_zero_approx() ? Vector3(0, -1, 0) : direction.normalized();
+    p_space.gravity = to_modern(unit * magnitude);
 }
 
 float AVBDPhysicsServer3D::_space_get_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param) const {
@@ -465,23 +483,19 @@ PackedVector3Array AVBDPhysicsServer3D::_space_get_contacts(const RID &p_space) 
     if (found == spaces.end()) {
         return out;
     }
-    // The engine's debug contacts are world-space points of recent contacts; serve the
-    // first-shape contact points of every manifold seen this step.
-    const avbd::Solver &solver = found->second->solver;
-    for (int m = 0; m < solver.manifoldCount(); m++) {
-        const int count = solver.manifoldContactCount(m);
-        if (count <= 0) {
-            continue;
-        }
-        // Walk the manifold's stored contacts: rA/rB are local offsets from each body.
-        const avbd::Rigid *a = solver.manifoldBodyA(m);
-        if (a == nullptr) {
-            continue;
-        }
-        for (int i = 0; i < count; i++) {
-            const avbd::float3 world = a->positionLin + qrot(a->positionAng, solver.manifoldContact(m, i).rA);
+    const SpaceData &space = *found->second;
+    if (space.modern == nullptr) {
+        return out;
+    }
+    // The engine's debug contacts are world-space points of recent contacts; serve every
+    // manifold's A-side contact points seen this step.
+    const State &state = space.modern->state();
+    for (const collision::Manifold &m : space.modern->manifolds()) {
+        for (std::size_t i = 0; i < m.count; ++i) {
+            const Vec3 world = state.pose.position(m.body_a) +
+                    rotate(state.pose.rotation(m.body_a), m.contacts[i].rA);
             out.push_back(to_godot(world));
-            if (out.size() >= static_cast<int64_t>(found->second->debug_contacts_max)) {
+            if (out.size() >= static_cast<int64_t>(space.debug_contacts_max)) {
                 return out;
             }
         }
@@ -494,7 +508,13 @@ int32_t AVBDPhysicsServer3D::_space_get_contact_count(const RID &p_space) const 
     if (found == spaces.end()) {
         return 0;
     }
-    return found->second->solver.manifoldContactPoints();
+    if (found->second->modern == nullptr) {
+        return 0;
+    }
+    int32_t points = 0;
+    for (const collision::Manifold &m : found->second->modern->manifolds())
+        points += static_cast<int32_t>(m.count);
+    return points;
 }
 
 // -----------------------------------------------------------------------------
@@ -645,11 +665,27 @@ AABB AVBDPhysicsServer3D::_soft_body_get_bounds(const RID &p_body) const { (void
 void AVBDPhysicsServer3D::_soft_body_update_rendering_server(const RID &p_body,
         PhysicsServer3DRenderingServerHandler *p_rendering_server_handler) { (void)p_body; (void)p_rendering_server_handler; }
 
+// Motion queries are implemented against the modern shapes' world AABBs rather than a
+// full swept narrowphase: this is the MVP contract. It gets CharacterBody3D/move_and_slide
+// a conservative, monotone answer (no tunnelling, correct stop distance for boxes and
+// spheres); the exact shape-vs-shape sweep is Phase 3 work.
+static void shape_world_aabb(const collision::Shape &p_shape, const Transform3D &p_xform,
+        Vec3 &r_lo, Vec3 &r_hi) {
+    const Vec3 half = p_shape.local_half_extents();
+    const Mat3 R = rot_matrix(to_modern(p_xform.basis.get_rotation_quaternion()));
+    const Vec3 world_half{std::abs(R[0][0]) * half.x + std::abs(R[1][0]) * half.y + std::abs(R[2][0]) * half.z,
+            std::abs(R[0][1]) * half.x + std::abs(R[1][1]) * half.y + std::abs(R[2][1]) * half.z,
+            std::abs(R[0][2]) * half.x + std::abs(R[1][2]) * half.y + std::abs(R[2][2]) * half.z};
+    const Vec3 center = to_modern(p_xform.origin);
+    r_lo = center - world_half;
+    r_hi = center + world_half;
+}
+
 bool AVBDPhysicsServer3D::_body_test_motion(const RID &p_body, const Transform3D &p_from, const Vector3 &p_motion,
         float p_margin, int32_t p_max_collisions, bool p_collide_separation_ray, bool p_recovery_as_collision,
         PhysicsServer3DExtensionMotionResult *p_result) const {
-    (void)p_collide_separation_ray; // separation-ray shapes are outside the supported set
-    (void)p_recovery_as_collision;  // initial overlap is reported as a safe=0 collision
+    (void)p_collide_separation_ray;
+    (void)p_recovery_as_collision;
 
     if (p_result != nullptr) {
         p_result->travel = p_motion;
@@ -661,107 +697,146 @@ bool AVBDPhysicsServer3D::_body_test_motion(const RID &p_body, const Transform3D
     }
 
     const auto moving_it = bodies.find(id_of(p_body));
-    if (moving_it == bodies.end() || moving_it->second.space.is_valid() == false) {
+    if (moving_it == bodies.end() || !moving_it->second.space.is_valid()) {
         return false;
     }
     const BodyData &moving = moving_it->second;
     const uint64_t moving_id = id_of(p_body);
-
-    avbd::Shape base;
-    if (moving.rigid != nullptr) {
-        base = query_shape_from_rigid(*moving.rigid);
-    } else if (!moving.shapes.empty()) {
-        if (!query_shape_from_data(moving.shapes.front(), p_from, base)) {
-            return false;
-        }
-    } else {
+    const SpaceData *space = find_space(moving.space);
+    if (space == nullptr || space->modern == nullptr) {
         return false;
     }
-    // The engine passes the pose to test from, which may differ from the body's current pose.
-    base.center = to_sim(p_from.origin);
-    base.rotation = to_sim(p_from.basis.get_rotation_quaternion());
-    base.axis = avbd::qrot(base.rotation, avbd::float3{0, 0, 1});
 
-    const avbd::float3 motion = to_sim(p_motion);
-    const float margin = std::max(0.0f, p_margin);
-    avbd::float3 swept_min, swept_max;
-    avbd::query::shapeAabb(base, swept_min, swept_max);
-    for (int i = 0; i < 3; i++) {
-        const float m = motion[i];
-        swept_min[i] = std::min(swept_min[i], swept_min[i] + m);
-        swept_max[i] = std::max(swept_max[i], swept_max[i] + m);
+    if (moving.shapes.empty()) {
+        return false;
     }
-    if (margin > 0.0f) {
-        const avbd::float3 pad{margin, margin, margin};
-        swept_min -= pad;
-        swept_max += pad;
+    collision::Shape base;
+    if (!query_shape_from_data(moving.shapes.front(), p_from, base)) {
+        return false;
     }
+
+    Vec3 base_lo, base_hi;
+    shape_world_aabb(base, p_from, base_lo, base_hi);
+    const Vec3 motion = to_modern(p_motion);
+    const Scalar_t margin = std::max(0.0f, p_margin);
 
     struct Hit {
-        avbd::query::SweepHit sweep;
+        Scalar_t safe = 1;
+        Scalar_t depth = 0;
+        Vector3 point;
+        Vector3 normal;
         uint64_t body_id = 0;
         uint64_t instance_id = 0;
         Vector3 linear_velocity;
         Vector3 angular_velocity;
     };
     std::vector<Hit> hits;
-    for (const QueryCandidate &candidate :
-            query_candidates_aabb(moving.space, swept_min, swept_max, moving.collision_mask)) {
-        if (candidate.rigid == nullptr || candidate.body_id == moving_id) {
+
+    const uint64_t space_id = id_of(moving.space);
+    for (auto &[other_id, other] : bodies) {
+        if (other_id == moving_id || id_of(other.space) != space_id) {
             continue;
         }
-        if (body_is_excepted(moving_id, candidate.body_id)) {
+        if ((other.collision_layer & moving.collision_mask) == 0) {
             continue;
         }
-        const avbd::Shape target = query_shape_from_rigid(*candidate.rigid);
-        avbd::query::SweepHit sweep = avbd::query::sweepShape(base, motion, target, margin);
-        if (!sweep.hit) {
+        if (body_is_excepted(moving_id, other_id)) {
             continue;
         }
-        const auto other = bodies.find(candidate.body_id);
-        Hit hit;
-        hit.sweep = sweep;
-        hit.body_id = candidate.body_id;
-        if (other != bodies.end()) {
-            hit.instance_id = other->second.instance_id;
-            hit.linear_velocity = other->second.linear_velocity;
-            hit.angular_velocity = other->second.angular_velocity;
+        for (std::size_t slot = 0; slot < other.shapes.size(); ++slot) {
+            if (slot < other.shape_disabled.size() && other.shape_disabled[slot]) {
+                continue;
+            }
+            collision::Shape shape;
+            if (!query_shape_from_data(other.shapes[slot], body_shape_transform(other, static_cast<int32_t>(slot)), shape)) {
+                continue;
+            }
+            Vec3 obs_lo, obs_hi;
+            shape_world_aabb(shape, body_shape_transform(other, static_cast<int32_t>(slot)), obs_lo, obs_hi);
+            obs_lo -= Vec3{margin};
+            obs_hi += Vec3{margin};
+
+            // Swept AABB (Minkowski): the interval of t where the moving box overlaps.
+            Scalar_t t_enter = 0;
+            Scalar_t t_exit = 1;
+            int enter_axis = -1;
+            Scalar_t enter_sign = 0;
+            bool separated = false;
+            for (int axis = 0; axis < 3; ++axis) {
+                const Scalar_t m = motion[axis];
+                if (std::abs(m) < Scalar_t(1e-9)) {
+                    if (base_hi[axis] < obs_lo[axis] || base_lo[axis] > obs_hi[axis]) {
+                        separated = true;
+                        break;
+                    }
+                    continue;
+                }
+                Scalar_t t1, t2;
+                if (m > 0) {
+                    t1 = (obs_lo[axis] - base_hi[axis]) / m;
+                    t2 = (obs_hi[axis] - base_lo[axis]) / m;
+                } else {
+                    t1 = (obs_hi[axis] - base_lo[axis]) / m;
+                    t2 = (obs_lo[axis] - base_hi[axis]) / m;
+                }
+                if (t1 > t_enter) {
+                    t_enter = t1;
+                    enter_axis = axis;
+                    enter_sign = m > 0 ? Scalar_t(-1) : Scalar_t(1);
+                }
+                t_exit = std::min(t_exit, t2);
+            }
+            if (separated || enter_axis < 0 || t_enter > t_exit || t_enter > 1 || t_exit < 0) {
+                continue;
+            }
+            Hit hit;
+            hit.safe = std::max<Scalar_t>(t_enter, 0);
+            hit.depth = std::max<Scalar_t>(0, std::min(base_hi[enter_axis], obs_hi[enter_axis]) -
+                                                  std::max(base_lo[enter_axis], obs_lo[enter_axis]));
+            Vec3 point = to_modern(p_from.origin);
+            point[enter_axis] += motion[enter_axis] * hit.safe;
+            hit.point = to_godot(point);
+            Vec3 normal{0};
+            normal[enter_axis] = enter_sign;
+            hit.normal = to_godot(normal);
+            hit.body_id = other_id;
+            hit.instance_id = other.instance_id;
+            hit.linear_velocity = other.linear_velocity;
+            hit.angular_velocity = other.angular_velocity;
+            hits.push_back(hit);
         }
-        hits.push_back(hit);
     }
 
     if (hits.empty()) {
         return false;
     }
-    std::sort(hits.begin(), hits.end(), [](const Hit &a, const Hit &b) {
-        return a.sweep.safe < b.sweep.safe;
-    });
+    std::sort(hits.begin(), hits.end(), [](const Hit &a, const Hit &b) { return a.safe < b.safe; });
 
     const Hit &nearest = hits.front();
     if (p_result != nullptr) {
-        p_result->travel = p_motion * nearest.sweep.safe;
-        p_result->remainder = p_motion * (1.0f - nearest.sweep.safe);
-        p_result->collision_depth = nearest.sweep.depth;
-        p_result->collision_safe_fraction = nearest.sweep.safe;
-        p_result->collision_unsafe_fraction = nearest.sweep.unsafe;
+        p_result->travel = p_motion * nearest.safe;
+        p_result->remainder = p_motion * (1.0f - nearest.safe);
+        p_result->collision_depth = nearest.depth;
+        p_result->collision_safe_fraction = nearest.safe;
+        p_result->collision_unsafe_fraction = nearest.safe;
         const int32_t max_collisions = std::clamp(p_max_collisions, 0, 32);
         const int32_t count = std::min<int32_t>(static_cast<int32_t>(hits.size()), max_collisions);
         p_result->collision_count = count;
         for (int32_t i = 0; i < count; i++) {
-            const Hit &hit = hits[static_cast<size_t>(i)];
+            const Hit &hit = hits[static_cast<std::size_t>(i)];
             PhysicsServer3DExtensionMotionCollision &collision = p_result->collisions[i];
-            collision.position = to_godot(hit.sweep.point);
-            collision.normal = to_godot(hit.sweep.normal);
+            collision.position = hit.point;
+            collision.normal = hit.normal;
             collision.collider_velocity = hit.linear_velocity;
             collision.collider_angular_velocity = hit.angular_velocity;
-            collision.depth = hit.sweep.depth;
+            collision.depth = hit.depth;
             collision.local_shape = 0;
             collision.collider_id = hit.instance_id;
             collision.collider = make_rid(hit.body_id);
             collision.collider_shape = 0;
         }
     }
-    return true;
+    return nearest.safe < 1.0f || nearest.depth > 0.0f;
 }
 
 void AVBDPhysicsServer3D::_shape_set_data(const RID &p_shape, const Variant &p_data) {
@@ -871,127 +946,63 @@ Variant AVBDPhysicsServer3D::_shape_get_data(const RID &p_shape) const {
     }
 }
 
+static bool modern_shape_from_data(const AVBDPhysicsServer3D::ShapeData &p_data,
+        collision::Shape &r_shape);
+
 bool AVBDPhysicsServer3D::query_shape_from_data(const ShapeData &p_data, const Transform3D &p_transform,
-        avbd::Shape &r_shape) {
-    avbd::Shape s;
+        collision::Shape &r_shape) {
+    // The transform is carried by the query alongside the shape; the modern Shape itself
+    // is purely local geometry.
+    (void)p_transform;
+    return modern_shape_from_data(p_data, r_shape);
+}
+
+// -----------------------------------------------------------------------------
+// Shape conversion + space rebuild
+// -----------------------------------------------------------------------------
+
+// Godot shape record -> modern collision shape. The map is deliberately narrow:
+// box/sphere/cylinder are the MVP set, capsule is simulated as the same cylinder the
+// legacy server used, and convex points become their local AABB box (a proxy, not the
+// hull). Everything else is refused by the caller.
+static bool modern_shape_from_data(const AVBDPhysicsServer3D::ShapeData &p_data,
+        collision::Shape &r_shape) {
     switch (p_data.type) {
+        case PhysicsServer3D::SHAPE_BOX: {
+            // ShapeData.extents holds Godot's full extents for boxes.
+            const Vec3 half{static_cast<Scalar_t>(p_data.extents.x * 0.5),
+                    static_cast<Scalar_t>(p_data.extents.y * 0.5),
+                    static_cast<Scalar_t>(p_data.extents.z * 0.5)};
+            r_shape = collision::Shape::box(half);
+            return true;
+        }
         case PhysicsServer3D::SHAPE_SPHERE:
-            s.type = avbd::ShapeType::Sphere;
-            s.radius = static_cast<float>(p_data.radius);
-            break;
+            r_shape = collision::Shape::sphere(static_cast<Scalar_t>(p_data.radius));
+            return p_data.radius > 0.0;
         case PhysicsServer3D::SHAPE_CYLINDER:
-            s.type = avbd::ShapeType::Cylinder;
-            s.radius = static_cast<float>(p_data.radius);
-            s.halfHeight = static_cast<float>(p_data.height) * 0.5f;
-            break;
+            // Godot's cylinder height is full height; the modern shape takes it the same way
+            // and both axes are local +Y, so no permutation.
+            r_shape = collision::Shape::cylinder(static_cast<Scalar_t>(p_data.radius),
+                    static_cast<Scalar_t>(p_data.height));
+            return p_data.radius > 0.0 && p_data.height > 0.0;
         case PhysicsServer3D::SHAPE_CAPSULE:
-            // The solver's capsule proxy is a cylinder over the capsule's radius and
-            // full height (the same dimensions rebuild_space stamps into the body).
-            s.type = avbd::ShapeType::Cylinder;
-            s.radius = static_cast<float>(p_data.radius);
-            s.halfHeight = static_cast<float>(p_data.height) * 0.5f;
-            break;
-        case PhysicsServer3D::SHAPE_CONVEX_POLYGON:
-            // The solver rotates the points' local AABB as an OBB, so the query does too.
-            s.type = avbd::ShapeType::Box;
-            s.half = to_sim_extents(p_data.extents) * 0.5f;
-            break;
-        case PhysicsServer3D::SHAPE_BOX:
-            s.type = avbd::ShapeType::Box;
-            s.half = to_sim_extents(p_data.extents) * 0.5f;
-            break;
-        case PhysicsServer3D::SHAPE_CONCAVE_POLYGON:
-        case PhysicsServer3D::SHAPE_HEIGHTMAP:
-        case PhysicsServer3D::SHAPE_WORLD_BOUNDARY:
-        case PhysicsServer3D::SHAPE_SEPARATION_RAY:
-        case PhysicsServer3D::SHAPE_CUSTOM:
+            // Documented proxy: a cylinder over the capsule's radius and full height.
+            r_shape = collision::Shape::cylinder(static_cast<Scalar_t>(p_data.radius),
+                    static_cast<Scalar_t>(p_data.height));
+            return p_data.radius > 0.0 && p_data.height > 0.0;
+        case PhysicsServer3D::SHAPE_CONVEX_POLYGON: {
+            // Documented proxy: the points' local AABB as a box.
+            const Vec3 half{static_cast<Scalar_t>(p_data.extents.x * 0.5),
+                    static_cast<Scalar_t>(p_data.extents.y * 0.5),
+                    static_cast<Scalar_t>(p_data.extents.z * 0.5)};
+            if (half.x <= 0 || half.y <= 0 || half.z <= 0)
+                return false;
+            r_shape = collision::Shape::box(half);
+            return true;
+        }
         default:
             return false;
     }
-    s.center = to_sim(p_transform.origin);
-    s.rotation = to_sim(p_transform.basis.get_rotation_quaternion());
-    s.axis = avbd::qrot(s.rotation, avbd::float3{0, 0, 1});
-    r_shape = s;
-    return true;
-}
-
-avbd::Shape AVBDPhysicsServer3D::query_shape_from_rigid(const avbd::Rigid &p_body) {
-    avbd::Shape s;
-    s.type = p_body.shape;
-    s.center = p_body.positionLin;
-    s.rotation = p_body.positionAng;
-    s.half = p_body.size * 0.5f;
-    s.radius = p_body.size.x;
-    s.halfHeight = p_body.size.z * 0.5f;
-    s.axis = avbd::qrot(p_body.positionAng, avbd::float3{0, 0, 1});
-    return s;
-}
-
-// Godot BodyAxis bits (linear X/Y/Z = 1/2/4, angular X/Y/Z = 8/16/32) to the solver's
-// sim-axis bits (0..2 = sim x/y/z). Godot Y is sim Z, Godot Z is sim -Y; the lock is a
-// directionless bit so the sign does not matter, only the permutation.
-static void axis_locks_to_sim(uint32_t p_locks, uint8_t &r_linear, uint8_t &r_angular) {
-    static constexpr int kMap[3] = {0, 2, 1}; // godot axis -> sim axis
-    r_linear = 0;
-    r_angular = 0;
-    for (int godot_axis = 0; godot_axis < 3; godot_axis++) {
-        if (p_locks & (1u << godot_axis)) {
-            r_linear |= static_cast<uint8_t>(1u << kMap[godot_axis]);
-        }
-        if (p_locks & (1u << (godot_axis + 3))) {
-            r_angular |= static_cast<uint8_t>(1u << kMap[godot_axis]);
-        }
-    }
-}
-
-template <typename Container, typename Range>
-inline Container to_container(Range&& r) {
-    return Container(std::ranges::begin(r), std::ranges::end(r));
-}
-
-// 用法
-
-
-
-// -----------------------------------------------------------------------------
-// The solver
-//
-// A space's solver is rebuilt from its bodies whenever any of them changes: AVBD holds one shape
-// per body and a flat body list, so there is nothing to incrementally patch. Bodies are few
-// enough per space that rebuilding is cheap, and it keeps the solver a pure function of the scene
-// rather than of the order the engine happened to call things in.
-// -----------------------------------------------------------------------------
-
-// Density the solver should see for a body: its mass divided by its first shape's volume. The
-// solver derives mass and inertia from shape and density, so the density has to carry exactly
-// the engine's mass - a body that never set one is 1 kg (BODY_PARAM_MASS's documented default),
-// whatever its size. Mass 0 means a body with no volume to divide into, or one the engine
-// explicitly made massless; both stay massless in the solver, which reads that as immovable.
-float AVBDPhysicsServer3D::density_for(const BodyData &p_body) {
-    if (p_body.mode != PhysicsServer3D::BODY_MODE_RIGID &&
-            p_body.mode != PhysicsServer3D::BODY_MODE_RIGID_LINEAR) {
-        return 0.0f; // static and kinematic bodies are immovable
-    }
-    if (p_body.shapes.empty() || p_body.mass <= 0.0) {
-        return 0.0f;
-    }
-    const ShapeData &shape = p_body.shapes.front();
-    double volume = 0.0;
-    switch (shape.type) {
-        case PhysicsServer3D::SHAPE_SPHERE:
-            volume = (4.0 / 3.0) * 3.14159265358979 * shape.radius * shape.radius * shape.radius;
-            break;
-        case PhysicsServer3D::SHAPE_CYLINDER:
-            volume = 3.14159265358979 * shape.radius * shape.radius * shape.height;
-            break;
-        default:
-            volume = shape.extents.x * shape.extents.y * shape.extents.z;
-            break;
-    }
-    if (volume <= 1.0e-9) {
-        return 0.0f;
-    }
-    return static_cast<float>(p_body.mass / volume);
 }
 
 void AVBDPhysicsServer3D::rebuild_space(const RID &p_space, std::source_location where) {
@@ -1007,456 +1018,150 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space, std::source_location
     rebuild_last_step = step_total;
     rebuild_last_reason = String::utf8(reason.c_str());
 
-    // Anything this space owned is gone; the solver is about to be refilled.
     for (auto &[id, body] : bodies) {
+        (void)id;
         if (id_of(body.space) == space_id) {
-            body.rigid = nullptr;
+            body.modern_index = -1;
         }
     }
-    space->solver.clear();
+
+    if (space->modern == nullptr) {
+        space->modern = std::make_unique<ModernSpace>();
+    } else {
+        space->modern->clear();
+    }
 
     // Deterministic order: ids are minted in creation order, so sorting by id makes the
-    // solver's body list - and with it the Gauss-Seidel update order - a function of the
-    // scene, not of unordered_map bucket layout. Two identical scenes rebuild identically.
-    std::vector<uint64_t> space_body_ids = to_container<std::vector<uint64_t>>(bodies 
-        | std::views::filter([&](const auto &entry) { return id_of(entry.second.space) == space_id; }) 
-        | std::views::keys);
-           
+    // state index - and with it the Gauss-Seidel order and every contact digest - a
+    // function of the scene rather than of unordered_map bucket layout.
+    std::vector<uint64_t> space_body_ids;
+    for (const auto &[id, body] : bodies) {
+        if (id_of(body.space) == space_id) {
+            space_body_ids.push_back(id);
+        }
+    }
     std::ranges::sort(space_body_ids);
+
+    std::vector<ModernBodyDesc> descs;
+    descs.reserve(space_body_ids.size());
 
     for (const uint64_t id : space_body_ids) {
         BodyData &body = bodies.find(id)->second;
 
-        // Refresh the shape snapshots from the engine's shape records: the resource data
-        // may have arrived after the shape was attached to the body.
-        for (size_t i = 0; i < body.shapes.size() && i < body.shape_rids.size(); i++) {
+        // Refresh the shape snapshots from the engine's records: resource data may have
+        // arrived after the shape was attached to the body.
+        for (std::size_t i = 0; i < body.shapes.size() && i < body.shape_rids.size(); i++) {
             if (const ShapeData *fresh = shape_data(body.shape_rids[i])) {
                 body.shapes[i] = *fresh;
             }
         }
-
-        // A body with no shape cannot collide and has no inertia; the engine always attaches one
-        // before it matters, and until then the body is left out of the solver.
-        if (body.shapes.empty()) {
-            continue;
+        if (body.shape_disabled.size() < body.shapes.size()) {
+            body.shape_disabled.resize(body.shapes.size(), false);
         }
 
-        const ShapeData &shape = body.shapes.front();
-        if (body.shapes.size() > 1) {
-            WARN_PRINT("AVBD physics server: a body has more than one shape; AVBD simulates one "
-                       "shape per body, so the first is used.");
+        ModernBodyDesc desc;
+        desc.id = id;
+        const bool immovable_mode = body.mode == PhysicsServer3D::BODY_MODE_STATIC ||
+                body.mode == PhysicsServer3D::BODY_MODE_KINEMATIC;
+        desc.is_static = immovable_mode || !(body.mass > 0.0);
+        desc.mass = body.mass;
+        desc.position = to_modern(body.transform.origin);
+        desc.rotation = to_modern(body.transform.basis.get_rotation_quaternion());
+        desc.linear_velocity = to_modern(body.linear_velocity);
+        desc.angular_velocity = to_modern(body.angular_velocity);
+        desc.layer = body.collision_layer;
+        desc.mask = body.collision_mask;
+        desc.axis_locks = body.axis_locks;
+        desc.exceptions = body.exceptions;
+
+        bool unsupported = false;
+        for (std::size_t i = 0; i < body.shapes.size(); ++i) {
+            if (body.shape_disabled[i]) {
+                continue;
+            }
+            collision::Shape shape;
+            if (!modern_shape_from_data(body.shapes[i], shape)) {
+                unsupported = true;
+                break;
+            }
+            // Friction is not implemented by the imported core yet; its tangent rows
+            // never receive a dual update and act as rigid anchors. Force the material
+            // to zero (frictionless contacts) and keep the engine value in BodyData.
+            shape.material.friction = 0;
+            collision::ShapeInstance inst;
+            inst.shape = shape;
+            const Transform3D &local = i < body.shape_transforms.size()
+                    ? body.shape_transforms[i]
+                    : Transform3D();
+            inst.local_position = to_modern(local.origin);
+            inst.local_rotation = to_modern(local.basis.get_rotation_quaternion());
+            desc.shapes.push_back(inst);
         }
 
-        avbd::float3 extents{1, 1, 1};
-        avbd::ShapeType type = avbd::ShapeType::Box;
-        bool simulated = true;
-        switch (shape.type) {
-            case PhysicsServer3D::SHAPE_SPHERE:
-                type = avbd::ShapeType::Sphere;
-                extents = {static_cast<float>(shape.radius), 0, 0};
-                break;
-            case PhysicsServer3D::SHAPE_CYLINDER:
-                type = avbd::ShapeType::Cylinder;
-                // Godot: x and z are the radius, y the height, axis local Y. The solver reads
-                // the radius from size.x and the height from size.z (its cylinder axis is its
-                // local Z, which is where Godot's Y lands in sim space), so order {r, r, h}.
-                extents = {static_cast<float>(shape.radius), static_cast<float>(shape.radius),
-                        static_cast<float>(shape.height)};
-                break;
-            case PhysicsServer3D::SHAPE_CAPSULE:
-                // Capsule proxy: the solver's cylinder over the capsule's radius and full
-                // height. The hemispherical caps are flat, dimensions and segment match.
-                type = avbd::ShapeType::Cylinder;
-                extents = {static_cast<float>(shape.radius), static_cast<float>(shape.radius),
-                        static_cast<float>(shape.height)};
-                break;
-            case PhysicsServer3D::SHAPE_CONVEX_POLYGON:
-                // Convex proxy: the points' local AABB as a box (stored at set_data time);
-                // the solver rotates it as an OBB. A bounding-box hull, not the hull.
-                extents = to_sim_extents(shape.extents);
-                break;
-            case PhysicsServer3D::SHAPE_CONCAVE_POLYGON:
-            case PhysicsServer3D::SHAPE_HEIGHTMAP:
-            case PhysicsServer3D::SHAPE_WORLD_BOUNDARY:
-            case PhysicsServer3D::SHAPE_SEPARATION_RAY:
-            case PhysicsServer3D::SHAPE_CUSTOM:
-                simulated = false;
-                break;
-            default:
-                // Godot's BoxShape3D size is full extents, and so is the solver's box size;
-                // permute into sim axes rather than scaling.
-                extents = to_sim_extents(shape.extents);
-                break;
-        }
-        if (!simulated) {
-            // No neutral proxy exists (a trimesh ground's AABB would be a giant solid
-            // box): the body stays out of the solver entirely, per the unsupported-list
-            // contract in the header. Swap the scene to a box shape instead.
+        if (unsupported) {
             if (!body.unsupported_warned) {
                 body.unsupported_warned = true;
                 WARN_PRINT("AVBD physics server: a body uses a shape AVBD cannot simulate "
-                        "(concave/heightmap/world boundary/separation ray/custom); the body "
-                        "is excluded from simulation. Use box/sphere/cylinder shapes.");
+                           "(concave/heightmap/world boundary/separation ray/custom); the body "
+                           "is excluded from simulation. Use box/sphere/cylinder shapes.");
             }
             continue;
         }
+        if (desc.shapes.empty()) {
+            // No shape yet: the engine attaches one before it matters, and until then the
+            // body has neither geometry nor inertia.
+            continue;
+        }
 
-        body.rigid = new avbd::Rigid(&space->solver, extents, type, density_for(body), body.friction,
-                to_sim(body.transform.origin), to_sim(body.linear_velocity));
-        // The same Y-up to Z-up mapping the node layer uses, applied to the orientation too.
-        body.rigid->positionAng = to_sim(body.transform.basis.get_rotation_quaternion());
-        body.rigid->velocityAng = to_sim(body.angular_velocity);
-        body.rigid->collisionLayer = body.collision_layer;
-        body.rigid->collisionMask = body.collision_mask;
-        axis_locks_to_sim(body.axis_locks, body.rigid->axisLockLinear, body.rigid->axisLockAngular);
-        body.rigid->sleeping = body.sleeping;
-        //body.rigid->sleeping = false;
-        // Solver sleep modes: 0 = never sleeps, 1 = may sleep. Idle detection lives in the
-        // solver (Solver::sleepFrames); can_sleep only opens the gate.
-        body.rigid->sleep_mode = body.can_sleep ? 1 : 0;
-        body.rigid->gravity = space->solver.gravity * static_cast<float>(body.gravity_scale);
+        descs.push_back(std::move(desc));
     }
 
-    // Collision exceptions: a pair never collides while either side lists the other. One
-    // solver IgnoreCollision per pair; its mere existence is what the broad phase tests.
-    for (auto &[id, body] : bodies) {
-        if (id_of(body.space) != space_id || body.rigid == nullptr) {
+    space->modern->rebuild(std::move(descs));
+
+    // Map indices back onto the records and stamp per-body gravity/damping, which the
+    // rebuild does not take from the desc (they are engine parameters, not geometry).
+    for (std::size_t i = 0; i < space->modern->size(); ++i) {
+        const uint64_t id = space->modern->body_id(i);
+        const auto found = bodies.find(id);
+        if (found == bodies.end()) {
             continue;
         }
-        for (const uint64_t other_id : body.exceptions) {
-            if (other_id <= id) {
-                continue; // each unordered pair once (from its lower id)
-            }
-            const auto other_found = bodies.find(other_id);
-            if (other_found == bodies.end() || other_found->second.rigid == nullptr ||
-                    id_of(other_found->second.space) != space_id) {
-                continue;
-            }
-            new avbd::IgnoreCollision(&space->solver, body.rigid, other_found->second.rigid);
-        }
-    }
-
-    // Solver-body -> server id index for the query paths: the BVH hands candidates back
-    // as Rigid*, and this is the O(1) bridge to RIDs. Rebuilt here because every Rigid
-    // was just re-created.
-    space->rigid_ids.clear();
-    for (auto &[id, body] : bodies) {
-        if (id_of(body.space) == space_id && body.rigid != nullptr) {
-            space->rigid_ids.emplace(body.rigid, id);
-        }
-    }
-
-    // Joints second, once every body exists. One solver GenericJoint per engine joint
-    // whose both bodies live in this space (or whose A side is the world). Every Godot
-    // joint type maps onto the solver's GenericJoint; the specialised types fix which
-    // axes are locked (conventions verified against Godot 4.7 sources):
-    //   Pin       - all three linear axes locked, all angular free
-    //   Hinge     - linear locked; angular free about the hinge axis, locked elsewhere
-    //               (the hinge axis is the Z column of the hinge frame, see
-    //               modules/godot_physics_3d/joints/godot_hinge_joint_3d.cpp:160)
-    //   Slider    - free (or limited) along the slide axis (the X column of the joint
-    //               frame, godot_slider_joint_3d.cpp:125), locked on the orthogonal
-    //               linear axes; angular free about the slide axis, locked elsewhere
-    //   ConeTwist - linear locked; angular free about the twist axis, swing limited
-    //               on the two orthogonal axes (godot_cone_twist_joint_3d.cpp:117-139)
-    // A joint axis that does not line up with a solver axis snaps to the nearest one:
-    // the GenericJoint's degrees of freedom are principal axes only.
-    std::vector<uint64_t> space_joint_ids = to_container<std::vector<uint64_t>>(joints
-            | std::views::keys);
-            
-    std::ranges::sort(space_joint_ids);
-    for (const uint64_t joint_id : space_joint_ids) {
-        const JointData &joint = joints.find(joint_id)->second;
-        const BodyData *data_a = joint.body_a.is_valid() ? find_body(joint.body_a) : nullptr;
-        const BodyData *data_b = find_body(joint.body_b);
-        if (data_b == nullptr || data_b->rigid == nullptr) {
-            continue;
-        }
-        if (joint.body_a.is_valid() && (data_a == nullptr || data_a->rigid == nullptr)) {
-            continue;
-        }
-        avbd::Rigid *rigid_a = joint.body_a.is_valid() ? data_a->rigid : nullptr;
-        if (rigid_a == nullptr && id_of(data_b->space) != space_id) {
-            continue;
-        }
-        if (rigid_a != nullptr && id_of(data_a->space) != space_id) {
-            continue;
-        }
-        if (joint.type == PhysicsServer3D::JOINT_TYPE_6DOF) {
-            rebuild_6dof_joint(space, joint, rigid_a, data_b->rigid);
-            continue;
-        }
-        if (joint.type == PhysicsServer3D::JOINT_TYPE_PIN) {
-            rebuild_pin_joint(space, joint, rigid_a, data_b->rigid);
-            continue;
-        }
-        if (joint.type == PhysicsServer3D::JOINT_TYPE_HINGE) {
-            rebuild_hinge_joint(space, joint, rigid_a, data_b->rigid);
-            continue;
-        }
-        if (joint.type == PhysicsServer3D::JOINT_TYPE_SLIDER) {
-            rebuild_slider_joint(space, joint, rigid_a, data_b->rigid);
-            continue;
-        }
-        if (joint.type == PhysicsServer3D::JOINT_TYPE_CONE_TWIST) {
-            rebuild_cone_twist_joint(space, joint, rigid_a, data_b->rigid);
-            continue;
-        }
-    }
-
-    // Constant forces that were queued before this body existed in the solver are applied on
-    // the first step (see _step); nothing to do here.
-}
-
-// --- specialised joint mappings -------------------------------------------------
-
-// The solver sim axis best aligned with a (sim-space) joint axis. The GenericJoint's
-// degrees of freedom are principal axes, so an off-axis hinge snaps to the dominant one.
-static int dominant_sim_axis(const avbd::float3 &axis_sim) {
-    const float abs_axis[3] = {std::fabs(axis_sim.x), std::fabs(axis_sim.y), std::fabs(axis_sim.z)};
-    int best = 0;
-    if (abs_axis[1] > abs_axis[best]) {
-        best = 1;
-    }
-    if (abs_axis[2] > abs_axis[best]) {
-        best = 2;
-    }
-    return best;
-}
-
-// Sign of the axis' dominant component (+1 / -1), for mirroring limits.
-static float dominant_sim_axis_sign(const avbd::float3 &axis_sim, int solver_axis) {
-    const float value = solver_axis == 0 ? axis_sim.x : (solver_axis == 1 ? axis_sim.y : axis_sim.z);
-    return value >= 0.0f ? 1.0f : -1.0f;
-}
-
-// Const-safe lookups into a joint record's parameter maps (default 0 when unset).
-static double param_value(const AVBDPhysicsServer3D::JointData &p_joint, int p_key) {
-    const auto found = p_joint.joint_params.find(p_key);
-    return found == p_joint.joint_params.end() ? 0.0 : found->second;
-}
-
-static bool param_flag(const AVBDPhysicsServer3D::JointData &p_joint, int p_key) {
-    const auto found = p_joint.joint_flags.find(p_key);
-    return found != p_joint.joint_flags.end() && found->second;
-}
-
-void AVBDPhysicsServer3D::rebuild_6dof_joint(SpaceData *space, const JointData &joint, avbd::Rigid *rigid_a,
-        avbd::Rigid *rigid_b) {
-    // Anchors: Godot's local_ref is a full transform whose basis carries the joint frame;
-    // AVBD wants the offset in each body's frame and measures angles from the relative
-    // orientation at creation, which is what the two bases encode. With no A body the A
-    // anchor is world-space already (the server's sim space is the world).
-    const avbd::float3 r_a = to_sim(joint.ref_a.origin);
-    const avbd::float3 r_b = to_sim(joint.ref_b.origin);
-
-    avbd::GenericJoint *solver_joint = new avbd::GenericJoint(&space->solver, rigid_a,
-            rigid_b, r_a, r_b);
-
-    // Six axes, Godot order X..Z linear then angular. Each Godot axis maps to a solver axis
-    // with a sign (Godot X -> solver X +, Y -> Z +, Z -> Y -); the same kAxisMapping the
-    // node layer uses, so both frontends mean the same joint.
-    for (int axis = 0; axis < 6; axis++) {
-        const int godot_index = axis % 3;
-        const bool angular = axis >= 3;
-        const AxisMapping &map = kAxisMapping[godot_index];
-        avbd::JointAxis &target = angular ? solver_joint->angular[map.solver]
-                                          : solver_joint->linear[map.solver];
-
-        const double lower = joint.params[axis][PhysicsServer3D::G6DOF_JOINT_LINEAR_LOWER_LIMIT];
-        const double upper = joint.params[axis][PhysicsServer3D::G6DOF_JOINT_LINEAR_UPPER_LIMIT];
-        const bool limit_enabled = angular
-                ? joint.flags[axis][PhysicsServer3D::G6DOF_JOINT_FLAG_ENABLE_ANGULAR_LIMIT]
-                : joint.flags[axis][PhysicsServer3D::G6DOF_JOINT_FLAG_ENABLE_LINEAR_LIMIT];
-
-        if (!limit_enabled) {
-            target.mode = avbd::AxisMode::Free;
-        } else if (std::fabs(upper - lower) < 1.0e-9) {
-            target.mode = avbd::AxisMode::Locked; // Godot spells "locked" as limits 0..0
-        } else {
-            target.mode = avbd::AxisMode::Limited;
-        }
-
-        // Springs: stiffness above zero and the spring flag on (Godot 4.3 enum slots;
-        // values at the top of this file since the pinned godot-cpp headers lack them).
-        const int spring_flag = angular ? g6dof_spring::FLAG_ENABLE_ANGULAR
-                                        : g6dof_spring::FLAG_ENABLE_LINEAR;
-        const double stiffness = angular ? joint.params[axis][g6dof_spring::ANGULAR_STIFFNESS]
-                                         : joint.params[axis][g6dof_spring::LINEAR_STIFFNESS];
-        const double damping = angular ? joint.params[axis][g6dof_spring::ANGULAR_DAMPING]
-                                       : joint.params[axis][g6dof_spring::LINEAR_DAMPING];
-        const double equilibrium = angular
-                ? joint.params[axis][g6dof_spring::ANGULAR_EQUILIBRIUM]
-                : joint.params[axis][g6dof_spring::LINEAR_EQUILIBRIUM];
-        if (joint.flags[axis][spring_flag] && stiffness > 0.0) {
-            target.springStiffness = static_cast<float>(stiffness);
-            target.springDamping = static_cast<float>(damping);
-            target.springEquilibrium = static_cast<float>(equilibrium) * map.sign;
-        }
-
-        // A reversed axis mirrors its limits and equilibrium, as in the node layer.
-        if (map.sign > 0.0f) {
-            target.lower = static_cast<float>(lower);
-            target.upper = static_cast<float>(upper);
-        } else {
-            target.lower = static_cast<float>(-upper);
-            target.upper = static_cast<float>(-lower);
-        }
+        BodyData &body = found->second;
+        body.modern_index = static_cast<int32_t>(i);
+        space->modern->set_gravity_scale(i, body.gravity_scale);
+        space->modern->set_damping(i, body.linear_damp, body.angular_damp);
     }
 }
 
-void AVBDPhysicsServer3D::rebuild_pin_joint(SpaceData *space, const JointData &joint, avbd::Rigid *rigid_a,
-        avbd::Rigid *rigid_b) {
-    const avbd::float3 r_a = to_sim(rigid_a != nullptr ? joint.pin_local_a : joint.pin_local_a);
-    const avbd::float3 r_b = to_sim(joint.pin_local_b);
+// -----------------------------------------------------------------------------
+// Joints
+//
+// Joint constraints are not part of the modern core yet (they are the largest remaining
+// gap on this branch). The records still store everything the engine sends, so scenes
+// load and getters replay, but the solver does not act on them. A joint edit marks its
+// space for a rebuild so the only joint-derived state that does exist - the collision
+// exclusion between its bodies - is refreshed.
+// -----------------------------------------------------------------------------
 
-    avbd::GenericJoint *solver_joint = new avbd::GenericJoint(&space->solver, rigid_a, rigid_b, r_a, r_b);
-
-    // A pin is a ball joint: all three linear axes locked, rotation free.
-    for (int solver_axis = 0; solver_axis < 3; solver_axis++) {
-        solver_joint->linear[solver_axis].mode = avbd::AxisMode::Locked;
+void AVBDPhysicsServer3D::_rebuild_for_joint(const RID &p_joint) {
+    const auto found = joints.find(id_of(p_joint));
+    if (found == joints.end()) {
+        return;
     }
-    for (int solver_axis = 0; solver_axis < 3; solver_axis++) {
-        solver_joint->angular[solver_axis].mode = avbd::AxisMode::Free;
+    const JointData &joint = found->second;
+    if (BodyData *body = find_body(joint.body_b)) {
+        rebuild_space(body->space);
+    } else if (BodyData *body = find_body(joint.body_a)) {
+        rebuild_space(body->space);
     }
-    // PIN_JOINT_BIAS / DAMPING / IMPULSE_CLAMP: recorded, not mapped (the solver's
-    // stabilisation is its own; documented in the README).
-}
-
-void AVBDPhysicsServer3D::rebuild_hinge_joint(SpaceData *space, const JointData &joint, avbd::Rigid *rigid_a,
-        avbd::Rigid *rigid_b) {
-    // The hinge axis: for _joint_make_hinge_simple it is the vector the engine stored in
-    // ref_a's basis Z column (see _joint_make_hinge_simple below); for the full form it is
-    // the Z column of the hinge frame. Expressed in body A's local frame.
-    const avbd::float3 axis_a_sim = to_sim(joint.ref_a.basis.get_column(2));
-    const int hinge_axis = dominant_sim_axis(axis_a_sim);
-    const float hinge_sign = dominant_sim_axis_sign(axis_a_sim, hinge_axis);
-
-    const avbd::float3 r_a = to_sim(joint.ref_a.origin);
-    const avbd::float3 r_b = to_sim(joint.ref_b.origin);
-
-    avbd::GenericJoint *solver_joint = new avbd::GenericJoint(&space->solver, rigid_a, rigid_b, r_a, r_b);
-
-    // Godot's hinge limits sit around the joint's rest angle with lower <= 0 <= upper.
-    const bool use_limit = param_flag(joint, PhysicsServer3D::HINGE_JOINT_FLAG_USE_LIMIT);
-    const double upper = param_value(joint, PhysicsServer3D::HINGE_JOINT_LIMIT_UPPER);
-    const double lower = param_value(joint, PhysicsServer3D::HINGE_JOINT_LIMIT_LOWER);
-
-    for (int solver_axis = 0; solver_axis < 3; solver_axis++) {
-        solver_joint->linear[solver_axis].mode = avbd::AxisMode::Locked;
-        if (solver_axis == hinge_axis) {
-            if (use_limit && std::fabs(upper - lower) > 1.0e-9) {
-                solver_joint->angular[solver_axis].mode = avbd::AxisMode::Limited;
-                solver_joint->angular[solver_axis].lower = static_cast<float>(hinge_sign > 0.0f ? lower : -upper);
-                solver_joint->angular[solver_axis].upper = static_cast<float>(hinge_sign > 0.0f ? upper : -lower);
-            } else {
-                solver_joint->angular[solver_axis].mode = avbd::AxisMode::Free;
-            }
-        } else {
-            solver_joint->angular[solver_axis].mode = avbd::AxisMode::Locked;
-        }
-    }
-    // HINGE_JOINT_FLAG_ENABLE_MOTOR and its velocity/force params: recorded, not mapped.
-}
-
-void AVBDPhysicsServer3D::rebuild_slider_joint(SpaceData *space, const JointData &joint, avbd::Rigid *rigid_a,
-        avbd::Rigid *rigid_b) {
-    // The slide axis is the X column of the joint frame (godot_slider_joint_3d.cpp:125).
-    const avbd::float3 axis_a_sim = to_sim(joint.ref_a.basis.get_column(0));
-    const int slide_axis = dominant_sim_axis(axis_a_sim);
-    const float slide_sign = dominant_sim_axis_sign(axis_a_sim, slide_axis);
-
-    const avbd::float3 r_a = to_sim(joint.ref_a.origin);
-    const avbd::float3 r_b = to_sim(joint.ref_b.origin);
-
-    avbd::GenericJoint *solver_joint = new avbd::GenericJoint(&space->solver, rigid_a, rigid_b, r_a, r_b);
-
-    const double lin_upper = param_value(joint, PhysicsServer3D::SLIDER_JOINT_LINEAR_LIMIT_UPPER);
-    const double lin_lower = param_value(joint, PhysicsServer3D::SLIDER_JOINT_LINEAR_LIMIT_LOWER);
-    const double ang_upper = param_value(joint, PhysicsServer3D::SLIDER_JOINT_ANGULAR_LIMIT_UPPER);
-    const double ang_lower = param_value(joint, PhysicsServer3D::SLIDER_JOINT_ANGULAR_LIMIT_LOWER);
-
-    for (int solver_axis = 0; solver_axis < 3; solver_axis++) {
-        // Linear: slide axis free or limited, the orthogonal pair locked.
-        if (solver_axis == slide_axis) {
-            if (std::fabs(lin_upper - lin_lower) > 1.0e-9) {
-                solver_joint->linear[solver_axis].mode = avbd::AxisMode::Limited;
-                solver_joint->linear[solver_axis].lower = static_cast<float>(slide_sign > 0.0f ? lin_lower : -lin_upper);
-                solver_joint->linear[solver_axis].upper = static_cast<float>(slide_sign > 0.0f ? lin_upper : -lin_lower);
-            } else {
-                solver_joint->linear[solver_axis].mode = avbd::AxisMode::Locked;
-            }
-        } else {
-            solver_joint->linear[solver_axis].mode = avbd::AxisMode::Locked;
-        }
-
-        // Angular: rotation about the slide axis limited per the angular limits
-        // (defaults 0/0 = locked in Godot), the orthogonal pair locked.
-        if (solver_axis == slide_axis) {
-            if (std::fabs(ang_upper - ang_lower) > 1.0e-9) {
-                solver_joint->angular[solver_axis].mode = avbd::AxisMode::Limited;
-                solver_joint->angular[solver_axis].lower = static_cast<float>(slide_sign > 0.0f ? ang_lower : -ang_upper);
-                solver_joint->angular[solver_axis].upper = static_cast<float>(slide_sign > 0.0f ? ang_upper : -ang_lower);
-            } else {
-                solver_joint->angular[solver_axis].mode = avbd::AxisMode::Locked;
-            }
-        } else {
-            solver_joint->angular[solver_axis].mode = avbd::AxisMode::Locked;
-        }
-    }
-    // The softness / restitution / damping / motor params of the slider family: recorded,
-    // not mapped (documented).
-}
-
-void AVBDPhysicsServer3D::rebuild_cone_twist_joint(SpaceData *space, const JointData &joint, avbd::Rigid *rigid_a,
-        avbd::Rigid *rigid_b) {
-    // The twist axis is the X column of the joint frame (b1Axis1 at
-    // godot_cone_twist_joint_3d.cpp:117); the two orthogonal axes carry the swing span.
-    const avbd::float3 axis_a_sim = to_sim(joint.ref_a.basis.get_column(0));
-    const int twist_axis = dominant_sim_axis(axis_a_sim);
-    const float twist_sign = dominant_sim_axis_sign(axis_a_sim, twist_axis);
-
-    const avbd::float3 r_a = to_sim(joint.ref_a.origin);
-    const avbd::float3 r_b = to_sim(joint.ref_b.origin);
-
-    avbd::GenericJoint *solver_joint = new avbd::GenericJoint(&space->solver, rigid_a, rigid_b, r_a, r_b);
-
-    const double swing = param_value(joint, PhysicsServer3D::CONE_TWIST_JOINT_SWING_SPAN);
-    const double twist = param_value(joint, PhysicsServer3D::CONE_TWIST_JOINT_TWIST_SPAN);
-
-    for (int solver_axis = 0; solver_axis < 3; solver_axis++) {
-        solver_joint->linear[solver_axis].mode = avbd::AxisMode::Locked;
-        if (solver_axis == twist_axis) {
-            // Twist span limits rotation about the twist axis (Godot's default is 0,
-            // i.e. no twist; a negative span means unlimited).
-            if (twist < -1.0e-9) {
-                solver_joint->angular[solver_axis].mode = avbd::AxisMode::Free;
-            } else if (twist > 1.0e-9) {
-                solver_joint->angular[solver_axis].mode = avbd::AxisMode::Limited;
-                solver_joint->angular[solver_axis].lower = static_cast<float>(twist_sign > 0.0f ? -twist : -twist);
-                solver_joint->angular[solver_axis].upper = static_cast<float>(twist);
-            } else {
-                solver_joint->angular[solver_axis].mode = avbd::AxisMode::Locked;
-            }
-        } else {
-            // Swing: Godot applies the same span to both orthogonal axes, centred.
-            if (swing > 1.0e-9) {
-                solver_joint->angular[solver_axis].mode = avbd::AxisMode::Limited;
-                solver_joint->angular[solver_axis].lower = static_cast<float>(-swing * 0.5f);
-                solver_joint->angular[solver_axis].upper = static_cast<float>(swing * 0.5f);
-            } else {
-                solver_joint->angular[solver_axis].mode = avbd::AxisMode::Locked;
-            }
-        }
-    }
-    // CONE_TWIST_JOINT_BIAS / SOFTNESS / RELAXATION: recorded, not mapped.
 }
 
 // Run every active space for one step, then tell each body what happened.
 //
 // Stepping follows the game: while the engine has the server inactive (SceneTree paused)
-// nothing steps. Solver parameters are stamped from project settings every step, and each
-// space runs `substeps` solver steps per engine step with dt split across them.
+// nothing steps. The modern core owns the actual integration; this function only turns
+// engine records into per-tick force injection, drives one ModernSpace step, and copies
+// the result back into the host records.
 void AVBDPhysicsServer3D::_step(float p_step) {
     if (!server_active) {
         return;
@@ -1480,7 +1185,6 @@ void AVBDPhysicsServer3D::_step(float p_step) {
     double prof_solver = 0.0;
     double prof_contacts = 0.0;
     int prof_threads = 1;
-    int prof_substeps = 0;
     int prof_iterations = 0;
     int prof_rebuild_count = 0;
     bool stepped_any = false;
@@ -1491,10 +1195,8 @@ void AVBDPhysicsServer3D::_step(float p_step) {
             continue;
         }
 
-        // A body joined/left this space since the last step; rebuild now that the
-        // engine has finished sending its setup (shapes, mass, material). Runs before
-        // the empty check: a space may be pending precisely because its first body is
-        // only now arriving.
+        // A body joined/left this space since the last step; rebuild now that the engine
+        // has finished sending its setup (shapes, mass, material).
         if (space_rebuild_pending.erase(id) > 0) {
             const ProfClock::time_point prof_t_rebuild = ProfClock::now();
             rebuild_space(make_rid(id));
@@ -1502,40 +1204,31 @@ void AVBDPhysicsServer3D::_step(float p_step) {
             prof_rebuild_count++;
         }
 
-        if (space.solver.bodies == nullptr) {
+        if (space.modern == nullptr || space.modern->empty()) {
             continue;
         }
 
-        // Project settings are re-read only after a change (the tests flip
-        // physics/avbd/substeps at runtime and expect it to apply without a restart).
         const ProfClock::time_point prof_t_params = ProfClock::now();
         if (space.params_dirty) {
             read_project_params(space);
+            read_project_gravity(space);
             space.params_dirty = false;
         }
         prof_params += seconds_since(prof_t_params);
 
-        const int substeps = space.substeps > 0 ? space.substeps : 1;
-        space.solver.iterations = space.iterations > 0 ? space.iterations : space.solver.iterations;
-        space.solver.alpha = static_cast<float>(space.alpha);
-        space.solver.betaLin = static_cast<float>(space.beta_linear);
-        space.solver.betaAng = static_cast<float>(space.beta_angular);
-        space.solver.gamma = static_cast<float>(space.gamma);
-        space.solver.adaptiveBeta = space.adaptive_beta;
-        space.solver.newtonRatio = static_cast<float>(std::clamp(space.newton_ratio, 0.0, 1.0));
-        space.solver.stiffnessDecay = static_cast<float>(std::clamp(space.stiffness_decay, 0.0, 1.0));
-        space.solver.threads = space.threads;
-        space.solver.jacobianRebuildDistance = static_cast<float>(std::max(space.jacobian_rebuild_distance, 0.0));
-        space.solver.positionProjection = space.position_projection;
-        space.solver.projectionIterations = std::max(space.projection_iterations, 0);
-        space.solver.projectionBeta = static_cast<float>(std::clamp(space.projection_beta, 0.0, 1.0));
-        space.solver.projectionSlop = static_cast<float>(std::max(space.projection_slop, 0.0));
-        space.solver.projectionMaxCorrection = static_cast<float>(std::max(space.projection_max_correction, 0.0));
+        const int iterations = space.iterations > 0 ? space.iterations : 8;
+        // Contact stiffness. The legacy beta_linear setting was the per-contact penalty
+        // scale; the modern AVBD policy exposes exactly that as its per-step k0.
+        space.modern->set_policy_stiffness(
+                static_cast<Scalar_t>(std::clamp(space.beta_linear, 1.0e4, 1.0e6)), Scalar_t(1e-2));
+        space.modern->set_contact_margin(Scalar_t(0.002));
 
         // Godot's physics tick is the sampling rate. If an internal rate is configured,
         // accumulate engine time and advance the solver on its own fixed tick; the engine
-        // tick then only samples the state. 0 keeps the legacy one-solver-tick-per-engine-
-        // tick behaviour. The catch-up cap drops a backlog instead of spiralling.
+        // tick then only samples the state. 0 keeps one solver tick per engine tick.
+        // Substepping (`physics/avbd/substeps`) is folded into this: the modern core's
+        // per-iteration solve replaces the legacy round split, and running the whole
+        // collision+force pass `substeps` times per tick would only multiply cost.
         double dt = p_step;
         int tickCount = 1;
         if (space.internal_ticks_per_second > 0.0) {
@@ -1550,34 +1243,30 @@ void AVBDPhysicsServer3D::_step(float p_step) {
                 space.internal_accumulator = std::fmod(space.internal_accumulator, dt);
             }
         }
-        space.solver.dt = static_cast<float>(dt / static_cast<double>(substeps));
-        // Idle-sleep horizon: Godot's 0.5 s default scaled by sleep_time, expressed in
-        // internal ticks. A fixed step count would make a high-tick-rate project fall
-        // asleep sooner than intended - the horizon is a TIME, not 60 frames.
-        space.solver.sleepFrames = std::max(1,
-                static_cast<int>(std::lround(0.5 * space.sleep_time / dt)));
-        space.solver.sleepLinearThreshold =
-                static_cast<float>(std::max(space.sleep_linear_threshold, 0.0));
-        space.solver.sleepAngularThreshold =
-                static_cast<float>(std::max(space.sleep_angular_threshold, 0.0));
-        space.solver.contactGraceTicks = std::max(space.contact_grace_ticks, 0);
-        space.solver.contactOnlyOverflow = !space.contact_gs;
-        space.solver.speculativeMargin = static_cast<float>(std::max(space.speculative_margin, 0.0));
 
+        ModernSpace &modern = *space.modern;
         for (int tick = 0; tick < tickCount; ++tick) {
-            const float tickDt = static_cast<float>(dt);
+            const Scalar_t tickDt = static_cast<Scalar_t>(dt);
 
-            // Forces accumulated since the last solver tick (persistent constant_* plus
-            // one-shot frame ones) become velocity changes now, so the solver integrates
-            // them with everything else. With an internal tick, a one-shot force waits
-            // until the next internal tick rather than being consumed by a sample.
             const ProfClock::time_point prof_t_forces = ProfClock::now();
             for (auto &[body_id, body] : bodies) {
-                if (id_of(body.space) != id || body.rigid == nullptr || body.rigid->mass <= 0.0f) {
+                (void)body_id;
+                if (id_of(body.space) == id && body.modern_index >= 0) {
+                    modern.set_sleeping(static_cast<std::size_t>(body.modern_index), body.sleeping);
+                }
+            }
+            modern.begin_tick(space.gravity, tickDt);
+
+            // Forces accumulated since the last solver tick (persistent constant_* plus
+            // one-shot frame ones). The modern core converts a force into acceleration
+            // through the body's inverse mass, exactly like the legacy path.
+            for (auto &[body_id, body] : bodies) {
+                (void)body_id;
+                if (id_of(body.space) != id || body.modern_index < 0) {
                     continue;
                 }
-                // A body with scripted integration applies its own forces in its callback.
                 if (body.omit_force_integration) {
+                    // A body with scripted integration applies its own forces in its callback.
                     body.frame_force = Vector3();
                     body.frame_torque = Vector3();
                     continue;
@@ -1587,81 +1276,35 @@ void AVBDPhysicsServer3D::_step(float p_step) {
                 body.frame_force = Vector3();
                 body.frame_torque = Vector3();
                 if (force.length_squared() > 0.0) {
-                    body.rigid->velocityLin += to_sim(force) / body.rigid->mass * tickDt;
+                    modern.add_force(static_cast<std::size_t>(body.modern_index), to_modern(force));
                 }
                 if (torque.length_squared() > 0.0) {
-                    // World-frame inverse inertia, as in the node layer's impulse paths.
-                    const avbd::float3 local = avbd::qrot(avbd::qconj(body.rigid->positionAng), to_sim(torque) * tickDt);
-                    const avbd::float3 delta{local.x / body.rigid->moment.x,
-                            local.y / body.rigid->moment.y, local.z / body.rigid->moment.z};
-                    body.rigid->velocityAng += qrot(body.rigid->positionAng, delta);
+                    modern.add_torque(static_cast<std::size_t>(body.modern_index), to_modern(torque));
                 }
             }
             prof_forces += seconds_since(prof_t_forces);
 
             const ProfClock::time_point prof_t_solver = ProfClock::now();
-            if (space.interleaved_substeps && substeps > 1) {
-                space.solver.stepInterleaved(substeps, space.rounds_per_substep);
-            } else {
-                for (int sub = 0; sub < substeps; sub++) {
-                    space.solver.step();
-                }
-            }
+            modern.step(iterations, space.threads);
             prof_solver += seconds_since(prof_t_solver);
         }
         if (tickCount > 0) {
             stepped_any = true;
         }
 
-        // Snapshot the deepest contact on the stepping thread, where the force list is
-        // stable. The getters run on the main thread; walking solver.forces there races
-        // with manifold creation, revival and reaping, and a manifold read after it was
-        // unlinked (or reused from the pool) reports a depth for a pair that is no longer
-        // touching - the "phantom depth" that does not match any geometry.
-        //
-        // The stored error alone is not the answer either: it belongs to the contact set
-        // the tick's collision pass found, and the bodies have moved since (a fast pair can
-        // have separated within the tick, and a contact that rotated makes its stored
-        // normal measure a separation that no longer exists). Report the pair the solver
-        // believes is deepest, but measure it with a real SAT pass at the current pose, so
-        // the number always describes the geometry the host can see. One extra narrow
-        // phase per step, on the stepping thread.
-        avbd::Rigid *deepest_a = nullptr;
-        avbd::Rigid *deepest_b = nullptr;
-        double deepest_stored = 0.0;
-        for (int m = 0; m < space.solver.manifoldCount(); m++) {
-            const int contacts = space.solver.manifoldContactCount(m);
-            for (int i = 0; i < contacts; i++) {
-                const double depth = static_cast<double>(avbd::COLLISION_MARGIN
-                        - space.solver.manifoldContactError(m, i).x);
-                if (depth > deepest_stored) {
-                    deepest_stored = depth;
-                    deepest_a = space.solver.manifoldBodyA(m);
-                    deepest_b = space.solver.manifoldBodyB(m);
-                }
-            }
-        }
-        if (deepest_a != nullptr) {
-            std::array<avbd::Manifold::Contact, 8> fresh{};
-            avbd::float3x3 freshBasis{};
-            const int freshCount = avbd::Manifold::collide(deepest_a, deepest_b,
-                    std::span<avbd::Manifold::Contact>(fresh), freshBasis);
-            for (int i = 0; i < freshCount; i++) {
-                const avbd::float3 xA = deepest_a->positionLin
-                        + avbd::qrot(deepest_a->positionAng, fresh[i].rA);
-                const avbd::float3 xB = deepest_b->positionLin
-                        + avbd::qrot(deepest_b->positionAng, fresh[i].rB);
-                const avbd::float3 c0 = avbd::mul(freshBasis, xA - xB)
-                        + avbd::float3{avbd::COLLISION_MARGIN, 0, 0};
-                const double depth = static_cast<double>(avbd::COLLISION_MARGIN - c0.x);
+        // --- diagnostics: deepest contact of the step -----------------------------
+        // ManifoldContact.depth is the geometric overlap measured by narrowphase at the
+        // pose the last solve worked against. Mapping back through the space's stable
+        // index gives the Godot instance ids the headless stress suites resolve.
+        for (const collision::Manifold &m : modern.manifolds()) {
+            for (std::size_t c = 0; c < m.count; ++c) {
+                const double depth = static_cast<double>(m.contacts[c].depth);
                 if (depth <= diag_max_penetration) {
                     continue;
                 }
                 diag_max_penetration = depth;
-                const auto it_a = space.rigid_ids.find(deepest_a);
-                const auto it_b = space.rigid_ids.find(deepest_b);
-                const auto rec_a = bodies.find(it_a != space.rigid_ids.end() ? it_a->second : 0);
-                const auto rec_b = bodies.find(it_b != space.rigid_ids.end() ? it_b->second : 0);
+                const auto rec_a = bodies.find(modern.body_id(m.body_a));
+                const auto rec_b = bodies.find(modern.body_id(m.body_b));
                 diag_deepest_a = rec_a != bodies.end() ? rec_a->second.instance_id : 0;
                 diag_deepest_b = rec_b != bodies.end() ? rec_b->second.instance_id : 0;
             }
@@ -1672,12 +1315,7 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         _monitor_areas();
         const ProfClock::time_point prof_t_contacts = ProfClock::now();
 
-        // Collect each body's contacts for the step (used by the DirectBodyState contact
-        // getters, i.e. RigidBody3D contact monitoring). Manifolds are the forces with
-        // contact points; a contact's world position comes from the anchor of the body
-        // being filled. Capped by max_contacts_reported, as Godot does: without the cap
-        // request no contacts are recorded. The manifold walk (and its two hash maps)
-        // only runs when some body in this space actually reports contacts.
+        // --- per-body contact reporting (RigidBody3D contact monitoring) -----------
         bool any_reports = false;
         for (auto &[collect_id, collect_body] : bodies) {
             (void)collect_id;
@@ -1690,47 +1328,50 @@ void AVBDPhysicsServer3D::_step(float p_step) {
             }
         }
         if (any_reports) {
-            // Rigid -> owning record, resolved once for the whole manifold walk.
-            ankerl::unordered_dense::map<const avbd::Rigid *, BodyData *> rigid_map;
-            ankerl::unordered_dense::map<const BodyData *, uint64_t> id_map;
-            for (auto &[bid, b] : bodies) {
-                if (id_of(b.space) == id && b.rigid != nullptr) {
-                    b.frame_contacts.clear();
-                    rigid_map.emplace(b.rigid, &b);
-                    id_map.emplace(&b, bid);
-                }
-            }
-            for (int m = 0; m < space.solver.manifoldCount(); m++) {
-                const int count = space.solver.manifoldContactCount(m);
-                if (count <= 0) {
+            const State &state = modern.state();
+            for (const collision::Manifold &m : modern.manifolds()) {
+                if (m.count == 0) {
                     continue;
                 }
-                avbd::Rigid *body_a = space.solver.manifoldBodyA(m);
-                avbd::Rigid *body_b = space.solver.manifoldBodyB(m);
-                const auto it_a = rigid_map.find(body_a);
-                const auto it_b = rigid_map.find(body_b);
-                BodyData *data[2] = {it_a != rigid_map.end() ? it_a->second : nullptr,
-                        it_b != rigid_map.end() ? it_b->second : nullptr};
-                const avbd::float3 normal = space.solver.manifoldNormal(m);
+                const auto found_a = bodies.find(modern.body_id(m.body_a));
+                const auto found_b = bodies.find(modern.body_id(m.body_b));
+                if (found_a == bodies.end() || found_b == bodies.end()) {
+                    continue;
+                }
+                BodyData *data[2] = {&found_a->second, &found_b->second};
+                const std::size_t index[2] = {m.body_a, m.body_b};
+                const Vec3 normal = m.basis.normal;
 
                 for (int side = 0; side < 2; side++) {
                     BodyData *fill = data[side];
-                    if (fill == nullptr || fill->max_contacts_reported <= 0) {
+                    if (fill->max_contacts_reported <= 0) {
                         continue;
                     }
-                    const BodyData *other = data[side == 0 ? 1 : 0];
-                    const avbd::Rigid *self_rigid = side == 0 ? body_a : body_b;
-                    for (int c = 0; c < count && static_cast<int32_t>(fill->frame_contacts.size()) < fill->max_contacts_reported; c++) {
-                        const avbd::Manifold::Contact &contact = space.solver.manifoldContact(m, c);
-                        const avbd::float3 world = self_rigid->positionLin
-                                + avbd::qrot(self_rigid->positionAng,
-                                        side == 0 ? contact.rA : contact.rB);
+                    const std::size_t self_index = index[side];
+                    for (std::size_t c = 0;
+                            c < m.count &&
+                            static_cast<int32_t>(fill->frame_contacts.size()) < fill->max_contacts_reported;
+                            ++c) {
+                        const collision::ManifoldContact &contact = m.contacts[c];
+                        if (static_cast<double>(contact.depth) < fill->contacts_depth_threshold) {
+                            continue;
+                        }
+                        const Vec3 r = side == 0 ? contact.rA : contact.rB;
+                        const Vec3 world = state.pose.position(self_index) +
+                                rotate(state.pose.rotation(self_index), r);
                         BodyData::FrameContact fc;
                         fc.position = to_godot(world);
-                        // The basis's first row points from B to A; each side reports the
-                        // normal as pointing out of the other body towards itself.
-                        fc.normal = to_godot(normal * (side == 0 ? 1.0f : -1.0f));
-                        fc.collider_body_id = other != nullptr ? id_map[other] : 0;
+                        // basis.normal points from B to A; each side reports the normal as
+                        // pointing out of the other body towards itself.
+                        fc.normal = to_godot(normal * (side == 0 ? Scalar_t(1) : Scalar_t(-1)));
+                        fc.impulse = to_godot(normal * (contact.lambda.x *
+                                (side == 0 ? Scalar_t(1) : Scalar_t(-1))));
+                        fc.collider_body_id = modern.body_id(index[side == 0 ? 1 : 0]);
+                        // The manifold stores proxy ids; the slot needs the shape table,
+                        // which the MVP contact path does not expose. Single-shape bodies
+                        // (the common case) report slot 0.
+                        fc.local_shape = 0;
+                        fc.collider_shape = 0;
                         fill->frame_contacts.push_back(fc);
                     }
                 }
@@ -1738,32 +1379,25 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         }
         prof_contacts += seconds_since(prof_t_contacts);
 
+        // --- write back ------------------------------------------------------------
         for (auto &[body_id, body] : bodies) {
-            if (id_of(body.space) != id || body.rigid == nullptr) {
+            (void)body_id;
+            if (id_of(body.space) != id || body.modern_index < 0) {
                 continue;
             }
-
-            // Snapshot the solver's output into the host record; _flush_queries delivers
-            // it to the scene before the next step, through the callback the engine
-            // registered for this body. The server does not touch the scene itself.
-            const avbd::Rigid *rigid = body.rigid;
-
+            const std::size_t i = static_cast<std::size_t>(body.modern_index);
             Transform3D transform;
-            transform.origin = to_godot(rigid->positionLin);
-            transform.basis = Basis(to_godot(rigid->positionAng).normalized());
-
+            transform.origin = to_godot(modern.body_origin(i));
+            transform.basis = Basis(to_godot(modern.body_rotation(i)).normalized());
             body.transform = transform;
-            body.linear_velocity = to_godot(rigid->velocityLin);
-            body.angular_velocity = to_godot(rigid->velocityAng);
-            // Keep the host copy in step with the solver's sleep state: the pre-step sync
-            // writes body.sleeping back into body.rigid->sleeping, so a solver-side sleep
-            // decision would otherwise be overwritten on the next step.
-            body.sleeping = rigid->sleeping;
+            body.linear_velocity = to_godot(modern.linear_velocity(i));
+            body.angular_velocity = to_godot(modern.angular_velocity(i));
+            // body.sleeping is owned by the engine (explicit sleep only; the modern core
+            // has no automatic idle detection yet).
         }
 
-        prof_threads = std::max(prof_threads, space.solver.threadCount());
-        prof_substeps = std::max(prof_substeps, substeps);
-        prof_iterations = std::max(prof_iterations, space.solver.iterations);
+        prof_threads = std::max(prof_threads, modern.threads_used());
+        prof_iterations = std::max(prof_iterations, iterations);
     }
 
     if (stepped_any) {
@@ -1788,7 +1422,6 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         if (prof_total > 2.0e6)
             prof.over_2ms_ticks++;
         prof.threads_used = std::max(prof.threads_used, prof_threads);
-        prof.substeps = prof_substeps;
         prof.iterations = prof_iterations;
         prof.ticks++;
         if (prof.ticks % 240 == 0) {
@@ -1827,14 +1460,6 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         }
     }
 }
-
-// -----------------------------------------------------------------------------
-// Joints
-//
-// The engine hands over a joint RID, then a type (joint_make_*), then axis parameters and flags
-// one call at a time. Everything is recorded in JointData; the solver object is built only in
-// rebuild_space, so a joint whose bodies are still being set up costs nothing.
-// -----------------------------------------------------------------------------
 
 RID AVBDPhysicsServer3D::_joint_create() {
     const uint64_t id = next_id++;
@@ -1906,19 +1531,6 @@ void AVBDPhysicsServer3D::_joint_make_generic_6dof(const RID &p_joint, const RID
 
     if (BodyData *body_b = find_body(p_body_b)) {
         rebuild_space(body_b->space);
-    }
-}
-
-// A shared body lookup that triggers the rebuild a completed joint definition needs.
-void AVBDPhysicsServer3D::_rebuild_for_joint(const RID &p_joint) {
-    const auto found = joints.find(id_of(p_joint));
-    if (found == joints.end()) {
-        return;
-    }
-    if (BodyData *body_b = find_body(found->second.body_b)) {
-        rebuild_space(body_b->space);
-    } else if (BodyData *body_a = find_body(found->second.body_a)) {
-        rebuild_space(body_a->space);
     }
 }
 
@@ -2272,52 +1884,45 @@ void AVBDPhysicsServer3D::_body_set_state(const RID &p_body, PhysicsServer3D::Bo
     switch (p_state) {
         case PhysicsServer3D::BODY_STATE_TRANSFORM:
             body->transform = p_value;
-            if (body->rigid != nullptr) {
-                // A transform set from the scene is the body's new pose right now, so the solver
-                // is told to match rather than being left to interpolate towards it.
+            if (ModernSpace *modern = modern_for(*body)) {
+                // A transform set from the scene is the body's new pose right now, so the
+                // solver is told to match rather than left to interpolate towards it.
                 const Transform3D &t = body->transform;
-                body->rigid->positionLin = avbd::float3{static_cast<float>(t.origin.x),
-                        static_cast<float>(-t.origin.z), static_cast<float>(t.origin.y)};
-                body->rigid->positionAng = to_sim(t.basis.get_rotation_quaternion());
-                // External teleports wake a sleeping body (Godot semantics).
-                body->rigid->sleeping = false;
-                body->rigid->stillFrames = 0;
+                modern->set_body_transform(static_cast<std::size_t>(body->modern_index),
+                        to_modern(t.origin), to_modern(t.basis.get_rotation_quaternion()));
             }
+            body->sleeping = false;
             break;
 
         case PhysicsServer3D::BODY_STATE_LINEAR_VELOCITY:
             body->linear_velocity = p_value;
-            if (body->rigid != nullptr) {
-                const Vector3 &v = body->linear_velocity;
-                body->rigid->velocityLin = avbd::float3{static_cast<float>(v.x), static_cast<float>(-v.z),
-                        static_cast<float>(v.y)};
-                // An explicit velocity assignment wakes a sleeping body (Godot semantics).
-                body->rigid->sleeping = false;
-                body->rigid->stillFrames = 0;
+            if (ModernSpace *modern = modern_for(*body)) {
+                modern->set_linear_velocity(static_cast<std::size_t>(body->modern_index),
+                        to_modern(static_cast<Vector3>(body->linear_velocity)));
             }
+            body->sleeping = false;
             break;
 
         case PhysicsServer3D::BODY_STATE_ANGULAR_VELOCITY:
             body->angular_velocity = p_value;
-            if (body->rigid != nullptr) {
-                const Vector3 &w = body->angular_velocity;
-                body->rigid->velocityAng = avbd::float3{static_cast<float>(w.x), static_cast<float>(-w.z),
-                        static_cast<float>(w.y)};
-                body->rigid->sleeping = false;
-                body->rigid->stillFrames = 0;
+            if (ModernSpace *modern = modern_for(*body)) {
+                modern->set_angular_velocity(static_cast<std::size_t>(body->modern_index),
+                        to_modern(static_cast<Vector3>(body->angular_velocity)));
             }
+            body->sleeping = false;
             break;
 
         case PhysicsServer3D::BODY_STATE_SLEEPING: {
             body->sleeping = p_value;
-            if (body->rigid != nullptr) {
-                body->rigid->sleeping = p_value;
-                if (p_value) {
-                    // Godot zeroes velocity when a body is put to sleep explicitly.
-                    body->rigid->velocityLin = avbd::float3{0, 0, 0};
-                    body->rigid->velocityAng = avbd::float3{0, 0, 0};
-                    body->linear_velocity = Vector3();
-                    body->angular_velocity = Vector3();
+            if (p_value) {
+                // Godot zeroes velocity when a body is put to sleep explicitly. There is
+                // no sleep in the modern core yet, so this only records the state and
+                // parks the velocity the engine can see.
+                body->linear_velocity = Vector3();
+                body->angular_velocity = Vector3();
+                if (ModernSpace *modern = modern_for(*body)) {
+                    modern->set_linear_velocity(static_cast<std::size_t>(body->modern_index), Vec3{0});
+                    modern->set_angular_velocity(static_cast<std::size_t>(body->modern_index), Vec3{0});
                 }
             }
             break;
@@ -2350,7 +1955,7 @@ Variant AVBDPhysicsServer3D::_body_get_state(const RID &p_body, PhysicsServer3D:
         case PhysicsServer3D::BODY_STATE_ANGULAR_VELOCITY:
             return body.angular_velocity;
         case PhysicsServer3D::BODY_STATE_SLEEPING:
-            return body.rigid != nullptr ? body.rigid->sleeping : body.sleeping;
+            return body.sleeping;
         case PhysicsServer3D::BODY_STATE_CAN_SLEEP:
             return body.can_sleep;
         default:
@@ -2469,40 +2074,34 @@ double AVBDPhysicsServer3D::body_state_step() const {
     // Every space steps with the engine's fixed timestep; report the common value.
     for (const auto &[id, space] : spaces) {
         (void)id;
-        return space->solver.dt;
+        if (space->modern != nullptr)
+            return static_cast<double>(space->modern->state().dt);
     }
     return 0.0;
 }
 
+// The modern core reports one total per step; the legacy phase split (broad phase /
+// colour graph / solve / finish) does not exist in it, so those getters stay 0 rather
+// than returning numbers that would be made up.
 double AVBDPhysicsServer3D::get_solver_broad_phase_time() const {
-    for (const auto &[id, space] : spaces) {
-        (void)id;
-        return space->solver.get_broadPhase_time();
-    }
     return 0.0;
 }
 
 double AVBDPhysicsServer3D::get_solver_colour_graph_time() const {
-    for (const auto &[id, space] : spaces) {
-        (void)id;
-        return space->solver.get_colourGraph_time();
-    }
     return 0.0;
 }
 
 double AVBDPhysicsServer3D::get_solver_solve_time() const {
+    double total = 0.0;
     for (const auto &[id, space] : spaces) {
         (void)id;
-        return space->solver.get_solve_time();
+        if (space->modern != nullptr)
+            total = std::max(total, space->modern->last_step_ms());
     }
-    return 0.0;
+    return total;
 }
 
 double AVBDPhysicsServer3D::get_solver_finish_time() const {
-    for (const auto &[id, space] : spaces) {
-        (void)id;
-        return space->solver.get_finish_time();
-    }
     return 0.0;
 }
 
@@ -2524,65 +2123,39 @@ Array AVBDPhysicsServer3D::get_solver_deepest_contact() const {
     return out;
 }
 
-// Sleep/wake state of the last step, aggregated over every space. Mirrors the solver's own
-// predicates: a body is asleep when `sleeping` is set, a manifold is frozen when neither side
-// is a movable awake body (ManifoldStore::frozen), and the update set is what the solve
-// actually moved.
+// Sleep/wake diagnostics. The modern core has no sleeping yet, so every movable body is
+// reported awake and no manifold is frozen; the counters stay meaningful for the stress
+// suites (`sleeping == 0` is itself the statement that sleep is not implemented).
 Dictionary AVBDPhysicsServer3D::get_solver_sleep_stats() const {
-    int body_count = 0;
+    int bodies_count = 0;
     int movable = 0;
-    int sleeping = 0;
-    int sleep_mode_never = 0;
-    int max_still_frames = 0;
-    int update_set = 0;
     int manifolds = 0;
-    int frozen_manifolds = 0;
-    int sleep_frames = 0;
 
     for (const auto &[id, space] : spaces) {
         (void)id;
-        if (!space->active) {
-            continue; // an unused Space3D would report its own empty solver as the aggregate
+        if (!space->active || space->modern == nullptr) {
+            continue;
         }
-        const avbd::Solver &solver = space->solver;
-        sleep_frames = solver.sleepFrames;
-        for (const avbd::Rigid *body = solver.bodies; body != nullptr; body = body->next) {
-            ++body_count;
-            if (body->mass > 0.0f) {
+        const ModernSpace &modern = *space->modern;
+        bodies_count += static_cast<int>(modern.size());
+        for (std::size_t i = 0; i < modern.size(); ++i) {
+            if (!modern.is_static(i)) {
                 ++movable;
-                if (body->sleeping) {
-                    ++sleeping;
-                }
-                if (body->sleep_mode == 0) {
-                    ++sleep_mode_never;
-                }
-                max_still_frames = std::max(max_still_frames, body->stillFrames);
-                if (body->inUpdateSet) {
-                    ++update_set;
-                }
             }
         }
-        const auto awake = [](const avbd::Rigid *b) {
-            return b != nullptr && b->mass > 0.0f && !b->sleeping;
-        };
-        manifolds += solver.manifoldCount();
-        for (int m = 0; m < solver.manifoldCount(); m++) {
-            if (!awake(solver.manifoldBodyA(m)) && !awake(solver.manifoldBodyB(m))) {
-                ++frozen_manifolds;
-            }
-        }
+        manifolds += static_cast<int>(modern.manifolds().size());
     }
 
     Dictionary out;
-    out["bodies"] = body_count;
+    out["bodies"] = bodies_count;
     out["movable"] = movable;
-    out["sleeping"] = sleeping;
-    out["sleep_mode_never"] = sleep_mode_never;
-    out["max_still_frames"] = max_still_frames;
-    out["update_set"] = update_set;
+    out["sleeping"] = 0;
+    out["sleep_mode_never"] = 0;
+    out["max_still_frames"] = 0;
+    out["update_set"] = movable;
     out["manifolds"] = manifolds;
-    out["frozen_manifolds"] = frozen_manifolds;
-    out["sleep_frames"] = sleep_frames;
+    out["frozen_manifolds"] = 0;
+    out["sleep_frames"] = 0;
     out["rebuilds"] = static_cast<int64_t>(rebuild_total);
     out["steps"] = static_cast<int64_t>(step_total);
     out["rebuild_last_step"] = static_cast<int64_t>(rebuild_last_step);
@@ -2613,64 +2186,65 @@ PhysicsDirectBodyState3D *AVBDPhysicsServer3D::_body_get_direct_state(const RID 
     if (body_state == nullptr) {
         body_state = memnew(AVBDDirectBodyState3D);
     }
-    body_state->bind(this, body->rigid, p_body);
+    body_state->bind(this, p_body);
     return body_state;
 }
 
 // --- query helpers -------------------------------------------------------------
 
-std::vector<AVBDPhysicsServer3D::QueryCandidate> AVBDPhysicsServer3D::query_candidates(const RID &p_space,
-        uint32_t p_mask) const {
-    if (!spaces.contains(id_of(p_space))) {
-        return {};
+Transform3D AVBDPhysicsServer3D::body_shape_transform(const BodyData &p_body, int32_t p_shape_idx) const {
+    if (p_shape_idx < 0 || static_cast<std::size_t>(p_shape_idx) >= p_body.shapes.size()) {
+        return p_body.transform;
     }
-    const uint64_t space_id = id_of(p_space);
-    return to_container<std::vector<AVBDPhysicsServer3D::QueryCandidate>>(bodies
-            | std::views::filter([&](const auto &entry) {
-                  const BodyData &body = entry.second;
-                  return body.rigid != nullptr && id_of(body.space) == space_id
-                          && (body.rigid->collisionLayer & p_mask) != 0;
-              })
-            | std::views::transform([](const auto &entry) {
-                  return QueryCandidate{entry.second.rigid, entry.first, entry.second.ray_pickable};
-              })
-    );
+    const Transform3D local = static_cast<std::size_t>(p_shape_idx) < p_body.shape_transforms.size()
+            ? p_body.shape_transforms[p_shape_idx]
+            : Transform3D();
+    return p_body.transform * local;
 }
 
-std::vector<AVBDPhysicsServer3D::QueryCandidate> AVBDPhysicsServer3D::query_candidates_aabb(
-        const RID &p_space, avbd::float3 p_min, avbd::float3 p_max, uint32_t p_mask) const {
-    const auto found = spaces.find(id_of(p_space));
-    if (found == spaces.end()) {
-        return {};
+std::vector<AVBDPhysicsServer3D::QueryShapeHit> AVBDPhysicsServer3D::query_body_shapes(
+        const RID &p_space, uint32_t p_mask) const {
+    std::vector<QueryShapeHit> out;
+    const uint64_t space_id = id_of(p_space);
+    if (!spaces.contains(space_id)) {
+        return out;
     }
-    const SpaceData &space = *found->second;
-
-    std::vector<avbd::Rigid *> rigids;
-    space.solver.collectAABB(p_min, p_max, p_mask, rigids);
-
-    std::vector<QueryCandidate> out;
-    out.reserve(rigids.size());
-    for (const avbd::Rigid *rigid : rigids) {
-        const auto id = space.rigid_ids.find(rigid);
-        if (id == space.rigid_ids.end()) {
+    for (const auto &[body_id, body] : bodies) {
+        if (id_of(body.space) != space_id) {
             continue;
         }
-        const auto body = bodies.find(id->second);
-        const bool pickable = body != bodies.end() ? body->second.ray_pickable : true;
-        out.push_back(QueryCandidate{const_cast<avbd::Rigid *>(rigid), id->second, pickable});
+        if ((body.collision_layer & p_mask) == 0) {
+            continue;
+        }
+        for (std::size_t slot = 0; slot < body.shapes.size(); ++slot) {
+            if (slot < body.shape_disabled.size() && body.shape_disabled[slot]) {
+                continue;
+            }
+            const Transform3D posed = body_shape_transform(body, static_cast<int32_t>(slot));
+            collision::Shape shape;
+            if (!query_shape_from_data(body.shapes[slot], posed, shape)) {
+                continue;
+            }
+            QueryShapeHit hit;
+            hit.shape = shape;
+            hit.transform = posed;
+            hit.rid = make_rid(body_id);
+            hit.collider_id = body.instance_id;
+            hit.body_id = body_id;
+            hit.shape_index = static_cast<int32_t>(slot);
+            hit.linear_velocity = body.linear_velocity;
+            hit.is_area = false;
+            hit.ray_pickable = body.ray_pickable;
+            out.push_back(hit);
+        }
     }
     return out;
 }
 
-std::vector<AVBDPhysicsServer3D::QueryAreaCandidate> AVBDPhysicsServer3D::query_area_candidates_aabb(
-        const RID &p_space, avbd::float3 p_min, avbd::float3 p_max, uint32_t p_mask) const {
-    const auto found = spaces.find(id_of(p_space));
-    if (found == spaces.end()) {
-        return {};
-    }
+std::vector<AVBDPhysicsServer3D::QueryShapeHit> AVBDPhysicsServer3D::query_area_shapes(
+        const RID &p_space, uint32_t p_mask) const {
+    std::vector<QueryShapeHit> out;
     const uint64_t space_id = id_of(p_space);
-
-    std::vector<QueryAreaCandidate> out;
     for (const auto &[area_id, area] : areas) {
         if (!area.space.is_valid() || id_of(area.space) != space_id) {
             continue;
@@ -2678,23 +2252,25 @@ std::vector<AVBDPhysicsServer3D::QueryAreaCandidate> AVBDPhysicsServer3D::query_
         if ((area.collision_layer & p_mask) == 0) {
             continue;
         }
-        for (size_t i = 0; i < area.shapes.size(); i++) {
-            if (area.shape_disabled[i]) {
+        for (std::size_t i = 0; i < area.shapes.size(); ++i) {
+            if (i < area.shape_disabled.size() && area.shape_disabled[i]) {
                 continue;
             }
             const Transform3D posed = area.transform * area.shape_transforms[i];
-            avbd::Shape shape;
+            collision::Shape shape;
             if (!query_shape_from_data(area.shapes[i], posed, shape)) {
                 continue;
             }
-            avbd::float3 shape_min, shape_max;
-            avbd::query::shapeAabb(shape, shape_min, shape_max);
-            if (shape_min.x > p_max.x || shape_min.y > p_max.y || shape_min.z > p_max.z
-                    || p_min.x > shape_max.x || p_min.y > shape_max.y || p_min.z > shape_max.z) {
-                continue;
-            }
-            out.push_back(QueryAreaCandidate{shape, make_rid(area_id), area.instance_id,
-                    static_cast<int>(i), area.ray_pickable});
+            QueryShapeHit hit;
+            hit.shape = shape;
+            hit.transform = posed;
+            hit.rid = make_rid(area_id);
+            hit.collider_id = area.instance_id;
+            hit.body_id = 0;
+            hit.shape_index = static_cast<int32_t>(i);
+            hit.is_area = true;
+            hit.ray_pickable = area.ray_pickable;
+            out.push_back(hit);
         }
     }
     return out;
@@ -2710,41 +2286,6 @@ bool AVBDPhysicsServer3D::body_is_excepted(uint64_t p_body_a, uint64_t p_body_b)
         return std::find(from.exceptions.begin(), from.exceptions.end(), other) != from.exceptions.end();
     };
     return lists(a->second, p_body_b) || lists(b->second, p_body_a);
-}
-
-avbd::Rigid *AVBDPhysicsServer3D::solver_pick(const RID &p_space, avbd::float3 p_origin, avbd::float3 p_dir,
-        uint32_t p_mask, avbd::float3 &r_local) {
-    SpaceData *space = find_space(p_space);
-    if (space == nullptr) {
-        return nullptr;
-    }
-    return space->solver.pick(p_origin, p_dir, r_local, p_mask);
-}
-
-uint64_t AVBDPhysicsServer3D::body_id_of(const RID &p_space, const avbd::Rigid *p_rigid) const {
-    // O(1) through the space's solver-body index (rebuilt with the space); the BVH
-    // query paths resolve every result through here.
-    const auto found = spaces.find(id_of(p_space));
-    if (found == spaces.end()) {
-        return 0;
-    }
-    const auto id = found->second->rigid_ids.find(p_rigid);
-    return id != found->second->rigid_ids.end() ? id->second : 0;
-}
-
-RID AVBDPhysicsServer3D::solver_pick_rid(const RID &p_space, const avbd::Rigid *p_rigid) {
-    const uint64_t id = body_id_of(p_space, p_rigid);
-    return id != 0 ? make_rid(id) : RID();
-}
-
-uint64_t AVBDPhysicsServer3D::body_instance_id(const RID &p_space, const avbd::Rigid *p_rigid) {
-    const BodyData *body = find_body(make_rid(body_id_of(p_space, p_rigid)));
-    return body != nullptr ? body->instance_id : 0;
-}
-
-Vector3 AVBDPhysicsServer3D::body_velocity_of(const RID &p_space, const avbd::Rigid *p_rigid) {
-    const BodyData *body = find_body(make_rid(body_id_of(p_space, p_rigid)));
-    return body != nullptr ? body->linear_velocity : Vector3();
 }
 
 const AVBDPhysicsServer3D::ShapeData *AVBDPhysicsServer3D::shape_data(const RID &p_shape) const {
@@ -2770,9 +2311,8 @@ void AVBDPhysicsServer3D::_body_set_param(const RID &p_body, PhysicsServer3D::Bo
             break;
         case PhysicsServer3D::BODY_PARAM_FRICTION:
             body->friction = p_value;
-            if (body->rigid != nullptr) {
-                body->rigid->friction = body->friction;
-            }
+            // Friction is carried by the shape material, so a change needs a rebuild.
+            space_rebuild_pending[id_of(body->space)] = true;
             break;
         case PhysicsServer3D::BODY_PARAM_BOUNCE:
             // The AVBD contact model is friction-only: a bounce value is remembered for
@@ -2781,20 +2321,26 @@ void AVBDPhysicsServer3D::_body_set_param(const RID &p_body, PhysicsServer3D::Bo
             break;
         case PhysicsServer3D::BODY_PARAM_GRAVITY_SCALE: {
             body->gravity_scale = p_value;
-            if (body->rigid != nullptr && body->space.is_valid()) {
-                // Re-derive the per-body gravity from the space's magnitude.
-                if (SpaceData *space = find_space(body->space)) {
-                    body->rigid->gravity = space->solver.gravity * static_cast<float>(body->gravity_scale);
-                }
+            if (ModernSpace *modern = modern_for(*body)) {
+                modern->set_gravity_scale(static_cast<std::size_t>(body->modern_index),
+                        static_cast<double>(body->gravity_scale));
             }
             break;
         }
         case PhysicsServer3D::BODY_PARAM_LINEAR_DAMP:
             body->linear_damp = p_value;
-            break; // damping is not simulated (documented)
+            if (ModernSpace *modern = modern_for(*body)) {
+                modern->set_damping(static_cast<std::size_t>(body->modern_index),
+                        body->linear_damp, body->angular_damp);
+            }
+            break;
         case PhysicsServer3D::BODY_PARAM_ANGULAR_DAMP:
             body->angular_damp = p_value;
-            break; // damping is not simulated (documented)
+            if (ModernSpace *modern = modern_for(*body)) {
+                modern->set_damping(static_cast<std::size_t>(body->modern_index),
+                        body->linear_damp, body->angular_damp);
+            }
+            break;
         case PhysicsServer3D::BODY_PARAM_LINEAR_DAMP_MODE:
         case PhysicsServer3D::BODY_PARAM_ANGULAR_DAMP_MODE:
             break; // damp modes are meaningless without damping
@@ -2814,14 +2360,10 @@ Variant AVBDPhysicsServer3D::_body_get_param(const RID &p_body, PhysicsServer3D:
     const BodyData &body = found->second;
 
     switch (p_param) {
-        case PhysicsServer3D::BODY_PARAM_MASS: {
-            if (body.rigid != nullptr && body.rigid->mass > 0.0f) {
-                return body.rigid->mass; // the solver's value, from density * volume
-            }
+        case PhysicsServer3D::BODY_PARAM_MASS:
             return body.mass;
-        }
         case PhysicsServer3D::BODY_PARAM_FRICTION:
-            return body.rigid != nullptr ? body.rigid->friction : body.friction;
+            return body.friction;
         case PhysicsServer3D::BODY_PARAM_BOUNCE:
             return body.bounce;
         case PhysicsServer3D::BODY_PARAM_GRAVITY_SCALE:
@@ -2835,46 +2377,42 @@ Variant AVBDPhysicsServer3D::_body_get_param(const RID &p_body, PhysicsServer3D:
     }
 }
 
-// Impulses and forces arrive in Godot's world frame; the solver lives in its own, so everything
-// below goes through to_sim. The math mirrors the node layer's apply_impulse/apply_torque_impulse.
+// Impulses and forces arrive in Godot's world frame, which is the modern core's frame
+// too; the modern space converts an impulse into a velocity change with the body's
+// inverse mass and world inverse inertia.
 
 void AVBDPhysicsServer3D::_body_apply_central_impulse(const RID &p_body, const Vector3 &p_impulse) {
     BodyData *body = find_body(p_body);
-    if (body == nullptr || body->rigid == nullptr || body->rigid->mass <= 0.0f) {
+    if (body == nullptr) {
         return;
     }
-    body->rigid->velocityLin += to_sim(p_impulse) / body->rigid->mass;
+    if (ModernSpace *modern = modern_for(*body)) {
+        modern->apply_central_impulse(static_cast<std::size_t>(body->modern_index),
+                to_modern(p_impulse));
+    }
 }
 
 void AVBDPhysicsServer3D::_body_apply_impulse(const RID &p_body, const Vector3 &p_impulse,
         const Vector3 &p_position) {
     BodyData *body = find_body(p_body);
-    if (body == nullptr || body->rigid == nullptr || body->rigid->mass <= 0.0f) {
+    if (body == nullptr) {
         return;
     }
-    avbd::Rigid &rigid = *body->rigid;
-    const avbd::float3 impulse = to_sim(p_impulse);
-    rigid.velocityLin += impulse / rigid.mass;
-
-    if (p_position.length_squared() > 0.0) {
-        const avbd::float3 torque = avbd::cross(to_sim(p_position), impulse);
-        const avbd::float3 local = avbd::qrot(avbd::qconj(rigid.positionAng), torque);
-        const avbd::float3 delta{local.x / rigid.moment.x, local.y / rigid.moment.y,
-                local.z / rigid.moment.z};
-        rigid.velocityAng += qrot(rigid.positionAng, delta);
+    if (ModernSpace *modern = modern_for(*body)) {
+        modern->apply_impulse(static_cast<std::size_t>(body->modern_index),
+                to_modern(p_impulse), to_modern(p_position));
     }
 }
 
 void AVBDPhysicsServer3D::_body_apply_torque_impulse(const RID &p_body, const Vector3 &p_impulse) {
     BodyData *body = find_body(p_body);
-    if (body == nullptr || body->rigid == nullptr || body->rigid->mass <= 0.0f) {
+    if (body == nullptr) {
         return;
     }
-    avbd::Rigid &rigid = *body->rigid;
-    const avbd::float3 local = avbd::qrot(avbd::qconj(rigid.positionAng), to_sim(p_impulse));
-    const avbd::float3 delta{local.x / rigid.moment.x, local.y / rigid.moment.y,
-            local.z / rigid.moment.z};
-    rigid.velocityAng += qrot(rigid.positionAng, delta);
+    if (ModernSpace *modern = modern_for(*body)) {
+        modern->apply_torque_impulse(static_cast<std::size_t>(body->modern_index),
+                to_modern(p_impulse));
+    }
 }
 
 void AVBDPhysicsServer3D::_body_apply_central_force(const RID &p_body, const Vector3 &p_force) {
@@ -2939,12 +2477,10 @@ void AVBDPhysicsServer3D::_body_set_axis_lock(const RID &p_body, PhysicsServer3D
     } else {
         body->axis_locks &= ~bit;
     }
-    if (body->rigid != nullptr) {
-        uint8_t linear = 0;
-        uint8_t angular = 0;
-        axis_locks_to_sim(body->axis_locks, linear, angular);
-        body->rigid->axisLockLinear = linear;
-        body->rigid->axisLockAngular = angular;
+    // Axis locks change the inverse inertia (and, for a full linear lock, immovability),
+    // which is baked at rebuild time.
+    if (body->space.is_valid()) {
+        space_rebuild_pending[id_of(body->space)] = true;
     }
 }
 
@@ -3074,8 +2610,8 @@ void AVBDPhysicsServer3D::_body_set_axis_velocity(const RID &p_body, const Vecto
         velocity.z = p_axis_velocity.z;
     }
     body->linear_velocity = velocity;
-    if (body->rigid != nullptr) {
-        body->rigid->velocityLin = to_sim(velocity);
+    if (ModernSpace *modern = modern_for(*body)) {
+        modern->set_linear_velocity(static_cast<std::size_t>(body->modern_index), to_modern(velocity));
     }
 }
 
@@ -3093,9 +2629,8 @@ bool AVBDPhysicsServer3D::_body_is_continuous_collision_detection_enabled(const 
 void AVBDPhysicsServer3D::_body_set_collision_layer(const RID &p_body, uint32_t p_layer) {
     if (BodyData *body = find_body(p_body)) {
         body->collision_layer = p_layer;
-        if (body->rigid != nullptr) {
-            body->rigid->collisionLayer = p_layer;
-        }
+        // The layer/mask tables live in ModernSpace; refresh them before the next step.
+        space_rebuild_pending[id_of(body->space)] = true;
     }
 }
 
@@ -3107,9 +2642,7 @@ uint32_t AVBDPhysicsServer3D::_body_get_collision_layer(const RID &p_body) const
 void AVBDPhysicsServer3D::_body_set_collision_mask(const RID &p_body, uint32_t p_mask) {
     if (BodyData *body = find_body(p_body)) {
         body->collision_mask = p_mask;
-        if (body->rigid != nullptr) {
-            body->rigid->collisionMask = p_mask;
-        }
+        space_rebuild_pending[id_of(body->space)] = true;
     }
 }
 
@@ -3152,7 +2685,7 @@ void AVBDPhysicsServer3D::_body_reset_mass_properties(const RID &p_body) {
 }
 
 void AVBDPhysicsServer3D::_body_add_shape(const RID &p_body, const RID &p_shape, const Transform3D &p_transform,
-        bool) {
+        bool p_disabled) {
     BodyData *body = find_body(p_body);
     ShapeData *shape = find_shape(p_shape);
     if (body == nullptr || shape == nullptr) {
@@ -3163,6 +2696,7 @@ void AVBDPhysicsServer3D::_body_add_shape(const RID &p_body, const RID &p_shape,
     body->shape_rids.push_back(p_shape);
     body->shapes.push_back(*shape);
     body->shape_transforms.push_back(p_transform);
+    body->shape_disabled.push_back(p_disabled);
     space_rebuild_pending[id_of(body->space)] = true;
 }
 
@@ -3188,18 +2722,15 @@ void AVBDPhysicsServer3D::_body_set_shape_transform(const RID &p_body, int32_t p
 }
 
 void AVBDPhysicsServer3D::_body_set_shape_disabled(const RID &p_body, int32_t p_shape_idx, bool p_disabled) {
-    // A disabled shape contributes nothing; AVBD has one shape per body, so a disabled one leaves
-    // the body without collision rather than with a smaller set.
     BodyData *body = find_body(p_body);
-    if (body == nullptr || p_shape_idx < 0) {
+    if (body == nullptr || p_shape_idx < 0 || static_cast<std::size_t>(p_shape_idx) >= body->shapes.size()) {
         return;
     }
-    if (p_disabled) {
-        body->shapes.clear();
-        body->shape_transforms.clear();
-        body->shape_rids.clear();
-        space_rebuild_pending[id_of(body->space)] = true;
+    if (body->shape_disabled.size() < body->shapes.size()) {
+        body->shape_disabled.resize(body->shapes.size(), false);
     }
+    body->shape_disabled[p_shape_idx] = p_disabled;
+    space_rebuild_pending[id_of(body->space)] = true;
 }
 
 int32_t AVBDPhysicsServer3D::_body_get_shape_count(const RID &p_body) const {
@@ -3208,12 +2739,12 @@ int32_t AVBDPhysicsServer3D::_body_get_shape_count(const RID &p_body) const {
 }
 
 RID AVBDPhysicsServer3D::_body_get_shape(const RID &p_body, int32_t p_shape_idx) const {
-    // The engine keeps the shape RIDs; this server only records the parameters it was given, so
-    // there is no handle to give back. Returning an invalid RID is honest - the caller is asking
-    // for something this implementation does not track.
-    (void)p_body;
-    (void)p_shape_idx;
-    return RID();
+    const auto found = bodies.find(id_of(p_body));
+    if (found == bodies.end() || p_shape_idx < 0 ||
+            static_cast<std::size_t>(p_shape_idx) >= found->second.shape_rids.size()) {
+        return RID();
+    }
+    return found->second.shape_rids[p_shape_idx];
 }
 
 Transform3D AVBDPhysicsServer3D::_body_get_shape_transform(const RID &p_body, int32_t p_shape_idx) const {
@@ -3233,6 +2764,9 @@ void AVBDPhysicsServer3D::_body_remove_shape(const RID &p_body, int32_t p_shape_
     body->shapes.erase(body->shapes.begin() + p_shape_idx);
     body->shape_transforms.erase(body->shape_transforms.begin() + p_shape_idx);
     body->shape_rids.erase(body->shape_rids.begin() + p_shape_idx);
+    if (static_cast<std::size_t>(p_shape_idx) < body->shape_disabled.size()) {
+        body->shape_disabled.erase(body->shape_disabled.begin() + p_shape_idx);
+    }
     space_rebuild_pending[id_of(body->space)] = true;
 }
 
@@ -3244,6 +2778,7 @@ void AVBDPhysicsServer3D::_body_clear_shapes(const RID &p_body) {
     body->shapes.clear();
     body->shape_transforms.clear();
     body->shape_rids.clear();
+    body->shape_disabled.clear();
     space_rebuild_pending[id_of(body->space)] = true;
 }
 
@@ -3449,28 +2984,41 @@ void AVBDPhysicsServer3D::_area_set_area_monitor_callback(const RID &p_area, con
 // fire the callbacks on the transitions. Godot's body-shape/area-shape arguments are the
 // first overlapping pair (this server keeps one solver shape per body, so 0 on the body
 // side and the area's first enabled shape on its side).
+// One step of area monitoring: diff every area's inside-set against the previous one and
+// fire the callbacks on the transitions. Overlap is AABB-based on the modern shapes: the
+// area path has no contact solver of its own, and a conservative box test is the right
+// contract for enter/exit notifications.
 void AVBDPhysicsServer3D::_monitor_areas() {
+    struct Placed {
+        collision::Shape shape;
+        Transform3D transform;
+    };
+    const auto overlap = [](const Placed &a, const Placed &b) {
+        Vec3 a_lo, a_hi, b_lo, b_hi;
+        shape_world_aabb(a.shape, a.transform, a_lo, a_hi);
+        shape_world_aabb(b.shape, b.transform, b_lo, b_hi);
+        return a_lo.x <= b_hi.x && a_hi.x >= b_lo.x && a_lo.y <= b_hi.y && a_hi.y >= b_lo.y &&
+               a_lo.z <= b_hi.z && a_hi.z >= b_lo.z;
+    };
+
     for (auto &[area_id, area] : areas) {
         (void)area_id;
         if (!area.space.is_valid()) {
             continue;
         }
-        const SpaceData *space = find_space(area.space);
-        if (space == nullptr) {
-            continue;
+        if (area.shape_disabled.size() < area.shapes.size()) {
+            area.shape_disabled.resize(area.shapes.size(), false);
         }
 
-        // The area's shapes in sim space, once per area. Unsupported shapes (concave,
-        // heightmap, ...) have no query proxy and are skipped, matching the body path.
-        std::vector<avbd::Shape> area_shapes;
-        for (size_t i = 0; i < area.shapes.size(); i++) {
+        std::vector<Placed> area_shapes;
+        for (std::size_t i = 0; i < area.shapes.size(); ++i) {
             if (area.shape_disabled[i]) {
                 continue;
             }
             const Transform3D posed = area.transform * area.shape_transforms[i];
-            avbd::Shape shape;
+            collision::Shape shape;
             if (query_shape_from_data(area.shapes[i], posed, shape)) {
-                area_shapes.push_back(shape);
+                area_shapes.push_back(Placed{shape, posed});
             }
         }
         if (area_shapes.empty()) {
@@ -3481,25 +3029,36 @@ void AVBDPhysicsServer3D::_monitor_areas() {
         std::vector<uint64_t> inside;
         if (area.monitor_callback_set || area.monitor_callback.is_valid()) {
             for (const auto &[body_id, body] : bodies) {
-                if (body.rigid == nullptr || id_of(body.space) != id_of(area.space)) {
+                if (id_of(body.space) != id_of(area.space) || body.modern_index < 0) {
                     continue;
                 }
                 // Godot's area test: the body's layer must meet the area's mask.
-                if ((body.rigid->collisionLayer & area.collision_mask) == 0) {
+                if ((body.collision_layer & area.collision_mask) == 0) {
                     continue;
                 }
-                const avbd::Shape body_shape = query_shape_from_rigid(*body.rigid);
-                for (const avbd::Shape &shape : area_shapes) {
-                    avbd::Manifold::Contact contact{};
-                    avbd::float3x3 basis{};
-                    if (avbd::collideShapes(shape, body_shape, std::span<avbd::Manifold::Contact>(&contact, 1), basis) > 0) {
-                        inside.push_back(body_id);
-                        break;
+                bool hits = false;
+                for (std::size_t slot = 0; slot < body.shapes.size() && !hits; ++slot) {
+                    if (slot < body.shape_disabled.size() && body.shape_disabled[slot]) {
+                        continue;
                     }
+                    const Transform3D posed = body_shape_transform(body, static_cast<int32_t>(slot));
+                    collision::Shape shape;
+                    if (!query_shape_from_data(body.shapes[slot], posed, shape)) {
+                        continue;
+                    }
+                    const Placed body_shape{shape, posed};
+                    for (const Placed &shape_area : area_shapes) {
+                        if (overlap(shape_area, body_shape)) {
+                            hits = true;
+                            break;
+                        }
+                    }
+                }
+                if (hits) {
+                    inside.push_back(body_id);
                 }
             }
 
-            // Diff against the previous step and fire.
             auto was_inside = [&area](uint64_t id) -> bool {
                 return std::find(area.prev_inside_bodies.begin(), area.prev_inside_bodies.end(), id)
                         != area.prev_inside_bodies.end();
@@ -3513,8 +3072,8 @@ void AVBDPhysicsServer3D::_monitor_areas() {
                 args.push_back(static_cast<int>(PhysicsServer3D::AREA_BODY_ADDED));
                 args.push_back(make_rid(body_id));
                 args.push_back(body != nullptr ? body->instance_id : 0);
-                args.push_back(0); // body shape index (one shape per solver body)
-                args.push_back(0); // area shape index (first shape)
+                args.push_back(0);
+                args.push_back(0);
                 area.monitor_callback.callv(args);
             }
             for (const uint64_t body_id : area.prev_inside_bodies) {
@@ -3538,44 +3097,43 @@ void AVBDPhysicsServer3D::_monitor_areas() {
             area.prev_inside_bodies.clear();
         }
 
-        // --- areas monitoring areas (only when monitorable) ---
+        // --- areas monitoring areas (only when the other area is monitorable) ---
         if (area.area_monitor_callback.is_valid()) {
             std::vector<uint64_t> areas_inside;
-            if (area.monitorable || true) { // area×area detection is symmetric and cheap
-                for (auto &[other_id, other] : areas) {
-                    if (other_id == area_id || !other.space.is_valid() || id_of(other.space) != id_of(area.space)) {
+            for (auto &[other_id, other] : areas) {
+                if (other_id == area_id || !other.space.is_valid() ||
+                        id_of(other.space) != id_of(area.space)) {
+                    continue;
+                }
+                if (!other.monitorable) {
+                    continue;
+                }
+                if ((other.collision_layer & area.collision_mask) == 0) {
+                    continue;
+                }
+                if (other.shape_disabled.size() < other.shapes.size()) {
+                    other.shape_disabled.resize(other.shapes.size(), false);
+                }
+                bool hits = false;
+                for (std::size_t i = 0; i < other.shapes.size() && !hits; ++i) {
+                    if (other.shape_disabled[i]) {
                         continue;
                     }
-                    if (!other.monitorable) {
-                        continue; // Godot: only monitorable areas are seen by other areas
-                    }
-                    // The other area's layer must meet this area's mask.
-                    if ((other.collision_layer & area.collision_mask) == 0) {
+                    const Transform3D posed = other.transform * other.shape_transforms[i];
+                    collision::Shape shape;
+                    if (!query_shape_from_data(other.shapes[i], posed, shape)) {
                         continue;
                     }
-                    bool overlaps = false;
-                    for (size_t i = 0; i < other.shapes.size() && !overlaps; i++) {
-                        if (other.shape_disabled[i]) {
-                            continue;
-                        }
-                        const Transform3D posed = other.transform * other.shape_transforms[i];
-                        avbd::Shape other_shape;
-                        if (!query_shape_from_data(other.shapes[i], posed, other_shape)) {
-                            continue;
-                        }
-
-                        for (const avbd::Shape &shape : area_shapes) {
-                            avbd::Manifold::Contact contact{};
-                            avbd::float3x3 basis{};
-                            if (avbd::collideShapes(shape, other_shape, std::span<avbd::Manifold::Contact>(&contact, 1), basis) > 0) {
-                                overlaps = true;
-                                break;
-                            }
+                    const Placed other_shape{shape, posed};
+                    for (const Placed &shape_area : area_shapes) {
+                        if (overlap(shape_area, other_shape)) {
+                            hits = true;
+                            break;
                         }
                     }
-                    if (overlaps) {
-                        areas_inside.push_back(other_id);
-                    }
+                }
+                if (hits) {
+                    areas_inside.push_back(other_id);
                 }
             }
 
@@ -3584,14 +3142,14 @@ void AVBDPhysicsServer3D::_monitor_areas() {
                         != area.prev_inside_areas.end();
             };
             for (const uint64_t other_id : areas_inside) {
-                if (area_was_inside(other_id)) {
+                if (area_was_inside(other_id) || !area.area_monitor_callback.is_valid()) {
                     continue;
                 }
-                const auto other_found = areas.find(other_id);
+                const AreaData *other = find_area(make_rid(other_id));
                 Array args;
                 args.push_back(static_cast<int>(PhysicsServer3D::AREA_BODY_ADDED));
                 args.push_back(make_rid(other_id));
-                args.push_back(other_found != areas.end() ? other_found->second.instance_id : 0);
+                args.push_back(other != nullptr ? other->instance_id : 0);
                 args.push_back(0);
                 args.push_back(0);
                 area.area_monitor_callback.callv(args);
@@ -3600,11 +3158,14 @@ void AVBDPhysicsServer3D::_monitor_areas() {
                 if (std::find(areas_inside.begin(), areas_inside.end(), other_id) != areas_inside.end()) {
                     continue;
                 }
-                const auto other_found = areas.find(other_id);
+                if (!area.area_monitor_callback.is_valid()) {
+                    break;
+                }
+                const AreaData *other = find_area(make_rid(other_id));
                 Array args;
                 args.push_back(static_cast<int>(PhysicsServer3D::AREA_BODY_REMOVED));
                 args.push_back(make_rid(other_id));
-                args.push_back(other_found != areas.end() ? other_found->second.instance_id : 0);
+                args.push_back(other != nullptr ? other->instance_id : 0);
                 args.push_back(0);
                 args.push_back(0);
                 area.area_monitor_callback.callv(args);

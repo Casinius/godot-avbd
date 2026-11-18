@@ -116,6 +116,7 @@ public:
   [[nodiscard]] const ConvexMesh *convex_mesh(ConvexMeshId id) const noexcept {
     return meshes_.get(id);
   }
+  [[nodiscard]] const ConvexMeshStore &convex_meshes() const noexcept { return meshes_; }
   [[nodiscard]] std::size_t convex_mesh_count() const noexcept { return meshes_.size(); }
 
   void set_emit_options(ContactEmitOptions opt) noexcept { emit_options_ = opt; }

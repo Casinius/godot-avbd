@@ -16,9 +16,9 @@
  *   integer id written into the RID's opaque bytes (`RID::_native_ptr()`); the engine only ever
  *   hands them back to us, so their internal representation is ours to choose. Every id maps to
  *   one of the records below, and the map is the single place an object's lifetime is decided.
- * - One Solver per space. Bodies are `avbd::Rigid`; the shapes attached to a body become that
- *   body's size and shape type, since AVBD gives each body exactly one collision shape. A body
- *   with several shapes uses the first, and says so rather than pretending.
+ * - One ModernSpace per space (the imported avbd-mo core). Every enabled shape on a body becomes
+ *   a collision::ShapeInstance, so compound bodies are supported; mass properties are summed
+ *   from the shapes and the pose is kept at the centre of mass.
  * - Transforms flow one way per step: the engine writes a body's transform through
  *   `_body_set_state`, `_step` runs the solver, and the result is pushed back by calling the sync
  *   callback the engine registered for that body with a single argument - a
@@ -55,7 +55,7 @@
 #include <godot_cpp/variant/transform3d.hpp>
 #include <godot_cpp/variant/variant.hpp>
 
-#include "avbd/solver.h"
+#include "server/modern_space.hpp"
 
 namespace godot {
 
@@ -90,8 +90,7 @@ public:
     // the hull's local AABB box, unsupported -> false. Keeping this shared is what
     // keeps ray/shape-cast results consistent with contact behaviour.
     static bool query_shape_from_data(const ShapeData &p_data, const Transform3D &p_transform,
-            avbd::Shape &r_shape);
-    static avbd::Shape query_shape_from_rigid(const avbd::Rigid &p_body);
+            collision::Shape &r_shape);
 
 protected:
     struct BodyData {
@@ -115,7 +114,8 @@ protected:
         float friction = 0.6f;
         double bounce = 0.0;
 
-        // Collision filtering, Godot semantics (see avbd::Rigid).
+        // Collision filtering, Godot semantics (layer/mask are enforced by the modern
+        // CollisionWorld's pair filter).
         uint32_t collision_layer = 1;
         uint32_t collision_mask = 1;
 
@@ -148,7 +148,10 @@ protected:
         struct FrameContact {
             Vector3 position;      // world space (Godot frame)
             Vector3 normal;        // world space, pointing out of the other body towards this one
-            uint64_t collider_body_id = 0; // solver map id of the other body
+            Vector3 impulse;       // contact impulse, world space
+            uint64_t collider_body_id = 0; // server id of the other body
+            int32_t local_shape = 0;       // this body's shape slot
+            int32_t collider_shape = 0;    // the other body's shape slot
         };
         std::vector<FrameContact> frame_contacts;
 
@@ -170,7 +173,11 @@ protected:
         // simulate (concave/heightmap/world boundary/separation ray/custom).
         bool unsupported_warned = false;
 
-        avbd::Rigid *rigid = nullptr;        // null until the body joins a space that is stepped
+        // State index inside the space's ModernSpace, or -1 when the body is not
+        // simulated (no shape, unsupported shape, or not in a space).
+        int32_t modern_index = -1;
+        // Index of the disabled flag per shape slot; kept parallel to `shapes`.
+        std::vector<bool> shape_disabled;
     };
 
     // One joint, as the engine described it. Parameters arrive axis by axis after the joint is
@@ -207,7 +214,12 @@ public:
 
 protected:
     struct SpaceData {
-        avbd::Solver solver;
+        // The imported modern core. One per space; rebuilt whenever the body/shape set
+        // changes. Body indices inside it are sorted by server id, so update order is a
+        // function of the scene rather than of hash-map layout.
+        std::unique_ptr<ModernSpace> modern;
+        // World gravity in Godot space (Y-up), read from the project settings.
+        Vec3 gravity{0, -9.8f, 0};
         bool active = true;
         // Re-read the project-setting solver parameters on the next step. Set at creation
         // and by the settings-changed signal, so the common tick does not hash nine
@@ -286,11 +298,6 @@ protected:
 
         // Cached direct space state handed to the engine; owned, freed with the space.
         AVBDDirectSpaceState3D *direct_state = nullptr;
-
-        // Solver-body -> server id, rebuilt with the space. The direct space state's
-        // queries get their candidates back as Rigid* from the BVH; this is the O(1)
-        // bridge back to RIDs (body_id_of used to scan every body per result).
-        ankerl::unordered_dense::map<const avbd::Rigid *, uint64_t> rigid_ids;
     };
 
     // One area, as the engine described it. Monitored each step against the bodies of
@@ -357,7 +364,11 @@ protected:
     const BodyData *find_body(const RID &p_rid) const;
     ShapeData *find_shape(const RID &p_rid);
     SpaceData *find_space(const RID &p_rid);
+    const SpaceData *find_space(const RID &p_rid) const;
     AreaData *find_area(const RID &p_rid);
+    // The modern space backing a body, or null when the body is not simulated.
+    ModernSpace *modern_for(const BodyData &p_body);
+    const ModernSpace *modern_for(const BodyData &p_body) const;
 
     // Godot keeps gravity in the project settings rather than handing it to the server.
     static void read_project_gravity(SpaceData &p_space);
@@ -389,58 +400,36 @@ protected:
     uint64_t rebuild_last_step = 0;
     String rebuild_last_reason;
 
-    // Density the solver should see for a body: mass / volume of the first shape, or the house
-    // density when no mass was set.
-    static float density_for(const BodyData &p_body);
-
-    // Joint mappings: build one solver GenericJoint per engine joint record.
-    void rebuild_6dof_joint(SpaceData *p_space, const JointData &p_joint, avbd::Rigid *p_rigid_a, avbd::Rigid *p_rigid_b);
-    void rebuild_pin_joint(SpaceData *p_space, const JointData &p_joint, avbd::Rigid *p_rigid_a, avbd::Rigid *p_rigid_b);
-    void rebuild_hinge_joint(SpaceData *p_space, const JointData &p_joint, avbd::Rigid *p_rigid_a, avbd::Rigid *p_rigid_b);
-    void rebuild_slider_joint(SpaceData *p_space, const JointData &p_joint, avbd::Rigid *p_rigid_a, avbd::Rigid *p_rigid_b);
-    void rebuild_cone_twist_joint(SpaceData *p_space, const JointData &p_joint, avbd::Rigid *p_rigid_a, avbd::Rigid *p_rigid_b);
+    // Joints are recorded (so scenes load and getters replay) but the modern core has no
+    // joint constraints yet. A joint change marks its space for a rebuild so the contact
+    // filter (exclude-collision) is refreshed.
     void _rebuild_for_joint(const RID &p_joint);
 
     // --- DirectBodyState accessors (used by AVBDDirectBodyState3D) ---------------
     // On the server rather than the state object because they need the body map.
 public:
-    // --- query helpers for AVBDDirectSpaceState3D -------------------------------
-    // One simulated body a query may hit.
-    struct QueryCandidate {
-        avbd::Rigid *rigid;
-        uint64_t body_id; // server map id
+    // One enabled shape a query may hit, already posed in world space.
+    struct QueryShapeHit {
+        collision::Shape shape;
+        Transform3D transform;
+        RID rid;                 // body or area RID
+        uint64_t collider_id = 0; // object instance id
+        uint64_t body_id = 0;     // server map id (0 for areas)
+        int32_t shape_index = 0;
+        Vector3 linear_velocity;
+        bool is_area = false;
         bool ray_pickable = true;
     };
-    // One enabled area shape a query may hit. `shape` is already posed in sim space.
-    struct QueryAreaCandidate {
-        avbd::Shape shape;
-        RID rid; // the area's server RID
-        uint64_t instance_id = 0;
-        int shape_index = 0;
-        bool ray_pickable = true;
-    };
-    // Every simulated body of the space whose layer survives the query mask.
-    std::vector<QueryCandidate> query_candidates(const RID &p_space, uint32_t p_mask) const;
-    // The same contract, narrowed by the last built broad-phase tree: only bodies whose
-    // bound overlaps the query AABB (sim space). Before any step has built a tree this
-    // answers from the body list with per-body bounds.
-    std::vector<QueryCandidate> query_candidates_aabb(const RID &p_space, avbd::float3 p_min,
-            avbd::float3 p_max, uint32_t p_mask) const;
-    // Area shapes whose world bound overlaps the query AABB, posed in sim space.
-    std::vector<QueryAreaCandidate> query_area_candidates_aabb(const RID &p_space, avbd::float3 p_min,
-            avbd::float3 p_max, uint32_t p_mask) const;
+    // Every enabled body shape of the space whose layer survives the query mask.
+    std::vector<QueryShapeHit> query_body_shapes(const RID &p_space, uint32_t p_mask) const;
+    // Every enabled area shape whose layer survives the query mask.
+    std::vector<QueryShapeHit> query_area_shapes(const RID &p_space, uint32_t p_mask) const;
     // True when either body lists the other as a collision exception.
     bool body_is_excepted(uint64_t p_body_a, uint64_t p_body_b) const;
 
-    // Solver::pick with a mask, on one space's solver.
-    avbd::Rigid *solver_pick(const RID &p_space, avbd::float3 p_origin, avbd::float3 p_dir, uint32_t p_mask,
-            avbd::float3 &r_local);
-    // The body record id owning a solver rigid within a space (0 if none).
-    uint64_t body_id_of(const RID &p_space, const avbd::Rigid *p_rigid) const;
-    RID solver_pick_rid(const RID &p_space, const avbd::Rigid *p_rigid);
-    uint64_t body_instance_id(const RID &p_space, const avbd::Rigid *p_rigid);
-    Vector3 body_velocity_of(const RID &p_space, const avbd::Rigid *p_rigid);
     const ShapeData *shape_data(const RID &p_shape) const;
+    // World transform of one enabled shape on a body (the body pose when out of range).
+    Transform3D body_shape_transform(const BodyData &p_body, int32_t p_shape_idx) const;
 
     void body_state_add_constant_force(const RID &p_body, const Vector3 &p_force, const Vector3 &p_position);
     void body_state_add_constant_torque(const RID &p_body, const Vector3 &p_torque);
@@ -680,7 +669,7 @@ RID _box_shape_create() override;
     bool _generic_6dof_joint_get_flag(const RID &p_joint, Vector3::Axis p_axis,
             PhysicsServer3D::G6DOFJointAxisFlag p_flag) const override;
 
-    // --- joints: the other four types, mapped onto avbd::GenericJoint -------------
+    // --- joints: the other four types (records only until the core has constraints) ---
     void _joint_make_pin(const RID &p_joint, const RID &p_body_a, const Vector3 &p_local_a,
             const RID &p_body_b, const Vector3 &p_local_b) override;
     void _pin_joint_set_param(const RID &p_joint, PhysicsServer3D::PinJointParam p_param, float p_value) override;

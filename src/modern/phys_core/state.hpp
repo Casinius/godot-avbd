@@ -517,9 +517,12 @@ struct SolverBuffers {
     std::array<std::array<Scalar_t, 6>, 6> a{};
     for (int r = 0; r < 3; ++r)
       for (int c = 0; c < 3; ++c) {
-        a[r][c] = a_ll[c][r];         // element(row=r, col=c) = m[c][r]
-        a[r][3 + c] = a_lt[c][r];     // A(lin, ang) = a_lt
-        a[3 + r][c] = a_lt[c][r];     // A(ang, lin) = a_ltᵀ 的 element(r, c)
+        a[r][c] = a_ll[c][r];     // element(row=r, col=c) = m[c][r]
+        a[r][3 + c] = a_lt[c][r]; // A(lin, ang) = a_lt，element(r, c)
+        // A(ang, lin) 是 A(lin, ang) 的转置：element(ang=r, lin=c) 必须落回
+        // A(lin=c, ang=r)，即 a_lt[r][c]。写成 a_lt[c][r] 会让 6x6 非对称，
+        // LDLT 在刚度足够大时随即失败（表现为高 k 下接触完全不动）。
+        a[3 + r][c] = a_lt[r][c];
         a[3 + r][3 + c] = a_tt[c][r];
       }
 

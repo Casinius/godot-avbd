@@ -1210,22 +1210,22 @@ inline CollisionCheck check_collision_world_pair_filter() {
   set_single_shape(world, 0, Shape::box(Vec3{0.5f, 0.5f, 0.5f}));
   set_single_shape(world, 1, Shape::box(Vec3{0.5f, 0.5f, 0.5f}));
 
-  // 规则表：layer/mask 双向都必须相交。
+  // 规则表：Godot 语义 —— 一方 layer 命中另一方 mask 即可（双向 OR）。
   struct LayerMask {
     std::uint32_t layer[2];
     std::uint32_t mask[2];
-  } rule{{1, 2}, {1, 1}};
+  } rule{{1, 2}, {1, 2}};
   const auto filter = [](void *user, std::size_t a, std::size_t b) noexcept {
     const auto *r = static_cast<const LayerMask *>(user);
     if (a >= 2 || b >= 2)
       return true;
-    return (r->layer[a] & r->mask[b]) != 0 && (r->layer[b] & r->mask[a]) != 0;
+    return (r->layer[a] & r->mask[b]) != 0 || (r->layer[b] & r->mask[a]) != 0;
   };
 
   ConstraintList list;
   std::uint64_t  version = 0;
 
-  // 1) body 1 的 layer=2 与 body 0 的 mask=1 不相交 ⇒ 不产生接触。
+  // 1) layer(1)/(2) 与对方的 mask 都不相交 ⇒ 不产生接触。
   world.set_pair_filter(filter, &rule);
   world.sync(s, list, version);
   if (!world.manifolds().empty()) {
@@ -1234,8 +1234,8 @@ inline CollisionCheck check_collision_world_pair_filter() {
     return c;
   }
 
-  // 2) 放开 body 0 的 mask ⇒ 双向相交，接触出现，版本号必须 bump。
-  rule.mask[0] = 2;
+  // 2) 让 body 0 的 mask 含 body 1 的 layer ⇒ 接触出现，版本号必须 bump。
+  rule.mask[0] = 3;
   world.set_pair_filter(filter, &rule);
   const std::uint64_t before = version;
   world.sync(s, list, version);

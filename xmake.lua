@@ -156,9 +156,11 @@ target("avbd")
 
     set_symbols("debug")
     set_strip("none")
-    add_files(table.join(avbd_core, "src/nodes/*.cpp", "src/server/*.cpp"))
-    add_includedirs("src")
-    add_packages("godotcpp4", "thread-pool","unordered_dense")
+    -- The modern core is compiled directly into the extension (rather than linking the
+    -- static library) so its objects pick up the shared target's flags and PIC mode.
+    add_files(table.join(avbd_core, modern_core_sources, "src/nodes/*.cpp", "src/server/*.cpp"))
+    add_includedirs("src", "src/modern")
+    add_packages("godotcpp4", "thread-pool", "unordered_dense", "glm")
     add_defines("BS_THREAD_POOL_DISABLE_EXCEPTION_HANDLING")
     set_exceptions("none")
     avbd_common()

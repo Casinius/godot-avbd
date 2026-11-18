@@ -34,7 +34,9 @@ public:
   static constexpr bool uses_solver_buffers = true;
 
   // 刚度 ramp 的起始值与步内增长率。k 是**步内**状态：每步回到 k0（见 begin_iterations）。
+  // k0 可配置（引擎按材质/接触刚度映射），默认值保持历史基线不变。
   static constexpr Scalar_t kStiffness0 = Scalar_t(1e4);
+  Scalar_t                  k0          = kStiffness0;
   Scalar_t                  k           = kStiffness0;
   Scalar_t                  beta        = Scalar_t(1e-2);
 
@@ -112,7 +114,7 @@ public:
   // （表现为"跑一会儿就僵住"，且完全不报错）。现在有断言盯着它。
   template <typename Exec, typename Sched>
   void begin_iterations(State &, Exec &, const Sched &) noexcept {
-    k = kStiffness0;
+    k = k0;
   }
 };
 

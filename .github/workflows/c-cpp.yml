@@ -112,13 +112,19 @@ jobs:
         run: |
           xmake run avbd_core_test > suite.log 2>&1 || true
           xmake run avbd_query_test > query_suite.log 2>&1 || true
+          # The imported modern core (avbd-mo) pins its own selftest plus solver and
+          # collision digests; a mismatch must fail the job.
+          xmake run avbd_modern_tests > modern_suite.log 2>&1
           grep -E 'checks, [0-9]+ failures' suite.log | tail -n 1 || true
           grep -E 'checks, [0-9]+ failures' query_suite.log | tail -n 1 || true
+          grep -E 'selftest|bit-identical|collision cases' modern_suite.log | tail -n 3 || true
           if grep -E '^FAIL' suite.log query_suite.log; then
             echo "::error::a C++ suite reported a failure; see the log artifacts"
             exit 1
           fi
-          echo "ok: solver and query suites passed"
+          grep -q '^\[selftest\].*passed' modern_suite.log \
+            || { echo "::error::modern selftest did not pass"; exit 1; }
+          echo "ok: solver, query and modern-core suites passed"
 
       - name: Upload the suite log
         if: always()

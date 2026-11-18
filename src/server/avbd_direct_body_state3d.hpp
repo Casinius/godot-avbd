@@ -11,11 +11,10 @@
  *
  * One instance per space is cached by the server and re-pointed at each body before
  * the callbacks run, so the engine never holds a stale view. Every getter reads the
- * avbd::Rigid live; setters write straight through to it, mirroring what the engine's
- * own `_integrate_forces` users expect.
+ * body record and its ModernSpace live; setters write straight through to them,
+ * mirroring what the engine's own `_integrate_forces` users expect.
  *
- * The converter lives in src/nodes/godot_convert.hpp and maps Godot's Y-up scene
- * space onto the solver's Z-up space.
+ * Both sides are Y-up, so no axis conversion is involved on this path.
  */
 
 #ifndef AVBD_DIRECT_BODY_STATE3D_HPP
@@ -26,8 +25,6 @@
 #include <godot_cpp/variant/transform3d.hpp>
 #include <godot_cpp/variant/vector3.hpp>
 
-#include "avbd/solver.h"
-
 namespace godot {
 
 class AVBDPhysicsServer3D;
@@ -36,8 +33,7 @@ class AVBDDirectBodyState3D : public PhysicsDirectBodyState3DExtension {
     GDCLASS(AVBDDirectBodyState3D, PhysicsDirectBodyState3DExtension)
 
     AVBDPhysicsServer3D *server = nullptr;
-    avbd::Rigid *rigid = nullptr; // the body this instance currently views
-    RID body_rid;
+    RID body_rid; // the body this instance currently views
 
 protected:
     static void _bind_methods() {}
@@ -47,7 +43,7 @@ public:
     ~AVBDDirectBodyState3D() override = default;
 
     // Re-aim the cached instance at one body before its callbacks run.
-    void bind(AVBDPhysicsServer3D *p_server, avbd::Rigid *p_rigid, const RID &p_body_rid);
+    void bind(AVBDPhysicsServer3D *p_server, const RID &p_body_rid);
 
     // --- reads/writes onto the bound body ------------------------------------
     Vector3 _get_total_gravity() const override;
