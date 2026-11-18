@@ -19,8 +19,11 @@
 -- silently dropped.
 --
 -- Targets:
---   avbd            GDExtension shared library (loaded by the demo project / any game)
---   avbd_core_test  standalone solver test binary (no Godot involved)
+--   avbd              GDExtension shared library (loaded by the demo project / any game)
+--   avbd_core_test    standalone solver test binary (legacy core, no Godot involved)
+--   avbd_modern_core  static library holding the imported modern core (avbd-mo)
+--   avbd_modern_test  standalone modern-core self-test + pinned digest driver
+--   avbd_modern_tests phony: selftest + solver digest + collision digest in one go
 
 add_rules("mode.debug", "mode.release")
 add_rules("plugin.compile_commands.autoupdate", { outputdir = "." })
@@ -29,6 +32,8 @@ add_requires("godotcpp4 4.5")
 add_requires("unordered_dense v4.8.1")
 -- BS::thread_pool: the job pool behind Solver's parallel update. Header-only, MIT, C++17.
 add_requires("thread-pool v5.1.0")
+-- The modern core (src/modern, imported from avbd-mo) uses glm for its SoA math types.
+add_requires("glm")
 local avbd_core = {
     "src/avbd/rigid.cpp",
     "src/avbd/bvh_broadphase.cpp",
@@ -40,6 +45,16 @@ local avbd_core = {
     "src/avbd/manifold.cpp",
     "src/avbd/collide.cpp",
     "src/avbd/solver.cpp",
+}
+
+-- The modern core is header-heavy: only the collision layer has translation units.
+local modern_core_sources = {
+    "src/modern/collision/broadphase.cpp",
+    "src/modern/collision/collision_world.cpp",
+    "src/modern/collision/convex_hull.cpp",
+    "src/modern/collision/convex_mesh.cpp",
+    "src/modern/collision/manifold.cpp",
+    "src/modern/collision/narrowphase.cpp",
 }
 
 option("asan")
@@ -175,6 +190,47 @@ target("avbd_query_test")
     avbd_common()
     on_config(avbd_toolchain)
 
+-- Modern core (imported from avbd-mo): the collision layer is the only compiled part;
+-- the solver is header-only by design. PIC because the Godot extension links it into a
+-- shared library.
+target("avbd_modern_core")
+    set_kind("static")
+    add_files(modern_core_sources)
+    add_includedirs("src/modern")
+    add_packages("glm")
+    avbd_common()
+    -- xmake only adds -fPIC to shared targets; this archive is linked into the extension's
+    -- shared library, so the objects have to be position independent as well. MSVC has no
+    -- equivalent flag (and does not need one).
+    if not is_plat("windows") then
+        add_cxflags("-fPIC")
+    end
+    on_config(avbd_toolchain)
+
+-- The modern core's own regression driver: structural self-tests plus the pinned solver
+-- and collision digests copied next to it (src/modern/tests). No Godot involved.
+-- `set_rundir` makes the relative baseline paths resolve from the project root when run
+-- through `xmake run`, not from the build directory.
+target("avbd_modern_test")
+    set_kind("binary")
+    add_files("src/modern/main.cpp")
+    add_deps("avbd_modern_core")
+    add_includedirs("src/modern")
+    add_packages("glm")
+    avbd_common()
+    set_rundir("$(projectdir)")
+    on_config(avbd_toolchain)
+
+-- One entry point for everything the imported core pins: structural self-tests, then the
+-- solver digest and the collision digest.
+target("avbd_modern_tests")
+    set_kind("phony")
+    on_run(function (target)
+        os.exec("xmake run avbd_modern_test --selftest")
+        os.exec("xmake run avbd_modern_test --check src/modern/tests/baseline.txt")
+        os.exec("xmake run avbd_modern_test --check-collision src/modern/tests/collision_observable.txt")
+    end)
+
 -- Constraint composition tests (Godot headless, inside the demo project).
 target("avbd_constraint_tests")
     set_kind("phony")
@@ -235,6 +291,7 @@ target("run_all_tests")
         local runner = import("scripts.run_godot_tests", {rootdir = "xmake"})
         os.exec("xmake run avbd_core_test")
         os.exec("xmake run avbd_query_test")
+        os.exec("xmake run avbd_modern_tests")
         runner.main("res://tests/test_solver.gd")
         runner.main("res://tests/test_queries.gd")
         runner.main("res://tests/test_constraints.gd")

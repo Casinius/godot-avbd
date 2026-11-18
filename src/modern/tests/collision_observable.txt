@@ -1,0 +1,12 @@
+narrow/box-box all=f9e2c08e0054745e contacts=4
+narrow/box-box-rot all=d83b87f4f4901aa8 contacts=1
+narrow/sphere-sphere all=cddccbe64745cde3 contacts=1
+narrow/box-sphere all=0c8defa8ae2629a5 contacts=1
+narrow/cylinder-box all=2a97f2d4c8672359 contacts=8
+narrow/cylinder-cylinder all=e1e53bd7bd9cd532 contacts=1
+narrow/sphere-cylinder all=690b1bf257471631 contacts=1
+world/box-pair all=15cbf19d9b967d75 manifolds=1 contacts=4 constraints=12
+world/box-stack all=01f043672b88a2f7 manifolds=2 contacts=8 constraints=24
+world/mixed all=4da48343908c8df9 manifolds=2 contacts=5 constraints=15
+world/compound all=87e529e556d5258c manifolds=2 contacts=8 constraints=24
+world/convex all=178b4905624f2a91 manifolds=1 contacts=4 constraints=12

@@ -1,0 +1,13 @@
+chain/32 avbd steps=4 iters=50 all=4fa90c3a7a709c26 pose=ce5d92d1672c9eac vel=dca4e90e62059d63 inert=4cf2ed1797581ab2 ext=bcb0d92d0574b993 cache=ae7247c25b401edf buf=2f95edcb13844983 lam=159e3ca6cf1288b1
+chain/32 xpbd steps=4 iters=50 all=9f701086ff79c9bb pose=a05730035d81fa66 vel=19373b24cb2af4db inert=75903663df563772 ext=bcb0d92d0574b993 cache=b85526625ce9f721 buf=2f95edcb13844983 lam=d9cc07e3264e8b28
+chain/32 pbd steps=4 iters=50 all=3e8fe06ab29f299b pose=a05730035d81fa66 vel=19373b24cb2af4db inert=75903663df563772 ext=bcb0d92d0574b993 cache=b85526625ce9f721 buf=2f95edcb13844983 lam=8321b0093226b748
+chain/32@rest+nograv avbd steps=4 iters=50 all=04e8e47fa6ce042c pose=02ba5620f63955fa vel=5e986624bcfd5165 inert=4cf2ed1797581ab2 ext=11ed2db93101f993 cache=60652a8fa4ed0779 buf=2f95edcb13844983 lam=8321b0093226b748
+freefall/4 avbd steps=8 iters=10 all=61834a21f97ff8b1 pose=7eb780de0d05619a vel=7ad433fcddad58f3 inert=6f02bc5e713bb763 ext=7c124b85491ed348 cache=3921812d81e5c85b buf=429a764542594443 lam=14650fb0739d0383
+freefall/4 xpbd steps=8 iters=10 all=61834a21f97ff8b1 pose=7eb780de0d05619a vel=7ad433fcddad58f3 inert=6f02bc5e713bb763 ext=7c124b85491ed348 cache=3921812d81e5c85b buf=429a764542594443 lam=14650fb0739d0383
+fan/64 avbd steps=3 iters=30 all=3888ec600e68c2d4 pose=42962bf528aeca32 vel=50e0061e916f443e inert=b2b1803a2cab2593 ext=80e7d0a93286db28 cache=f206d3f9f9c642a7 buf=adb43ca9613d6333 lam=cc96b34e94961f13
+fan/64 xpbd steps=3 iters=30 all=86dc3e5e4817c4f8 pose=aeb941a2b49ce10a vel=191d7bc098c5e520 inert=b2b1803a2cab2593 ext=80e7d0a93286db28 cache=a709c95be7f4b688 buf=adb43ca9613d6333 lam=a746aeda4d7b8528
+lattice/5x4x1 avbd steps=3 iters=30 all=1c4c01b5ea16a64c pose=e93eb9956b0c1656 vel=3abf279e813ceee1 inert=d75f574846c85ab2 ext=48d5c061864d4413 cache=c4f5b8b24c300720 buf=800ec5b02fd42743 lam=de9d209a84c4f975
+lattice/4x3x2 avbd steps=3 iters=30 all=27dc71efbc1aa59f pose=96be3217add9d7bb vel=2e983c2eddedd6e8 inert=b5b5cf72d057cdfb ext=2324660c2d9982c8 cache=104166003dd6e408 buf=f381f7187e915803 lam=634f00e07f4887d8
+mixed/20 avbd steps=3 iters=30 all=01358a7bd07ddb0e pose=76d306c9a2de7f9d vel=d342fc959241e181 inert=460aacbf344c8f62 ext=a2e33e2bf4cbe213 cache=75373d601be7ed47 buf=800ec5b02fd42743 lam=d05fd37dd834614c
+mixed/20 xpbd steps=3 iters=30 all=be52c3bb9936fdc4 pose=903072d0c4ee8ca3 vel=512fda4f28581462 inert=460aacbf344c8f62 ext=a2e33e2bf4cbe213 cache=1aab2d8fd86287ad buf=800ec5b02fd42743 lam=d37d3429851656cf
+lattice/12x10x4 avbd steps=3 iters=30 all=c9f43980e8afcbcd pose=441702b8329ca931 vel=861ebf29f509b388 inert=6f92669e402d5e53 ext=38bf2de02e4ab3c8 cache=07faf6c716a8a602 buf=5fa45f2b56161d83 lam=3e6409f35006ae0e
