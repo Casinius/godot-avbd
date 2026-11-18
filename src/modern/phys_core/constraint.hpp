@@ -39,6 +39,10 @@
 //   3) manifold_id == kStandaloneManifold 表示独立约束（不参与分组）；
 //   4) 约束列表的拥有者（scene / 未来的 narrowphase）是这两条的唯一维护者：
 //      改动顺序或增删就必须重新分配 manifold_id。
+//   5) 同一个接触点的行按 normal, tangent0, tangent1 顺序**紧邻**发射
+//      （contact_constraints.hpp 保证）；AVBDStep::post_dual 按
+//      (manifold_id, contact_index) 把它们聚成一组做联合夹紧。μ == 0 的接触只发
+//      法线一行。
 
 // —— 距离约束（两个 body，纯线性 DOF） ——
 struct DistanceConstraint {
@@ -79,6 +83,26 @@ inline constexpr std::uint32_t kStandaloneManifold = 0xFFFFFFFFu;
 
 enum class ContactKind : std::uint8_t { Normal, Tangent0, Tangent1 };
 
+// ==================== 接触的罚函数 / 摩擦常数 ====================
+// 全部对齐参考实现 savant117/avbd-demo3d（source/manifold.cpp + solver.h）：
+//   alpha = 0.99 (stabilization), gamma = 0.999 (warmstart decay),
+//   betaLin = 1e4 (penalty ramp), PENALTY_MIN/MAX = 1 / 1e10, STICK_THRESH = 1e-5。
+//
+// 约束值用一阶稳定化：
+//     C_eff = C_current - alpha * C0        （C0 = 步首原始违反量 = initial_c）
+// 它等价于参考实现的  C = C0*(1-alpha) + J*dq  —— 因为 basis/锚点在步内固定，
+// C_current = C0 + J*dq 精确成立。C0 每步只在 capture 时取一次。
+inline constexpr Scalar_t kContactStabilization = Scalar_t(0.99);
+inline constexpr Scalar_t kWarmStartGamma       = Scalar_t(0.999);
+// warm start 的 λ 衰减率 = alpha * gamma（参考实现 Eq.19）。
+inline constexpr Scalar_t kWarmStartDecay = kContactStabilization * kWarmStartGamma;
+inline constexpr Scalar_t kContactPenaltyFloor = Scalar_t(1);
+inline constexpr Scalar_t kContactPenaltyCeil  = Scalar_t(1e10);
+// 每迭代的罚因子 ramp 速率（单位 1/m：K += betaLin*|C|）。
+inline constexpr Scalar_t kContactPenaltyBeta = Scalar_t(1e4);
+// 静摩擦判定：切向 C 的模小于它 ⇒ 仍然粘着，下一帧保留旧锚点。
+inline constexpr Scalar_t kContactStickThreshold = Scalar_t(1e-5);
+
 struct ContactConstraint {
   // bodies_[0] = A（被推开的 body）；bodies_[1] = B（支撑面/另一侧）。
   // gradient 返回 {+n, -n}，所以 A 沿 +n 被推开——符号约定与 DistanceConstraint 一致。
@@ -89,30 +113,45 @@ struct ContactConstraint {
 
   // 冗余存 basis（3 个 Vec3，36 B）：scatter 因此是纯函数，不查任何 store。
   // 分组规则见文件头的【接触分组的不变量】——由列表拥有者保证 constraints 连续。
-  // 整条约束 108 B（16 + 4 + 1 + 1 + 2 pad + 36 + 12 + 12 + 20 + 1 + 3 pad），
-  // 放在 variant 里约 116 B/条；改字段顺序会改变这个数字，也改变 digest 的稳定性。
   Vec3 basis[3]; // [0] = normal, [1..2] = tangents
 
   Vec3     rA{0}, rB{0};   // 局部接触点，角向梯度用
-  Scalar_t target     = 0; // Normal: depth（静止时的允许重叠量，>0）；Tangent: 0
-  Scalar_t lambda     = 0; // dual 变量；单边 ⇒ λ ≤ 0（见 update_dual）
+  Scalar_t target     = 0; // Normal: -margin（静止时的允许重叠量）；Tangent: 0
   Scalar_t compliance = 0;
-  // 下面三个字段当前**没有任何消费者**：AVBD 用的是全局 k（Policy::k），摩擦锥也还没做。
-  // 保留它们是因为 digest 已经把它们纳入哈希（见 digest.hpp），删掉会改变基线；
-  // 它们的真实语义要等 manifold 级聚合与摩擦一起设计。
-  Scalar_t penalty    = 0;     // 预留：per-constraint penalty
-  Scalar_t beta_scale = 1;     // 预留：per-constraint ramp 缩放
-  bool     stick      = false; // 预留：静摩擦标记
 
-  // C 的符号约定与 DistanceConstraint 完全相同：C < 0 ⇒ 需要沿 +g 推开。
-  //   法线：C = n·(xA - xB) - depth   （比允许重叠还深 ⇒ C<0）
-  //   切线：C = t·(xA - xB) - target  （target 恒为 0，一旦相对滑动 ⇒ C≠0）
-  // 早期版本的法线分支直接 `return target`，C 与位姿无关（梯度是常量）——那等于
-  // 把接触写成了单向推进器，永远是同一个位移，现在改为位姿相关。
-  Scalar_t evaluate(const State &s) const {
+  // —— dual / 罚因子状态（每行一份；三行是同一次 manifold 级 dual 的联合状态）——
+  // lambda   ：上一次 dual 夹紧后的**力** F = K*C + λ（法线 ≤ 0；切线在锥内）。
+  //            注意它存的是力，不是 λ 递增量——增量形式（λ += k*C）会发散。
+  // penalty  ：该行的自适应罚因子 K。接触行只用它，非接触行用 Policy 的全局 k。
+  // initial_c：步首的原始 C0，稳定化用（每步由 capture_step_start 重取一次）。
+  // friction ：该接触点的 μ（同一 contact 的三行相同；行数也因此决定）。
+  // force_min/max：primal 里该行力的界（参考实现 updatePrimal 也夹紧：法线 F ≤ 0，
+  //            切向 |F| ≤ μ|F_n|）。必须夹在 RHS 上：否则一个"先粘住、后滑动"的
+  //            接触会拿 K_t*C_t（= K_t·滑移量）当摩擦力，滑移量的量级是 cm ⇒ 上万 N，
+  //            表现为 box 一落地就被焊住、再被甩飞。锥界用**上一轮**的 F_n（lag 一轮），
+  //            因为 gather 是 per-row 的，没有"三行同时"的位置；差别只有一轮迭代。
+  Scalar_t lambda     = 0;
+  Scalar_t penalty    = 0;
+  Scalar_t initial_c  = 0;
+  Scalar_t friction   = 0;
+  Scalar_t force_min  = -kForceUnclamped;
+  Scalar_t force_max  = kForceUnclamped;
+  Scalar_t beta_scale = 1;     // 预留：per-constraint ramp 缩放（未消费）
+  bool     stick      = false; // 上一帧是否粘着：决定下一帧是否重锚定 rA/rB
+
+  // 原始约束值（不掺稳定化）。C 的符号约定与 DistanceConstraint 相同：C < 0 ⇒ 需要沿 +g 推开。
+  //   法线：C = n·(xA - xB) + margin   （穿透超过 margin ⇒ C<0）
+  //   切线：C = t·(xA - xB)            （一旦相对滑动 ⇒ C≠0）
+  Scalar_t value(const State &s) const {
     const Vec3 xA = s.pose.position(bodies_[0]) + rotate(s.pose.rotation(bodies_[0]), rA);
     const Vec3 xB = s.pose.position(bodies_[1]) + rotate(s.pose.rotation(bodies_[1]), rB);
     return glm::dot(xA - xB, basis[static_cast<int>(kind)]) - target;
+  }
+
+  // 求解器看到的约束值：一阶稳定化后的 C_eff（见文件头的常数说明）。
+  // initial_c == 0（非接触 / XPBD 路径）时与 value() 完全相同。
+  Scalar_t evaluate(const State &s) const {
+    return value(s) - kContactStabilization * initial_c;
   }
 
   std::array<Vec3, 2> gradient(const State &) const {
@@ -124,26 +163,55 @@ struct ContactConstraint {
     const Vec3 n   = basis[static_cast<int>(kind)];
     const Vec3 rAw = rotate(s.pose.rotation(bodies_[0]), rA);
     const Vec3 rBw = rotate(s.pose.rotation(bodies_[1]), rB);
-    return {glm::cross(rAw, n), glm::cross(rBw, n)};
+    // C = n·(xA - xB) - target ⇒
+    //   ∂C/∂θ_A = +(rAw × n)
+    //   ∂C/∂θ_B = -(rBw × n)      ← B 的贡献带负号（与线性梯度 {+n,-n} 一致）
+    // 这里曾经漏掉 B 的负号：接触力作用在 B 上的**力矩方向**因此是反的，表现为
+    // 平地上纯滑动的 box 会朝"翻车"的反方向持续自旋、再靠法线重分布去纠——而
+    // 1~2 点 manifold 根本纠不回来，于是整摞/整块持续被泵能量。
+    return {glm::cross(rAw, n), -glm::cross(rBw, n)};
   }
 
   std::span<const std::size_t> bodies() const { return bodies_; }
 
-  // 单边接触的 dual 更新：只推不拉 ⇒ λ ∈ (-∞, 0]。
-  // （符号回推：g_A = +n，delta = g·(inv_mass·dλ)；C<0 要推出 ⇒ dλ>0 ⇒ λ 不能为正。）
-  // 切向的摩擦锥 |λ_t| ≤ μ|λ_n| 需要 manifold 级聚合，在它落地前**不做伪更新**，
-  // 所以切向直接返回（见文件头的决策记录）。AVBD 目前不消费 λ（只用全局 k 与 C），
-  // 所以这里维护 λ 主要是为了 digest 的完整性与将来摩擦锥的容量。
-  void update_dual(const State &s, Scalar_t k) {
-    if (kind != ContactKind::Normal)
-      return;
-    lambda = std::min(Scalar_t(0), lambda + k * evaluate(s));
-  }
+  // 为什么**没有** update_dual：
+  // 接触的三行（normal/t0/t1）是一个联合问题——法线单边夹紧和切向摩擦锥夹紧必须
+  // 同时做，逐行更新会把切线拉出锥外（也是上一版发散的原因之一）。
+  // 联合更新在 AVBDStep::post_dual（串行，按 manifold 分组）里完成。
+  // ConstraintRef::update_dual 因此对接触为 nullptr ⇒ 逐约束 dual 阶段跳过它们。
 };
 template <> struct constraint_traits<ContactConstraint> {
   using Scalar_t   = ::Scalar_t;
   using Gradient_t = std::array<Vec3, 2>;
 };
+
+// ==================== 接触行的 block-Jacobi mass-split 权重 ====================
+//
+// 【为什么要它】本仓库的 accumulate 是 scatter + per-body gather（block-Jacobi）：
+// 两条约束行对同一对 body 的贡献在**同一个线性化点**上被折进两个独立的 6x6
+// 局部系统。对一条刚度 K、两侧可动质量倒数 em_self / em_other 的行，
+// 每侧各走一步 ⇒ 相对位移是
+//     u_jacobi = -2F/(K + 1/em)        （K ≫ 1/em 时 ≈ -2F/K）
+// 而耦合精确解是 u = -F/(K + 1/(em_self+em_other)) ≈ -F/K。
+// 没有 λ 时这只是"每迭代乘 -1"的临界振荡（旧行为，有界）；λ 一旦进 RHS，
+// 迭代变成 e → -3e（特征值 2+√3），几轮就把接触推开、下一帧再砸回来。
+//
+// 【修法】把每个 body 块的 H 乘上 (1 + em_other/em_self)：
+//     Δ_self = -F / (K(1+em_other/em_self) + 1/em_self)
+//            = em_self/(em_self+em_other) · u
+// 正好是耦合精确解按可动性分配的那一份。静/动（另一侧 em_other == 0）时系数
+// 为 1，保持"半步收敛"的行为；两侧都动（等质量）时系数为 2，相对位移一步到位。
+// RHS 的力不受影响（仍是 K·C + λ），所以平衡点、λ 的语义与摩擦锥的界都不变。
+[[nodiscard]] inline Scalar_t contact_hessian_scale(const State &s, std::size_t body_self,
+                                                   std::size_t body_other, Vec3 g_self,
+                                                   Vec3 ga_self, Vec3 g_other,
+                                                   Vec3 ga_other) noexcept {
+  const Scalar_t em_self  = s.inertial.effective_mass(body_self, g_self, ga_self);
+  const Scalar_t em_other = s.inertial.effective_mass(body_other, g_other, ga_other);
+  if (!(em_self > Scalar_t(0)) || !(em_other > Scalar_t(0)))
+    return Scalar_t(1); // 任一侧静态：没有对侧过冲
+  return Scalar_t(1) + em_other / em_self;
+}
 
 // （已删除：contact_sort_key / feature_id 排序草案。它引用了一个并不存在的
 //  feature 概念，且排序 key 只在 narrowphase 侧有意义——等 narrowphase 落地时

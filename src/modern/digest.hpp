@@ -162,6 +162,8 @@ inline std::uint64_t constraints(const ConstraintList &cs) noexcept {
         h = mix_scalar(h, c.target);
         h = mix_scalar(h, Scalar_t(c.manifold_id));
         h = mix_scalar(h, c.penalty);
+        h = mix_scalar(h, c.initial_c);
+        h = mix_scalar(h, c.friction);
         h = mix_scalar(h, c.beta_scale);
         h = mix_scalar(h, Scalar_t(c.stick));
         h = mix_scalar(h, Scalar_t(c.contact_index));

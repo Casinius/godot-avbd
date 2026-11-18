@@ -1,9 +1,14 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <span>
+#include <type_traits>
+#include <variant>
 
 #include "base_concept.hpp"
+#include "constraint.hpp"
 
 // ==================== 三种 Policy ====================
 //
@@ -41,18 +46,39 @@ public:
   Scalar_t                  beta        = Scalar_t(1e-2);
 
   // 单约束：把 k·g gᵀ / k·C g 累加进 per-body 系统（只走 buffers 接口）
+  // 接触行不一样：它有自己的 K（自适应罚因子）和 λ（上一轮 dual 夹紧后的力），
+  // 所以走 accumulate_row()。其余约束仍用 policy 的全局 k 且 λ = 0 ⇒ 与旧行为逐位相同。
   template <Constraint<State> C> void step(State &s, C &c) {
     const Scalar_t Cv     = c.evaluate(s);
     auto           g      = c.gradient(s);
     auto           bodies = c.bodies();
 
+    Scalar_t K_row = k;
+    Scalar_t l_row = Scalar_t(0);
+    Scalar_t h_row = k;
+    if constexpr (std::is_same_v<C, ContactConstraint>) {
+      auto           g_ang = angular_gradient_of(c, s);
+      K_row                = c.penalty;
+      l_row                = c.lambda;
+      // 见 contact_hessian_scale()：H 的权重按 body 做 mass-split，RHS 仍是物理力。
+      const Scalar_t row_scale = Scalar_t(1);
+      for (std::size_t n = 0; n < g.size(); ++n) {
+        const std::size_t j     = (n == 0) ? 1 : 0;
+        const Scalar_t    scale = contact_hessian_scale(s, c.bodies_[n], c.bodies_[j], g[n],
+                                                        g_ang[n], g[j], g_ang[j]);
+        s.buffers.accumulate_row(bodies[n], g[n], g_ang[n], K_row, Cv, l_row,
+                                 K_row * scale * row_scale, c.force_min, c.force_max);
+      }
+      return;
+    }
+
     if constexpr (HasAngularGradient<C, State>) {
       auto g_ang = c.gradient_angular(s);
       for (std::size_t n = 0; n < g.size(); ++n)
-        s.buffers.accumulate_penalty(bodies[n], g[n], g_ang[n], k, Cv);
+        s.buffers.accumulate_row(bodies[n], g[n], g_ang[n], K_row, Cv, l_row, h_row);
     } else {
       for (std::size_t n = 0; n < g.size(); ++n)
-        s.buffers.accumulate_penalty(bodies[n], g[n], Vec3{0}, k, Cv);
+        s.buffers.accumulate_row(bodies[n], g[n], Vec3{0}, K_row, Cv, l_row, h_row);
     }
   }
 
@@ -60,8 +86,14 @@ public:
   // gather 按 body 并行调用这里，每个调用只写 buffers[b]，且同 body 内的调用顺序
   // 由 body_entries（约束升序）决定 ⇒ 与串行逐条累加位精确。
   // 注意 k 只在 accumlate 阶段读，改写它的是 ramp_stiffness()。
+  // entry.penalty > 0 ⇒ 这一行自带罚因子（接触），否则用 policy 的 k、λ = 0。
   void accumulate_entry(State &s, std::size_t b, const ConstraintEntry &e) const noexcept {
-    s.buffers.accumulate_penalty(b, e.g_lin, e.g_ang, k, e.C);
+    const Scalar_t K_row = e.penalty > Scalar_t(0) ? e.penalty : k;
+    // hessian < 0 是"这一行不提供刚度"的哨兵（滑动的摩擦行）；== 0 表示沿用 K_row。
+    const Scalar_t h_row =
+        e.hessian > Scalar_t(0) ? e.hessian : (e.hessian < Scalar_t(0) ? Scalar_t(0) : K_row);
+    s.buffers.accumulate_row(b, e.g_lin, e.g_ang, K_row, e.C, e.lambda, h_row, e.force_min,
+                             e.force_max);
   }
 
   // —— 阶段 2：逐 body 解局部系统 ——
@@ -101,6 +133,75 @@ public:
               });
   }
 
+  // —— 阶段 3b：manifold 级 dual（**串行**，接触专用）——
+  //
+  // 为什么必须是串行、且按"每点三行"成组：
+  //   法线的单边夹紧（F_n ≤ 0）与切线的摩擦锥夹紧（|F_t| ≤ μ|F_n|）是同一个
+  //   投影的两个部分。逐行做只能各夹各的，结果不属于锥内；参考实现
+  //   （avbd-demo3d Manifold::updateDual）也是每点一次算完三行。
+  // 为什么放在逐约束 parallel dual 之后：接触行没有 update_dual（见 constraint.hpp），
+  //   所以并行 dual 阶段对它们什么都不做，这里不会重复更新。
+  // 确定性：只写每条约束自己的字段，与调度无关；约定同(manifold_id, contact_index)
+  //   的行连续（见 constraint.hpp 【接触分组的不变量】5）。
+  void post_dual(State &s, ConstraintList &cs) const {
+    const std::size_t n = cs.size();
+    std::size_t       i = 0;
+    while (i < n) {
+      if (!std::holds_alternative<ContactConstraint>(cs[i])) {
+        ++i;
+        continue;
+      }
+      const ContactConstraint &first = std::get<ContactConstraint>(cs[i]);
+      std::size_t              end   = i + 1;
+      while (end < n && end < i + 3 && std::holds_alternative<ContactConstraint>(cs[end])) {
+        const ContactConstraint &next = std::get<ContactConstraint>(cs[end]);
+        if (next.manifold_id != first.manifold_id || next.contact_index != first.contact_index)
+          break;
+        ++end;
+      }
+      ContactConstraint *rows[3] = {nullptr, nullptr, nullptr};
+      for (std::size_t j = i; j < end; ++j) {
+        ContactConstraint &c     = std::get<ContactConstraint>(cs[j]);
+        const int          row_k = static_cast<int>(c.kind);
+        if (row_k >= 0 && row_k < 3 && rows[row_k] == nullptr)
+          rows[row_k] = &c;
+      }
+      dual_contact(s, rows);
+      i = end;
+    }
+  }
+
+  // 接触罚因子的上限：材料刚度 k0（引擎映射 beta_linear），再夹到参考实现的
+  // PENALTY_MAX / PENALTY_MIN 之间。k0 设成极大值时退化成参考实现的 1e10。
+  [[nodiscard]] Scalar_t contact_penalty_max() const noexcept {
+    return std::min(kContactPenaltyCeil, std::max(kContactPenaltyFloor, k0));
+  }
+
+  // —— 步首准备（每步一次，在迭代循环之前）——
+  // 对齐参考实现 Manifold::initialize() 的 C0 部分：取 C0 = 步首的**原始**约束值，
+  // 作为整步的稳定化基准（步内不变，见 ContactConstraint::evaluate）。
+  // 罚因子不在这里初始化：它由 manifold 的 warm start 带来（emit 时已按 gamma 衰减），
+  // 新接触就是 floor，随后由 dual_contact 的 ramp 自适应增长。
+  void capture_step_start(State &s, ConstraintList &cs) {
+    for (ConstraintVariant &v : cs) {
+      if (!std::holds_alternative<ContactConstraint>(v))
+        continue;
+      ContactConstraint &c = std::get<ContactConstraint>(v);
+      c.initial_c          = c.value(s);
+      // 罚因子一律从 manifold 带来的值起步（新接触 = floor），K 由 dual_contact 的
+      // ramp 自适应增长——这是参考实现的做法，也是唯一同时满足下面两条的起点：
+      //   a) 深度穿透（box 生成在斜坡里 9 cm / 落地 11 m/s）不能产生上万 N 的
+      //      瞬时法线力：F = K·(1-alpha)·C0 与 K 成正比，K 从 floor 起步就压得住；
+      //   b) 滑动的接触不能带着 K_t = 1e5 的 Hessian：局部系统会把切向自由度钉死
+      //      （Δ = -β·r/(K_t+β)），μ 小的接触根本滑不动。
+      // 上限用材料刚度 k0（引擎的 beta_linear）：既给 ramp 一个有物理含义的天花板，
+      // 也让"设成 1e10 就永远是参考实现的 PENALTY_MAX"这种映射仍然可用。
+      if (!(c.penalty > Scalar_t(0)))
+        c.penalty = kContactPenaltyFloor;
+      c.penalty = std::min(c.penalty, contact_penalty_max());
+    }
+  }
+
   // —— 阶段 4：刚度 ramp —— 一个标量，串行，不该并行。
   void ramp_stiffness() noexcept { k *= (Scalar_t(1) + beta); }
 
@@ -115,6 +216,74 @@ public:
   template <typename Exec, typename Sched>
   void begin_iterations(State &, Exec &, const Sched &) noexcept {
     k = k0;
+  }
+
+private:
+  // 单个接触点（至多三行）的联合 dual。rows[k] == nullptr 表示该行不存在（μ == 0）。
+  // 公式（与参考实现逐项对应）：
+  //   F      = K*C_eff + λ                       （逐行）
+  //   F_n    = min(F_n, 0)                       单边
+  //   F_t    = F_t * min(1, μ|F_n| / |F_t|)       径向夹紧到摩擦锥
+  //   λ      = F                                 （存力，不是增量）
+  //   K_row += betaLin*|C_row|                    仅在 F_n<0 / 切向仍在锥内时 ramp
+  void dual_contact(State &s, ContactConstraint *const rows[3]) const {
+    if (rows[0] == nullptr)
+      return; // 没有法线行 ⇒ 没有锥可夹，切向也就没有意义
+
+    Scalar_t C[3] = {0, 0, 0};
+    Scalar_t K[3] = {0, 0, 0};
+    Scalar_t F[3] = {0, 0, 0};
+    for (int k = 0; k < 3; ++k) {
+      if (rows[k] == nullptr)
+        continue;
+      C[k] = rows[k]->evaluate(s);
+      K[k] = rows[k]->penalty;
+      F[k] = K[k] * C[k] + rows[k]->lambda;
+    }
+
+    F[0] = std::min(F[0], Scalar_t(0)); // 只推不拉
+
+    const bool     tangent = rows[1] != nullptr && rows[2] != nullptr;
+    const Scalar_t bounds  = std::abs(F[0]) * rows[0]->friction;
+    const Scalar_t scale   = std::sqrt(F[1] * F[1] + F[2] * F[2]);
+    if (tangent && scale > bounds && scale > Scalar_t(0)) {
+      const Scalar_t f = bounds / scale;
+      F[1] *= f;
+      F[2] *= f;
+    }
+
+    // 写回：λ 是夹紧后的力；同时把 primal 的力界刷成同一组（下一轮迭代生效）。
+    // 法线行**不夹** RHS：夹成 F=0 但保留 H=K 会让局部系统的最小化目标与 RHS 不再
+    // 一致，二体块 Jacobi 的平移/转动耦合项就变成凭空扭矩（实测平地上纯滑动的 box
+    // 会自己仰头、越转越快）。单边性由 dual 的 F_n ≤ 0 保证；旧实现也一直是两侧
+    // 弹簧（C>0 时轻微吸附），保持它既一致又稳定。
+    // 切向行的 ±μ|F_n| 不一致只是"欠松弛"（H 与 RHS 同向、只是被缩小），不会注入
+    // 能量；而它正是防止"先粘后滑"的接触把 K_t·滑移量当摩擦力的关键。
+    rows[0]->lambda    = F[0];
+    rows[0]->force_min = -kForceUnclamped;
+    rows[0]->force_max = kForceUnclamped;
+    for (int k = 1; k < 3; ++k) {
+      if (rows[k] == nullptr)
+        continue;
+      rows[k]->force_min = -bounds;
+      rows[k]->force_max = bounds;
+      rows[k]->lambda    = F[k];
+    }
+
+    // 罚因子 ramp（Eq.16）：法线只在受压时涨；切向只在**夹紧前**还在锥内时涨。
+    if (F[0] < Scalar_t(0))
+      rows[0]->penalty =
+          std::min(K[0] + kContactPenaltyBeta * std::abs(C[0]), contact_penalty_max());
+    if (tangent && scale <= bounds) {
+      rows[1]->penalty =
+          std::min(K[1] + kContactPenaltyBeta * std::abs(C[1]), contact_penalty_max());
+      rows[2]->penalty =
+          std::min(K[2] + kContactPenaltyBeta * std::abs(C[2]), contact_penalty_max());
+      // 静摩擦标记：切向基本没滑 ⇒ 下一帧保留旧锚点（ManifoldStore::match 消费）。
+      const bool stick = std::sqrt(C[1] * C[1] + C[2] * C[2]) < kContactStickThreshold;
+      rows[1]->stick   = stick;
+      rows[2]->stick   = stick;
+    }
   }
 };
 

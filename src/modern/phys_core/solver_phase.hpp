@@ -50,6 +50,11 @@ void solve(State &s, ConstraintList &cs, Policy &p, int iters, Exec &exec,
     batches.build(std::span<const ConstraintRef<Policy>>{refs}, s.scratch);
   }
 
+  // 步首一次：约束的稳定化基准（C0）与接触罚因子初值。必须在**任何迭代之前**，
+  // 且必须在碰撞 sync 之后（接触锚点/基已经就位）——调用方保证这个顺序。
+  if constexpr (requires { p.capture_step_start(s, cs); })
+    p.capture_step_start(s, cs);
+
   for (int it = 0; it < iters; ++it) {
     if (obs) obs->on_phase(SolvePhase::IterationBegin, it, s); //阶段hook 用来观察的
 
@@ -83,6 +88,10 @@ void solve(State &s, ConstraintList &cs, Policy &p, int iters, Exec &exec,
 
     // —— 相位 3：dual（逐约束）——
     p.solve_dual(s, std::span{refs}, exec, sched);
+    // 相位 3b：manifold 级 dual（串行）。接触的三行必须联合夹紧（单边 + 摩擦锥），
+    // 逐行做不出来；接触没有 update_dual，所以与上面的并行 dual 不重叠。
+    if constexpr (requires { p.post_dual(s, cs); })
+      p.post_dual(s, cs);
     if (obs) obs->on_phase(SolvePhase::Dual, it, s);
 
     // —— 相位 4：刚度 ramp（串行标量，并行它只会更慢）——

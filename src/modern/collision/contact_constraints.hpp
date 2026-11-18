@@ -11,8 +11,10 @@
 //   5) normal 的 target = -margin：
 //        C = n·(xA-xB) - target = n·(xA-xB) + margin
 //      穿透时 n·(xA-xB) < 0，C<0 触发沿 +n 推开 A；静息允许 margin 的重叠。
-//   6) 切向 target = 0：第一阶段用 penalty 型静摩擦，摩擦锥在 dual 阶段按
-//      manifold_id 聚合（见 plan 的第二阶段）。
+//   6) 切向 target = 0：摩擦是 penalty 型；摩擦锥与法线单边夹紧在同一处按
+//      (manifold_id, contact_index) 成组做（AVBDStep::post_dual）。
+//   7) 每个接触的 λ/K 在发射时做一次 warm start 衰减（alpha*gamma / gamma），
+//      位置与参考实现的 Manifold::initialize 相同。
 //
 //  【为什么不新增约束类型】
 //   现有 ContactConstraint 已经有 basis/rA/rB/target/lambda/penalty/beta_scale/stick，
@@ -45,6 +47,13 @@ inline void erase_contact_constraints(ConstraintList &list) {
 }
 
 // 追加接触约束。返回发射的约束条数。manifold_id 从 0 开始按 manifolds 顺序分配。
+//
+// 【warm start 的初始化（与参考实现 Manifold::initialize 同一位置）】
+//   λ ← λ * alpha*gamma          （Eq.19）
+//   K ← clamp(K * gamma, floor, ceil)
+// 放在这里而不是 absorb_warm_start：absorb 的契约是"把 ContactConstraint 的 dual
+// 状态原样写回 manifold"（collision_selftest 直接断言逐位相等），参考实现也是在
+// 每个接触被**初始化**成这一帧的行时衰减，而不是在写回时。两者都只衰减一次/帧。
 inline std::size_t emit_contact_constraints(std::span<const Manifold> manifolds,
                                             const ContactEmitOptions &opt, ConstraintList &list) {
   std::size_t emitted = 0;
@@ -54,6 +63,9 @@ inline std::size_t emit_contact_constraints(std::span<const Manifold> manifolds,
       const ManifoldContact &mc = m.contacts[ci];
       // μ == 0 时没有切向约束：不要发射两条永远不该有 λ 的切线。
       const int rows = m.friction > Scalar_t(0) ? 3 : 1;
+      // primal 的力界（lagged 锥）：法线 F ≤ 0；切向 |F| ≤ μ|λ_n|（用发射时的 λ_n）。
+      const Scalar_t lambda_n = mc.lambda[0] * kWarmStartDecay;
+      const Scalar_t cone_cap = m.friction * std::abs(lambda_n);
       for (int k = 0; k < rows; ++k) {
         ContactConstraint cc;
         cc.bodies_       = {m.body_a, m.body_b};
@@ -66,9 +78,14 @@ inline std::size_t emit_contact_constraints(std::span<const Manifold> manifolds,
         cc.rA            = mc.rA;
         cc.rB            = mc.rB;
         cc.target        = (k == static_cast<int>(ContactKind::Normal)) ? -opt.margin : Scalar_t(0);
-        cc.lambda        = mc.lambda[k];
+        cc.lambda        = mc.lambda[k] * kWarmStartDecay;
+        cc.friction      = m.friction;
         cc.compliance    = opt.compliance;
-        cc.penalty       = mc.penalty[k];
+        cc.penalty       = std::clamp(mc.penalty[k] * kWarmStartGamma, kContactPenaltyFloor,
+                                      kContactPenaltyCeil);
+        cc.initial_c     = 0; // 步首由 AVBDStep::capture_step_start 取（步作用域状态）
+        cc.force_min     = (k == 0) ? -kForceUnclamped : -cone_cap;
+        cc.force_max     = (k == 0) ? kForceUnclamped : cone_cap;
         cc.beta_scale    = mc.beta_scale;
         cc.stick         = mc.stick;
         list.emplace_back(cc);

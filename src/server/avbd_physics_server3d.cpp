@@ -1084,10 +1084,10 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space, std::source_location
                 unsupported = true;
                 break;
             }
-            // Friction is not implemented by the imported core yet; its tangent rows
-            // never receive a dual update and act as rigid anchors. Force the material
-            // to zero (frictionless contacts) and keep the engine value in BodyData.
-            shape.material.friction = 0;
+            // Friction is carried by the shape material (the core combines the two
+            // bodies' values as sqrt(fA*fB), Godot's own rule). The engine stores the
+            // per-body value in BodyData, so pass it through here.
+            shape.material.friction = static_cast<Scalar_t>(body.friction);
             collision::ShapeInstance inst;
             inst.shape = shape;
             const Transform3D &local = i < body.shape_transforms.size()

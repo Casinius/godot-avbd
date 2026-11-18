@@ -8,6 +8,6 @@ fan/64 avbd steps=3 iters=30 all=3888ec600e68c2d4 pose=42962bf528aeca32 vel=50e0
 fan/64 xpbd steps=3 iters=30 all=86dc3e5e4817c4f8 pose=aeb941a2b49ce10a vel=191d7bc098c5e520 inert=b2b1803a2cab2593 ext=80e7d0a93286db28 cache=a709c95be7f4b688 buf=adb43ca9613d6333 lam=a746aeda4d7b8528
 lattice/5x4x1 avbd steps=3 iters=30 all=1c4c01b5ea16a64c pose=e93eb9956b0c1656 vel=3abf279e813ceee1 inert=d75f574846c85ab2 ext=48d5c061864d4413 cache=c4f5b8b24c300720 buf=800ec5b02fd42743 lam=de9d209a84c4f975
 lattice/4x3x2 avbd steps=3 iters=30 all=27dc71efbc1aa59f pose=96be3217add9d7bb vel=2e983c2eddedd6e8 inert=b5b5cf72d057cdfb ext=2324660c2d9982c8 cache=104166003dd6e408 buf=f381f7187e915803 lam=634f00e07f4887d8
-mixed/20 avbd steps=3 iters=30 all=01358a7bd07ddb0e pose=76d306c9a2de7f9d vel=d342fc959241e181 inert=460aacbf344c8f62 ext=a2e33e2bf4cbe213 cache=75373d601be7ed47 buf=800ec5b02fd42743 lam=d05fd37dd834614c
-mixed/20 xpbd steps=3 iters=30 all=be52c3bb9936fdc4 pose=903072d0c4ee8ca3 vel=512fda4f28581462 inert=460aacbf344c8f62 ext=a2e33e2bf4cbe213 cache=1aab2d8fd86287ad buf=800ec5b02fd42743 lam=d37d3429851656cf
+mixed/20 avbd steps=3 iters=30 all=96bf92d265f10ef5 pose=cca6b58787615d0a vel=89bbbd0bdfa2ffd0 inert=460aacbf344c8f62 ext=a2e33e2bf4cbe213 cache=3faaa6ff2028577f buf=800ec5b02fd42743 lam=e11c6d6e8562918e
+mixed/20 xpbd steps=3 iters=30 all=30469673955a63ce pose=903072d0c4ee8ca3 vel=512fda4f28581462 inert=460aacbf344c8f62 ext=a2e33e2bf4cbe213 cache=1aab2d8fd86287ad buf=800ec5b02fd42743 lam=3e8358b356d9cb2f
 lattice/12x10x4 avbd steps=3 iters=30 all=c9f43980e8afcbcd pose=441702b8329ca931 vel=861ebf29f509b388 inert=6f92669e402d5e53 ext=38bf2de02e4ab3c8 cache=07faf6c716a8a602 buf=5fa45f2b56161d83 lam=3e6409f35006ae0e

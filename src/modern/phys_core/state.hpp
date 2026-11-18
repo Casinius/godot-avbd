@@ -439,6 +439,10 @@ struct BodyResiduals {
   Vec3 ang{0};
 };
 
+// "不做夹紧"的哨兵（比任何物理力大得多，且不引入 <limits>）。
+// 约束行可以给 RHS 的力一个上下界（接触的 lagged 摩擦锥），非接触行用它表示无界。
+inline constexpr Scalar_t kForceUnclamped = Scalar_t(1e30);
+
 // ==================== 7. SolverBuffers：per-body 局部线性系统 ====================
 struct SolverBuffers {
   std::vector<Mat3> hessian_lin;     // ∂²E/∂p∂p
@@ -488,11 +492,31 @@ struct SolverBuffers {
   // 罚项累积：H += k·g gᵀ，grad += k·C·g
   void accumulate_penalty(std::size_t b, Vec3 g_lin, Vec3 g_ang, Scalar_t k,
                           Scalar_t C) noexcept {
-    hessian_lin[b] += outer(g_lin, g_lin) * k;
-    hessian_lin_ang[b] += outer(g_lin, g_ang) * k;
-    hessian_ang[b] += outer(g_ang, g_ang) * k;
-    grad_lin[b] += g_lin * (k * C);
-    grad_ang[b] += g_ang * (k * C);
+    accumulate_row(b, g_lin, g_ang, k, C, Scalar_t(0), k);
+  }
+
+  // 罚项 + 对偶力的累积（AVBD 的行更新）：
+  //     H += K_h·g gᵀ       （Hessian 权重 K_h 不含 λ 的导数）
+  //     grad += g·(K·C + λ)
+  // λ = 0 且 K_h = K 时与 accumulate_penalty 逐位相同，所以非接触行行为完全不变。
+  // H 的权重与 RHS 的力分开传：接触行用 mass-split 把 H 放大（见 ConstraintEntry），
+  // 但 RHS 必须是**物理力** K·C + λ，否则力的平衡点会跟着 H 一起漂。
+  // 符号回推：C<0 且 λ=0 ⇒ F=K·C<0，grad_A = +n·F，solve_body 的 -grad 把 A 沿 +n 推。
+  void accumulate_row(std::size_t b, Vec3 g_lin, Vec3 g_ang, Scalar_t K, Scalar_t C,
+                      Scalar_t lambda, Scalar_t hessian_K,
+                      Scalar_t force_min = -kForceUnclamped,
+                      Scalar_t force_max = kForceUnclamped) noexcept {
+    // hessian_K <= 0 ⇒ 这一行不提供刚度（滑动的摩擦行：力已经被锥夹死，与切向位置无关）
+    if (hessian_K > Scalar_t(0)) {
+      hessian_lin[b] += outer(g_lin, g_lin) * hessian_K;
+      hessian_lin_ang[b] += outer(g_lin, g_ang) * hessian_K;
+      hessian_ang[b] += outer(g_ang, g_ang) * hessian_K;
+    }
+    Scalar_t f = K * C + lambda;
+    if (f < force_min) f = force_min;
+    if (f > force_max) f = force_max;
+    grad_lin[b] += g_lin * f;
+    grad_ang[b] += g_ang * f;
   }
 
   // 块 Newton 步：
@@ -568,6 +592,19 @@ struct ConstraintEntry {
   Vec3 g_lin{0};
   Vec3 g_ang{0};
   Scalar_t C = 0;
+  // —— 每行的罚因子/对偶力（接触行用；其余行留空走 Policy 的全局 k）——
+  // penalty <= 0 是"该行没有自己的罚因子"的哨兵：DistanceConstraint 等非接触行
+  // 一直是 0，gather 时由 Policy 用自己的 k 代替。接触行的 K 恒 ≥ 1（floor）。
+  Scalar_t penalty = 0;
+  Scalar_t lambda  = 0;
+  // Hessian 权重（只影响 H，不影响 RHS 的力）。接触行用它做 block-Jacobi 的
+  // mass-split 修正：per-body 局部系统只看到自己的那一块，对二体约束来说相对
+  // 位移会被走成 2 倍，AVBD 的 λ 反馈会把这个 2 倍放大成 3 倍每迭代（发散）。
+  // 见 AVBDStep 里的 jacobi_hessian_scale()。0 表示"没有修正"。
+  Scalar_t hessian = 0;
+  // primal 力的上下界（接触行用；非接触行保持 ±unclamped）。
+  Scalar_t force_min = -kForceUnclamped;
+  Scalar_t force_max = kForceUnclamped;
 };
 
 // 拓扑签名。version 由**约束列表的拥有者**维护：增删/替换约束时必须自增。

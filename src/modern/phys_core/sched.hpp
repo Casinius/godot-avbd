@@ -25,7 +25,7 @@ struct SolveSchedule {
   // grain_body 必须是 kDefaultGrainBody（16）的倍数，原因见 state.hpp 的伪共享推导：
   // 132 B/body × 16 = 33 条完整 cacheline，chunk 起点正好落在行边界上。
   std::size_t grain_body = kDefaultGrainBody;
-  // 约束项更小（一个 entry 28 B），但逐约束的活也更轻，用 32 让每块有足够工作。
+  // 约束项更小（一个 entry 36 B），但逐约束的活也更轻，用 32 让每块有足够工作。
   std::size_t grain_constraint = 32;
 
   // —— 串行快速路径阈值 ——
@@ -173,6 +173,12 @@ void scatter_typed(const State &s, const std::uint32_t *slots, const void *const
       ent.g_lin = g[k];
       ent.g_ang = ga[k];
       ent.C = Cv;
+      // 非接触行没有自己的罚因子 / 对偶力：0 是"用 Policy 的全局 k、λ=0"的哨兵。
+      ent.penalty = Scalar_t(0);
+      ent.lambda  = Scalar_t(0);
+      ent.hessian = Scalar_t(0);
+      ent.force_min = -kForceUnclamped;
+      ent.force_max = kForceUnclamped;
     }
   }
 }
@@ -238,6 +244,11 @@ void scatter_range(const State &s, std::span<const Ref> refs, ConstraintScratch 
       e.g_lin = g_lin[i];
       e.g_ang = g_ang[i];
       e.C = Cv;
+      e.penalty = Scalar_t(0); // 通用路径：用 Policy 的全局 k、λ = 0
+      e.lambda  = Scalar_t(0);
+      e.hessian = Scalar_t(0);
+      e.force_min = -kForceUnclamped;
+      e.force_max = kForceUnclamped;
     }
   }
 }
@@ -258,6 +269,11 @@ void gather_entries(State &s, Policy &p, const ConstraintScratch &scr, Exec &exe
 
 
 //scatter_typed<ContactConstraint>
+// 接触行的三个特例：
+//   1) C 是**稳定化后**的 C_eff（ContactConstraint::evaluate 已减去 alpha*initial_c）；
+//   2) 每行带自己的罚因子 K 与上一轮夹紧后的力 λ，一起进 entry（gather 直接用）；
+//   3) Hessian 权重按 body 做 block-Jacobi mass-split（见 contact_hessian_scale），
+//      与 AVBDStep::step 的直写路径必须给出同一组数字。
 template <>
 inline void scatter_typed<ContactConstraint>(const State &s, const std::uint32_t *slots,
                                       const void *const *objs, ConstraintScratch &scr,
@@ -273,6 +289,13 @@ inline void scatter_typed<ContactConstraint>(const State &s, const std::uint32_t
       ent.g_lin = g[k];
       ent.g_ang = ga[k];
       ent.C = C;
+      ent.penalty = c.penalty;
+      ent.lambda = c.lambda;
+      ent.force_min = c.force_min;
+      ent.force_max = c.force_max;
+      const std::size_t j = (k == 0) ? 1 : 0;
+      ent.hessian = c.penalty * contact_hessian_scale(s, c.bodies_[k], c.bodies_[j], g[k], ga[k],
+                                                      g[j], ga[j]);
     }
   }
 }
