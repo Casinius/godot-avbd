@@ -1191,6 +1191,71 @@ inline CollisionCheck check_compound_filters() {
   return c;
 }
 
+inline CollisionCheck check_collision_world_pair_filter() {
+  CollisionCheck c{"collision world pair filter gates layer/mask pairs", true, ""};
+
+  // 两个动态盒在几何上重叠；只有过滤规则决定它们是否产生接触。
+  State s;
+  s.resize(2);
+  s.dt = Scalar_t(1) / 60;
+  s.pose.set_position(0, Vec3{0, 0, 0});
+  s.pose.set_position(1, Vec3{0, 0.9f, 0});
+  s.inertial.set_inv_mass(0, 1);
+  s.inertial.set_inv_mass(1, 1);
+  s.inertial.set_local_inv_inertia(0, Mat3(1));
+  s.inertial.set_local_inv_inertia(1, Mat3(1));
+
+  CollisionWorld world;
+  world.resize(2);
+  set_single_shape(world, 0, Shape::box(Vec3{0.5f, 0.5f, 0.5f}));
+  set_single_shape(world, 1, Shape::box(Vec3{0.5f, 0.5f, 0.5f}));
+
+  // 规则表：layer/mask 双向都必须相交。
+  struct LayerMask {
+    std::uint32_t layer[2];
+    std::uint32_t mask[2];
+  } rule{{1, 2}, {1, 1}};
+  const auto filter = [](void *user, std::size_t a, std::size_t b) noexcept {
+    const auto *r = static_cast<const LayerMask *>(user);
+    if (a >= 2 || b >= 2)
+      return true;
+    return (r->layer[a] & r->mask[b]) != 0 && (r->layer[b] & r->mask[a]) != 0;
+  };
+
+  ConstraintList list;
+  std::uint64_t  version = 0;
+
+  // 1) body 1 的 layer=2 与 body 0 的 mask=1 不相交 ⇒ 不产生接触。
+  world.set_pair_filter(filter, &rule);
+  world.sync(s, list, version);
+  if (!world.manifolds().empty()) {
+    c.ok     = false;
+    c.detail = std::format("filtered pair produced {} manifolds", world.manifolds().size());
+    return c;
+  }
+
+  // 2) 放开 body 0 的 mask ⇒ 双向相交，接触出现，版本号必须 bump。
+  rule.mask[0] = 2;
+  world.set_pair_filter(filter, &rule);
+  const std::uint64_t before = version;
+  world.sync(s, list, version);
+  if (world.manifolds().empty() || version <= before) {
+    c.ok     = false;
+    c.detail = std::format("allowed pair manifolds={} version {} -> {}", world.manifolds().size(),
+                           before, version);
+    return c;
+  }
+
+  // 3) 清除过滤器后行为与从未设置过一致（除内建规则外全部允许）。
+  world.set_pair_filter(nullptr);
+  world.sync(s, list, version);
+  if (world.manifolds().empty()) {
+    c.ok     = false;
+    c.detail = "clearing the filter removed contacts";
+  }
+  return c;
+}
+
 inline CollisionCheck check_convex_world_end_to_end() {
   CollisionCheck c{"collision convex world end-to-end", true, ""};
 
@@ -1319,6 +1384,7 @@ inline std::vector<CollisionCheck> run() {
       check_collision_digest_tracks_input(),
       check_compound_proxy_pipeline(),
       check_compound_filters(),
+      check_collision_world_pair_filter(),
   };
 }
 

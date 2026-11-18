@@ -3,15 +3,17 @@
 This tree is a snapshot of `/home/cyan/avbd-mo/src`, imported to replace the legacy
 `src/avbd` solver on the `modernize` branch.
 
-- Source HEAD: `a3d99303ff6996446f71e9533bb799ca80e09aa2` (`manifold`)
-- Source working tree: dirty. The staged collision-layer work was included:
-  `collision_digest.hpp`, `convex_hull.*`, `convex_mesh.*`, `mass_properties.hpp`,
-  `shape_instance.hpp`, `shape_table.hpp`, plus the modified broadphase/narrowphase/
-  manifold/collision_world/shape/main files.
-- Snapshot tree SHA-256: `31a80374eb9afe3cfe3bfafa345b1e02ee9ff90034947141823905f46233590d`
+- Source HEAD: `4450b74` (`manifold`) — "add collision layer: compound shapes, convex
+  meshes, digests, pair filter". The earlier snapshot was taken from `a3d9930` plus its
+  staged collision work; that work is now committed upstream, so this tree corresponds
+  to a clean commit.
+- Snapshot tree SHA-256 (everything under `src/modern` except this file):
+  `99d1ecb823736ee01ebe1722ef9af1c52c8d2b8b0f996276fbfed333ab77f711`
 - Baseline data copied to `src/modern/tests/`:
   `baseline.txt`, `collision_observable.txt` (the solver/collision digests this snapshot
   was verified against).
+- The snapshot builds with `-Wshadow` warnings at `phys_core/state.hpp:518` (an `int r`
+  shadowing a parameter). Left as-is: it is upstream's code and the warning is harmless.
 
 ## Rules
 

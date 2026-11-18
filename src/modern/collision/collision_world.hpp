@@ -16,6 +16,13 @@
 //  【为什么 topology_version 由这里管】
 //     接触约束每帧重建；只有 pair 集合/每 manifold 点数变化才需要重建 scatter 邻接。
 //     签名只包含拓扑（pair + count），不包含深度/位置，因此静息接触不会每帧失效。
+//
+//  【body pair 过滤】
+//     自碰撞与静态-静态是内建规则；引擎侧的 layer/mask/例外表通过 set_pair_filter()
+//     注入。回调是普通函数指针 + 不透明 user 指针：不分配、不做类型擦除、不依赖
+//     全局状态，因此结果仍只由 (body 索引, 过滤规则) 决定。过滤器在 broadphase
+//     pair 转成 body pair 之后、narrowphase 之前咨询；返回 false 的 pair 直接丢弃。
+//     修改过滤器会作废已缓存的 manifold（接触集合变了，warm start 不再有效）。
 // ============================================================================
 
 #include <cstddef>
@@ -34,6 +41,10 @@
 #include "collision/shape_table.hpp"
 
 namespace collision {
+
+// 引擎侧过滤规则：返回 true 表示 body_a 与 body_b 这一对允许产生接触。
+// 参数顺序不保证 a < b；实现方必须对称处理，且只读 (user, a, b)。
+using PairFilter = bool (*)(void *user, std::size_t body_a, std::size_t body_b);
 
 struct CollisionWorldStats {
   std::size_t bodies         = 0;
@@ -110,6 +121,11 @@ public:
   void set_emit_options(ContactEmitOptions opt) noexcept { emit_options_ = opt; }
   [[nodiscard]] const ContactEmitOptions &emit_options() const noexcept { return emit_options_; }
 
+  // 引擎侧 pair 过滤（layer/mask/例外表）。nullptr 表示"除了内建规则外全部允许"。
+  // 会作废 manifold：过滤结果变了，旧接触就不能继续 warm start。
+  void set_pair_filter(PairFilter filter, void *user = nullptr);
+  [[nodiscard]] PairFilter pair_filter() const noexcept { return pair_filter_; }
+
   // 从 State 的当前 pose 重建所有 ShapeView/AABB，跑宽相 + 窄相 + manifold 合并。
   void step(const State &state);
 
@@ -138,6 +154,8 @@ public:
     layout_signature_ = 0;
     last_signature_   = 0;
     ++geometry_epoch_;
+    pair_filter_      = nullptr;
+    pair_filter_user_ = nullptr;
     stats_            = {};
   }
 
@@ -171,6 +189,8 @@ private:
   std::uint64_t          layout_signature_ = 0;
   std::uint64_t          last_signature_   = 0;
   std::uint64_t          geometry_epoch_    = 0;
+  PairFilter             pair_filter_      = nullptr;
+  void                  *pair_filter_user_ = nullptr;
 };
 
 } // namespace collision

@@ -41,6 +41,14 @@ static_assert(NarrowphaseModel<DiscreteNarrowphase>);
 static_assert(ContactSink<ConstraintListSink>);
 } // namespace
 
+void CollisionWorld::set_pair_filter(PairFilter filter, void *user) {
+  // 即使 (filter, user) 与上次相同也作废：user 指向的规则表可能已经变了，而这里
+  // 无从知道。调用方应在规则真正变化时才调用（每帧调用会清掉 warm start）。
+  pair_filter_      = filter;
+  pair_filter_user_ = user;
+  invalidate_contacts();
+}
+
 void CollisionWorld::step(const State &state) {
   if (shapes_.body_count() != state.size())
     resize(state.size());
@@ -97,6 +105,10 @@ void CollisionWorld::step(const State &state) {
     if (body_a == body_b)
       continue;
     if (src.is_static(body_a) && src.is_static(body_b))
+      continue;
+
+    // 引擎侧规则（layer/mask/例外表）。放在内建规则之后：内建规则永远不能被放开。
+    if (pair_filter_ != nullptr && !pair_filter_(pair_filter_user_, body_a, body_b))
       continue;
 
     ContactPatch patch;
