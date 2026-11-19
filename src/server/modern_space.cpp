@@ -112,6 +112,15 @@ bool ModernSpace::pair_filter_cb(void *user, std::size_t a, std::size_t b) {
     return !std::binary_search(eb.begin(), eb.end(), static_cast<std::uint32_t>(a));
 }
 
+bool ModernSpace::body_active_cb(void *user, std::size_t body) {
+    const auto *self = static_cast<const ModernSpace *>(user);
+    // The persistent world body (index == sleeping_.size()) is static and always
+    // "active"; only explicit sleepers are treated as immovable by the CCD pass.
+    if (body >= self->sleeping_.size())
+        return true;
+    return !self->sleeping_[body];
+}
+
 void ModernSpace::apply_mass_properties(std::size_t index, const ModernBodyDesc &desc,
         std::span<const collision::ShapeInstance> shapes) {
     const bool static_body = desc.is_static || !(desc.mass > 0.0);
@@ -220,6 +229,8 @@ void ModernSpace::rebuild(std::vector<ModernBodyDesc> bodies) {
 
     // The filter tables are owned by this object; rebuild() just refreshed them.
     collision_.set_pair_filter(&ModernSpace::pair_filter_cb, this);
+    // CCD must treat explicitly slept bodies as immovable, not as equal-mass movers.
+    collision_.set_body_active_filter(&ModernSpace::body_active_cb, this);
     topology_version_ = 0;
 }
 
@@ -421,6 +432,10 @@ void ModernSpace::set_contact_margin(Scalar_t margin) noexcept {
     collision_.set_emit_options(opt);
 }
 
+void ModernSpace::set_speculative_distance(Scalar_t distance) noexcept {
+    collision_.set_speculative_distance(distance);
+}
+
 void ModernSpace::set_policy_stiffness(Scalar_t k0, Scalar_t beta) noexcept {
     policy_.k0 = k0;
     policy_.k = k0;
@@ -447,6 +462,19 @@ void ModernSpace::step(int iterations, int threads) {
 
     state_.begin_step();
     collision_.sync(state_, constraints_, topology_version_);
+
+    // Continuous-collision fallback, then speculative pre-contact velocity clamp,
+    // then a second CCD pass. The pre-contact clamp can hand a little closing motion
+    // to the body below it (momentum-conserving), so that body must be swept again
+    // against the ground before the position solve. All three are no-ops when
+    // speculative_distance == 0 (the core default), so scenes that do not opt in
+    // keep the exact-overlap-only behaviour bit-for-bit. They alter velocities after
+    // begin_step(), so they also refresh the inertial targets of the bodies they
+    // touch (see CollisionWorld implementations).
+    collision_.clamp_fast_bodies(state_, state_.dt);
+    collision_.apply_speculative_velocity_clamp(state_, state_.dt);
+    collision_.clamp_fast_bodies(state_, state_.dt);
+
     solve<AVBDStep, task::ThreadPoolExecutor, NullPhaseObserver>(
             state_, constraints_, policy_, std::max(iterations, 1), *exec_, schedule_, nullptr,
             topology_version_);

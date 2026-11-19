@@ -171,6 +171,12 @@ public:
     // Resting overlap the normal constraints target (metres). Smaller = less visible
     // penetration at the cost of a stiffer contact solve.
     void set_contact_margin(Scalar_t margin) noexcept;
+    // Contact generation distance (metres). >0 turns on speculative contacts and the
+    // conservative swept-CCD fallback. 0 keeps the core's exact-overlap-only behaviour.
+    void set_speculative_distance(Scalar_t distance) noexcept;
+    [[nodiscard]] Scalar_t speculative_distance() const noexcept {
+        return collision_.speculative_distance();
+    }
     [[nodiscard]] int threads_used() const noexcept;
 
     // --- observations ------------------------------------------------------------
@@ -193,6 +199,7 @@ public:
 
 private:
     static bool pair_filter_cb(void *user, std::size_t body_a, std::size_t body_b);
+    static bool body_active_cb(void *user, std::size_t body);
     void ensure_executor(int threads);
     void apply_mass_properties(std::size_t index, const ModernBodyDesc &desc,
             std::span<const collision::ShapeInstance> shapes);

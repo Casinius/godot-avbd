@@ -1412,6 +1412,14 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         }
 
         ModernSpace &modern = *space.modern;
+        // Contact generation distance from project settings. Only push it when it
+        // changes: set_speculative_distance is cheap, but the value participates in
+        // the collision broadphase/narrowphase options.
+        const Scalar_t want_speculative = static_cast<Scalar_t>(
+                std::max(space.speculative_margin, 0.0));
+        if (modern.speculative_distance() != want_speculative) {
+            modern.set_speculative_distance(want_speculative);
+        }
         for (int tick = 0; tick < tickCount; ++tick) {
             const Scalar_t tickDt = static_cast<Scalar_t>(dt);
 

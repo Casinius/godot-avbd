@@ -65,12 +65,30 @@ struct ContactPatch {
 std::size_t collide_shapes(const ShapeView &a, const ShapeView &b, std::span<ContactPoint> out,
                            BasisFrame &basis);
 
+// 带预接触距离的版本：先跑与上面逐位相同的 exact 检测；只有 exact 返回 0 时，
+// 才为间隙 <= speculative_distance 的分离形状对生成 depth<0 的接触点。
+// speculative_distance <= 0 时与上面的重载完全相同。
+std::size_t collide_shapes(const ShapeView &a, const ShapeView &b, std::span<ContactPoint> out,
+                           BasisFrame &basis, Scalar_t speculative_distance);
+
+// 保守平移 TOI：a/b 用当前位姿，relative_motion 是 (v_a - v_b)*dt。只沿相对
+// 平移扫掠（**忽略旋转**），用形状的分离轴/最近点求一个不晚于真实接触的时间
+// 下界 t∈(0,1]。返回 false 表示本步不会闭合到接触。
+// 由于使用"任一正间隙轴必须先闭合"这一必要条件，t 可能早于真实 TOI；这正适合
+// 做 CCD 兜底：宁可稍微提前减速，也不允许穿过去。
+bool sweep_shapes_toi(const ShapeView &a, const ShapeView &b, Vec3 relative_motion,
+                      Scalar_t &t);
+
 // NarrowphaseModel 的具体实现：把自由函数包成一个可替换的策略对象。
 // 以后加 CCD / GPU narrowphase 时，换这个对象即可，CollisionWorld 的流程不变。
 struct DiscreteNarrowphase {
   std::size_t collide(const ShapeView &a, const ShapeView &b, std::span<ContactPoint> out,
                       BasisFrame &basis) const {
     return collide_shapes(a, b, out, basis);
+  }
+  std::size_t collide(const ShapeView &a, const ShapeView &b, std::span<ContactPoint> out,
+                      BasisFrame &basis, Scalar_t speculative_distance) const {
+    return collide_shapes(a, b, out, basis, speculative_distance);
   }
 };
 

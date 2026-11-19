@@ -32,8 +32,13 @@
 namespace collision {
 
 struct ContactEmitOptions {
+  // 静息接触允许的重叠量（法线 target = -margin）。与生成距离无关。
   Scalar_t margin     = Scalar_t(0.005);
   Scalar_t compliance = Scalar_t(0);
+  // 预接触生成距离（米）。>0 时宽相把 AABB 外扩这么多，窄相为间隙不超过它的
+  // 形状对生成 depth<0 的 speculative 接触点。默认 0：核心的钉死基线/摘要
+  // 逐位不变，只有引擎显式打开时才产生新行为。
+  Scalar_t speculative_distance = Scalar_t(0);
 };
 
 // 删除所有 ContactConstraint，保留 DistanceConstraint 等用户约束。
@@ -61,6 +66,13 @@ inline std::size_t emit_contact_constraints(std::span<const Manifold> manifolds,
     const Manifold &m = manifolds[mi];
     for (std::size_t ci = 0; ci < m.count; ++ci) {
       const ManifoldContact &mc = m.contacts[ci];
+      // speculative 接触（depth<0，几何上还隔着间隙）不发射求解行。
+      // 理由：法线行的 primal RHS 是 K*C+λ，C = gap+margin > 0 且 λ=0 时
+      // K*C 是吸引力；只靠 dual 的 F_n≤0 夹紧来不及，因为 primal 已经先动了。
+      // 预接触只负责在 solve 之前做速度夹紧；真正的支撑等形状重叠后由普通
+      // 接触行（depth≥0）建立。这样也与"不得加能量"硬约束一致。
+      if (mc.depth < Scalar_t(0))
+        continue;
       // μ == 0 时没有切向约束：不要发射两条永远不该有 λ 的切线。
       const int rows = m.friction > Scalar_t(0) ? 3 : 1;
       // primal 的力界（lagged 锥）：法线 F ≤ 0；切向 |F| ≤ μ|λ_n|（用发射时的 λ_n）。

@@ -13,6 +13,10 @@ constexpr Scalar_t kSatAxisEpsilon    = Scalar_t(1e-6);
 constexpr Scalar_t kPlaneEpsilon      = Scalar_t(1e-5);
 constexpr Scalar_t kContactMergeDist2 = Scalar_t(1e-6);
 constexpr int      kMaxPolyVerts      = 16;
+// 预接触必须严格记录一个正间隙：depth = -gap < 0 是"这是 speculative 点"的
+// 唯一标记。gap == 0（正好接触）交给 exact 路径；否则 -0.0 不是负数，
+// 会被当成普通接触发射出去，而 C = margin > 0 会产生吸引。
+constexpr Scalar_t kSpecGapEpsilon = Scalar_t(1e-6);
 
 [[nodiscard]] inline int clip_polygon_against_plane(const Vec3 *in, int in_count, Vec3 plane_normal,
                                                     Scalar_t plane_offset, Vec3 *out) noexcept {
@@ -72,6 +76,34 @@ inline bool add_contact(const ShapeView &a, const ShapeView &b, std::span<Contac
   return true;
 }
 
+// speculative 版本：接触点表示的是**间隙**而不是穿透，depth 记成 -gap（负值）。
+// 合并规则与 add_contact 相同，保证同一 manifold 内的点序仍然只由几何决定。
+inline bool add_contact_gap(const ShapeView &a, const ShapeView &b, std::span<ContactPoint> out,
+                            std::size_t &count, Vec3 *midpoints, Vec3 xA, Vec3 xB,
+                            std::uint64_t feature_key, Scalar_t gap) noexcept {
+  if (!(gap > Scalar_t(0)))
+    return false;
+  const Vec3 mid = (xA + xB) * Scalar_t(0.5);
+  for (std::size_t i = 0; i < count; ++i) {
+    const Vec3 d = mid - midpoints[i];
+    if (glm::dot(d, d) < kContactMergeDist2)
+      return false;
+  }
+  if (count >= out.size() || count >= kMaxContactsPerManifold)
+    return false;
+
+  ContactPoint &c = out[count];
+  c.feature_key   = feature_key;
+  c.rA            = a.world_to_body_local(xA);
+  c.rB            = b.world_to_body_local(xB);
+  c.xA            = xA;
+  c.xB            = xB;
+  c.depth         = -gap; // gap > 0 ⇒ 严格负值
+  midpoints[count] = mid;
+  ++count;
+  return true;
+}
+
 inline void closest_points_on_segments(Vec3 p0, Vec3 p1, Vec3 q0, Vec3 q1, Vec3 &c0,
                                        Vec3 &c1) noexcept {
   const Vec3     d1 = p1 - p0;
@@ -125,6 +157,32 @@ std::size_t collide_sphere_sphere(const ShapeView &a, const ShapeView &b,
   std::array<Vec3, kMaxContactsPerManifold> midpoints{};
   add_contact(a, b, out, count, midpoints.data(), a.center + normal_ab * a.radius,
               b.center - normal_ab * b.radius, 1u, basis.normal);
+  return count;
+}
+
+// 间隙 ≤ max_gap 的球/球预接触。法线/见证点约定与重叠路径完全一致；
+// 只有 depth 变成负的 gap。exact 路径已经返回 0 才会走到这里，所以 gap > 0。
+std::size_t collide_sphere_sphere_speculative(const ShapeView &a, const ShapeView &b,
+                                              std::span<ContactPoint> out, BasisFrame &basis,
+                                              Scalar_t max_gap) noexcept {
+  const Vec3     d   = b.center - a.center;
+  const Scalar_t d2  = glm::dot(d, d);
+  const Scalar_t sum = a.radius + b.radius;
+  const Scalar_t reach = sum + max_gap;
+  if (d2 >= reach * reach)
+    return 0;
+  const Scalar_t dist = std::sqrt(d2);
+  if (!(dist > kSatAxisEpsilon) || !(dist >= sum))
+    return 0;
+  const Vec3 normal_ab = d / dist;
+  const Scalar_t gap   = dist - sum;
+  if (!(gap > kSpecGapEpsilon) || gap > max_gap)
+    return 0;
+  basis = make_basis(-normal_ab);
+  std::size_t                               count = 0;
+  std::array<Vec3, kMaxContactsPerManifold> midpoints{};
+  add_contact_gap(a, b, out, count, midpoints.data(), a.center + normal_ab * a.radius,
+                  b.center - normal_ab * b.radius, 1u, gap);
   return count;
 }
 
@@ -560,6 +618,121 @@ struct PolytopeSat {
   return true;
 }
 
+// ============================================================================
+//  speculative SAT：允许轴上有正间隙，取"最小正间隙"的分离轴
+// ----------------------------------------------------------------------------
+//  与 sat_polytope 的区别只有两点：
+//    1) 分离轴不再直接拒绝，而是记录 gap = min_b - max_a > 0 的最小者；
+//    2) 任一轴 gap > max_gap 立即拒绝（投影间隙是真实距离的下界）。
+//  面轴的朝向规则与 sat_polytope::test_face 完全一致：A 只测朝向 B 的面，
+//  B 只测朝向 A 的面，normal_ab 统一指 A->B。这样生成器可以复用同一套
+//  reference/incident face 约定，不会把"远面"当成参考面。
+// ============================================================================
+struct PolytopeGapSat {
+  bool             found   = false;
+  PolytopeAxisKind kind    = PolytopeAxisKind::FaceA;
+  std::uint32_t    face_a  = 0;
+  std::uint32_t    face_b  = 0;
+  std::uint32_t    edge_a  = 0;
+  std::uint32_t    edge_b  = 0;
+  Vec3             edge_dir_a{1, 0, 0};
+  Vec3             edge_dir_b{1, 0, 0};
+  Vec3             normal_ab{0, 1, 0};
+  Scalar_t         gap = std::numeric_limits<Scalar_t>::infinity();
+};
+
+[[nodiscard]] bool sat_polytope_speculative(const PolytopeView &a, const PolytopeView &b,
+                                            Scalar_t max_gap, PolytopeGapSat &result) noexcept {
+  const Vec3 delta = b.center() - a.center();
+
+  auto test_face = [&](bool is_a, std::uint32_t f) -> bool {
+    const Vec3 n = is_a ? a.face_normal(f) : b.face_normal(f);
+    if (is_a) {
+      if (glm::dot(delta, n) < -kPolytopeEpsilon)
+        return true; // B 在 A 的这个面的背面：不是朝向 B 的参考面
+    } else {
+      if (glm::dot(-delta, n) < -kPolytopeEpsilon)
+        return true; // A 在 B 的这个面的背面
+    }
+    const Vec3 axis = is_a ? n : -n; // A -> B
+    Scalar_t   min_a, max_a, min_b, max_b;
+    polytope_interval(a, axis, min_a, max_a);
+    polytope_interval(b, axis, min_b, max_b);
+    const Scalar_t gap = min_b - max_a;
+    if (gap > max_gap)
+      return false; // 真实距离 ≥ 该投影间隙
+    if (gap > Scalar_t(0) && (!result.found || gap < result.gap)) {
+      result          = PolytopeGapSat{};
+      result.kind     = is_a ? PolytopeAxisKind::FaceA : PolytopeAxisKind::FaceB;
+      result.face_a   = is_a ? f : 0;
+      result.face_b   = is_a ? 0 : f;
+      result.normal_ab = axis;
+      result.gap      = gap;
+      result.found    = true;
+    }
+    return true;
+  };
+
+  for (std::uint32_t f = 0; f < a.face_count(); ++f)
+    if (!test_face(true, f))
+      return false;
+  for (std::uint32_t f = 0; f < b.face_count(); ++f)
+    if (!test_face(false, f))
+      return false;
+
+  auto collect_dirs = [](const PolytopeView &p, Vec3 *dirs, std::uint32_t &count) {
+    count = 0;
+    for (std::uint32_t e = 0; e < p.edge_count() && count < kMaxSatEdgeDirs; ++e) {
+      const Vec3 d   = p.edge_dir(e);
+      bool       dup = false;
+      for (std::uint32_t i = 0; i < count; ++i) {
+        if (std::abs(glm::dot(dirs[i], d)) > Scalar_t(1) - Scalar_t(1e-5)) {
+          dup = true;
+          break;
+        }
+      }
+      if (!dup)
+        dirs[count++] = d;
+    }
+  };
+
+  std::array<Vec3, kMaxSatEdgeDirs> da{}, db{};
+  std::uint32_t                     na = 0, nb = 0;
+  collect_dirs(a, da.data(), na);
+  collect_dirs(b, db.data(), nb);
+
+  for (std::uint32_t i = 0; i < na; ++i) {
+    for (std::uint32_t j = 0; j < nb; ++j) {
+      Vec3           axis = glm::cross(da[i], db[j]);
+      const Scalar_t len  = glm::length(axis);
+      if (!(len > kSatAxisEpsilon))
+        continue;
+      axis /= len;
+      if (glm::dot(delta, axis) < 0)
+        axis = -axis;
+
+      Scalar_t min_a, max_a, min_b, max_b;
+      polytope_interval(a, axis, min_a, max_a);
+      polytope_interval(b, axis, min_b, max_b);
+      const Scalar_t gap = min_b - max_a;
+      if (gap > max_gap)
+        return false;
+      if (gap > Scalar_t(0) && (!result.found || gap < result.gap)) {
+        result           = PolytopeGapSat{};
+        result.kind      = PolytopeAxisKind::Edge;
+        result.edge_a    = i;
+        result.edge_b    = j;
+        result.edge_dir_a = da[i];
+        result.edge_dir_b = db[j];
+        result.normal_ab  = axis;
+        result.gap        = gap;
+        result.found      = true;
+      }
+    }
+  }
+  return result.found;
+}
+
 [[nodiscard]] inline bool point_in_face(const PolytopeView &p, std::uint32_t f, Vec3 q,
                                         Scalar_t eps) noexcept {
   const Vec3          n     = p.face_normal(f);
@@ -759,6 +932,131 @@ build_polytope_edge_manifold(const ShapeView &sa, const ShapeView &sb, const Pol
                                       sat.normal_ab, out, basis);
 }
 
+// speculative 面 manifold：与 build_polytope_face_manifold 的裁剪/投影过程逐行
+// 相同，区别只有：入射点允许落在参考面外侧最多 max_gap 处，depth 记 -距离。
+[[nodiscard]] std::size_t build_polytope_face_manifold_gap(
+        const ShapeView &sa, const ShapeView &sb, const PolytopeView &pa,
+        const PolytopeView &pb, bool reference_is_a, std::uint32_t reference_face,
+        Vec3 normal_ab, Scalar_t max_gap, std::span<ContactPoint> out,
+        const BasisFrame &basis) noexcept {
+  const PolytopeView &reference        = reference_is_a ? pa : pb;
+  const PolytopeView &incident         = reference_is_a ? pb : pa;
+  const Vec3          reference_normal = reference_is_a ? normal_ab : -normal_ab;
+
+  if (glm::dot(reference.face_normal(reference_face), reference_normal) < 0)
+    return 0;
+
+  std::uint32_t incident_face = kInvalidConvexMesh;
+  Scalar_t      best_dot      = std::numeric_limits<Scalar_t>::infinity();
+  for (std::uint32_t f = 0; f < incident.face_count(); ++f) {
+    const Scalar_t d = glm::dot(incident.face_normal(f), reference_normal);
+    if (d < best_dot) {
+      best_dot      = d;
+      incident_face = f;
+    }
+  }
+  if (incident_face == kInvalidConvexMesh || best_dot > kPolytopeEpsilon)
+    return 0;
+
+  const std::uint32_t inc_count = incident.face_vertex_count(incident_face);
+  if (inc_count < 3 || inc_count > kMaxPolyVerts)
+    return 0;
+
+  std::array<Vec3, kMaxPolyVerts> poly_a{}, poly_b{};
+  for (std::uint32_t i = 0; i < inc_count; ++i)
+    poly_a[i] = incident.face_vertex(incident_face, i);
+
+  Vec3 *in      = poly_a.data();
+  Vec3 *out_buf = poly_b.data();
+  int   count   = static_cast<int>(inc_count);
+
+  const std::uint32_t ref_count = reference.face_vertex_count(reference_face);
+  for (std::uint32_t i = 0; i < ref_count && count > 0; ++i) {
+    const Vec3 a = reference.face_vertex(reference_face, i);
+    const Vec3 b = reference.face_vertex(reference_face, (i + 1) % ref_count);
+    Vec3       outward = glm::cross(b - a, reference_normal);
+    const Scalar_t len = glm::length(outward);
+    if (!(len > kPolytopeEpsilon))
+      continue;
+    outward /= len;
+    const Scalar_t offset = glm::dot(outward, a);
+    count = clip_polygon_against_plane(in, count, outward, offset, out_buf);
+    std::swap(in, out_buf);
+  }
+
+  std::size_t                               contact_count = 0;
+  std::array<Vec3, kMaxContactsPerManifold> midpoints{};
+  const Vec3                                ref_point = reference.face_vertex(reference_face, 0);
+  for (int i = 0; i < count && contact_count < kMaxContactsPerManifold; ++i) {
+    const Vec3     p_incident = in[i];
+    const Scalar_t distance   = glm::dot(p_incident - ref_point, reference_normal);
+    if (distance > max_gap)
+      continue;
+    if (!(distance > kSpecGapEpsilon))
+      continue; // exact 路径已返回 0：这里只生成严格正的间隙
+    const Vec3          p_reference = p_incident - reference_normal * distance;
+    const Vec3          xA          = reference_is_a ? p_reference : p_incident;
+    const Vec3          xB          = reference_is_a ? p_incident : p_reference;
+    const std::uint64_t key         = make_feature_key(1, reference_is_a ? 0 : 1, reference_face,
+                                                       incident_face, static_cast<std::uint64_t>(i));
+    add_contact_gap(sa, sb, out, contact_count, midpoints.data(), xA, xB, key, distance);
+  }
+  return contact_count;
+}
+
+[[nodiscard]] std::size_t collide_polytope_polytope_speculative(const ShapeView &a,
+                                                                const ShapeView &b,
+                                                                std::span<ContactPoint> out,
+                                                                BasisFrame &basis,
+                                                                Scalar_t max_gap) noexcept {
+  const PolytopeView pa(a);
+  const PolytopeView pb(b);
+  if (pa.vertex_count() == 0 || pb.vertex_count() == 0)
+    return 0;
+
+  PolytopeGapSat sat;
+  if (!sat_polytope_speculative(pa, pb, max_gap, sat))
+    return 0;
+
+  basis = make_basis(-sat.normal_ab);
+  if (sat.kind == PolytopeAxisKind::Edge) {
+    Vec3 a0, a1, b0, b1;
+    pa.support_edge(sat.edge_dir_a, sat.normal_ab, a0, a1);
+    pb.support_edge(sat.edge_dir_b, -sat.normal_ab, b0, b1);
+    Vec3 xA, xB;
+    closest_points_on_segments(a0, a1, b0, b1, xA, xB);
+    const Scalar_t gap = glm::dot(basis.normal, xA - xB);
+    if (!(gap > kSpecGapEpsilon) || gap > max_gap)
+      return 0;
+    std::size_t                               contact_count = 0;
+    std::array<Vec3, kMaxContactsPerManifold> midpoints{};
+    add_contact_gap(a, b, out, contact_count, midpoints.data(), xA, xB,
+                    make_feature_key(3, sat.edge_a, sat.edge_b, 0), gap);
+    return contact_count;
+  }
+
+  const bool          reference_is_a = sat.kind == PolytopeAxisKind::FaceA;
+  const std::uint32_t reference_face = reference_is_a ? sat.face_a : sat.face_b;
+  const std::size_t   n =
+          build_polytope_face_manifold_gap(a, b, pa, pb, reference_is_a, reference_face,
+                                           sat.normal_ab, max_gap, out, basis);
+  if (n > 0)
+    return n;
+
+  // 裁剪退化（例如旋转后投影几乎平行）：退回沿分离轴的支撑点。
+  // 支撑点在轴向上的距离正好是 sat.gap，仍是合法的最接近特征。
+  const Vec3 xA = pa.support(sat.normal_ab);
+  const Vec3 xB = pb.support(-sat.normal_ab);
+  const Scalar_t gap = glm::dot(basis.normal, xA - xB);
+  if (!(gap > kSpecGapEpsilon) || gap > max_gap)
+    return 0;
+  std::size_t                               contact_count = 0;
+  std::array<Vec3, kMaxContactsPerManifold> midpoints{};
+  add_contact_gap(a, b, out, contact_count, midpoints.data(), xA, xB,
+                  make_feature_key(2, reference_is_a ? 0 : 1, reference_face, 0), gap);
+  return contact_count;
+}
+
 [[nodiscard]] std::size_t collide_sphere_polytope(const ShapeView &a, const ShapeView &b,
                                                   bool sphere_is_a, std::span<ContactPoint> out,
                                                   BasisFrame &basis) noexcept {
@@ -802,6 +1100,45 @@ build_polytope_edge_manifold(const ShapeView &sa, const ShapeView &sb, const Pol
   return contact_count;
 }
 
+[[nodiscard]] std::size_t collide_sphere_polytope_speculative(const ShapeView &a,
+                                                              const ShapeView &b,
+                                                              bool sphere_is_a,
+                                                              std::span<ContactPoint> out,
+                                                              BasisFrame &basis,
+                                                              Scalar_t max_gap) noexcept {
+  const ShapeView   &sphere = sphere_is_a ? a : b;
+  const ShapeView   &other  = sphere_is_a ? b : a;
+  const PolytopeView poly(other);
+  if (poly.vertex_count() == 0)
+    return 0;
+
+  Vec3     push;
+  Scalar_t face_depth = 0;
+  if (point_in_polytope(poly, sphere.center, push, face_depth))
+    return 0; // 球心在内：exact 路径已经处理
+
+  const PolytopeClosest c    = closest_point_on_polytope(poly, sphere.center);
+  const Scalar_t        dist = std::sqrt(std::max(c.dist2, Scalar_t(0)));
+  if (!(dist > kPolytopeEpsilon))
+    return 0;
+  const Scalar_t gap = dist - sphere.radius;
+  if (!(gap > kSpecGapEpsilon) || gap > max_gap)
+    return 0;
+
+  const Vec3 normal_other_to_sphere = (sphere.center - c.point) / dist;
+  const Vec3 normal_ab = sphere_is_a ? -normal_other_to_sphere : normal_other_to_sphere;
+  basis                = make_basis(-normal_ab);
+
+  const Vec3  on_sphere     = sphere.center - normal_other_to_sphere * sphere.radius;
+  const Vec3  xA            = sphere_is_a ? on_sphere : c.point;
+  const Vec3  xB            = sphere_is_a ? c.point : on_sphere;
+  std::size_t contact_count = 0;
+  std::array<Vec3, kMaxContactsPerManifold> midpoints{};
+  add_contact_gap(a, b, out, contact_count, midpoints.data(), xA, xB,
+                  make_feature_key(4, sphere_is_a ? 0 : 1, 0, 0), gap);
+  return contact_count;
+}
+
 } // namespace
 
 BasisFrame make_basis(Vec3 normal_b_to_a) noexcept {
@@ -817,13 +1154,106 @@ BasisFrame make_basis(Vec3 normal_b_to_a) noexcept {
   return f;
 }
 
-std::size_t collide_shapes(const ShapeView &a, const ShapeView &b, std::span<ContactPoint> out,
-                           BasisFrame &basis) {
+namespace {
+std::size_t collide_shapes_exact(const ShapeView &a, const ShapeView &b,
+                                 std::span<ContactPoint> out, BasisFrame &basis) {
   if (a.type == ShapeType::Sphere && b.type == ShapeType::Sphere)
     return collide_sphere_sphere(a, b, out, basis);
   if (a.type == ShapeType::Sphere || b.type == ShapeType::Sphere)
     return collide_sphere_polytope(a, b, a.type == ShapeType::Sphere, out, basis);
   return collide_polytope_polytope(a, b, out, basis);
+}
+
+std::size_t collide_shapes_speculative(const ShapeView &a, const ShapeView &b,
+                                       std::span<ContactPoint> out, BasisFrame &basis,
+                                       Scalar_t speculative_distance) {
+  if (a.type == ShapeType::Sphere && b.type == ShapeType::Sphere)
+    return collide_sphere_sphere_speculative(a, b, out, basis, speculative_distance);
+  if (a.type == ShapeType::Sphere || b.type == ShapeType::Sphere)
+    return collide_sphere_polytope_speculative(a, b, a.type == ShapeType::Sphere, out, basis,
+                                               speculative_distance);
+  return collide_polytope_polytope_speculative(a, b, out, basis, speculative_distance);
+}
+} // namespace
+
+bool sweep_shapes_toi(const ShapeView &a, const ShapeView &b, Vec3 relative_motion,
+                      Scalar_t &t) {
+  const Scalar_t motion_len = glm::length(relative_motion);
+  if (!(motion_len > kSatAxisEpsilon))
+    return false;
+  const Scalar_t max_gap = motion_len + Scalar_t(1e-6);
+
+  if (a.type == ShapeType::Sphere && b.type == ShapeType::Sphere) {
+    const Vec3     d   = b.center - a.center;
+    const Scalar_t d2  = glm::dot(d, d);
+    const Scalar_t sum = a.radius + b.radius;
+    const Scalar_t dist = std::sqrt(d2);
+    if (!(dist > kSatAxisEpsilon))
+      return false;
+    const Scalar_t gap = dist - sum;
+    if (!(gap > kSpecGapEpsilon) || gap > max_gap)
+      return false;
+    const Vec3     normal_ab = d / dist;
+    const Scalar_t closing   = glm::dot(relative_motion, normal_ab);
+    if (!(closing > Scalar_t(0)))
+      return false;
+    t = gap / closing;
+    return t > Scalar_t(0) && t <= Scalar_t(1);
+  }
+
+  if (a.type == ShapeType::Sphere || b.type == ShapeType::Sphere) {
+    const bool        sphere_is_a = a.type == ShapeType::Sphere;
+    const ShapeView  &sphere      = sphere_is_a ? a : b;
+    const ShapeView  &other       = sphere_is_a ? b : a;
+    const PolytopeView poly(other);
+    if (poly.vertex_count() == 0)
+      return false;
+    Vec3     push;
+    Scalar_t face_depth = 0;
+    if (point_in_polytope(poly, sphere.center, push, face_depth))
+      return false;
+    const PolytopeClosest c    = closest_point_on_polytope(poly, sphere.center);
+    const Scalar_t        dist = std::sqrt(std::max(c.dist2, Scalar_t(0)));
+    if (!(dist > kPolytopeEpsilon))
+      return false;
+    const Scalar_t gap = dist - sphere.radius;
+    if (!(gap > kSpecGapEpsilon) || gap > max_gap)
+      return false;
+    const Vec3 normal_other_to_sphere = (sphere.center - c.point) / dist;
+    const Vec3 normal_ab = sphere_is_a ? -normal_other_to_sphere : normal_other_to_sphere;
+    const Scalar_t closing = glm::dot(relative_motion, normal_ab);
+    if (!(closing > Scalar_t(0)))
+      return false;
+    t = gap / closing;
+    return t > Scalar_t(0) && t <= Scalar_t(1);
+  }
+
+  const PolytopeView pa(a);
+  const PolytopeView pb(b);
+  if (pa.vertex_count() == 0 || pb.vertex_count() == 0)
+    return false;
+  PolytopeGapSat sat;
+  if (!sat_polytope_speculative(pa, pb, max_gap, sat))
+    return false;
+  const Scalar_t closing = glm::dot(relative_motion, sat.normal_ab);
+  if (!(closing > Scalar_t(0)))
+    return false;
+  t = sat.gap / closing;
+  return t > Scalar_t(0) && t <= Scalar_t(1);
+}
+
+std::size_t collide_shapes(const ShapeView &a, const ShapeView &b, std::span<ContactPoint> out,
+                           BasisFrame &basis) {
+  return collide_shapes_exact(a, b, out, basis);
+}
+
+std::size_t collide_shapes(const ShapeView &a, const ShapeView &b, std::span<ContactPoint> out,
+                           BasisFrame &basis, Scalar_t speculative_distance) {
+  // 重叠路径逐位不变：只有 exact 明确返回 0、且允许预接触时，才走 speculative。
+  const std::size_t n = collide_shapes_exact(a, b, out, basis);
+  if (n > 0 || !(speculative_distance > Scalar_t(0)))
+    return n;
+  return collide_shapes_speculative(a, b, out, basis, speculative_distance);
 }
 
 } // namespace collision

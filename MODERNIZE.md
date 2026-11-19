@@ -29,6 +29,14 @@ This file is the honest state of the migration, not a wish list.
   `ContactConstraint::gradient_angular` (B-side torque was inverted). Without
   friction it showed up as slow wrong rolling; with a real dual it pumped
   energy every frame.
+- **Speculative contacts + CCD** (`8b9fa9a`): narrowphase generates true-gap
+  contacts within `speculative_distance` and a pre-solve pass clamps closing
+  speed to `(gap+margin)/dt`; fast bodies additionally get a translation-only
+  swept TOI with momentum shared by inverse mass. The core default is 0, so
+  pinned digests stay bit-identical; the server maps
+  `physics/avbd/speculative_margin` (0.02 in the demo). Documented limits: the
+  speculative pre-pass applies a central impulse (no torque), and CCD ignores
+  rotation.
 - **Contact stability** (`0c73d9a`): impact penetration is capped at 2 cm for
   the normal stabilization offset (the live bracket stays unclamped so deep
   overlaps keep their restoring gradient), contacts release their warm-started
@@ -49,8 +57,8 @@ This file is the honest state of the migration, not a wish list.
 - **Cone-twist joint**: records and getters work, but no constraint is emitted
   (see above).
 - **Automatic sleep**: only explicit `BODY_STATE_SLEEPING` freezes a body.
-- **Speculative contacts / CCD / position projection**: not ported. A fast
-  body can still tunnel a thin slab; the contact solve only sees overlap.
+- **Position projection**: not ported. AVBD's position solve covers most of it;
+  the remaining fidelity gap is the 40 s deep pile (below).
 - **Deep-pile long run**: `test_pyramid` passes its 10 s gate (9/9), but a 40 s
   run still develops a late runaway. Deep-pile penetration in the 20–30 s
   window is ~14 cm, above the legacy-quality target.
@@ -69,5 +77,5 @@ has no axis permutation. The soft-body nodes keep their own Z-up conversion.
 
 1. Cone-twist joint (or a real cone constraint primitive).
 2. Island-based sleep in the frame/world layer.
-3. Speculative contacts / CCD, then revisit the 40 s deep-pile run.
+3. Revisit the 40 s deep-pile run with the new CCD path.
 4. Then remove `src/avbd` and the soft-body dependence on it.

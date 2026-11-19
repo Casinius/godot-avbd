@@ -61,4 +61,50 @@ struct Aabb {
            a.lo.y > b.hi.y || a.lo.z > b.hi.z);
 }
 
+// ============================================================================
+//  swept_aabb_fraction —— 平移扫掠 AABB 的保守 TOI（连续碰撞兜底用）
+// ----------------------------------------------------------------------------
+//  把 moving 沿 motion（= v*dt，世界单位）平移，求它第一次与 target 相交的
+//  参数 t ∈ (0,1]。语义与 _body_test_motion 的 Minkowski 扫掠完全一致：
+//    * 起始就相交（t=0 / 已接触）返回 false —— 那是窄相接触，不是 CCD 的事；
+//    * 三个轴各给一个进入/离开区间，t_enter = max(进入)，t_exit = min(离开)；
+//    * t_enter > t_exit、或 t_enter 不在 (0,1] 内 ⇒ 不相交。
+//  **忽略旋转**：这是一个保守的平移兜底，不是精确旋转扫掠；调用方不得把它
+//  当成精确 TOI。用 AABB 只会高估形状，因此结果是保守的（提前停下）。
+// ============================================================================
+inline constexpr Scalar_t kAabbSweepEpsilon = Scalar_t(1e-9);
+
+[[nodiscard]] inline bool swept_aabb_fraction(const Aabb &moving, Vec3 motion, const Aabb &target,
+                                              Scalar_t &t_enter) noexcept {
+  t_enter                = Scalar_t(0);
+  Scalar_t       t_exit  = Scalar_t(1);
+  bool           entered = false;
+  for (int axis = 0; axis < 3; ++axis) {
+    const Scalar_t m = motion[axis];
+    if (std::abs(m) < kAabbSweepEpsilon) {
+      if (moving.hi[axis] < target.lo[axis] || moving.lo[axis] > target.hi[axis])
+        return false;
+      continue;
+    }
+    Scalar_t t1, t2;
+    if (m > Scalar_t(0)) {
+      t1 = (target.lo[axis] - moving.hi[axis]) / m;
+      t2 = (target.hi[axis] - moving.lo[axis]) / m;
+    } else {
+      t1 = (target.hi[axis] - moving.lo[axis]) / m;
+      t2 = (target.lo[axis] - moving.hi[axis]) / m;
+    }
+    if (t1 > t_enter) {
+      t_enter = t1;
+      entered = true;
+    }
+    t_exit = std::min(t_exit, t2);
+    if (t_enter > t_exit)
+      return false;
+  }
+  if (!entered || !(t_enter > Scalar_t(0)) || t_enter > Scalar_t(1))
+    return false;
+  return true;
+}
+
 } // namespace collision

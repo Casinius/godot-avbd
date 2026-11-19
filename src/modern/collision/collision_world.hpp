@@ -25,6 +25,7 @@
 //     修改过滤器会作废已缓存的 manifold（接触集合变了，warm start 不再有效）。
 // ============================================================================
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -45,6 +46,11 @@ namespace collision {
 // 引擎侧过滤规则：返回 true 表示 body_a 与 body_b 这一对允许产生接触。
 // 参数顺序不保证 a < b；实现方必须对称处理，且只读 (user, a, b)。
 using PairFilter = bool (*)(void *user, std::size_t body_a, std::size_t body_b);
+
+// CCD 的"醒着"查询。核心没有 sleep 概念；引擎通过它告诉 CCD 哪些 body 在
+// 本步参与运动/受力。返回 false 的 body 在 CCD 里按静态处理（不会被推走），
+// 这样显式 sleep 的 body 不会被穿过去。nullptr = 全部醒着。
+using BodyActiveFilter = bool (*)(void *user, std::size_t body);
 
 struct CollisionWorldStats {
   std::size_t bodies         = 0;
@@ -121,6 +127,18 @@ public:
 
   void set_emit_options(ContactEmitOptions opt) noexcept { emit_options_ = opt; }
   [[nodiscard]] const ContactEmitOptions &emit_options() const noexcept { return emit_options_; }
+  // 预接触生成距离的便捷入口（等价于改 emit_options().speculative_distance）。
+  void set_speculative_distance(Scalar_t distance) noexcept {
+    emit_options_.speculative_distance = std::max(Scalar_t(0), distance);
+  }
+  [[nodiscard]] Scalar_t speculative_distance() const noexcept {
+    return emit_options_.speculative_distance;
+  }
+
+  void set_body_active_filter(BodyActiveFilter filter, void *user = nullptr) noexcept {
+    body_active_      = filter;
+    body_active_user_ = user;
+  }
 
   // 引擎侧 pair 过滤（layer/mask/例外表）。nullptr 表示"除了内建规则外全部允许"。
   // 会作废 manifold：过滤结果变了，旧接触就不能继续 warm start。
@@ -141,6 +159,21 @@ public:
   // absorb_warm_start + step + emit，并只在拓扑签名变化时 bump version。返回是否 bump。
   bool sync(const State &state, ConstraintList &list, std::uint64_t &topology_version);
 
+  // —— Layer 2：保守扫掠 CCD 兜底 ——
+  // 在 sync() 之后、求解之前调用。只处理"本步线位移超过
+  // max(2*speculative_distance, 0.5*min_half_extent)"且醒着的动态 body；
+  // 用平移 AABB 扫掠求最早 t∈(0,1]，把相对速度缩到 t（动量按逆质量分配）。
+  // 不改 pose；下一步的接触求解负责剩余部分。**忽略旋转**（保守兜底，不是精确 TOI）。
+  // speculative_distance <= 0 时是空操作。
+  void clamp_fast_bodies(State &state, Scalar_t dt);
+
+  // —— Layer 1：speculative 接触的速度夹紧 ——
+  // 对 manifold 里 depth<0（几何间隙 gap>0）的接触点，如果本步闭合位移
+  // -v_n*dt 超过 gap+margin，就沿法线施加冲量把闭合速度降到 (gap+margin)/dt。
+  // 只用与接触行相同的逆质量/世界逆惯量；切向速度不动，且只减不增。
+  // speculative_distance <= 0 时是空操作。返回被夹紧的接触点数。
+  std::size_t apply_speculative_velocity_clamp(State &state, Scalar_t dt);
+
   [[nodiscard]] std::uint64_t layout_signature() const noexcept { return layout_signature_; }
   [[nodiscard]] std::span<const Manifold>  manifolds() const noexcept { return store_.manifolds(); }
   [[nodiscard]] const Broadphase          &broadphase() const noexcept { return broadphase_; }
@@ -157,6 +190,8 @@ public:
     ++geometry_epoch_;
     pair_filter_      = nullptr;
     pair_filter_user_ = nullptr;
+    body_active_      = nullptr;
+    body_active_user_ = nullptr;
     stats_            = {};
   }
 
@@ -192,6 +227,8 @@ private:
   std::uint64_t          geometry_epoch_    = 0;
   PairFilter             pair_filter_      = nullptr;
   void                  *pair_filter_user_ = nullptr;
+  BodyActiveFilter       body_active_      = nullptr;
+  void                  *body_active_user_ = nullptr;
 };
 
 } // namespace collision
