@@ -1075,6 +1075,175 @@ Check check_bpxpbd_contact_block_oracle() {
   return c;
 }
 
+// Phase 3d：深度穿透 cap。投影看到的法线 C 被夹在 -kContactMaxPenetration，
+// 所以**一次约束求解**最多修正 2 cm。5 cm / 9 cm 的初始重叠必须给出相同的位移，
+// 而不是各自一步弹出去（9 cm 一步会把 0.085/dt ≈ 5 m/s 直接写进速度，正是斜坡
+// box 被"发射"的机制）。切向不受影响（这条只测法线）。
+Check check_bpxpbd_contact_deep_penetration_cap() {
+  Check c{"BPXPBD deep-overlap contact caps one solve at 2 cm", true, ""};
+
+  auto displacement = [](Scalar_t penetration, int iters) {
+    scene::Scene sc = contact_pair_scene(penetration, Scalar_t(0), Vec3{0}, false);
+    const Vec3   before = sc.state.pose.position(1);
+    BPXPBDStep   p;
+    drive(sc, p, g_serial, g_sched, 1, iters);
+    return sc.state.pose.position(1) - before;
+  };
+
+  // 单轮迭代：cap 生效时两个深度给出同一个 2 cm 修正，未超 cap 的给出原始深度。
+  const Vec3 shallow = displacement(Scalar_t(0.015), 1); // C=-0.01：cap 不生效
+  const Vec3 mid     = displacement(Scalar_t(0.05), 1);  // C=-0.045：cap 生效
+  const Vec3 deep    = displacement(Scalar_t(0.09), 1);  // C=-0.085：cap 生效
+
+  constexpr Scalar_t kTol = Scalar_t(1e-6);
+  if (std::abs(shallow.y - Scalar_t(0.01)) > kTol) {
+    c.ok     = false;
+    c.detail = std::format("uncapped 1 cm overlap moved {} (want 0.01)", shallow.y);
+    return c;
+  }
+  if (std::abs(deep.y - kContactMaxPenetration) > kTol) {
+    c.ok     = false;
+    c.detail = std::format("9 cm overlap moved {} (want cap {})", deep.y,
+                           kContactMaxPenetration);
+    return c;
+  }
+  // cap 内的两个深度必须给出**逐位相同**的修正量。
+  if (!bitwise_eq(mid, deep)) {
+    c.ok     = false;
+    c.detail = std::format("5 cm moved {} but 9 cm moved {} under the same cap", mid.y, deep.y);
+    return c;
+  }
+  // 没有 cap 的旧行为是 0.085 m；这里必须明显更小（发射速度 0.02/dt vs 0.085/dt）。
+  if (!(deep.y < Scalar_t(0.03))) {
+    c.ok     = false;
+    c.detail = std::format("9 cm correction {} is not capped", deep.y);
+    return c;
+  }
+  if (std::abs(deep.x) > kTol || std::abs(deep.z) > kTol) {
+    c.ok     = false;
+    c.detail = std::format("cap leaked into tangents: dx={} dz={}", deep.x, deep.z);
+    return c;
+  }
+
+  // 这是真正的"不发射"断言：默认的 8 轮迭代也必须只走 2 cm。单纯把实时 C 夹到
+  // -2 cm 的实现会在这里露馅 —— 每轮都读到 -2 cm，8 轮下来仍然修完 8.5 cm。
+  const Vec3 deep8 = displacement(Scalar_t(0.09), 8);
+  if (!(deep8.y > Scalar_t(0)) || !(deep8.y <= kContactMaxPenetration + kTol)) {
+    c.ok     = false;
+    c.detail = std::format("9 cm overlap moved {} over 8 iterations (want ≤ cap)", deep8.y);
+    return c;
+  }
+
+  // 撞击步**不能**夹：静息深重叠才夹（见 begin_sweep 的速度门）。用 2 m/s 的
+  // 接近速度喂给同一个 9 cm 重叠，位移必须是完整的去穿透（≈ 8.5 cm），否则
+  // 冲击只能以 2 cm/步退穿透，整摞会被压着穿过地板（双金字塔实测的第一处
+  // 背离）。这条同时钉住"cap 没有偷偷变成全局的软化"。
+  {
+    scene::Scene sc = contact_pair_scene(Scalar_t(0.09), Scalar_t(0), Vec3{0}, false);
+    sc.state.velocity.set_velocity(1, Vec3{0, -2, 0});
+    const Vec3 before = sc.state.pose.position(1);
+    BPXPBDStep p;
+    drive(sc, p, g_serial, g_sched, 1, 1);
+    const Vec3 d = sc.state.pose.position(1) - before;
+    if (!(d.y > Scalar_t(0.05))) {
+      c.ok     = false;
+      c.detail = std::format("impact (2 m/s) was depenetrated only {} m (cap must be off)", d.y);
+      return c;
+    }
+  }
+  return c;
+}
+
+// Phase 3e：步末速度级摩擦必须是**纯耗散**的。
+// 手工给一个真实重叠的接触一点法向乘子 λ_n > 0 和切向滑块速度，然后只跑
+// post_step：切向相对速度必须下降，系统动能不许上升。
+Check check_bpxpbd_friction_pass_is_dissipative() {
+  Check c{"BPXPBD friction pass removes tangential speed without adding energy", true, ""};
+
+  auto kinetic = [](const State &s) {
+    Scalar_t e = 0;
+    for (std::size_t b = 0; b < s.size(); ++b) {
+      if (s.inertial.is_static(b))
+        continue;
+      const Vec3 v = s.velocity.velocity(b);
+      const Vec3 w = s.velocity.angular_velocity(b);
+      const Mat3 I = glm::inverse(s.inertial.world_inv_inertia(b));
+      e += Scalar_t(0.5) * (glm::dot(v, v) / s.inertial.inv_mass(b) + glm::dot(w, I * w));
+    }
+    return e;
+  };
+
+  // 接触点相对切向速度（与 policy 的 post_step 同一几何）。
+  auto tangential_speed = [](const State &s, const ContactConstraint &row) {
+    const Vec3 rAw = rotate(s.pose.rotation(row.bodies_[0]), row.rA);
+    const Vec3 rBw = rotate(s.pose.rotation(row.bodies_[1]), row.rB);
+    const Vec3 vA =
+        s.velocity.velocity(row.bodies_[0]) +
+        glm::cross(s.velocity.angular_velocity(row.bodies_[0]), rAw);
+    const Vec3 vB =
+        s.velocity.velocity(row.bodies_[1]) +
+        glm::cross(s.velocity.angular_velocity(row.bodies_[1]), rBw);
+    const Vec3     v_rel = vA - vB;
+    const Scalar_t x     = glm::dot(v_rel, row.basis[1]);
+    const Scalar_t y     = glm::dot(v_rel, row.basis[2]);
+    return std::sqrt(x * x + y * y);
+  };
+
+  auto probe = [&](Scalar_t lambda_n) {
+    scene::Scene sc = contact_pair_scene(Scalar_t(0.01), Scalar_t(0.5), Vec3{0}, false);
+    for (ConstraintVariant &v : sc.constraints) {
+      ContactConstraint &cc = std::get<ContactConstraint>(v);
+      if (cc.kind == ContactKind::Normal)
+        cc.lambda = lambda_n;
+    }
+    sc.state.velocity.set_velocity(1, Vec3{1, 0, 0}); // 1 m/s across the contact plane
+    // post_step 读世界逆惯量；真实帧里 begin_step 已经刷新，这里直接调钩子要先补上。
+    sc.state.inertial.refresh_all(sc.state.pose);
+    const ContactConstraint &normal = std::get<ContactConstraint>(sc.constraints.front());
+    const Scalar_t           before_vt = tangential_speed(sc.state, normal);
+    const Scalar_t           before_e  = kinetic(sc.state);
+
+    BPXPBDStep p;
+    p.post_step(sc.state, sc.constraints);
+
+    const Scalar_t after_vt = tangential_speed(sc.state, normal);
+    const Scalar_t after_e  = kinetic(sc.state);
+    return std::tuple{before_vt, after_vt, before_e, after_e};
+  };
+
+  // λ_n = 0.1 kg·m ⇒ μλ_n/dt 远超 1 m/s：静摩擦必须把切向速度压到 ~0。
+  const auto [b0, a0, e0, f0] = probe(Scalar_t(0.1));
+  if (!(b0 > Scalar_t(0.5))) {
+    c.ok     = false;
+    c.detail = std::format("probe is vacuous: initial tangential speed {}", b0);
+    return c;
+  }
+  if (!(f0 <= e0 + Scalar_t(1e-6))) {
+    c.ok     = false;
+    c.detail = std::format("friction added energy: {} -> {}", e0, f0);
+    return c;
+  }
+  if (!(a0 < b0 * Scalar_t(0.01)) || !(a0 < Scalar_t(1e-4))) {
+    c.ok     = false;
+    c.detail = std::format("static friction left tangential speed {} -> {}", b0, a0);
+    return c;
+  }
+
+  // λ_n = 1e-4 kg·m ⇒ 锥界只允许削掉一点点：速度必须下降但仍有剩余。
+  const auto [b1, a1, e1, f1] = probe(Scalar_t(1e-4));
+  if (!(a1 < b1) || !(a1 > Scalar_t(0.5) * b1)) {
+    c.ok     = false;
+    c.detail = std::format("bounded impulse is wrong: {} -> {}", b1, a1);
+    return c;
+  }
+  if (!(f1 <= e1 + Scalar_t(1e-6))) {
+    c.ok     = false;
+    c.detail = std::format("bounded friction added energy: {} -> {}", e1, f1);
+    return c;
+  }
+  return c;
+}
+
 // 数值卫生：所有解算结果必须有限，且不许超出物理量级（solve_body 的冻结阈值是 10m）。
 Check check_all_finite_and_bounded() {
   Check c{"all finite and within physical bound", true, ""};
@@ -1691,6 +1860,8 @@ std::vector<Check> run_selftest() {
       check_bpxpbd_contact_unilateral_no_pull(),
       check_bpxpbd_contact_friction_cone(),
       check_bpxpbd_contact_block_oracle(),
+      check_bpxpbd_contact_deep_penetration_cap(),
+      check_bpxpbd_friction_pass_is_dissipative(),
       check_scatter_gather_equals_direct_accumulation(),
       check_topology_cache_is_reused(),
       check_cached_layout_equals_rebuilt(),

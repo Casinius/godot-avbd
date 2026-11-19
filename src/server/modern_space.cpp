@@ -525,6 +525,17 @@ void ModernSpace::step(int iterations, int threads) {
             policy_);
     state_.finish_step();
 
+    // B-PXPBD only: velocity-level Coulomb friction (Müller et al. 2020 §3.6).
+    // Runs after finish_step so the velocity exists, and before the lock/sleep
+    // projections so a locked/sleeping body still wins. `if constexpr` drops the
+    // call for AVBD at compile time, leaving the AVBD path untouched.
+    std::visit(
+            [&](auto &policy) {
+                if constexpr (requires { policy.post_step(state_, constraints_); })
+                    policy.post_step(state_, constraints_);
+            },
+            policy_);
+
     // Axis locks and explicit sleep are projections on top of the core solve. They are
     // engine semantics, not solver physics, so they live in the adapter: a locked
     // coordinate (or a sleeping body) is restored to its step-start value and its

@@ -53,11 +53,13 @@ This file is the honest state of the migration, not a wish list.
   deterministic body-disjoint block sweep, the paper's `(1-zeta)` residual
   correction, per-axis joints and an XPBD contact unit kernel. Core selftests
   62/62, and the adapter switches solvers at runtime with dual-state reset.
-  It is **not yet at parity**: rigid contacts fail the friction/stack gates;
-  `bpxpbd_contact_compliance=1e-4` fixes friction and greatly improves the
-  stack, but the 420-box pile still fails. The next blocker is deep initial
-  overlap (a 9 cm spawn overlap launches upward because XPBD has no penetration
-  cap); a capped contact target is the next change.
+  Status: with `iterations=20`, `bpxpbd_zeta=0.4`,
+  `bpxpbd_contact_compliance=2e-4`, B-PXPBD passes `test_solver` 38/38
+  (stack drift 0.009 m, friction exact), constraints, API, queries and load.
+  The 420-box pyramid still fails 6/9: XPBD turns impact depenetration into
+  velocity through `v=dx/dt`, ejecting boxes (~16 m/s) that then free-fall.
+  AVBD's implicit contact does not do that. The next fix is a velocity-neutral
+  position projection after `finish_step`; B-PXPBD stays opt-in until then.
 - `avbd_modern_test`: 50/50 structural selftests, solver digest and collision
   digest bit-identical to the pinned upstream baselines. Wired into
   `run_all_tests` and CI (`avbd_modern_tests`).
@@ -97,6 +99,6 @@ has no axis permutation. The soft-body nodes keep their own Z-up conversion.
 
 1. Cone-twist joint (or a real cone constraint primitive).
 2. Island-based sleep in the frame/world layer.
-3. Make B-PXPBD reach parity: cap deep initial penetration, add the missing
-   stack convergence, then re-run friction/stack/pyramid and flip the default.
+3. Make B-PXPBD reach parity: velocity-neutral position projection for impact
+   depenetration, then re-run pyramid and flip the default.
 4. Then remove `src/avbd` and the soft-body dependence on it.

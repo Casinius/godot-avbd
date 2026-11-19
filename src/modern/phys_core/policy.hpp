@@ -442,15 +442,39 @@ public:
     for (auto &r : R_ang) r = Vec3{0};
 
     // 接触 λ 的量纲是乘子（kg·m），AVBD 的 λ 是力（N）。两者不能互相暖启动，
-    // 所以每步**第一次** begin_sweep 把接触的 λ/initial_c 清零；之后各迭代保留
-    // 本步累积的乘子。manifold store 里的 AVBD λ 只能通过 reset_warm_start()
-    // 在切换求解器时清掉（见 CollisionWorld）。
+    // 所以每步**第一次** begin_sweep 把接触的 λ 清零，并记录本步的 raw C0 与
+    // 深度 cap（见 contact_unit 的 C_eff）；之后各迭代保留本步累积的乘子。
+    // manifold store 里的 AVBD λ 只能通过 reset_warm_start() 在切换求解器时清掉
+    // （见 CollisionWorld）。
     if (!contacts_initialized_) {
       for (ConstraintVariant &v : cs) {
         if (auto *c = std::get_if<ContactConstraint>(&v)) {
-          c->lambda        = Scalar_t(0);
-          c->initial_c     = Scalar_t(0);
-          c->initial_c_raw = Scalar_t(0);
+          c->lambda = Scalar_t(0);
+          const Scalar_t raw = c->value(s);
+          c->initial_c_raw   = raw;
+
+          // 【谁需要 cap】只有"慢速/静止的深重叠"才夹。典型场景：box 生成在斜坡
+          // 里、角上已经重叠 9 cm，一求速度就是 0 —— 不夹的话位置投影一步修完，
+          // v = 0.09/dt 直接把它发射出去。真正的撞击（|v_n| ≥ 1 m/s）不能夹：
+          // XPBD 的法向支撑就是位置乘子，把求解器能看到的深度钉在 -2 cm 等于
+          // 只允许 2 cm/步的退穿透，而 5 m/s 的撞击一步就压进 8 cm，盒子会被
+          // 整摞压着穿过地板（实测双金字塔在 t≈1.2 s 开始整体下沉）。
+          // 判据复用 AVBD 的 kContactCapApproachSpeed，但方向相反 —— AVBD 用
+          // 它给"冲击步"开 cap（它有 force 级支撑托底），XPBD 只对静息重叠开。
+          bool cap = false;
+          if (c->kind == ContactKind::Normal && c->target <= Scalar_t(0)) {
+            const Vec3 n   = c->basis[0];
+            const Vec3 rAw = rotate(s.pose.rotation(c->bodies_[0]), c->rA);
+            const Vec3 rBw = rotate(s.pose.rotation(c->bodies_[1]), c->rB);
+            const Vec3 vA  = s.velocity.velocity(c->bodies_[0]) +
+                            glm::cross(s.velocity.angular_velocity(c->bodies_[0]), rAw);
+            const Vec3 vB = s.velocity.velocity(c->bodies_[1]) +
+                            glm::cross(s.velocity.angular_velocity(c->bodies_[1]), rBw);
+            cap = glm::dot(vA - vB, n) >= -kContactCapApproachSpeed;
+          }
+          // target > 0 是 mixed 场景那种"期望深度"的合成接触，没有"两表面最多
+          // 重叠 2 cm"的物理含义，保持原值。
+          c->initial_c = cap ? std::max(raw, -kContactMaxPenetration) : raw;
         }
       }
       contacts_initialized_ = true;
@@ -558,7 +582,129 @@ public:
     for (std::uint32_t r = 0; r < rows; ++r) refs[first + r].step(s, *this);
   }
 
+  // —— 步末速度级库仑摩擦（Müller et al. 2020, §3.6）——
+  //
+  // 位置级的切线行（contact_unit）每步只能把滑移压到 O(1/iters)；静摩擦下残留的
+  // 切向位移跨帧累积，表现为堆叠的横向蠕移。这里在 finish_step() **之后**（速度已由
+  // 位移反推出来）额外做一次**纯耗散**的速度投影，不再动 pose。
+  //
+  // 【量纲】接触行的 λ 是 XPBD 的位置乘子：Δx = λ·w（w = ΣgᵀM⁻¹g，单位 1/kg），
+  // 所以本步的法向冲量是
+  //     j_n = λ_n / dt                     [kg·m/s]
+  // Coulomb 界给切向冲量 |j_t| ≤ μ·j_n = μ·λ_n/dt。沿切向单位方向 d 的有效逆质量
+  //     w_d = Σ_b [ g_linᵀ M_b⁻¹ g_lin + g_angᵀ I_b⁻¹ g_ang ]   [1/kg]
+  // 一个切向冲量 j_t 造成的相对切向速度改变是 w_d·j_t，所以摩擦最多能抹掉的
+  // 速度是 μ·λ_n·w_d/dt。令 v_t 为接触点的相对切向速度，
+  //     fraction = min(1, μ·λ_n·w_d / (|v_t|·dt))
+  //     Δv_t     = -fraction · v_t
+  // 等价于沿 d 施加冲量 j_t = fraction·|v_t|/w_d。能量变化
+  //     ΔKE = -(fraction - fraction²/2)·|v_t|² / w_d ≤ 0，
+  // 即这一步只会减慢切向相对运动，不会注入能量。
+  //
+  // 【顺序 / 确定性】串行、按 ConstraintList 顺序逐 contact unit 施加。冲量会改变
+  // 共享 body 的速度，所以顺序有意义；但它来自固定的约束顺序，与线程/调度无关。
+  // 与 AVBD 的 post_dual 一样按 (manifold_id, contact_index) 分组，standalone 接触
+  // 各自成组（kStandaloneManifold 只是哨兵，不能拿来比较相等）。
+  //
+  // 【跳过条件】μ == 0；λ_n ≤ 0（没有法向载荷 ⇒ 分离/推测接触也在此列：它们的
+  // λ 在最后一次 dual 里已经被单边夹回 0）；两侧都静态；切向速度小到无法分辨。
+  void post_step(State &s, ConstraintList &cs) const {
+    const std::size_t n = cs.size();
+    std::size_t       i = 0;
+    while (i < n) {
+      if (!std::holds_alternative<ContactConstraint>(cs[i])) {
+        ++i;
+        continue;
+      }
+      const ContactConstraint &first = std::get<ContactConstraint>(cs[i]);
+      std::size_t              end   = i + 1;
+      if (first.manifold_id != kStandaloneManifold) {
+        while (end < n && end < i + 3 && std::holds_alternative<ContactConstraint>(cs[end])) {
+          const ContactConstraint &next = std::get<ContactConstraint>(cs[end]);
+          if (next.manifold_id != first.manifold_id ||
+              next.contact_index != first.contact_index)
+            break;
+          ++end;
+        }
+      }
+      apply_contact_friction(s, cs, i, end);
+      i = end;
+    }
+  }
+
 private:
+  // 单个接触点的步末摩擦冲量。begin/end 是该 contact unit 的行区间。
+  void apply_contact_friction(State &s, ConstraintList &cs, std::size_t begin,
+                              std::size_t end) const {
+    ContactConstraint *row[3] = {nullptr, nullptr, nullptr};
+    for (std::size_t j = begin; j < end; ++j) {
+      ContactConstraint &c     = std::get<ContactConstraint>(cs[j]);
+      const int          row_k = static_cast<int>(c.kind);
+      if (row_k >= 0 && row_k < 3 && row[row_k] == nullptr)
+        row[row_k] = &c;
+    }
+    if (row[0] == nullptr)
+      return;
+
+    const Scalar_t mu    = row[0]->friction;
+    const Scalar_t lam_n = row[0]->lambda;
+    if (!(mu > Scalar_t(0)) || !(lam_n > Scalar_t(0)))
+      return;
+    // 分离/推测接触不施摩擦：它们的法向乘子在最后一次 dual 里已经被单边夹回 0，
+    // 所以上面的 λ_n > 0 就是"本步真的在承力"的判据。不能再要求 value(s) < 0：
+    // 位置投影把接触收敛到 C≈0（甚至浮点意义上的微正间隙）之后 λ_n 仍然 > 0，
+    // 而静止的堆叠恰好就停在这个状态 —— 那样会把所有静摩擦都跳过。
+
+    const auto bodies = row[0]->bodies_;
+    if (s.inertial.is_static(bodies[0]) && s.inertial.is_static(bodies[1]))
+      return;
+
+    const Vec3 t0 = row[0]->basis[1];
+    const Vec3 t1 = row[0]->basis[2];
+    const Vec3 rAw = rotate(s.pose.rotation(bodies[0]), row[0]->rA);
+    const Vec3 rBw = rotate(s.pose.rotation(bodies[1]), row[0]->rB);
+    const Vec3 vA  = s.velocity.velocity(bodies[0]) +
+                    glm::cross(s.velocity.angular_velocity(bodies[0]), rAw);
+    const Vec3 vB = s.velocity.velocity(bodies[1]) +
+                    glm::cross(s.velocity.angular_velocity(bodies[1]), rBw);
+    const Vec3 v_rel = vA - vB;
+
+    const Scalar_t vt0   = glm::dot(v_rel, t0);
+    const Scalar_t vt1   = glm::dot(v_rel, t1);
+    const Scalar_t speed = std::sqrt(vt0 * vt0 + vt1 * vt1);
+    // 低于可分辨的滑移速度就不做：既避免除零，也避免把数值噪声当成摩擦。
+    constexpr Scalar_t kMinTangentialSpeed = Scalar_t(1e-6);
+    if (!(speed > kMinTangentialSpeed))
+      return;
+
+    const Vec3 d = -(t0 * vt0 + t1 * vt1) / speed; // 摩擦方向：与 v_t 反向的单位切向量
+    const Scalar_t w_d = s.inertial.effective_mass(bodies[0], d, glm::cross(rAw, d)) +
+                         s.inertial.effective_mass(bodies[1], d, glm::cross(rBw, d));
+    if (!(w_d > Scalar_t(0)))
+      return;
+
+    // μ·λ_n/dt 是切向冲量上界；乘 w_d 换成它最多能产生的速度改变。
+    const Scalar_t max_dv = mu * lam_n * w_d / s.dt;
+    const Scalar_t frac   = std::min(Scalar_t(1), max_dv / speed);
+    if (!(frac > Scalar_t(0)))
+      return;
+
+    // 冲量（动量）j 沿 +d 作用在 A 上、-d 作用在 B 上。
+    const Scalar_t j = frac * speed / w_d;
+    const std::size_t pair[2] = {bodies[0], bodies[1]};
+    for (int side = 0; side < 2; ++side) {
+      const std::size_t b = pair[side];
+      if (s.inertial.is_static(b))
+        continue;
+      const Scalar_t sign = (side == 0) ? Scalar_t(1) : Scalar_t(-1);
+      const Scalar_t jb   = sign * j;
+      const Vec3     rb   = (side == 0) ? rAw : rBw;
+      s.velocity.add_velocity(b, d * (s.inertial.inv_mass(b) * jb));
+      // 角向梯度：A 是 +rA×d，B 是 -rB×d；冲量方向已带符号，统一写成 r_b × (d·j_b)。
+      s.velocity.add_omega(b, s.inertial.world_inv_inertia(b) * (glm::cross(rb, d) * jb));
+    }
+  }
+
   // 单个接触点（法线 + 两条切线）的联合 XPBD 行。
   //
   //   C        = ContactConstraint::value(s)      （**原始几何**，不掺 AVBD 稳定化）
@@ -599,6 +745,19 @@ private:
         continue;
       have[k] = true;
       C[k]    = row[k]->value(s); // raw geometry: no alpha*initial_c stabilization
+      // 深度穿透上限（与 AVBD 的 kContactMaxPenetration 同一个意图，但**纯几何**）：
+      // 步首由 begin_sweep 记录 raw C0 与它的 cap，投影看到的是
+      //     C_eff = C_raw(s) - (C0_raw - C0_cap) = (C_raw(s) - C0_raw) + C0_cap
+      // 即 cap 只减掉**步首就已经超过 2 cm 的那部分常量**，实时括号仍是未夹的。
+      // 效果：本步最多修正 |C0_cap| ≤ 2 cm，剩下的重叠留给后续步，绝不会把 9 cm
+      // 的 spawn 重叠在一步内变成 v = 0.09/dt 的发射；同时 body 一被推动，C_eff
+      // 立刻以斜率 1 恢复，支撑正常建立（不会像"直接把 C_raw 钉在 -2 cm"那样让
+      // 求解器看不到进展）。
+      // 注意不能直接用 max(C_raw, -cap)：XPBD 每轮迭代都会重新读几何，8 轮迭代
+      // 照样把 9 cm 全修完，一步的总位移（也就是速度）和没有 cap 一样。
+      // 只作用于法线：切线的 C 量的是摩擦锚点的滑移，与穿透深度无关。
+      if (k == 0)
+        C[0] = C[0] - (row[0]->initial_c_raw - row[0]->initial_c);
       const auto gl = row[k]->gradient(s);
       const auto glang = row[k]->gradient_angular(s);
       for (int n = 0; n < 2; ++n) {
@@ -632,25 +791,39 @@ private:
       const Scalar_t denom = w[k] + alpha[k];
       cand[k] = denom > Scalar_t(0) ? old - (C[k] + alpha[k] * old) / denom : old;
     }
+    const Scalar_t cone_bound = std::max(Scalar_t(0), row[0]->friction) * lam_n;
+    const Scalar_t tau_before =
+            std::sqrt(cand[1] * cand[1] + cand[2] * cand[2]);
     if (have[1] && have[2]) {
-      const Scalar_t bound = std::max(Scalar_t(0), row[0]->friction) * lam_n;
-      const Scalar_t tau   = std::sqrt(cand[1] * cand[1] + cand[2] * cand[2]);
-      if (tau > bound && tau > Scalar_t(0)) {
-        const Scalar_t scale = bound / tau;
+      if (tau_before > cone_bound && tau_before > Scalar_t(0)) {
+        const Scalar_t scale = cone_bound / tau_before;
         cand[1] *= scale;
         cand[2] *= scale;
       }
     } else {
       // μ == 0 只发一行法线；万一发射了单条切线，也要守锥。
-      const Scalar_t bound = std::max(Scalar_t(0), row[0]->friction) * lam_n;
       for (int k = 1; k < 3; ++k)
-        if (have[k]) cand[k] = std::clamp(cand[k], -bound, bound);
+        if (have[k]) cand[k] = std::clamp(cand[k], -cone_bound, cone_bound);
     }
     for (int k = 1; k < 3; ++k) {
       if (!have[k])
         continue;
       dlam[k]        = cand[k] - row[k]->lambda;
       row[k]->lambda = cand[k];
+    }
+    // 静摩擦标记：与 AVBDStep::dual_contact 同一语义 —— 切向乘子仍在锥内且切向
+    // 位移小于阈值 ⇒ 下一帧 manifold store 保留旧锚点（ManifoldStore::match 消费）。
+    // B-PXPBD 早期漏了这一步：锚点每帧重设，位置级切线行看不到跨帧滑移，静摩擦
+    // 退化成"每帧重新开始"，整摞会持续缓慢横向蠕移。
+    if (have[1] && have[2]) {
+      // 判据用"切向乘子是否被锥夹住"，而不是 |C_t| 的绝对阈值：B-PXPBD 每步
+      // 重新从当前接触点取锚点，单步数值滑移 ~1e-4 m，远大于 AVBD 那套 1e-5
+      // 阈值，于是永远判不成 stick、锚点每帧重置、切线行看不到跨帧滑移 ——
+      // 整摞就会以每步 ~1e-4 m 的速度"走"出去（实测 600 步 9 cm）。
+      // 在锥内 = 静摩擦：保留材料点锚点，切线行下一帧才有力可恢复。
+      const bool stick = tau_before <= cone_bound;
+      row[1]->stick = stick;
+      row[2]->stick = stick;
     }
 
     // —— 位置 + R：每个 body 在本 unit 内只写一次，blend 也只加一次 ——

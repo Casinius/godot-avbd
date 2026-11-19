@@ -106,6 +106,13 @@ FrameStats step_frame(State &s, ConstraintList &cs, Policy &policy, Exec &exec,
               }
             });
 
+  // —— 策略的步末钩子（B-PXPBD 的速度级摩擦）——
+  // 必须在 finish（速度由位移反推）之后、commit_prev 之前：它只改 velocity，
+  // 不改 pose，所以与 finish 的写集不冲突，但顺序不能反。AVBD 没有这个钩子，
+  // `if constexpr` 在编译期整段消失 ⇒ AVBD 路径逐位不变。
+  if constexpr (requires { policy.post_step(s, cs); })
+    policy.post_step(s, cs);
+
   s.cache.commit_prev(s.velocity);
   return st;
 }
