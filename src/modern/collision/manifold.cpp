@@ -69,8 +69,33 @@ void ManifoldStore::match(const ContactPatch &patch) {
         dst.penalty                 = prev.penalty;
         dst.beta_scale              = prev.beta_scale;
         dst.stick                   = prev.stick;
-        if (prev.stick) {
-          // 静摩擦把锚点钉在上一帧的材料点上，避免接触点滑动导致“记忆”被重置。
+        // 新鲜接触的几何间隙（法线方向，含 margin，与 ContactConstraint::value 同一口径）。
+        // 超过 margin + kContactReleaseGap ⇒ 真的分开了：旧 λ 不能跨过间隙继续施力。
+        // 只丢 λ/stick，penalty（刚度）保留：重合时一轮就能重建支撑。
+        const Scalar_t fresh_c =
+                glm::dot(patch.basis.normal, src.xA - src.xB) + patch.margin;
+        if (fresh_c > patch.margin + kContactReleaseGap) {
+          // 锚点保持本帧的新值（默认已写入），只清掉跨帧力与静摩擦标记。
+          dst.lambda = Vec3{0};
+          dst.stick  = false;
+          break;
+        }
+        if (!prev.stick) {
+          // 无静摩擦：直接用本帧的新锚点（默认值）。
+          break;
+        }
+        // 静摩擦把锚点钉在上一帧的材料点上，避免接触点滑动导致“记忆”被重置。
+        // 用局部锚点算漂移即可：同一 body 的旋转对两个局部向量等长保持。
+        const Scalar_t drift = std::max(glm::length(prev.rA - src.rA),
+                                        glm::length(prev.rB - src.rB));
+        if (drift > kStickDriftHeal) {
+          // 冻结锚点已滑离真实接触面：重新采用新锚点，并清掉绑在旧锚点上的摩擦
+          // 历史（法线支撑是“压得多紧”的函数，不是锚点位置的函数，保留）。
+          dst.rA     = src.rA;
+          dst.rB     = src.rB;
+          dst.stick  = false;
+          dst.lambda = Vec3{dst.lambda[0], Scalar_t(0), Scalar_t(0)};
+        } else {
           dst.rA = prev.rA;
           dst.rB = prev.rB;
         }

@@ -3,12 +3,25 @@
 This tree is a snapshot of `/home/cyan/avbd-mo/src`, imported to replace the legacy
 `src/avbd` solver on the `modernize` branch.
 
-- Source HEAD: `0c4853b` (`manifold`) — "add per-axis joint constraints". Earlier
-  snapshots were `7107cff` (friction + gradient sign), `04d2833` (k0 / block
-  assembly), `4450b74` (pair filter) and `a3d9930` plus staged collision work;
-  this tree corresponds to a clean commit.
+- Source HEAD: `0c73d9a` (`manifold`) — "contact stability: penetration cap,
+  release, stick-anchor heal". Earlier snapshots were `0c4853b` (joints),
+  `7107cff` (friction + gradient sign), `04d2833` (k0 / block assembly),
+  `4450b74` (pair filter) and `a3d9930` plus staged collision work.
+- The contact-stability part of this snapshot:
+  * `phys_core/constraint.hpp` — normal-row penetration cap
+    `kContactMaxPenetration = 0.02f` (legacy `CONTACT_MAX_PENETRATION`), applied to
+    the step-start stabilization offset on impact steps; `initial_c_raw` keeps the
+    unclamped C0 so `evaluate()` retains the live restoring bracket (the literal
+    "clamp the live C" form makes a deeply overlapped pair lose all support and sink).
+  * `collision/manifold.{hpp,cpp}` — contact release (`kContactReleaseGap = 2 mm`)
+    and stick-anchor heal (`kStickDriftHeal = 2 mm`), matching legacy
+    `CONTACT_RELEASE_GAP` / `STICK_DRIFT_HEAL`; `ContactPatch::margin` carries the
+    emit margin into `ManifoldStore::match`.
+  * No pinned solver/collision digest changes: the cap is inert on the pinned
+    scenes, and the release path never fires in the modern (non-speculative)
+    narrowphase.
 - Snapshot tree SHA-256 (everything under `src/modern` except this file):
-  `1005994cedd672792758561d7a33e8ad8e295c533ec30ced28c6fab289d20016`
+  `cf9951f08e783a19d03640f15f3ce9fabc893a5d9d4affa8ac5f1f44c3f53e93`
   Recipe: `find src/modern -type f ! -name UPSTREAM.md -print0 | sort -z |
   xargs -0 sha256sum | sha256sum`.
 - Baseline data copied to `src/modern/tests/`:

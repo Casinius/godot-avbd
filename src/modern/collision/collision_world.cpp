@@ -118,6 +118,8 @@ void CollisionWorld::step(const State &state) {
     patch.proxy_b  = pair.b;
     patch.friction = std::sqrt(std::max(Scalar_t(0), views_[pair.a].friction) *
                                std::max(Scalar_t(0), views_[pair.b].friction));
+    // 释放/粘连修复判定用同一个 margin（target = -margin），与 emit 保持一致。
+    patch.margin = emit_options_.margin;
 
     const std::size_t n = narrowphase_.collide(views_[pair.a], views_[pair.b],
                                                std::span<ContactPoint>{patch.points}, patch.basis);

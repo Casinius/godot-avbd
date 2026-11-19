@@ -29,6 +29,11 @@ This file is the honest state of the migration, not a wish list.
   `ContactConstraint::gradient_angular` (B-side torque was inverted). Without
   friction it showed up as slow wrong rolling; with a real dual it pumped
   energy every frame.
+- **Contact stability** (`0c73d9a`): impact penetration is capped at 2 cm for
+  the normal stabilization offset (the live bracket stays unclamped so deep
+  overlaps keep their restoring gradient), contacts release their warm-started
+  force when the fresh gap exceeds margin + 2 mm, and sticky anchors heal after
+  2 mm of drift. This took `test_pyramid` from 7/9 to 9/9.
 - **Joints** (`0c4853b`): a joint is decomposed into per-axis rows (locked,
   limited, free; linear and angular) with stabilization, force bounds and a
   penalty cap. The server maps pin, hinge, slider and generic 6DOF onto them,
@@ -44,14 +49,16 @@ This file is the honest state of the migration, not a wish list.
 - **Cone-twist joint**: records and getters work, but no constraint is emitted
   (see above).
 - **Automatic sleep**: only explicit `BODY_STATE_SLEEPING` freezes a body.
-- **Speculative contacts / CCD / position projection**: not ported.
+- **Speculative contacts / CCD / position projection**: not ported. A fast
+  body can still tunnel a thin slab; the contact solve only sees overlap.
+- **Deep-pile long run**: `test_pyramid` passes its 10 s gate (9/9), but a 40 s
+  run still develops a late runaway. Deep-pile penetration in the 20–30 s
+  window is ~14 cm, above the legacy-quality target.
 - **Capsule and convex** are documented proxies, not exact geometry.
 
 Current suites: `test_solver.gd` **38/38**, `test_constraints.gd` **11/11**,
 `test_server.gd` **30/30**, `test_queries.gd` **27/27**, `test_load.gd` gate
-PASS. `test_pyramid` is 7/9: the 420-box pile still loses a few boxes below the
-ground and drifts 1.3 m over 10 s, so deep piles are not at legacy quality yet
-(speculative contacts / position projection are the missing pieces).
+PASS, `test_pyramid.gd` **9/9**.
 
 ## Coordinates / conventions
 
@@ -62,5 +69,5 @@ has no axis permutation. The soft-body nodes keep their own Z-up conversion.
 
 1. Cone-twist joint (or a real cone constraint primitive).
 2. Island-based sleep in the frame/world layer.
-3. Speculative contacts / position projection for deep piles.
+3. Speculative contacts / CCD, then revisit the 40 s deep-pile run.
 4. Then remove `src/avbd` and the soft-body dependence on it.

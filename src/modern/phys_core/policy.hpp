@@ -214,7 +214,7 @@ public:
       if (!std::holds_alternative<ContactConstraint>(v))
         continue;
       ContactConstraint &c = std::get<ContactConstraint>(v);
-      c.initial_c          = c.value(s);
+      c.capture_contact_c0(s);
       // 罚因子一律从 manifold 带来的值起步（新接触 = floor），K 由 dual_contact 的
       // ramp 自适应增长——这是参考实现的做法，也是唯一同时满足下面两条的起点：
       //   a) 深度穿透（box 生成在斜坡里 9 cm / 落地 11 m/s）不能产生上万 N 的

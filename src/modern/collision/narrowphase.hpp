@@ -52,6 +52,9 @@ struct ContactPatch {
   std::array<ContactPoint, kMaxContactsPerManifold> points{};
   std::size_t                                       count    = 0;
   Scalar_t                                          friction = Scalar_t(0.5);
+  // 与 ContactEmitOptions::margin 相同（法线 target = -margin）。ManifoldStore 只
+  // 用它换算“新鲜接触的几何间隙”，做释放判定，不参与窄相。
+  Scalar_t margin = Scalar_t(0.005);
 };
 
 // 从“B->A 的约束法线”构造右手正交基：normal 为第一行，两条切线为另两行。

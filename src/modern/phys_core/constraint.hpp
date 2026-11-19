@@ -102,6 +102,17 @@ inline constexpr Scalar_t kContactPenaltyCeil  = Scalar_t(1e10);
 inline constexpr Scalar_t kContactPenaltyBeta = Scalar_t(1e4);
 // 静摩擦判定：切向 C 的模小于它 ⇒ 仍然粘着，下一帧保留旧锚点。
 inline constexpr Scalar_t kContactStickThreshold = Scalar_t(1e-5);
+// 单步内求解器允许看到的**几何穿透**上限（米，参考实现 CONTACT_MAX_PENETRATION）。
+// 位置级一步把位移变成速度（v = dp/dt），一次 10 cm 的冲击重叠会被当成 20+ m/s 的
+// 弹射；把冲击步的法线稳定化基准夹在 2 cm 以内，冲击能量就不会一步灌进速度。
+// 只作用于法线行：切向行量的是摩擦锚点的滑移，与穿透深度无关。
+// 适配层以后可把它映射到 legacy 的 physics/avbd 设置；这里不读任何 project setting。
+inline constexpr Scalar_t kContactMaxPenetration = Scalar_t(0.02);
+// 触发上面的 cap 所需的法线接近速度（m/s）。cap 的目的只是防止**冲击**把深重叠
+// 一步弹出去；静息/慢速的深重叠（测试里预置的 10 cm 初始穿插、被压住的静止堆叠）
+// 没有弹射风险，夹住它只会把每步的收敛量从 1%·深度 降到 1%·2cm，支撑反而建立不起来。
+// 1 m/s 高于静息噪声（重力每步 ~0.16 m/s），远低于真实冲击（~10 m/s）。
+inline constexpr Scalar_t kContactCapApproachSpeed = Scalar_t(1);
 
 // ==================== 关节行的罚函数 / 稳定化常数 ====================
 // 与接触同一套语义（alpha / gamma / floor / ceil），但角的 beta 用参考实现的 betaAng，
@@ -144,8 +155,12 @@ struct ContactConstraint {
   // lambda   ：上一次 dual 夹紧后的**力** F = K*C + λ（法线 ≤ 0；切线在锥内）。
   //            注意它存的是力，不是 λ 递增量——增量形式（λ += k*C）会发散。
   // penalty  ：该行的自适应罚因子 K。接触行只用它，非接触行用 Policy 的全局 k。
-  // initial_c：步首的原始 C0，稳定化用（每步由 capture_step_start 重取一次）。
-  // friction ：该接触点的 μ（同一 contact 的三行相同；行数也因此决定）。
+  //  initial_c：步首的原始 C0，稳定化用（每步由 capture_step_start 重取一次）。
+  //            法线行存的是**已夹**的 C0（kContactMaxPenetration），见 capture_contact_c0。
+  //  initial_c_raw：法线行的未夹 C0。仅在 cap 生效时与 initial_c 不同，evaluate 用两者
+  //            的差把被 cap 减掉的常量补回实时括号；不单独参与 digest（它是 initial_c
+  //            与场景几何的派生量）。
+  //  friction ：该接触点的 μ（同一 contact 的三行相同；行数也因此决定）。
   // force_min/max：primal 里该行力的界（参考实现 updatePrimal 也夹紧：法线 F ≤ 0，
   //            切向 |F| ≤ μ|F_n|）。必须夹在 RHS 上：否则一个"先粘住、后滑动"的
   //            接触会拿 K_t*C_t（= K_t·滑移量）当摩擦力，滑移量的量级是 cm ⇒ 上万 N，
@@ -154,6 +169,7 @@ struct ContactConstraint {
   Scalar_t lambda     = 0;
   Scalar_t penalty    = 0;
   Scalar_t initial_c  = 0;
+  Scalar_t initial_c_raw = 0;
   Scalar_t friction   = 0;
   Scalar_t force_min  = -kForceUnclamped;
   Scalar_t force_max  = kForceUnclamped;
@@ -169,10 +185,53 @@ struct ContactConstraint {
     return glm::dot(xA - xB, basis[static_cast<int>(kind)]) - target;
   }
 
+  // 法线行的“步首深度上限”（参考实现 CONTACT_MAX_PENETRATION 的移植点）。
+  // 只夹 target <= 0 的行：这是本文件与 contact_constraints.hpp 的碰撞口径
+  // target = -margin（margin >= 0）。scene::mixed 的独立接触把 target 当正的“期望
+  // 深度”用，margin = -target 为负，没有“两表面最多重叠 2 cm”的物理含义；对它套
+  // 这条 cap 会把该场景的基线改掉，而 cap 的目的是限制刚体表面的真实穿透。
+  [[nodiscard]] Scalar_t clamped_c0(Scalar_t raw) const noexcept {
+    if (kind != ContactKind::Normal || target > Scalar_t(0))
+      return raw;
+    return std::max(raw, -target - kContactMaxPenetration);
+  }
+
+  // 步首记录稳定化基准。initial_c 存**已夹**的 C0（cap 生效时它才是求解器允许看到的
+  // 深度），initial_c_raw 存原始 C0，两者之差就是 legacy constraintError 里被 cap 减掉
+  // 的那部分常量。只有法线行的**冲击步**才夹：cap 防的是把深冲击重叠一步变成速度，
+  // 静息深重叠没有这个风险，夹住反而让支撑/收敛变慢。
+  void capture_contact_c0(const State &s) noexcept {
+    const Scalar_t raw = value(s);
+    initial_c_raw      = raw;
+    bool cap = false;
+    if (kind == ContactKind::Normal && target <= Scalar_t(0)) {
+      const Vec3 n   = basis[0];
+      const Vec3 rAw = rotate(s.pose.rotation(bodies_[0]), rA);
+      const Vec3 rBw = rotate(s.pose.rotation(bodies_[1]), rB);
+      const Vec3 vA  = s.velocity.velocity(bodies_[0]) +
+                      glm::cross(s.velocity.angular_velocity(bodies_[0]), rAw);
+      const Vec3 vB  = s.velocity.velocity(bodies_[1]) +
+                      glm::cross(s.velocity.angular_velocity(bodies_[1]), rBw);
+      cap = glm::dot(vA - vB, n) < -kContactCapApproachSpeed;
+    }
+    initial_c = cap ? clamped_c0(raw) : raw;
+  }
+
   // 求解器看到的约束值：一阶稳定化后的 C_eff（见文件头的常数说明）。
   // initial_c == 0（非接触 / XPBD 路径）时与 value() 完全相同。
+  //
+  // cap 生效（initial_c_raw < initial_c）时不能直接用 clamp(value(s))：那样一旦当前
+  // 重叠仍深于 cap，value 就被钉在同一个 floor 上，求解器**看不到**它把 body 往上
+  // 推的效果，接触等于没有支撑（实测 box 会一直下沉穿过地面）。legacy 的写法是
+  //     C_eff = (C_raw(s) - C0_raw) + (1-alpha) * C0_clamped
+  // 即 cap 只改稳定化基准的常量，实时括号仍是未夹的 C_raw(s) - C0_raw。这样深穿透
+  // 的步首 C_eff 仍是 (1-alpha)*C0_clamped（很小，不会弹射），但 body 一被推动，
+  // C_eff 立刻以斜率 1 恢复，支撑正常建立。未触发 cap 时走原式，逐位不变。
   Scalar_t evaluate(const State &s) const {
-    return value(s) - kContactStabilization * initial_c;
+    const Scalar_t raw = value(s);
+    if (kind == ContactKind::Normal && initial_c_raw < initial_c)
+      return (raw - initial_c_raw) + (Scalar_t(1) - kContactStabilization) * initial_c;
+    return raw - kContactStabilization * initial_c;
   }
 
   std::array<Vec3, 2> gradient(const State &) const {

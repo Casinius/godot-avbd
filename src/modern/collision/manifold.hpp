@@ -32,6 +32,21 @@ namespace collision {
 inline constexpr Scalar_t kPenaltyFloor = Scalar_t(1);
 inline constexpr Scalar_t kPenaltyCeil  = Scalar_t(1e10);
 
+// ==================== 跨帧热状态的释放 / 修复阈值 ====================
+// 与 legacy Manifold::initialize 的 CONTACT_RELEASE_GAP / STICK_DRIFT_HEAL 同值。
+//
+// 释放：新鲜接触点在法线方向的真实间隙超过 margin + 2 mm 时，该对已经分开，双变量
+// 里的 λ 是旧位姿的力，不能再跨过间隙施加。warm-start 衰减只有 ~0.99/步，一次冲击
+// 的冲量会残留几百步，接触的罚项又每轮把它重新写进求解，表现为接触分开很久后仍被
+// 弹飞。释放只丢 λ/stick，不动 penalty：刚度留着重合时一轮就能重建支撑。
+//
+// 粘连修复：stick 把 rA/rB 冻在静摩擦生效时的材料点上。两锚点互相粘着，它们的间距
+// （STICK_THRESH 每轮量的量）永远≈0，所以哪怕整对已经滑了几十厘米，stick 也不会自己
+// 解除，冻住的锚点却早已滑离真实接触面，C0 变成幻影穿透。漂移超过 2 mm 就重新采用
+// 本帧的新锚点并清掉摩擦历史；否则保持冻结锚点（稳定静摩擦）。
+inline constexpr Scalar_t kContactReleaseGap  = Scalar_t(2e-3);
+inline constexpr Scalar_t kStickDriftHeal     = Scalar_t(2e-3);
+
 struct ManifoldContact {
   std::uint64_t feature_key = 0;
   Vec3          rA{0};
