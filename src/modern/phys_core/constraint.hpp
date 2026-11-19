@@ -103,6 +103,27 @@ inline constexpr Scalar_t kContactPenaltyBeta = Scalar_t(1e4);
 // 静摩擦判定：切向 C 的模小于它 ⇒ 仍然粘着，下一帧保留旧锚点。
 inline constexpr Scalar_t kContactStickThreshold = Scalar_t(1e-5);
 
+// ==================== 关节行的罚函数 / 稳定化常数 ====================
+// 与接触同一套语义（alpha / gamma / floor / ceil），但角的 beta 用参考实现的 betaAng，
+// 且两者都受 penalty_limit() 的频率上限约束。单独命名是为了让"改接触会顺手改到关节"
+// 不会发生；值本身必须与接触一致，下面的 static_assert 盯着。
+inline constexpr Scalar_t kJointStabilization   = kContactStabilization;
+inline constexpr Scalar_t kJointWarmStartGamma  = kWarmStartGamma;
+inline constexpr Scalar_t kJointWarmStartDecay  = kWarmStartDecay;
+inline constexpr Scalar_t kJointPenaltyFloor    = kContactPenaltyFloor;
+inline constexpr Scalar_t kJointPenaltyCeil     = kContactPenaltyCeil;
+// 新行的起始罚因子。接触从 floor 起步（它的 ramp 由 |C|*1e4 一步拉满），关节的
+// C 被稳定化压到 1% 后 ramp 太慢，靠它跨帧爬会让锚点长期停在毫米级。直接用材料
+// 刚度起步，再由 penalty_limit() 夹到该自由度能承受的上限。
+inline constexpr Scalar_t kJointInitialPenalty = Scalar_t(1e4);
+inline constexpr Scalar_t kJointPenaltyBetaLin  = Scalar_t(1e4);
+inline constexpr Scalar_t kJointPenaltyBetaAng  = Scalar_t(1e2);
+// 约束频率上限 = 该比例 * 步率。参考实现的 0.25 是给"λ 直接反馈"的显式迭代留的余量；
+// 现代核心的 primal 是带 m/dt² 的隐式 6x6 块解、并做了 mass-split，能承受与接触同级
+// 的刚度。4.0 给 1 kg @ 60 Hz 的线性自由度留 5.76e4 N/m 的上限（接触默认 k0=1e4），
+// 关节在头几帧就能把重力位移压到亚毫米，而不是靠 λ 跨帧慢慢爬。
+inline constexpr Scalar_t kJointMaxFrequencyRatio = Scalar_t(4);
+
 struct ContactConstraint {
   // bodies_[0] = A（被推开的 body）；bodies_[1] = B（支撑面/另一侧）。
   // gradient 返回 {+n, -n}，所以 A 沿 +n 被推开——符号约定与 DistanceConstraint 一致。
@@ -217,9 +238,283 @@ template <> struct constraint_traits<ContactConstraint> {
 //  feature 概念，且排序 key 只在 narrowphase 侧有意义——等 narrowphase 落地时
 //  连同 manifold 契约一起设计，见文件头的决策记录。）
 
+// ==================== 关节轴约束（每个自由度一行） ====================
+//
+// 【为什么是一行一个约束，而不是一个 6-DOF 约束】
+//   驱动器的 ConstraintList 每个 alternative 只有**一个标量 λ** 和一组 body 上的梯度。
+//   一个带 Vec6 λ 的复合关节无法塞进这个形态：duel 阶段无法逐行并行，也无法复用既有的
+//   scatter/gather。所以关节按"每轴一行"发射，和接触"每点三行"完全同构：
+//     Locked  → 双边等式（λ 不夹紧）
+//     Limited → 单边不等式（λ 夹到指向可行域的一侧；在范围内时 λ = 0）
+//     Free    → 不发射行
+//   每行独立，所以既有的并行 dual / 拓扑缓存 / 位精确性全部原样成立。
+//
+// 【线性 vs 角向】
+//   * 线性行：C = axis·(anchorA - anchorB) - target，轴与锚点在 body A 的局部系里。
+//     梯度同时有线性项和角向项（锚点偏离质心时，转动也会移动锚点）。
+//   * 角向行：C 是绕 joint frame 某轴的转角（弧度），测量自关节建立时的相对姿态。
+//     必须提供 gradient_angular；线性梯度为 0。
+//   * body A / body B 都是真实 State 下标；世界侧由调用方用一个静态 body 表示
+//     （现代服务器的 ModernSpace 常驻一个 world body），因此这里不需要 nullptr 分支。
+//
+// 【角向测量的 twist 分解】
+//   锁定轴不能直接读相对旋转向量的分量：绕自由轴转一整圈会让它每半圈扫过整圈，铰链
+//   会在几圈后把自己撕开。所以先把 dev 中绕每个**非锁定**轴的 twist 拆出来（那个轴的
+//   读数就是 twist 角，限位/弹簧读它），剩下的 swing 才交给锁定轴。拆一个 twist 是精确的；
+//   多个自由轴时逐个拆是通常近似。
+//
+// 【稳定化 / 罚因子 / 暖启动】
+//   与接触同一套常数与语义：
+//     Locked : C_eff = (C - target) - alpha * C0    （C0 = 步首原始值）
+//              λ ← K*C_eff + λ（存力，不是增量），K ← K + beta|C_eff|
+//     Limited: 只在越界时产生 C = value - bound；λ 强制指向可行域一侧；范围内 λ=0、无刚度。
+//   暖启动在 capture_step_start 里做一次/步（λ *= alpha*gamma，K *= gamma）。
+//   刚度的上限见 penalty_limit()：罚因子涨到求解器在一个步长内分辨不了时就只会发散。
+//
+// 【已知缺口】spring / softness 没有映射：一行只有一个 (K, λ, C)，装不下"硬约束 + 弹簧"
+//   两套力。Limited/Locked/Free 与 target 已覆盖 6DOF / pin / hinge / slider 的服务端
+//   映射；弹簧参数仍只记录在引擎记录里（与 legacy 服务器同一口径）。
+enum class JointAxisMode : std::uint8_t {
+  Free    = 0,
+  Locked  = 1,
+  Limited = 2,
+};
+
+namespace joint_axis_detail {
+
+[[nodiscard]] inline Vec3 principal_axis(int p_axis) noexcept {
+  static const std::array<Vec3, 3> axes = {Vec3{1, 0, 0}, Vec3{0, 1, 0}, Vec3{0, 0, 1}};
+  return axes[static_cast<std::size_t>(p_axis)];
+}
+
+[[nodiscard]] inline Scalar_t quat_component(const Quat &p_q, int p_axis) noexcept {
+  switch (p_axis) {
+    case 0: return p_q.x;
+    case 1: return p_q.y;
+    default: return p_q.z;
+  }
+}
+
+// 把 dev 中绕 axis 的 twist 拆掉，角度写进 r_angle。四元数按 glm 的 {w,x,y,z} 构造。
+// 纯 twist = normalize((n*(v·n), w))；近半圈时 twist 退化（vector 与 w 同时趋零），
+// 此时没有可拆的 twist。
+inline void remove_twist(Quat &p_dev, int p_axis, Scalar_t &r_angle) noexcept {
+  const Vec3 n = principal_axis(p_axis);
+  const Vec3 v{p_dev.x, p_dev.y, p_dev.z};
+  const Scalar_t proj = glm::dot(v, n);
+  const Quat twist{p_dev.w, n * proj}; // glm: qua(w, xyz)
+  if (glm::length(twist) <= Scalar_t(1.0e-12)) {
+    r_angle = Scalar_t(0);
+    return;
+  }
+  r_angle = Scalar_t(2) * std::atan2(proj, p_dev.w);
+  p_dev  = glm::normalize(p_dev) * glm::conjugate(glm::normalize(twist));
+}
+
+// 三个角向自由度的读数（弧度，相对建立时的姿态，joint frame 下）。
+// Locked 轴读 swing 分量；Free/Limited 轴读拆出来的 twist 角。
+inline void angular_values(const State &s, const std::array<std::size_t, 2> &bodies,
+                           const Quat &frame_a, const Quat &frame_b, const Quat &rest,
+                           const std::array<JointAxisMode, 3> &modes,
+                           Scalar_t p_out[3]) noexcept {
+  const Quat q_a = glm::normalize(s.pose.rotation(bodies[0]) * frame_a);
+  const Quat q_b = glm::normalize(s.pose.rotation(bodies[1]) * frame_b);
+  const Quat relative_now = glm::normalize(glm::conjugate(q_a) * q_b);
+  // dev 是 **B 相对 A** 自建立以来多转的量（先取 rest⁻¹ 再乘当前相对姿态）。
+  // 这与 Godot 的 hinge/slider 角度同号，服务器可以直接把限位抄过来；角向梯度则
+  // 相应取 {-n, +n}，与 dev 的符号一致。
+  Quat dev = glm::normalize(glm::conjugate(rest) * relative_now);
+
+  // 非锁定轴的 twist 先拆掉（顺序固定为 0,1,2），锁定轴只看剩下的 swing。
+  for (int i = 0; i < 3; ++i) {
+    if (modes[static_cast<std::size_t>(i)] != JointAxisMode::Locked)
+      remove_twist(dev, i, p_out[i]);
+  }
+  for (int i = 0; i < 3; ++i) {
+    if (modes[static_cast<std::size_t>(i)] == JointAxisMode::Locked)
+      p_out[i] = quat_component(dev, i) * Scalar_t(2);
+  }
+}
+
+} // namespace joint_axis_detail
+
+// 一个自由度对应的一行。自由度是 body A 的 joint frame 的主轴。
+struct JointAxisConstraint {
+  std::array<std::size_t, 2> bodies_ = {0, 0};
+  Vec3     rA{0}, rB{0};        // 局部锚点（线性行用；角向行也可携带，便于调试）
+  Vec3     axis{1, 0, 0};       // 轴方向，在 body A 的**局部系**里（joint frame 已折进来）
+  bool     angular = false;     // true: 角向自由度；false: 线性
+  JointAxisMode mode = JointAxisMode::Free;
+  Scalar_t target = 0;          // Locked 的目标值（线性：米；角向：弧度）
+  Scalar_t lower  = 0;          // Limited 的可行区间（与测量同单位）
+  Scalar_t upper  = 0;
+
+  // 角向测量用：joint frame 在各自 body 局部系里的朝向，建立时的相对姿态，以及三个
+  // 角向轴的模式（twist 分解需要知道哪些轴非锁定）。线性行不使用这些字段。
+  Quat frame_a = identity_quat();
+  Quat frame_b = identity_quat();
+  Quat rest    = identity_quat();
+  std::array<JointAxisMode, 3> angular_modes{{JointAxisMode::Free, JointAxisMode::Free,
+                                              JointAxisMode::Free}};
+  std::uint8_t axis_index = 0;
+
+  Scalar_t lambda     = 0; // 上一次 dual 夹紧后的**力** F（不是增量）
+  Scalar_t penalty    = 0; // 自适应罚因子；<= 0 表示未初始化
+  Scalar_t initial    = 0; // 步首的原始 C（稳定化基准）
+  Scalar_t compliance = 0; // 仅 XPBD 路径使用；AVBD 不读
+
+  [[nodiscard]] Scalar_t value(const State &s) const {
+    if (angular) {
+      Scalar_t values[3];
+      joint_axis_detail::angular_values(s, bodies_, frame_a, frame_b, rest, angular_modes,
+                                        values);
+      return values[axis_index];
+    }
+    const Vec3 x_a = s.pose.position(bodies_[0]) + rotate(s.pose.rotation(bodies_[0]), rA);
+    const Vec3 x_b = s.pose.position(bodies_[1]) + rotate(s.pose.rotation(bodies_[1]), rB);
+    const Vec3 n   = rotate(s.pose.rotation(bodies_[0]), axis);
+    return glm::dot(x_a - x_b, n);
+  }
+
+  // 求解器看到的约束值：Locked 做一阶稳定化，Limited 只在越界时返回违反量（范围内为 0）。
+  [[nodiscard]] Scalar_t evaluate(const State &s) const {
+    const Scalar_t v = value(s);
+    switch (mode) {
+      case JointAxisMode::Locked:
+        return (v - target) - kJointStabilization * initial;
+      case JointAxisMode::Limited:
+        if (v > upper) return v - upper;
+        if (v < lower) return v - lower;
+        return Scalar_t(0);
+      case JointAxisMode::Free:
+      default:
+        return Scalar_t(0);
+    }
+  }
+
+  [[nodiscard]] std::array<Vec3, 2> gradient(const State &s) const {
+    if (angular)
+      return {Vec3{0}, Vec3{0}};
+    const Vec3 n = rotate(s.pose.rotation(bodies_[0]), axis);
+    return {n, -n};
+  }
+
+  [[nodiscard]] std::array<Vec3, 2> gradient_angular(const State &s) const {
+    const Vec3 n = rotate(s.pose.rotation(bodies_[0]), axis);
+    // 角向测量是 B 相对 A（见 angular_values），所以符号与线性行相反。
+    if (angular)
+      return {-n, n};
+    const Vec3 r_a = rotate(s.pose.rotation(bodies_[0]), rA);
+    const Vec3 r_b = rotate(s.pose.rotation(bodies_[1]), rB);
+    return {glm::cross(r_a, n), -glm::cross(r_b, n)};
+  }
+
+  [[nodiscard]] std::span<const std::size_t> bodies() const { return bodies_; }
+
+  // 这一行的 RHS 力允许的区间：Limited 只许朝可行域内推；范围内 [0,0] 表示不施力。
+  void force_bounds(const State &s, Scalar_t &r_min, Scalar_t &r_max) const {
+    if (mode != JointAxisMode::Limited) {
+      r_min = -kForceUnclamped;
+      r_max = kForceUnclamped;
+      return;
+    }
+    const Scalar_t v = value(s);
+    if (v > upper) {
+      r_min = Scalar_t(0);
+      r_max = kForceUnclamped;
+    } else if (v < lower) {
+      r_min = -kForceUnclamped;
+      r_max = Scalar_t(0);
+    } else {
+      r_min = Scalar_t(0);
+      r_max = Scalar_t(0);
+    }
+  }
+
+  // 该自由度能承受的罚因子上限。约束的频率是 sqrt(K * 有效可动性)，接近步率时迭代不再
+  // 收敛：误差涨 ⇒ K 涨 ⇒ 更不收敛。上限取"频率仍是步率一小部分"的 K，用两侧 body 里
+  // 更轻的那一侧（参考实现的 GenericJoint::penaltyLimit 同一公式）。
+  [[nodiscard]] Scalar_t penalty_limit(const State &s) const {
+    // 用参考实现的量纲：线性轴看质量，角向轴看绕轴的转动惯量。注意**不要**用整行的
+    // gᵀM⁻¹g：离轴锚点的线性行还耦合着转动，那个有效质量会把上限压到 1/7，关节在
+    // 头几帧会像没有约束一样下坠。
+    Scalar_t cap = kForceUnclamped;
+    const Vec3 n = rotate(s.pose.rotation(bodies_[0]), axis);
+    for (std::size_t i = 0; i < 2; ++i) {
+      Scalar_t inertia = 0;
+      if (angular) {
+        const Scalar_t inv_along =
+                glm::dot(n, s.inertial.world_inv_inertia(bodies_[i]) * n);
+        if (!(inv_along > Scalar_t(0)))
+          continue;
+        inertia = Scalar_t(1) / inv_along;
+      } else {
+        const Scalar_t inv_mass = s.inertial.inv_mass(bodies_[i]);
+        if (!(inv_mass > Scalar_t(0)))
+          continue;
+        inertia = Scalar_t(1) / inv_mass;
+      }
+      const Scalar_t limit = inertia * kJointMaxFrequencyRatio * kJointMaxFrequencyRatio /
+                             (s.dt * s.dt);
+      cap = std::min(cap, limit);
+    }
+    return cap;
+  }
+
+  // 每步一次，在迭代之前：记录稳定化基准并暖启动对偶状态（Eq.19）。
+  void capture_step_start(const State &s) {
+    if (mode == JointAxisMode::Free)
+      return;
+    initial = value(s) - target;
+    lambda *= kJointWarmStartDecay;
+    const Scalar_t cap = std::max(penalty_limit(s), kJointPenaltyFloor);
+    if (!(penalty > Scalar_t(0)))
+      penalty = std::min(kJointInitialPenalty, cap);
+    else
+      penalty = std::clamp(penalty * kJointWarmStartGamma, kJointPenaltyFloor, cap);
+    // 互补松弛：不在边界上的限位没有力；留着上一帧的 λ 会在回到边界时踢一脚。
+    if (mode == JointAxisMode::Limited) {
+      const Scalar_t v = value(s);
+      if (!(v > upper) && !(v < lower))
+        lambda = Scalar_t(0);
+    }
+  }
+
+  void update_dual(const State &s, Scalar_t /*p_k*/) {
+    if (mode == JointAxisMode::Free)
+      return;
+    const Scalar_t C = evaluate(s);
+    Scalar_t F       = penalty * C + lambda;
+    if (mode == JointAxisMode::Limited) {
+      if (C > Scalar_t(0))
+        F = std::max(F, Scalar_t(0));
+      else if (C < Scalar_t(0))
+        F = std::min(F, Scalar_t(0));
+      else
+        F = Scalar_t(0);
+    }
+    lambda = F;
+
+    const bool active = mode == JointAxisMode::Locked || C != Scalar_t(0);
+    if (active) {
+      const Scalar_t beta = angular ? kJointPenaltyBetaAng : kJointPenaltyBetaLin;
+      const Scalar_t cap  = std::max(penalty_limit(s), kJointPenaltyFloor);
+      penalty = std::clamp(penalty + std::abs(C) * beta, Scalar_t(0), cap);
+    }
+  }
+};
+
+template <> struct constraint_traits<JointAxisConstraint> {
+  using Scalar_t   = ::Scalar_t;
+  using Gradient_t = std::array<Vec3, 2>;
+};
+
 // ==================== 5. 异质约束容器 ====================
-using ConstraintVariant = std::variant<DistanceConstraint, ContactConstraint>;
-using ConstraintList    = std::vector<ConstraintVariant>;
+// 注意：新增 alternative 只能在**末尾**追加。variant index 被 collision digest 哈希，
+// 改变既有顺序会无谓地换掉已有场景的摘要。
+using ConstraintVariant =
+    std::variant<DistanceConstraint, ContactConstraint, JointAxisConstraint>;
+using ConstraintList = std::vector<ConstraintVariant>;
 
 // ==================== 8. Policy 相关的类型擦除视图 ====================
 // variant 里某个类型的 alternative 下标（编译期）。

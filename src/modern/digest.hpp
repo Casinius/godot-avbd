@@ -172,6 +172,24 @@ inline std::uint64_t constraints(const ConstraintList &cs) noexcept {
         for (int j = 0; j < 3; ++j) h = mix_vec3(h, c.basis[j]);
         h = mix_vec3(h, c.rA);
         h = mix_vec3(h, c.rB);
+      } else if constexpr (std::is_same_v<std::decay_t<decltype(c)>, JointAxisConstraint>) {
+        // 关节行的每一个标量都要进摘要：模式/限位/暖启动状态任一改错，基线才看得见。
+        h = mix_vec3(h, c.axis);
+        h = mix_scalar(h, Scalar_t(static_cast<int>(c.mode)));
+        h = mix_scalar(h, Scalar_t(c.angular ? 1 : 0));
+        h = mix_scalar(h, c.target);
+        h = mix_scalar(h, c.lower);
+        h = mix_scalar(h, c.upper);
+        h = mix_scalar(h, c.penalty);
+        h = mix_scalar(h, c.initial);
+        h = mix_scalar(h, Scalar_t(c.axis_index));
+        for (JointAxisMode m : c.angular_modes)
+          h = mix_scalar(h, Scalar_t(static_cast<int>(m)));
+        h = mix_vec3(h, c.rA);
+        h = mix_vec3(h, c.rB);
+        h = mix_quat(h, c.frame_a);
+        h = mix_quat(h, c.frame_b);
+        h = mix_quat(h, c.rest);
       }
     }, v);
   }

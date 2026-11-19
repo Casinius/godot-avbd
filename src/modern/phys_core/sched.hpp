@@ -299,3 +299,45 @@ inline void scatter_typed<ContactConstraint>(const State &s, const std::uint32_t
     }
   }
 }
+
+// 关节行：与接触行相同的三条特例（自有 K / λ / 力界），外加两件事：
+//   1) Hessian 同样做 block-Jacobi mass-split。二体行在 per-body 局部系统里会被两侧
+//      各走一步，没有这项修正时相对位移是精确解的 2 倍，λ 在 RHS 里会把 2 倍放大成
+//      每迭代 3 倍（与接触注释里推导的完全一样）。
+//   2) 落在可行区间内的 Limited 行不提供任何刚度：hessian < 0 是"这一行没有 H"的
+//      哨兵（见 accumulate_entry）。若照常给 K，局部系统会把轴钉在当前点，限位内的
+//      自由度就动不了了。
+template <>
+inline void scatter_typed<JointAxisConstraint>(const State &s, const std::uint32_t *slots,
+                                               const void *const *objs, ConstraintScratch &scr,
+                                               std::size_t b, std::size_t e) noexcept {
+  for (std::size_t i = b; i < e; ++i) {
+    const auto &c = *static_cast<const JointAxisConstraint *>(objs[i]);
+    const Scalar_t C = c.evaluate(s);
+    const auto g = c.gradient(s);
+    const auto ga = c.gradient_angular(s);
+    Scalar_t force_min = -kForceUnclamped;
+    Scalar_t force_max = kForceUnclamped;
+    c.force_bounds(s, force_min, force_max);
+    // Limited 且未越界 ⇒ C == 0 且没有力：既不提供刚度也不提供 RHS。
+    const bool inactive_limit = c.mode == JointAxisMode::Limited && C == Scalar_t(0);
+    const std::uint32_t slot = slots[i];
+    for (std::size_t k = 0; k < 2; ++k) {
+      ConstraintEntry &ent = scr.entries[slot + k];
+      ent.g_lin = g[k];
+      ent.g_ang = ga[k];
+      ent.C = C;
+      ent.penalty = c.penalty;
+      ent.lambda = c.lambda;
+      ent.force_min = force_min;
+      ent.force_max = force_max;
+      if (inactive_limit) {
+        ent.hessian = Scalar_t(-1);
+      } else {
+        const std::size_t j = (k == 0) ? 1 : 0;
+        ent.hessian = c.penalty * contact_hessian_scale(s, c.bodies_[k], c.bodies_[j], g[k], ga[k],
+                                                        g[j], ga[j]);
+      }
+    }
+  }
+}

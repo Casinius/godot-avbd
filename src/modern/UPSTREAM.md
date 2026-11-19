@@ -3,18 +3,19 @@
 This tree is a snapshot of `/home/cyan/avbd-mo/src`, imported to replace the legacy
 `src/avbd` solver on the `modernize` branch.
 
-- Source HEAD: `7107cff` (`manifold`) — "implement Coulomb friction and fix contact
-  angular gradient sign". Earlier snapshots were `04d2833` (k0 / block assembly),
-  `4450b74` (pair filter) and `a3d9930` plus staged collision work; this tree
-  corresponds to a clean commit.
+- Source HEAD: `0c4853b` (`manifold`) — "add per-axis joint constraints". Earlier
+  snapshots were `7107cff` (friction + gradient sign), `04d2833` (k0 / block
+  assembly), `4450b74` (pair filter) and `a3d9930` plus staged collision work;
+  this tree corresponds to a clean commit.
 - Snapshot tree SHA-256 (everything under `src/modern` except this file):
-  `712fecaeeaeef1e7dbe74619009dfe6ad41e9b3f456ae9b54c3c5a172ef3b93f`
+  `1005994cedd672792758561d7a33e8ad8e295c533ec30ced28c6fab289d20016`
   Recipe: `find src/modern -type f ! -name UPSTREAM.md -print0 | sort -z |
   xargs -0 sha256sum | sha256sum`.
 - Baseline data copied to `src/modern/tests/`:
   `baseline.txt`, `collision_observable.txt` (the solver/collision digests this snapshot
   was verified against). The solver baseline was re-recorded when contact duals became
-  real; the collision digest is unchanged.
+  real; adding joints did not change it (the pinned scenes are joint-free), and the
+  collision digest is unchanged.
 - The snapshot builds with `-Wshadow` warnings in `phys_core/state.hpp` (an `int r`
   shadowing a parameter in `solve_body`). Left as-is: it is upstream's code and the
   warning is harmless.

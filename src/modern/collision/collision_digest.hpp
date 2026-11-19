@@ -183,6 +183,21 @@ inline std::uint64_t constraints(const ConstraintList &list) noexcept {
             h = mix_scalar(h, c.rest_length);
             h = mix_scalar(h, c.lambda);
             h = mix_scalar(h, c.compliance);
+          } else if constexpr (std::is_same_v<C, JointAxisConstraint>) {
+            h = mix_u64(h, static_cast<std::uint64_t>(c.bodies_[0]));
+            h = mix_u64(h, static_cast<std::uint64_t>(c.bodies_[1]));
+            h = mix_vec3(h, c.axis);
+            h = mix_vec3(h, c.rA);
+            h = mix_vec3(h, c.rB);
+            h = mix_scalar(h, c.target);
+            h = mix_scalar(h, c.lower);
+            h = mix_scalar(h, c.upper);
+            h = mix_scalar(h, c.lambda);
+            h = mix_scalar(h, c.penalty);
+            h = mix_scalar(h, c.initial);
+            h = mix_u64(h, static_cast<std::uint64_t>(c.angular ? 1 : 0));
+            h = mix_u64(h, static_cast<std::uint64_t>(c.mode));
+            h = mix_u64(h, static_cast<std::uint64_t>(c.axis_index));
           }
         },
         v);

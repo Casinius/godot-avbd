@@ -1131,17 +1131,184 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space, std::source_location
         space->modern->set_gravity_scale(i, body.gravity_scale);
         space->modern->set_damping(i, body.linear_damp, body.angular_damp);
     }
+
+    // Joints last: they need the body indices the loop above just wrote.
+    rebuild_joints_for_space(*space, space_id);
 }
 
 // -----------------------------------------------------------------------------
 // Joints
 //
-// Joint constraints are not part of the modern core yet (they are the largest remaining
-// gap on this branch). The records still store everything the engine sends, so scenes
-// load and getters replay, but the solver does not act on them. A joint edit marks its
-// space for a rebuild so the only joint-derived state that does exist - the collision
-// exclusion between its bodies - is refreshed.
+// Every engine joint is translated into modern JointAxisConstraint rows:
+//   Pin      - 3 linear locked, angular free.
+//   Hinge    - 3 linear locked; angular free about the hinge axis (joint frame Z),
+//              locked about the other two. HINGE_JOINT_FLAG_USE_LIMIT turns the hinge
+//              axis into a Limited row (Godot's hinge angle is B-relative-to-A, which is
+//              exactly what the row measures).
+//   6DOF     - each axis Free / Locked / Limited from its enable flag and limits. Godot
+//              spells "locked" as an enabled limit with lower == upper.
+//   Slider   - linear/angular about the joint frame X; the orthogonal axes locked.
+//   ConeTwist- not mapped yet (documented gap); it has no row.
+// Spring and motor parameters are still record-only: one row carries one (K, lambda, C)
+// pair, so a hard constraint and a spring cannot share an axis in this representation.
+//
+// A joint edit calls rebuild_space, which rebuilds the body set and then reinstalls the
+// rows from the records; that is what makes parameter changes take effect.
 // -----------------------------------------------------------------------------
+
+namespace {
+
+double joint_param(const AVBDPhysicsServer3D::JointData &p_joint, int p_key) {
+    const auto found = p_joint.joint_params.find(p_key);
+    return found == p_joint.joint_params.end() ? 0.0 : found->second;
+}
+
+bool joint_flag(const AVBDPhysicsServer3D::JointData &p_joint, int p_key) {
+    const auto found = p_joint.joint_flags.find(p_key);
+    return found != p_joint.joint_flags.end() && found->second;
+}
+
+// Godot's generic-6DOF convention: an enabled limit with lower == upper means "locked"
+// (the legacy mapping used the same rule).
+ModernJointAxis axis_from_limit(bool p_enabled, double p_lower, double p_upper) {
+    ModernJointAxis axis;
+    if (!p_enabled) {
+        axis.mode = JointAxisMode::Free;
+        return axis;
+    }
+    if (std::fabs(p_upper - p_lower) < 1.0e-9) {
+        axis.mode = JointAxisMode::Locked;
+        return axis;
+    }
+    axis.mode = JointAxisMode::Limited;
+    axis.lower = static_cast<Scalar_t>(p_lower);
+    axis.upper = static_cast<Scalar_t>(p_upper);
+    return axis;
+}
+
+Quat basis_rotation(const Basis &p_basis) {
+    return to_modern(p_basis.get_rotation_quaternion());
+}
+
+} // namespace
+
+void AVBDPhysicsServer3D::rebuild_joints_for_space(SpaceData &p_space, uint64_t p_space_id) {
+    if (p_space.modern == nullptr) {
+        return;
+    }
+
+    std::vector<uint64_t> space_joint_ids;
+    space_joint_ids.reserve(joints.size());
+    for (const auto &[id, joint] : joints) {
+        (void)joint;
+        space_joint_ids.push_back(id);
+    }
+    std::ranges::sort(space_joint_ids);
+
+    std::vector<ModernJointDesc> descs;
+    for (const uint64_t joint_id : space_joint_ids) {
+        const JointData &joint = joints.find(joint_id)->second;
+
+        const BodyData *body_a = joint.body_a.is_valid() ? find_body(joint.body_a) : nullptr;
+        const BodyData *body_b = find_body(joint.body_b);
+        if (body_b == nullptr || body_b->modern_index < 0 || id_of(body_b->space) != p_space_id) {
+            continue;
+        }
+        if (joint.body_a.is_valid() &&
+                (body_a == nullptr || body_a->modern_index < 0 ||
+                        id_of(body_a->space) != p_space_id)) {
+            continue;
+        }
+
+        ModernJointDesc desc;
+        desc.id = joint_id;
+        desc.body_a = joint.body_a.is_valid() ? body_a->modern_index : -1;
+        desc.body_b = body_b->modern_index;
+        desc.anchor_a = to_modern(joint.ref_a.origin);
+        desc.anchor_b = to_modern(joint.ref_b.origin);
+        desc.frame_a = basis_rotation(joint.ref_a.basis);
+        desc.frame_b = basis_rotation(joint.ref_b.basis);
+
+        for (int axis = 0; axis < 3; ++axis) {
+            desc.linear[axis] = ModernJointAxis{}; // Free
+            desc.angular[axis] = ModernJointAxis{};
+        }
+
+        switch (joint.type) {
+            case PhysicsServer3D::JOINT_TYPE_PIN: {
+                // Godot's pin is a ball joint: the anchor is fixed, rotation is free.
+                for (int axis = 0; axis < 3; ++axis)
+                    desc.linear[axis].mode = JointAxisMode::Locked;
+                break;
+            }
+            case PhysicsServer3D::JOINT_TYPE_HINGE: {
+                for (int axis = 0; axis < 3; ++axis)
+                    desc.linear[axis].mode = JointAxisMode::Locked;
+                desc.angular[0].mode = JointAxisMode::Locked;
+                desc.angular[1].mode = JointAxisMode::Locked;
+                const bool use_limit = joint_flag(joint, PhysicsServer3D::HINGE_JOINT_FLAG_USE_LIMIT);
+                const double upper = joint_param(joint, PhysicsServer3D::HINGE_JOINT_LIMIT_UPPER);
+                const double lower = joint_param(joint, PhysicsServer3D::HINGE_JOINT_LIMIT_LOWER);
+                desc.angular[2] = axis_from_limit(use_limit, lower, upper);
+                break;
+            }
+            case PhysicsServer3D::JOINT_TYPE_SLIDER: {
+                const double lin_upper =
+                        joint_param(joint, PhysicsServer3D::SLIDER_JOINT_LINEAR_LIMIT_UPPER);
+                const double lin_lower =
+                        joint_param(joint, PhysicsServer3D::SLIDER_JOINT_LINEAR_LIMIT_LOWER);
+                desc.linear[0] = axis_from_limit(true, lin_lower, lin_upper);
+                desc.linear[1].mode = JointAxisMode::Locked;
+                desc.linear[2].mode = JointAxisMode::Locked;
+
+                const double ang_upper =
+                        joint_param(joint, PhysicsServer3D::SLIDER_JOINT_ANGULAR_LIMIT_UPPER);
+                const double ang_lower =
+                        joint_param(joint, PhysicsServer3D::SLIDER_JOINT_ANGULAR_LIMIT_LOWER);
+                desc.angular[0] = axis_from_limit(true, ang_lower, ang_upper);
+                desc.angular[1].mode = JointAxisMode::Locked;
+                desc.angular[2].mode = JointAxisMode::Locked;
+                break;
+            }
+            case PhysicsServer3D::JOINT_TYPE_6DOF: {
+                for (int axis = 0; axis < 3; ++axis) {
+                    const double lin_lower =
+                            joint.params[axis][PhysicsServer3D::G6DOF_JOINT_LINEAR_LOWER_LIMIT];
+                    const double lin_upper =
+                            joint.params[axis][PhysicsServer3D::G6DOF_JOINT_LINEAR_UPPER_LIMIT];
+                    const bool lin_enabled = joint.flags[axis]
+                            [PhysicsServer3D::G6DOF_JOINT_FLAG_ENABLE_LINEAR_LIMIT];
+                    desc.linear[axis] = axis_from_limit(lin_enabled, lin_lower, lin_upper);
+
+                    // Angular params are stored with the angular enum family rebased to 0
+                    // (see _generic_6dof_joint_set_param): the angular lower/upper slots
+                    // are 0/1 on row 3+axis, not the enum's 10/11.
+                    constexpr int kAngularParamBase =
+                            PhysicsServer3D::G6DOF_JOINT_ANGULAR_LOWER_LIMIT;
+                    const double ang_lower =
+                            joint.params[axis + 3][PhysicsServer3D::G6DOF_JOINT_ANGULAR_LOWER_LIMIT -
+                                                   kAngularParamBase];
+                    const double ang_upper =
+                            joint.params[axis + 3][PhysicsServer3D::G6DOF_JOINT_ANGULAR_UPPER_LIMIT -
+                                                   kAngularParamBase];
+                    const bool ang_enabled = joint.flags[axis + 3]
+                            [PhysicsServer3D::G6DOF_JOINT_FLAG_ENABLE_ANGULAR_LIMIT];
+                    desc.angular[axis] = axis_from_limit(ang_enabled, ang_lower, ang_upper);
+                }
+                break;
+            }
+            case PhysicsServer3D::JOINT_TYPE_CONE_TWIST:
+            default:
+                // Cone-twist has no row yet: its swing cone is not a per-axis interval,
+                // and shipping a wrong approximation is worse than no constraint.
+                continue;
+        }
+
+        descs.push_back(std::move(desc));
+    }
+
+    p_space.modern->rebuild_joints(std::move(descs));
+}
 
 void AVBDPhysicsServer3D::_rebuild_for_joint(const RID &p_joint) {
     const auto found = joints.find(id_of(p_joint));

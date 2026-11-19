@@ -387,6 +387,11 @@ protected:
     void rebuild_space(const RID &p_space,
             std::source_location where = std::source_location::current());
 
+    // Translate the engine's joint records for one space into modern joint rows and
+    // install them. Called by rebuild_space after the body indices are known; every
+    // supported joint type maps onto JointAxisConstraint rows (see the definitions).
+    void rebuild_joints_for_space(SpaceData &p_space, uint64_t p_space_id);
+
     // Spaces whose body set changed since the last step; rebuilt at the top of _step so
     // a body joining mid-setup lands with its shapes attached.
     ankerl::unordered_dense::map<uint64_t, bool> space_rebuild_pending;

@@ -29,26 +29,29 @@ This file is the honest state of the migration, not a wish list.
   `ContactConstraint::gradient_angular` (B-side torque was inverted). Without
   friction it showed up as slow wrong rolling; with a real dual it pumped
   energy every frame.
+- **Joints** (`0c4853b`): a joint is decomposed into per-axis rows (locked,
+  limited, free; linear and angular) with stabilization, force bounds and a
+  penalty cap. The server maps pin, hinge, slider and generic 6DOF onto them,
+  including world anchors. Cone-twist is deliberately not mapped: a swing cone
+  is not a per-axis interval, and a wrong approximation would be worse than no
+  constraint.
 - `avbd_modern_test`: 50/50 structural selftests, solver digest and collision
   digest bit-identical to the pinned upstream baselines. Wired into
   `run_all_tests` and CI (`avbd_modern_tests`).
 
 ## Known gaps (upstream)
 
-- **Joints**: no joint constraint in the core yet. Joint records are stored and
-  getters replay, but nothing is simulated (`test_solver`'s hard/world joint
-  cases fail; `test_constraints` is expected to fail). `hard_joint` used to pass
-  on the frictionless tree only by accident: the links free-fell in formation
-  because contacts were forced to zero friction.
+- **Cone-twist joint**: records and getters work, but no constraint is emitted
+  (see above).
 - **Automatic sleep**: only explicit `BODY_STATE_SLEEPING` freezes a body.
 - **Speculative contacts / CCD / position projection**: not ported.
 - **Capsule and convex** are documented proxies, not exact geometry.
 
-Current `test_solver.gd`: 38 checks, **3 failures** — all joints. Friction
-(static creep 0.009 m, dynamic travel 4.3 m), stack height/penetration/drift
-and both impulse checks pass. `test_server.gd` 30/30 and `test_queries.gd`
-27/27 pass. `test_pyramid` still cannot hold a 420-box pile (joints and sleep
-are absent, and a friction-only penalty model is not enough for that depth).
+Current suites: `test_solver.gd` **38/38**, `test_constraints.gd` **11/11**,
+`test_server.gd` **30/30**, `test_queries.gd` **27/27**, `test_load.gd` gate
+PASS. `test_pyramid` is 7/9: the 420-box pile still loses a few boxes below the
+ground and drifts 1.3 m over 10 s, so deep piles are not at legacy quality yet
+(speculative contacts / position projection are the missing pieces).
 
 ## Coordinates / conventions
 
@@ -57,6 +60,7 @@ has no axis permutation. The soft-body nodes keep their own Z-up conversion.
 
 ## Next
 
-1. Port joints as core constraints (`AxisConstraint`/generic 6-DOF).
+1. Cone-twist joint (or a real cone constraint primitive).
 2. Island-based sleep in the frame/world layer.
-3. Then remove `src/avbd` and the soft-body dependence on it.
+3. Speculative contacts / position projection for deep piles.
+4. Then remove `src/avbd` and the soft-body dependence on it.

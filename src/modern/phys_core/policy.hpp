@@ -72,6 +72,28 @@ public:
       return;
     }
 
+    // 关节行与接触行同一形态：自有 K/λ/力界；Hessian 走 mass-split，限位内不提供刚度。
+    // 走 solve() 时它们由 scatter_typed 的专用重载处理，这条分支是给直接调 step() 的
+    // Policy 用法（以及 selftest 的 scatter/gather 对照）对齐同一组数字。
+    if constexpr (std::is_same_v<C, JointAxisConstraint>) {
+      auto     g_ang = c.gradient_angular(s);
+      Scalar_t force_min = -kForceUnclamped;
+      Scalar_t force_max = kForceUnclamped;
+      c.force_bounds(s, force_min, force_max);
+      const Scalar_t row_k = c.penalty > Scalar_t(0) ? c.penalty : k;
+      const bool inactive_limit = c.mode == JointAxisMode::Limited && Cv == Scalar_t(0);
+      for (std::size_t n = 0; n < g.size(); ++n) {
+        const std::size_t j = (n == 0) ? 1 : 0;
+        const Scalar_t h = inactive_limit
+                ? Scalar_t(0)
+                : row_k * contact_hessian_scale(s, c.bodies_[n], c.bodies_[j], g[n], g_ang[n],
+                                                g[j], g_ang[j]);
+        s.buffers.accumulate_row(bodies[n], g[n], g_ang[n], row_k, Cv, c.lambda, h, force_min,
+                                 force_max);
+      }
+      return;
+    }
+
     if constexpr (HasAngularGradient<C, State>) {
       auto g_ang = c.gradient_angular(s);
       for (std::size_t n = 0; n < g.size(); ++n)
@@ -184,6 +206,11 @@ public:
   // 新接触就是 floor，随后由 dual_contact 的 ramp 自适应增长。
   void capture_step_start(State &s, ConstraintList &cs) {
     for (ConstraintVariant &v : cs) {
+      // 关节行：记录本步的稳定化基准并暖启动 λ/K，一次/步。
+      if (auto *joint = std::get_if<JointAxisConstraint>(&v)) {
+        joint->capture_step_start(s);
+        continue;
+      }
       if (!std::holds_alternative<ContactConstraint>(v))
         continue;
       ContactConstraint &c = std::get<ContactConstraint>(v);

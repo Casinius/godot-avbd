@@ -45,6 +45,7 @@
 #include "collision/contact_constraints.hpp"
 #include "collision/mass_properties.hpp"
 #include "collision/shape_instance.hpp"
+#include "phys_core/joint.hpp"
 #include "phys_core/policy.hpp"
 #include "phys_core/solver_phase.hpp"
 #include "phys_core/state.hpp"
@@ -74,6 +75,29 @@ struct ModernBodyDesc {
     // for "no mesh". Kept out of ShapeInstance so the desc stays copyable/cheap.
 };
 
+// One joint axis, as the server describes it. Axis i is the i-th axis of the joint
+// frame (frame_a / frame_b rotations, usually the identity); Free axes emit no row.
+struct ModernJointAxis {
+    JointAxisMode mode = JointAxisMode::Free;
+    Scalar_t lower = 0; // metres for linear, radians for angular
+    Scalar_t upper = 0;
+    Scalar_t target = 0;
+};
+
+// One joint, as the server describes it to the modern core. Body indices are ModernSpace
+// state indices; body_a < 0 means the joint's A side is the world, which is represented
+// by the persistent static world body (see world_body_index()).
+struct ModernJointDesc {
+    std::uint64_t id = 0; // server joint id, used only to keep rebuild order deterministic
+    std::int32_t body_a = -1;
+    std::int32_t body_b = -1;
+    Vec3 anchor_a{0}, anchor_b{0}; // body-local anchors
+    Quat frame_a = identity_quat();
+    Quat frame_b = identity_quat();
+    std::array<ModernJointAxis, 3> linear{};
+    std::array<ModernJointAxis, 3> angular{};
+};
+
 class ModernSpace {
 public:
     ModernSpace();
@@ -84,8 +108,21 @@ public:
 
     // Replace the whole body set. Sorts by desc.id, builds shapes, mass properties,
     // collision filter tables and the collision world. Destroys contact warm start.
+    // Also reserves one trailing static body for joints whose A side is the world, so a
+    // joint always has two valid state indices.
     void rebuild(std::vector<ModernBodyDesc> bodies);
     void clear();
+
+    // Replace every joint row. Rows are kept in `constraints_` in front of the contact
+    // rows (collision_.sync only erases/re-emits contacts at the tail), so repeated steps
+    // do not rebuild them and keep their warm-started dual state. Bumps topology_version_
+    // only when the row identities change. Dual state is carried over for rows that keep
+    // the same (bodies, kind, axis, mode).
+    void rebuild_joints(std::vector<ModernJointDesc> joints);
+
+    // Index of the persistent static world body. Valid after rebuild(); it is the state
+    // index just past the last real body and is never part of ids_/collision pairs.
+    [[nodiscard]] std::size_t world_body_index() const noexcept { return world_index_; }
 
     [[nodiscard]] std::size_t size() const noexcept { return ids_.size(); }
     [[nodiscard]] bool empty() const noexcept { return ids_.empty(); }
@@ -163,6 +200,8 @@ private:
 
     State state_{};
     ConstraintList constraints_{};
+    std::vector<Joint> joints_{};
+    std::size_t world_index_ = 0;
     collision::CollisionWorld collision_{};
     AVBDStep policy_{};
     SolveSchedule schedule_{};

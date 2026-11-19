@@ -32,6 +32,8 @@ ModernSpace::~ModernSpace() = default;
 void ModernSpace::clear() {
     state_.clear();
     constraints_.clear();
+    joints_.clear();
+    world_index_ = 0;
     collision_.clear();
     ids_.clear();
     com_local_.clear();
@@ -164,10 +166,14 @@ void ModernSpace::rebuild(std::vector<ModernBodyDesc> bodies) {
 
     clear();
     const std::size_t n = bodies.size();
-    state_.resize(n);
+    // One extra state slot is the static world body that world-anchored joints use as
+    // their A side. It has no id, no shapes and never takes part in collision; it is
+    // simply a fixed frame the constraint math can read like any other body.
+    world_index_ = n;
+    state_.resize(n + 1);
     ids_.resize(n);
     com_local_.resize(n, Vec3{0});
-    collision_.resize(n);
+    collision_.resize(n + 1);
     rebuild_filter_tables(bodies);
 
     for (std::size_t i = 0; i < n; ++i) {
@@ -200,9 +206,96 @@ void ModernSpace::rebuild(std::vector<ModernBodyDesc> bodies) {
             collision_.set_shapes(i, shapes);
     }
 
+    // The world body: identity frame at the origin, infinite mass. Any joint with an
+    // invalid A RID keeps its anchor in world space, so rA is used verbatim.
+    state_.pose.set_position(world_index_, Vec3{0});
+    state_.pose.set_rotation(world_index_, identity_quat());
+    state_.inertial.set_inv_mass(world_index_, 0);
+    state_.inertial.set_local_inv_inertia(world_index_, Mat3(0));
+    state_.cache.refresh_rotmat(world_index_, state_.pose);
+    state_.cache.refresh_dq(world_index_, state_.pose);
+    state_.cache.set_inertial(world_index_, state_.pose.position(world_index_),
+            state_.pose.rotation(world_index_));
+    collision_.clear_shapes(world_index_);
+
     // The filter tables are owned by this object; rebuild() just refreshed them.
     collision_.set_pair_filter(&ModernSpace::pair_filter_cb, this);
     topology_version_ = 0;
+}
+
+namespace {
+bool same_joint_row_identity(const JointAxisConstraint &a, const JointAxisConstraint &b) {
+    return a.bodies_[0] == b.bodies_[0] && a.bodies_[1] == b.bodies_[1] &&
+           a.angular == b.angular && a.axis_index == b.axis_index && a.mode == b.mode;
+}
+} // namespace
+
+void ModernSpace::rebuild_joints(std::vector<ModernJointDesc> descs) {
+    // Deterministic order: server ids are minted in creation order, so sorting here keeps
+    // the row order - and with it every digest and the dual order - a function of the scene.
+    std::sort(descs.begin(), descs.end(),
+            [](const ModernJointDesc &a, const ModernJointDesc &b) { return a.id < b.id; });
+
+    // Keep the previous dual state so a limit/spring edit does not throw away the force
+    // the joint has built up. Only rows with the same identity inherit it.
+    std::vector<JointAxisConstraint> old_rows;
+    for (const ConstraintVariant &v : constraints_) {
+        if (const auto *row = std::get_if<JointAxisConstraint>(&v))
+            old_rows.push_back(*row);
+    }
+    constraints_.erase(std::remove_if(constraints_.begin(), constraints_.end(),
+                               [](const ConstraintVariant &v) {
+                                   return std::holds_alternative<JointAxisConstraint>(v);
+                               }),
+            constraints_.end());
+
+    joints_.clear();
+    std::vector<JointAxisConstraint> rows;
+    for (ModernJointDesc &d : descs) {
+        if (d.body_b < 0 || static_cast<std::size_t>(d.body_b) >= ids_.size())
+            continue;
+        if (d.body_a < 0) {
+            d.body_a = static_cast<std::int32_t>(world_index_);
+        } else if (static_cast<std::size_t>(d.body_a) >= ids_.size()) {
+            continue;
+        }
+
+        JointDesc jd;
+        jd.body_a = static_cast<std::size_t>(d.body_a);
+        jd.body_b = static_cast<std::size_t>(d.body_b);
+        jd.rA = d.anchor_a;
+        jd.rB = d.anchor_b;
+        jd.frame_a = d.frame_a;
+        jd.frame_b = d.frame_b;
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            const ModernJointAxis &lin = d.linear[axis];
+            jd.linear[axis] = JointAxisSpec{lin.mode, lin.lower, lin.upper, lin.target};
+            const ModernJointAxis &ang = d.angular[axis];
+            jd.angular[axis] = JointAxisSpec{ang.mode, ang.lower, ang.upper, ang.target};
+        }
+        joints_.emplace_back(jd, state_);
+        for (JointAxisConstraint row : joints_.back().rows()) {
+            for (const JointAxisConstraint &old : old_rows) {
+                if (same_joint_row_identity(row, old)) {
+                    row.lambda = old.lambda;
+                    row.penalty = old.penalty;
+                    row.initial = old.initial;
+                    break;
+                }
+            }
+            rows.push_back(row);
+        }
+    }
+
+    bool changed = old_rows.size() != rows.size();
+    for (std::size_t i = 0; !changed && i < rows.size(); ++i)
+        changed = !same_joint_row_identity(old_rows[i], rows[i]);
+
+    // Contacts live at the tail (collision_.sync erases/re-emits only those), so joint
+    // rows go in front and survive every step without being rebuilt.
+    constraints_.insert(constraints_.begin(), rows.begin(), rows.end());
+    if (changed)
+        ++topology_version_;
 }
 
 void ModernSpace::set_body_transform(std::size_t index, Vec3 origin, Quat rotation) {
@@ -363,7 +456,7 @@ void ModernSpace::step(int iterations, int threads) {
     // engine semantics, not solver physics, so they live in the adapter: a locked
     // coordinate (or a sleeping body) is restored to its step-start value and its
     // velocity component is cleared.
-    for (std::size_t i = 0; i < state_.size(); ++i) {
+    for (std::size_t i = 0; i < ids_.size(); ++i) {
         const std::uint32_t locks = axis_locks_[i];
         if (locks == 0 && !sleeping_[i])
             continue;
