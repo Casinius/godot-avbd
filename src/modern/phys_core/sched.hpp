@@ -38,6 +38,11 @@ struct SolveSchedule {
   // 拓扑缓存校验（测试用）：复用缓存时把布局重算一遍比对。
   // 开着会多一份 O(entries) 的临时分配，所以默认关。
   bool verify_topology = false;
+
+  // 测试专用：强制"一 unit 一 block，block 升序"。这是 ζ=1 时与 XPBD 串行
+  // Gauss-Seidel **逐位等价**的唯一分区形态（见 oracle 1），用来在固定的 pinned
+  // 场景上验证 block 扫掠本身没有改变更新顺序/算术。生产路径保持 false。
+  bool force_single_unit_blocks = false;
 };
 
 // —— 唯一的“该不该并行”判定 ——
@@ -108,9 +113,119 @@ void build_entry_layout(ConstraintScratch &scr, std::span<const Ref> refs, std::
   }
 }
 
+// —— 块分区的 body 可动性签名 ——
+// block 的冲突判定会跳过静态 body，因此分区依赖"哪些 body 是静态的"。
+// 静态性不在 TopologyKey 里（改质量不算拓扑变更），所以 block 缓存额外带一个
+// 可动性签名：它变了就只重建 block 分区，entry 布局照常复用。
+[[nodiscard]] inline std::uint64_t static_mask_hash(const State &s) noexcept {
+  std::uint64_t h = 1469598103934665603ull;
+  const auto *  p = s.inertial.mass_inv.data();
+  for (std::size_t b = 0; b < s.inertial.mass_inv.size(); ++b) {
+    const unsigned char v = p[b] == Scalar_t(0) ? 1u : 0u;
+    h = (h ^ static_cast<std::uint64_t>(v)) * 1099511628211ull;
+  }
+  return h;
+}
+
+// —— 块分区（constraint_blocks 策略）——
+// 与 entry 布局同属拓扑状态：只依赖约束→body 邻接与"哪两行是同一 unit"，
+// 所以和 entry 布局一起挂在 TopologyKey 下缓存、一起在 verify 时重算比对。
+//
+// 规则（确定性）：
+//   1) unit 按 ConstraintList 索引升序枚举；
+//   2) 每个 unit first-fit 到**编号最小**的、所有动态 body 都空闲的 block；
+//   3) 静态 body 不参与冲突判定 —— 否则常驻的 world body 会把所有约束塞进同一个
+//      block，着色退化成完全串行。
+// 结果只由输入顺序决定，没有任何哈希序/调度参与。
+template <typename Ref>
+void build_block_layout(ConstraintScratch &scr, std::span<const Ref> refs, const State &s,
+                        bool force_single_unit = false) {
+  scr.unit_begin.clear();
+  scr.unit_rows.clear();
+  scr.block_begin.clear();
+  scr.block_units.clear();
+
+  const std::size_t nc = refs.size();
+
+  // 1) unit：相邻且属于同一 unit 的行（接触点的 1~3 行）合在一起。
+  // 必须先比 type_index：joins_unit 是**按 refs[end] 的类型**强转两端的函数指针，
+  // 跨类型调用会把 Distance/JointAxis 当成 ContactConstraint 读（UB）。
+  std::size_t u = 0;
+  while (u < nc) {
+    std::size_t end = u + 1;
+    while (end < nc && end - u < 3 && refs[end].type_index == refs[end - 1].type_index &&
+           refs[end].joins_unit != nullptr &&
+           refs[end].joins_unit(refs[end - 1].obj, refs[end].obj))
+      ++end;
+    scr.unit_begin.push_back(static_cast<std::uint32_t>(u));
+    scr.unit_rows.push_back(static_cast<std::uint32_t>(end - u));
+    u = end;
+  }
+
+  const std::size_t nu = scr.unit_rows.size();
+
+  // 2) first-fit。block_units_tmp / block_bodies 都是拓扑重建期的临时量，
+  //    不进缓存；块数通常很小（网格着色），复杂度不是热路径。
+  std::vector<std::vector<std::uint32_t>> block_units_tmp;
+  std::vector<std::vector<std::size_t>>   block_bodies;
+
+  for (std::size_t ui = 0; ui < nu; ++ui) {
+    if (force_single_unit) {
+      block_units_tmp.emplace_back();
+      block_units_tmp.back().push_back(static_cast<std::uint32_t>(ui));
+      continue;
+    }
+    // 收集这个 unit 的动态 body（去重；一个 unit 最多 3 行 × 2 body）。
+    std::array<std::size_t, 6> bodies{};
+    std::size_t                nb = 0;
+    const std::uint32_t        r0 = scr.unit_begin[ui];
+    for (std::uint32_t r = 0; r < scr.unit_rows[ui]; ++r) {
+      const Ref &ref = refs[r0 + r];
+      for (std::size_t b : ref.bodies(ref.obj)) {
+        if (s.inertial.is_static(b)) continue; // 静态 body 不制造冲突
+        bool dup = false;
+        for (std::size_t k = 0; k < nb; ++k) dup = dup || bodies[k] == b;
+        if (!dup) bodies[nb++] = b;
+      }
+    }
+
+    std::size_t chosen = block_units_tmp.size();
+    for (std::size_t bi = 0; bi < block_units_tmp.size(); ++bi) {
+      bool conflict = false;
+      for (std::size_t k = 0; k < nb && !conflict; ++k)
+        for (std::size_t x : block_bodies[bi]) conflict = conflict || x == bodies[k];
+      if (!conflict) {
+        chosen = bi;
+        break;
+      }
+    }
+    if (chosen == block_units_tmp.size()) {
+      block_units_tmp.emplace_back();
+      block_bodies.emplace_back();
+    }
+    block_units_tmp[chosen].push_back(static_cast<std::uint32_t>(ui));
+    for (std::size_t k = 0; k < nb; ++k) block_bodies[chosen].push_back(bodies[k]);
+  }
+
+  // 3) 展平成 block_begin/block_units（块内 unit 索引保持升序）。
+  scr.block_begin.resize(block_units_tmp.size() + 1);
+  scr.block_begin[0] = 0;
+  for (std::size_t bi = 0; bi < block_units_tmp.size(); ++bi)
+    scr.block_begin[bi + 1] =
+        scr.block_begin[bi] + static_cast<std::uint32_t>(block_units_tmp[bi].size());
+  scr.block_units.resize(scr.block_begin.back());
+  std::size_t w = 0;
+  for (const auto &bl : block_units_tmp)
+    for (std::uint32_t ui : bl) scr.block_units[w++] = ui;
+}
+
 // —— 拓扑缓存：拓扑不变就不重建 ——
 // verify = true 时（测试用）会把布局重算一遍逐字节比对，把"拓扑没变"从“相信调用方”
 // 变成“可验证”。stale_detected 一旦为真，就是 version 维护错了。
+//
+// entry 布局与 block 分区共用同一个 TopologyKey；block 是**按需**构建的
+// （with_blocks = Policy::constraint_blocks），并用 block_valid 记录，避免
+// "同一个 Scene 先跑 AVBD 再跑 BPXPBD"时命中 entry 缓存却没有 block 分区。
 struct LayoutResult {
   bool rebuilt = false;
   bool stale_detected = false;
@@ -118,19 +233,50 @@ struct LayoutResult {
 
 template <typename Ref>
 LayoutResult ensure_layout(ConstraintScratch &scr, std::span<const Ref> refs, TopologyKey want,
-                           bool verify) {
-  LayoutResult out;
+                           bool verify, const State &s, bool with_blocks,
+                           bool force_single_unit = false) {
+  LayoutResult  out;
+  std::uint64_t mass_hash = static_mask_hash(s);
+  if (force_single_unit) mass_hash ^= 0x9E3779B97F4A7C15ull; // 分区模式进缓存签名
+
   if (scr.key.same_as(want)) {
     if (verify) {
       ConstraintScratch fresh;
       build_entry_layout(fresh, refs, want.body_count);
       out.stale_detected = fresh.begin != scr.begin || fresh.body_begin != scr.body_begin ||
                            fresh.body_entries != scr.body_entries;
+      // 分区依赖静态性：只有签名一致时才能拿 fresh 和缓存比。签名变了会重建，
+      // 不算"拓扑没 bump"的 stale。
+      if (!out.stale_detected && with_blocks && scr.block_valid &&
+          scr.block_mass_hash == mass_hash) {
+        build_block_layout(fresh, refs, s, force_single_unit);
+        out.stale_detected = fresh.unit_begin != scr.unit_begin ||
+                             fresh.unit_rows != scr.unit_rows ||
+                             fresh.block_begin != scr.block_begin ||
+                             fresh.block_units != scr.block_units;
+      }
+    }
+    if (with_blocks && (!scr.block_valid || scr.block_mass_hash != mass_hash)) {
+      build_block_layout(scr, refs, s, force_single_unit);
+      scr.block_mass_hash = mass_hash;
+      scr.block_valid     = true;
     }
     return out; // 复用
   }
 
   build_entry_layout(scr, refs, want.body_count);
+  if (with_blocks) {
+    build_block_layout(scr, refs, s, force_single_unit);
+    scr.block_mass_hash = mass_hash;
+    scr.block_valid     = true;
+  } else {
+    scr.unit_begin.clear();
+    scr.unit_rows.clear();
+    scr.block_begin.clear();
+    scr.block_units.clear();
+    scr.block_mass_hash = 0;
+    scr.block_valid     = false;
+  }
   scr.key = want;
   ++scr.build_count;
   out.rebuilt = true;

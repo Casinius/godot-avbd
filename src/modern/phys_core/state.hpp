@@ -641,6 +641,22 @@ struct ConstraintScratch {
   std::vector<std::uint32_t> body_entries; // 每个 body 的 entry 索引，按约束索引升序
   std::vector<std::uint32_t> cursor;       // 建邻接用的临时写指针（复用，免每步分配）
 
+  // —— 块分区（constraint_blocks 策略；BPXPBD）——
+  // 与 entries 同一生命周期：只依赖"哪条约束碰哪些 body" + 哪两行是同一个 unit，
+  // 与几何/λ 无关 ⇒ 和 entry 布局一起挂在 TopologyKey 下缓存。
+  //   unit_begin[u]               = unit u 的第一行在 ConstraintList 里的索引
+  //   unit_rows[u]                = unit u 的行数（1；接触点为 1~3）
+  //   block_units[block_begin[b]..block_begin[b+1]) = block b 的 unit 索引（块内升序）
+  // 分块规则：unit 按索引升序 first-fit 到第一个"所有动态 body 都空闲"的 block。
+  // 静态 body 不参与冲突判定（否则 world body 会把所有约束串行化）。
+  std::vector<std::uint32_t> unit_begin;
+  std::vector<std::uint32_t> unit_rows;
+  std::vector<std::uint32_t> block_begin;
+  std::vector<std::uint32_t> block_units;
+  // block 分区额外依赖"哪些 body 静态"（见 sched.hpp 的 static_mask_hash）。
+  std::uint64_t block_mass_hash = 0;
+  bool          block_valid     = false;
+
   void clear() {
     key = TopologyKey{};
     build_count = 0;
@@ -650,6 +666,12 @@ struct ConstraintScratch {
     body_begin.clear();
     body_entries.clear();
     cursor.clear();
+    unit_begin.clear();
+    unit_rows.clear();
+    block_begin.clear();
+    block_units.clear();
+    block_mass_hash = 0;
+    block_valid     = false;
   }
   void resize_bodies(std::size_t n) {
     // 【缓存失效的唯一入口】
@@ -662,6 +684,12 @@ struct ConstraintScratch {
     begin.clear();
     entries.clear();
     cursor.clear();
+    unit_begin.clear();
+    unit_rows.clear();
+    block_begin.clear();
+    block_units.clear();
+    block_mass_hash = 0;
+    block_valid     = false;
     key = TopologyKey{};
   }
   std::size_t constraint_count() const noexcept {

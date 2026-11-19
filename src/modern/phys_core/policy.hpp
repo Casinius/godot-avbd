@@ -6,6 +6,7 @@
 #include <span>
 #include <type_traits>
 #include <variant>
+#include <vector>
 
 #include "base_concept.hpp"
 #include "constraint.hpp"
@@ -37,6 +38,11 @@ class AVBDStep {
 public:
   // 只有 AVBD 会用到 SolverBuffers；XPBD/PBD 不走局部系统。
   static constexpr bool uses_solver_buffers = true;
+  // 拓扑布局（per-constraint entry 邻接 / block 分区）只有 AVBD/BPXPBD 需要。
+  // 两者共用同一个 TopologyKey，但 block 只在 constraint_blocks 策略下构建。
+  static constexpr bool needs_topology = true;
+  // AVBD 的约束更新在 scatter/gather 里，不扫 block。
+  static constexpr bool constraint_blocks = false;
 
   // 刚度 ramp 的起始值与步内增长率。k 是**步内**状态：每步回到 k0（见 begin_iterations）。
   // k0 可配置（引擎按材质/接触刚度映射），默认值保持历史基线不变。
@@ -319,6 +325,8 @@ class XPBDStep {
 public:
   // 不走 per-body 局部系统：进度完全在 step() 里的直接位置投影（Gauss-Seidel）。
   static constexpr bool uses_solver_buffers = false;
+  static constexpr bool needs_topology = false;
+  static constexpr bool constraint_blocks = false;
 
   template <Constraint<State> C> void step(State &s, C &c) {
     const Scalar_t Cv     = c.evaluate(s);
@@ -372,6 +380,380 @@ public:
   void ramp_stiffness() noexcept {}
 };
 
+// —— B-PXPBD：Blended Primal XPBD（Chen et al., MIG'23） ——
+//
+// 在 XPBD 的位置更新上多加一个全局残差修正项：
+//
+//   x̃ = x + dt·(v + M⁻¹f_ext)           （begin_iterations 已把 pose 搬到 x̃）
+//   for k in 0..K-1:
+//     R_i = Σ_c λ_c ∇C_c(x)             （begin_sweep，串行、约束升序）
+//     for each unit（着色 block 扫掠）:
+//       C = C_d(x); g = ∇C_d(x); w = Σ gᵀM⁻¹g
+//       α̃ = compliance/dt²
+//       Δλ = -(C + α̃λ) / (w + α̃)
+//       λ += Δλ
+//       for i: B_i = (x̃_i - x_i) + M_i⁻¹R_i
+//              x_i += M_i⁻¹g_iΔλ + (1-ζ)B_i
+//              R_i += g_iΔλ
+//   v = (x - x_prev)/dt                 （finish_step）
+//
+// ζ = 1 时 blend 项恒为 0 ⇒ 与 XPBDStep 的串行 Gauss-Seidel **逐位相同**（已有断言）。
+// ζ = 0 是一次精确 fixed-point 步；默认 0.5。
+//
+// 与 AVBD 的语义差：λ 是**乘子**（力 = λ∇C），不是 AVBD 存的力 F = K·C + λ。
+// 关节 Limited 行的可行方向因此与 AVBD 相反，夹紧区间取 (-force_max, -force_min)。
+// 关节初始稳定化基准 `initial` 必须为 0（不跑 AVBD 的 capture_step_start）。
+class BPXPBDStep : public XPBDStep {
+public:
+  static constexpr bool needs_topology = true;
+  static constexpr bool uses_solver_buffers = false; // 不需要 per-body 局部系统
+  static constexpr bool constraint_blocks = true;    // 走着色 block 扫掠
+
+  Scalar_t zeta = Scalar_t(0.5);
+
+  // 接触行的附加柔度（单位 m/N，即 1/K）。0 = 刚体接触，与发射路径一致
+  // （ContactEmitOptions::compliance 默认 0）；>0 时用 α = 1/K 把 AVBD 的罚刚度
+  // 映射成 XPBD 柔度，用来做"软/硬" A/B。它加在 ContactConstraint::compliance 上，
+  // 不修改发射路径。
+  Scalar_t contact_compliance = Scalar_t(0);
+
+  // R = Σ λ∇C，每步/每迭代刷新。resize 只在 body 数变化时发生。
+  std::vector<Vec3> R_lin;
+  std::vector<Vec3> R_ang;
+
+  // 本步是否已经清过接触的 λ/initial_c（每步第一次 begin_sweep 清一次）。
+  bool contacts_initialized_ = false;
+
+  // 继承 XPBD 的 begin_iterations（把 pose 搬到惯性目标），额外准备 R。
+  template <typename Exec, typename Sched>
+  void begin_iterations(State &s, Exec &exec, const Sched &sched) {
+    XPBDStep::begin_iterations(s, exec, sched);
+    resize_R(s.size());
+    contacts_initialized_ = false;
+  }
+
+  // 每次迭代开始时调用一次：串行、按约束索引升序 gather R。
+  // 这里同时把关节行的 XPBD 语义钉死：
+  //   * initial 必须为 0（XPBD 不做 AVBD 的一阶稳定化）；
+  //   * Limited 行在可行域内 λ = 0（互补松弛；λ 是乘子，可行方向一侧见 step）。
+  void begin_sweep(State &s, ConstraintList &cs) {
+    resize_R(s.size());
+    for (auto &r : R_lin) r = Vec3{0};
+    for (auto &r : R_ang) r = Vec3{0};
+
+    // 接触 λ 的量纲是乘子（kg·m），AVBD 的 λ 是力（N）。两者不能互相暖启动，
+    // 所以每步**第一次** begin_sweep 把接触的 λ/initial_c 清零；之后各迭代保留
+    // 本步累积的乘子。manifold store 里的 AVBD λ 只能通过 reset_warm_start()
+    // 在切换求解器时清掉（见 CollisionWorld）。
+    if (!contacts_initialized_) {
+      for (ConstraintVariant &v : cs) {
+        if (auto *c = std::get_if<ContactConstraint>(&v)) {
+          c->lambda        = Scalar_t(0);
+          c->initial_c     = Scalar_t(0);
+          c->initial_c_raw = Scalar_t(0);
+        }
+      }
+      contacts_initialized_ = true;
+    }
+
+    for (ConstraintVariant &v : cs) {
+      if (auto *j = std::get_if<JointAxisConstraint>(&v)) {
+        j->initial = Scalar_t(0);
+        if (j->mode == JointAxisMode::Limited) {
+          const Scalar_t val = j->value(s);
+          if (!(val > j->upper) && !(val < j->lower)) j->lambda = Scalar_t(0);
+        }
+      }
+      std::visit([&](const auto &c) { gather_R(s, c); }, v);
+    }
+  }
+
+  // 单行内核。接触点的 1~3 行必须由 step_unit() 的 unit 内核联合求解（法线夹紧
+  // 决定摩擦锥上界），所以直接逐行调用这里时接触是 no-op；driver 的 block 扫掠
+  // 总是走 step_unit()。
+  template <Constraint<State> C> void step(State &s, C &c) {
+    if constexpr (std::is_same_v<C, ContactConstraint>) {
+      (void)s;
+      (void)c;
+      return;
+    } else {
+      const Scalar_t Cv     = c.evaluate(s);
+      const auto     g      = c.gradient(s);
+      const auto     bodies = c.bodies();
+
+      if constexpr (HasAngularGradient<C, State>) {
+        const auto ga = c.gradient_angular(s);
+
+        Scalar_t denom = 0;
+        for (std::size_t n = 0; n < g.size(); ++n)
+          denom += s.inertial.effective_mass(bodies[n], g[n], ga[n]);
+
+        const Scalar_t alpha_tilde = c.compliance / (s.dt * s.dt);
+        const Scalar_t denom_all   = denom + alpha_tilde;
+        if (!(denom_all > Scalar_t(0))) return; // 全静态且无 compliance：没有可动 DOF
+        Scalar_t dlambda = (-Cv - alpha_tilde * c.lambda) / denom_all;
+        apply_lambda(s, c, dlambda);
+
+        const Scalar_t blend = Scalar_t(1) - zeta;
+        for (std::size_t n = 0; n < g.size(); ++n) {
+          const std::size_t b = bodies[n];
+          if (s.inertial.is_static(b)) continue; // 无限质量 ⇒ 不写 pose，也不写 R
+
+          Vec3 d_lin = g[n] * (s.inertial.inv_mass(b) * dlambda);
+          Vec3 d_ang = (s.inertial.world_inv_inertia(b) * ga[n]) * dlambda;
+          if (blend != Scalar_t(0)) {
+            // B_i = (x̃_i - x_i) + M_i⁻¹R_i，角向用同一阶旋转向量表示。
+            const Vec3 B_lin = (s.cache.inertial_position(b) - s.pose.position(b)) +
+                               s.inertial.inv_mass(b) * R_lin[b];
+            const Vec3 B_ang =
+                    rotvec_between(s.pose.rotation(b), s.cache.inertial_rotation(b)) +
+                    s.inertial.world_inv_inertia(b) * R_ang[b];
+            d_lin += B_lin * blend;
+            d_ang += B_ang * blend;
+          }
+          s.pose.apply_delta(b, d_lin, d_ang);
+          R_lin[b] += g[n] * dlambda;
+          R_ang[b] += ga[n] * dlambda;
+        }
+      } else {
+        Scalar_t denom = 0;
+        for (std::size_t n = 0; n < g.size(); ++n)
+          denom += s.inertial.effective_mass(bodies[n], g[n], Vec3{0});
+
+        const Scalar_t alpha_tilde = c.compliance / (s.dt * s.dt);
+        const Scalar_t denom_all   = denom + alpha_tilde;
+        if (!(denom_all > Scalar_t(0))) return;
+        Scalar_t dlambda = (-Cv - alpha_tilde * c.lambda) / denom_all;
+        apply_lambda(s, c, dlambda);
+
+        const Scalar_t blend = Scalar_t(1) - zeta;
+        for (std::size_t n = 0; n < g.size(); ++n) {
+          const std::size_t b = bodies[n];
+          if (s.inertial.is_static(b)) continue;
+
+          Vec3 d_lin = g[n] * (s.inertial.inv_mass(b) * dlambda);
+          if (blend != Scalar_t(0)) {
+            const Vec3 B_lin = (s.cache.inertial_position(b) - s.pose.position(b)) +
+                               s.inertial.inv_mass(b) * R_lin[b];
+            d_lin += B_lin * blend;
+          }
+          s.pose.apply_delta(b, d_lin, Vec3{0});
+          R_lin[b] += g[n] * dlambda;
+        }
+      }
+    }
+  }
+
+  // —— unit 内核：driver 的 block 扫掠以一个 unit 为单位调用 ——
+  //
+  // 普通约束的 unit 只有一行，转给 step()（与 XPBD 同序同式）。接触点的 unit 是
+  // 同一 (manifold_id, contact_index) 的 1~3 行，必须一起解：法线的单边夹紧决定
+  // 切线的摩擦锥上界，逐行解会把切线拉出锥外。
+  template <typename Ref>
+  void step_unit(State &s, Ref *refs, std::uint32_t first, std::uint32_t rows) {
+    if (refs[first].type_index == variant_index<ContactConstraint, ConstraintVariant>::value) {
+      contact_unit(s, refs, first, rows);
+      return;
+    }
+    for (std::uint32_t r = 0; r < rows; ++r) refs[first + r].step(s, *this);
+  }
+
+private:
+  // 单个接触点（法线 + 两条切线）的联合 XPBD 行。
+  //
+  //   C        = ContactConstraint::value(s)      （**原始几何**，不掺 AVBD 稳定化）
+  //   α̃        = compliance/dt²
+  //   w        = Σ gᵀM⁻¹g（线性 + 角向，两侧 body）
+  //   法线     Δλ = -(C_n + α̃λ_n)/(w_n + α̃)，λ_n = max(0, λ_n + Δλ)
+  //   切线     Δλ = -(C_t + α̃λ_t)/(w_t + α̃)，然后 |λ_t| ≤ μλ_n 径向夹紧
+  //   位置     x += M⁻¹g Δλ_clamped（夹紧后的增量），blend 项每个 body 每 unit 一次
+  //
+  // 单边性：C_n > 0 且 λ_n == 0 时整行跳过（分离、没有累积冲量）。这保证分离的
+  // 接触绝不产生吸引力（AVBD 的 value 符号：C<0 需要沿 +n 推开 A）。
+  //
+  // R 的更新用 Δλ_clamped，且 blend 的 B_i = (x̃-x) + M⁻¹R 在**本 unit 开始前**的
+  // R 上算一次（一个 unit 的三行是同一个整体；按行各加一次会把 blend 放大三倍）。
+  template <typename Ref>
+  void contact_unit(State &s, Ref *refs, std::uint32_t first, std::uint32_t rows) {
+    ContactConstraint *row[3] = {nullptr, nullptr, nullptr};
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      auto *c = static_cast<ContactConstraint *>(refs[first + r].obj);
+      const auto k = static_cast<int>(c->kind);
+      if (k >= 0 && k < 3 && row[k] == nullptr)
+        row[k] = c;
+    }
+    if (row[0] == nullptr)
+      return; // 没有法线行 ⇒ 没有锥可夹，切线没有意义
+
+    const auto bodies = row[0]->bodies_;
+    const Scalar_t inv_dt2 = Scalar_t(1) / (s.dt * s.dt);
+
+    bool     have[3] = {false, false, false};
+    Scalar_t C[3]    = {0, 0, 0};
+    Scalar_t w[3]    = {0, 0, 0};
+    Scalar_t alpha[3] = {0, 0, 0};
+    Vec3     g[3][2];
+    Vec3     ga[3][2];
+    for (int k = 0; k < 3; ++k) {
+      if (row[k] == nullptr)
+        continue;
+      have[k] = true;
+      C[k]    = row[k]->value(s); // raw geometry: no alpha*initial_c stabilization
+      const auto gl = row[k]->gradient(s);
+      const auto glang = row[k]->gradient_angular(s);
+      for (int n = 0; n < 2; ++n) {
+        g[k][n]  = gl[n];
+        ga[k][n] = glang[n];
+      }
+      w[k] = s.inertial.effective_mass(bodies[0], g[k][0], ga[k][0]) +
+             s.inertial.effective_mass(bodies[1], g[k][1], ga[k][1]);
+      alpha[k] = (row[k]->compliance + contact_compliance) * inv_dt2;
+    }
+
+    // —— 法线：单边 XPBD dual ——
+    Scalar_t dlam[3] = {0, 0, 0};
+    Scalar_t lam_n   = row[0]->lambda;
+    if (!(C[0] > Scalar_t(0) && lam_n == Scalar_t(0))) {
+      const Scalar_t denom = w[0] + alpha[0];
+      if (denom > Scalar_t(0)) {
+        const Scalar_t next = std::max(Scalar_t(0), lam_n - (C[0] + alpha[0] * lam_n) / denom);
+        dlam[0]             = next - lam_n;
+        row[0]->lambda      = next;
+        lam_n               = next;
+      }
+    }
+
+    // —— 切线：先各自做 XPBD dual，再按**新鲜**的 λ_n 做径向摩擦锥夹紧 ——
+    Scalar_t cand[3] = {0, 0, 0};
+    for (int k = 1; k < 3; ++k) {
+      if (!have[k])
+        continue;
+      const Scalar_t old   = row[k]->lambda;
+      const Scalar_t denom = w[k] + alpha[k];
+      cand[k] = denom > Scalar_t(0) ? old - (C[k] + alpha[k] * old) / denom : old;
+    }
+    if (have[1] && have[2]) {
+      const Scalar_t bound = std::max(Scalar_t(0), row[0]->friction) * lam_n;
+      const Scalar_t tau   = std::sqrt(cand[1] * cand[1] + cand[2] * cand[2]);
+      if (tau > bound && tau > Scalar_t(0)) {
+        const Scalar_t scale = bound / tau;
+        cand[1] *= scale;
+        cand[2] *= scale;
+      }
+    } else {
+      // μ == 0 只发一行法线；万一发射了单条切线，也要守锥。
+      const Scalar_t bound = std::max(Scalar_t(0), row[0]->friction) * lam_n;
+      for (int k = 1; k < 3; ++k)
+        if (have[k]) cand[k] = std::clamp(cand[k], -bound, bound);
+    }
+    for (int k = 1; k < 3; ++k) {
+      if (!have[k])
+        continue;
+      dlam[k]        = cand[k] - row[k]->lambda;
+      row[k]->lambda = cand[k];
+    }
+
+    // —— 位置 + R：每个 body 在本 unit 内只写一次，blend 也只加一次 ——
+    const Scalar_t blend = Scalar_t(1) - zeta;
+    for (int n = 0; n < 2; ++n) {
+      const std::size_t b = bodies[n];
+      if (s.inertial.is_static(b))
+        continue; // 静态 body 不写 pose，也不写 R（与 XPBD/距离内核一致）
+
+      Vec3 d_lin{0}, d_ang{0}, r_lin{0}, r_ang{0};
+      for (int k = 0; k < 3; ++k) {
+        if (!have[k] || dlam[k] == Scalar_t(0))
+          continue;
+        d_lin += g[k][n] * (s.inertial.inv_mass(b) * dlam[k]);
+        d_ang += (s.inertial.world_inv_inertia(b) * ga[k][n]) * dlam[k];
+        r_lin += g[k][n] * dlam[k];
+        r_ang += ga[k][n] * dlam[k];
+      }
+      if (blend != Scalar_t(0)) {
+        const Vec3 B_lin = (s.cache.inertial_position(b) - s.pose.position(b)) +
+                           s.inertial.inv_mass(b) * R_lin[b];
+        const Vec3 B_ang =
+                rotvec_between(s.pose.rotation(b), s.cache.inertial_rotation(b)) +
+                s.inertial.world_inv_inertia(b) * R_ang[b];
+        d_lin += B_lin * blend;
+        d_ang += B_ang * blend;
+      }
+      s.pose.apply_delta(b, d_lin, d_ang);
+      R_lin[b] += r_lin;
+      R_ang[b] += r_ang;
+    }
+  }
+
+  void resize_R(std::size_t n) {
+    if (R_lin.size() != n) {
+      R_lin.assign(n, Vec3{0});
+      R_ang.assign(n, Vec3{0});
+    }
+  }
+
+  // λ 是乘子。普通行直接累加；Limited 行夹到与 AVBD 力界相反的区间。
+  // 注意：位置更新必须用**夹紧后**的 Δλ，否则约束会施加超过限位允许的力。
+  template <typename C> void apply_lambda(State &s, C &c, Scalar_t &dlambda) {
+    if constexpr (std::is_same_v<C, JointAxisConstraint>) {
+      if (c.mode == JointAxisMode::Limited) {
+        Scalar_t force_min = -kForceUnclamped;
+        Scalar_t force_max = kForceUnclamped;
+        c.force_bounds(s, force_min, force_max);
+        const Scalar_t lo = -force_max;
+        const Scalar_t hi = -force_min;
+        const Scalar_t nl = std::clamp(c.lambda + dlambda, lo, hi);
+        dlambda           = nl - c.lambda;
+        c.lambda          = nl;
+        return;
+      }
+    }
+    c.lambda += dlambda;
+  }
+
+  // R_i += λ_c ∇C_c,i。串行、按 ConstraintList 顺序 ⇒ 与线程/调度无关。
+  // 接触行的 λ 在步首已被 begin_sweep 清成乘子，这里和普通行同式累加；它把上一
+  // 迭代的乘子重新纳入 R，使 R 始终等于"当前 λ 的 Σλ∇C"。
+  template <typename C> void gather_R(const State &s, const C &c) {
+    if constexpr (std::is_same_v<C, ContactConstraint>) {
+      if (c.lambda == Scalar_t(0))
+        return;
+      const auto g      = c.gradient(s);
+      const auto ga     = c.gradient_angular(s);
+      const auto bodies = c.bodies();
+      for (std::size_t n = 0; n < g.size(); ++n) {
+        const std::size_t b = bodies[n];
+        if (s.inertial.is_static(b))
+          continue;
+        R_lin[b] += g[n] * c.lambda;
+        R_ang[b] += ga[n] * c.lambda;
+      }
+    } else {
+      if constexpr (std::is_same_v<C, JointAxisConstraint>) {
+        if (c.mode == JointAxisMode::Free) return;
+      }
+      if (c.lambda == Scalar_t(0)) return; // 0 乘任何梯度都是 0，跳过不改变结果
+
+      const auto g      = c.gradient(s);
+      const auto bodies = c.bodies();
+      if constexpr (HasAngularGradient<C, State>) {
+        const auto ga = c.gradient_angular(s);
+        for (std::size_t n = 0; n < g.size(); ++n) {
+          const std::size_t b = bodies[n];
+          if (s.inertial.is_static(b)) continue;
+          R_lin[b] += g[n] * c.lambda;
+          R_ang[b] += ga[n] * c.lambda;
+        }
+      } else {
+        for (std::size_t n = 0; n < g.size(); ++n) {
+          const std::size_t b = bodies[n];
+          if (s.inertial.is_static(b)) continue;
+          R_lin[b] += g[n] * c.lambda;
+        }
+      }
+    }
+  }
+};
+
 // —— PBD：XPBD 去掉 compliance/λ 项之后的退化形式 ——
 // 它存在的唯一理由是给 main.cpp 的 check_xpbd_equals_pbd_when_rigid 提供对照：
 // “XPBD(compliance=0) 与 PBD 位精确相同”是公式级事实（dlambda = -C/denom），
@@ -384,6 +766,8 @@ public:
 class PBDStep {
 public:
   static constexpr bool uses_solver_buffers = false;
+  static constexpr bool needs_topology = false;
+  static constexpr bool constraint_blocks = false;
 
   template <Constraint<State> C> void step(State &s, C &c) {
     const Scalar_t Cv     = c.evaluate(s);

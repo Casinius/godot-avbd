@@ -265,6 +265,26 @@ template <> struct constraint_traits<ContactConstraint> {
   using Gradient_t = std::array<Vec3, 2>;
 };
 
+// ==================== 4b. 求解单元（block 分区的粒度） ====================
+// 一个 unit 是"必须按整体分到一个 block 的一组行"：
+//   * 普通约束（Distance / JointAxis）＝ 一行；
+//   * 接触点 ＝ 同一 (manifold_id, contact_index) 的 1~3 行（见【接触分组的不变量】5）。
+// 判据只看拓扑（哪两行属于同一个 unit），不看几何/λ，所以可以进拓扑缓存。
+//
+// 默认：任何两行都不属于同一个 unit。
+template <typename C>
+[[nodiscard]] inline bool same_constraint_unit(const C &, const C &) noexcept {
+  return false;
+}
+
+// 接触：同一 manifold、同一 contact 的多行必须同块。standalone 接触没有 manifold，
+// 每个都是独立 unit（kStandaloneManifold 是哨兵，不能拿来比较相等）。
+[[nodiscard]] inline bool same_constraint_unit(const ContactConstraint &a,
+                                               const ContactConstraint &b) noexcept {
+  return a.manifold_id != kStandaloneManifold && a.manifold_id == b.manifold_id &&
+         a.contact_index == b.contact_index;
+}
+
 // ==================== 接触行的 block-Jacobi mass-split 权重 ====================
 //
 // 【为什么要它】本仓库的 accumulate 是 scatter + per-body gather（block-Jacobi）：
@@ -597,6 +617,10 @@ template <typename Policy> struct ConstraintRef {
   void (*gradient_angular)(const void *, const State &, std::span<Vec3>) = nullptr;
   std::span<const std::size_t> (*bodies)(const void *)                   = nullptr;
 
+  // 拓扑：相邻两行是否属于同一个求解单元（接触点的 1~3 行）。nullptr = 永远单行。
+  // 只被 block 分区（BPXPBD）消费；AVBD/XPBD/PBD 不读。
+  bool (*joins_unit)(const void *, const void *) = nullptr;
+
   // 只有 AVBD 用到，nullable
   void (*update_dual)(void *, const State &, Scalar_t) = nullptr;
 
@@ -618,6 +642,9 @@ template <typename Policy> struct ConstraintRef {
       std::copy(g.begin(), g.end(), out.begin());
     };
     r.bodies = [](const void *p) { return static_cast<const C *>(p)->bodies(); };
+    r.joins_unit = [](const void *a, const void *b) {
+      return same_constraint_unit(*static_cast<const C *>(a), *static_cast<const C *>(b));
+    };
 
     if constexpr (HasAngularGradient<C, State>) {
       r.gradient_angular = [](const void *p, const State &s, std::span<Vec3> out) {

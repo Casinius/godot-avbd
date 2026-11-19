@@ -372,6 +372,12 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
 
     p_space.threads = static_cast<int>(settings->get_setting("physics/avbd/threads", 0));
     p_space.iterations = static_cast<int>(settings->get_setting("physics/avbd/iterations", 8));
+    // Policy selection. Absent setting = "avbd", so existing projects keep AVBD.
+    const String solver_mode = settings->get_setting("physics/avbd/solver", "avbd");
+    p_space.solver = (solver_mode == "bpxpbd") ? 1 : 0;
+    p_space.bpxpbd_zeta = settings->get_setting("physics/avbd/bpxpbd_zeta", 0.5);
+    p_space.bpxpbd_contact_compliance =
+            settings->get_setting("physics/avbd/bpxpbd_contact_compliance", 0.0);
     p_space.alpha = settings->get_setting("physics/avbd/alpha", 0.99);
     p_space.beta_linear = settings->get_setting("physics/avbd/beta_linear", 1e4);
     p_space.beta_angular = settings->get_setting("physics/avbd/beta_angular", 1e2);
@@ -1384,10 +1390,18 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         prof_params += seconds_since(prof_t_params);
 
         const int iterations = space.iterations > 0 ? space.iterations : 8;
+        // Policy selection first: set_policy_stiffness is type-aware, and switching the
+        // solver resets dual state (no force<->multiplier cross-injection). set_solver is
+        // a cheap no-op when the kind has not changed.
+        space.modern->set_solver(
+                space.solver == 1 ? SolverKind::BPXPBD : SolverKind::AVBD);
         // Contact stiffness. The legacy beta_linear setting was the per-contact penalty
         // scale; the modern AVBD policy exposes exactly that as its per-step k0.
+        // B-PXPBD uses zeta/contact-compliance instead (see ModernSpace).
         space.modern->set_policy_stiffness(
-                static_cast<Scalar_t>(std::clamp(space.beta_linear, 1.0e4, 1.0e6)), Scalar_t(1e-2));
+                static_cast<Scalar_t>(std::clamp(space.beta_linear, 1.0e4, 1.0e6)), Scalar_t(1e-2),
+                static_cast<Scalar_t>(std::clamp(space.bpxpbd_zeta, 0.0, 1.0)),
+                static_cast<Scalar_t>(std::max(space.bpxpbd_contact_compliance, 0.0)));
         space.modern->set_contact_margin(Scalar_t(0.002));
 
         // Godot's physics tick is the sampling rate. If an internal rate is configured,

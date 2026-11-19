@@ -96,6 +96,18 @@ public:
   // 不返回裸指针、不暴露内部 vector 的修改接口。
   [[nodiscard]] std::span<Manifold> manifolds_for_warm_start() noexcept { return current_; }
 
+  // 清除跨帧热状态（λ / stick），保留 manifold 本身与罚因子。求解器切换时用：
+  // AVBD 的 λ 是力（N），B-PXPBD 的 λ 是位置乘子（kg·m），量纲不同，不能互相
+  // 暖启动。只在切换时调用，不能每帧调用（那会丢掉正常 warm start）。
+  void reset_warm_start() noexcept {
+    for (Manifold &m : current_) {
+      for (std::size_t i = 0; i < m.count; ++i) {
+        m.contacts[i].lambda = Vec3{0};
+        m.contacts[i].stick  = false;
+      }
+    }
+  }
+
   [[nodiscard]] std::size_t size() const noexcept { return current_.size(); }
 
   void clear() {

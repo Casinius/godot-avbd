@@ -48,6 +48,16 @@ This file is the honest state of the migration, not a wish list.
   including world anchors. Cone-twist is deliberately not mapped: a swing cone
   is not a per-axis interval, and a wrong approximation would be worse than no
   constraint.
+- **B-PXPBD (optional, A/B)**: Blended Primal XPBD is wired as a second policy
+  (`physics/avbd/solver = "bpxpbd"`, default remains `"avbd"`). It has a
+  deterministic body-disjoint block sweep, the paper's `(1-zeta)` residual
+  correction, per-axis joints and an XPBD contact unit kernel. Core selftests
+  62/62, and the adapter switches solvers at runtime with dual-state reset.
+  It is **not yet at parity**: rigid contacts fail the friction/stack gates;
+  `bpxpbd_contact_compliance=1e-4` fixes friction and greatly improves the
+  stack, but the 420-box pile still fails. The next blocker is deep initial
+  overlap (a 9 cm spawn overlap launches upward because XPBD has no penetration
+  cap); a capped contact target is the next change.
 - `avbd_modern_test`: 50/50 structural selftests, solver digest and collision
   digest bit-identical to the pinned upstream baselines. Wired into
   `run_all_tests` and CI (`avbd_modern_tests`).
@@ -59,9 +69,19 @@ This file is the honest state of the migration, not a wish list.
 - **Automatic sleep**: only explicit `BODY_STATE_SLEEPING` freezes a body.
 - **Position projection**: not ported. AVBD's position solve covers most of it;
   the remaining fidelity gap is the 40 s deep pile (below).
-- **Deep-pile long run**: `test_pyramid` passes its 10 s gate (9/9), but a 40 s
-  run still develops a late runaway. Deep-pile penetration in the 20–30 s
-  window is ~14 cm, above the legacy-quality target.
+- **Deep-pile long run**: `test_pyramid` passes its 10 s gate (9/9; the gate
+  actually simulates 0–30 s). A 40 s probe shows no solver runaway and no
+  energy gain: the first below-ground body at t≈31 s is a box that has already
+  pivoted 0.34 m past the slab's ±10 m z-edge and then free-falls (min_y is
+  gravity, not an ejection). The lower pyramid alone is stable for 40 s with
+  |z|≈0.1 m. Measured 20–30 s penetration at 8 iterations is 6.4 cm (ground
+  pair ≤4 cm), not the 14 cm previously recorded here.
+- **dt invariance**: the supported `internal_ticks_per_second = 0` mode (dt =
+  1/240) collapses the same pile within 8 s, while 1/60 is quiet. Contact
+  stiffness/ramp/cap and the `v = Δp/dt` recovery are not dt-scaled, and CCD's
+  travel threshold is dt-dependent. This is the real velocity/schedule bug to
+  fix; `iterations` 4 vs 16 also moves the failure from 59 s to 32 s, so the
+  solve is not converged.
 - **Capsule and convex** are documented proxies, not exact geometry.
 
 Current suites: `test_solver.gd` **38/38**, `test_constraints.gd` **11/11**,
@@ -77,5 +97,6 @@ has no axis permutation. The soft-body nodes keep their own Z-up conversion.
 
 1. Cone-twist joint (or a real cone constraint primitive).
 2. Island-based sleep in the frame/world layer.
-3. Revisit the 40 s deep-pile run with the new CCD path.
+3. Make B-PXPBD reach parity: cap deep initial penetration, add the missing
+   stack convergence, then re-run friction/stack/pyramid and flip the default.
 4. Then remove `src/avbd` and the soft-body dependence on it.

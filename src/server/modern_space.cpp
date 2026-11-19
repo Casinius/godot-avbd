@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <glm/matrix.hpp>
+#include <type_traits>
 #include <unordered_map>
 
 namespace godot {
@@ -436,10 +437,50 @@ void ModernSpace::set_speculative_distance(Scalar_t distance) noexcept {
     collision_.set_speculative_distance(distance);
 }
 
-void ModernSpace::set_policy_stiffness(Scalar_t k0, Scalar_t beta) noexcept {
-    policy_.k0 = k0;
-    policy_.k = k0;
-    policy_.beta = beta;
+SolverKind ModernSpace::solver_kind() const noexcept {
+    return std::holds_alternative<BPXPBDStep>(policy_) ? SolverKind::BPXPBD : SolverKind::AVBD;
+}
+
+void ModernSpace::set_solver(SolverKind kind) {
+    if (kind == solver_kind())
+        return;
+
+    // Dual state does not cross the boundary: AVBD stores force (N) in lambda,
+    // B-PXPBD stores a position multiplier (kg*m). Reset the live constraints and the
+    // manifold store so neither solver warm-starts from the other's numbers.
+    for (ConstraintVariant &v : constraints_) {
+        std::visit([](auto &c) {
+            using C = std::decay_t<decltype(c)>;
+            c.lambda = Scalar_t(0);
+            if constexpr (std::is_same_v<C, JointAxisConstraint>) {
+                c.initial = Scalar_t(0);
+                c.penalty = Scalar_t(0);
+            } else if constexpr (std::is_same_v<C, ContactConstraint>) {
+                c.initial_c     = Scalar_t(0);
+                c.initial_c_raw = Scalar_t(0);
+                c.penalty       = Scalar_t(0);
+                c.stick         = false;
+            }
+        }, v);
+    }
+    collision_.reset_warm_start();
+
+    if (kind == SolverKind::BPXPBD)
+        policy_.emplace<BPXPBDStep>(BPXPBDStep{});
+    else
+        policy_.emplace<AVBDStep>(AVBDStep{});
+}
+
+void ModernSpace::set_policy_stiffness(Scalar_t k0, Scalar_t beta, Scalar_t zeta,
+        Scalar_t contact_compliance) noexcept {
+    if (auto *avbd = std::get_if<AVBDStep>(&policy_)) {
+        avbd->k0 = k0;
+        avbd->k = k0;
+        avbd->beta = beta;
+    } else if (auto *bpxpbd = std::get_if<BPXPBDStep>(&policy_)) {
+        bpxpbd->zeta = zeta;
+        bpxpbd->contact_compliance = contact_compliance;
+    }
 }
 
 void ModernSpace::ensure_executor(int threads) {
@@ -475,9 +516,13 @@ void ModernSpace::step(int iterations, int threads) {
     collision_.apply_speculative_velocity_clamp(state_, state_.dt);
     collision_.clamp_fast_bodies(state_, state_.dt);
 
-    solve<AVBDStep, task::ThreadPoolExecutor, NullPhaseObserver>(
-            state_, constraints_, policy_, std::max(iterations, 1), *exec_, schedule_, nullptr,
-            topology_version_);
+    std::visit(
+            [&](auto &policy) {
+                // Explicit null observer type: `nullptr` alone cannot deduce Observer*.
+                solve(state_, constraints_, policy, std::max(iterations, 1), *exec_, schedule_,
+                        static_cast<NullPhaseObserver *>(nullptr), topology_version_);
+            },
+            policy_);
     state_.finish_step();
 
     // Axis locks and explicit sleep are projections on top of the core solve. They are

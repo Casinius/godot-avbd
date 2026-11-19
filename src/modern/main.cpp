@@ -40,6 +40,7 @@
 #include "digest.hpp"
 #include "frame.hpp"
 #include "phys_core/constraint.hpp"
+#include "phys_core/joint.hpp"
 #include "phys_core/policy.hpp"
 #include "phys_core/sched.hpp"
 #include "phys_core/solver_phase.hpp"
@@ -394,6 +395,682 @@ Check check_xpbd_equals_pbd_when_rigid() {
   if (pa != pb) {
     c.ok     = false;
     c.detail = std::format("{} != {}", digest::to_hex(pa), digest::to_hex(pb));
+  }
+  return c;
+}
+
+// ==================== B-PXPBD（blended primal XPBD）====================
+// 这些断言覆盖 Phase 0–2 的三条硬契约：
+//   1) ζ = 1 必须逐位退化为 XPBD 的串行 Gauss-Seidel；
+//   2) ζ = 0 的 fixed-point 修正必须让真实残差单调不增，且优于 ζ = 1；
+//   3) 着色 block 扫掠必须对线程数/粒度/串行阈值不敏感；
+//   4) 静止链条不许出现由 stale λ/initial 引起的"幻影拉力"。
+
+// 单步内的残差探针：每次迭代结束（Ramp 之后）记一次
+//     ‖ M(x - x̃) - Σ λ∇C(x) ‖       （对所有动态 body 取平方和再开方）
+// 这是 XPBD/B-PXPBD 的乘子平衡式：M(x-x̃) = Σ λ∇C（λ 的量纲是 kg·m，力 = λ∇C/dt²）。
+// 注意不要再除 dt²：那会把乘子项的量级弄错 3600 倍，残差看起来"越迭代越大"。
+struct ResidualProbe {
+  const ConstraintList *cs = nullptr;
+  std::vector<Scalar_t> residual;
+
+  void on_phase(SolvePhase ph, int, const State &s) {
+    if (ph != SolvePhase::Ramp || cs == nullptr) return;
+    std::vector<Vec3> R(s.size(), Vec3{0});
+    for (const auto &v : *cs) {
+      std::visit(
+          [&](const auto &c) {
+            if constexpr (std::is_same_v<std::decay_t<decltype(c)>, ContactConstraint>) {
+              return; // Phase 3
+            }
+            if (c.lambda == Scalar_t(0)) return;
+            const auto g      = c.gradient(s);
+            const auto bodies = c.bodies();
+            for (std::size_t n = 0; n < g.size(); ++n)
+              if (!s.inertial.is_static(bodies[n])) R[bodies[n]] += g[n] * c.lambda;
+          },
+          v);
+    }
+    Scalar_t       sum     = 0;
+    for (std::size_t b = 0; b < s.size(); ++b) {
+      if (s.inertial.is_static(b)) continue;
+      const Vec3 d = (s.pose.position(b) - s.cache.inertial_position(b)) *
+                         s.inertial.inv_mass(b) - R[b];
+      sum += glm::dot(d, d);
+    }
+    residual.push_back(std::sqrt(sum));
+  }
+};
+
+// 所有动态 body 共享一个可动 hub 的星形场景。每条约束都碰 hub ⇒ first-fit 必然
+// 给每个 unit 一个独立 block，且 block 顺序 = 约束顺序（正是 oracle 1 的前提）。
+scene::Scene hub_star(std::size_t n) {
+  scene::Scene sc;
+  sc.name     = "hub_star";
+  sc.state.dt = Scalar_t(1) / 60;
+  sc.state.resize(n + 1);
+  scene::add_body(sc.state, 0, Vec3{0, 0, 0}, 1.0f, Vec3{0.1f, 0, 0}, Vec3{0, 0, 0.05f});
+  for (std::size_t i = 0; i < n; ++i) {
+    const Vec3 p{Scalar_t(1) + Scalar_t(0.1) * Scalar_t(i), Scalar_t(0.2) * Scalar_t(i % 3),
+                 Scalar_t(0.05) * Scalar_t(i % 5)};
+    scene::add_body(sc.state, i + 1, p, 0.0f); // 静态叶子：只有 hub 是动态 body
+  }
+  for (std::size_t i = 0; i < n; ++i)
+    sc.constraints.emplace_back(
+        DistanceConstraint{{0, i + 1}, Scalar_t(0.9) * scene::jitter(i)});
+  return sc;
+}
+
+// 一行 JointAxis 的最小场景：body 0 是静态世界，body 1 是动态滑块。
+scene::Scene joint_slider(JointAxisMode mode, Scalar_t x, Scalar_t lower, Scalar_t upper) {
+  scene::Scene sc;
+  sc.name     = "joint_slider";
+  sc.state.dt = Scalar_t(1) / 60;
+  sc.state.resize(2);
+  scene::add_body(sc.state, 0, Vec3{0, 0, 0}, 0.0f);
+  scene::add_body(sc.state, 1, Vec3{x, 0, 0}, 1.0f);
+  scene::make_gravity_free(sc); // 只让关节轴上的自由度参与
+
+  JointAxisConstraint row;
+  row.bodies_ = {1, 0};
+  row.axis    = Vec3{1, 0, 0};
+  row.angular = false;
+  row.mode    = mode;
+  row.target  = Scalar_t(0.5);
+  row.lower   = lower;
+  row.upper   = upper;
+  sc.constraints.emplace_back(row);
+  return sc;
+}
+
+// 角向 JointAxis 的最小场景：body 0 静态世界 + body 1 动态，绕 X 轴 Locked。
+// 关节建立后再把 body 1 转 0.2 rad ⇒ C=0.2。用 Joint::rebuild 生成 frame/rest/
+// angular_modes，避免手写四元数把测试写错。
+scene::Scene angular_joint() {
+  scene::Scene sc;
+  sc.name     = "angular_joint";
+  sc.state.dt = Scalar_t(1) / 60;
+  sc.state.resize(2);
+  scene::add_body(sc.state, 0, Vec3{0, 0, 0}, 0.0f);
+  scene::add_body(sc.state, 1, Vec3{0, 0, 0}, 1.0f);
+  scene::make_gravity_free(sc);
+
+  JointDesc desc;
+  desc.body_a          = 0;
+  desc.body_b          = 1;
+  desc.angular[0].mode = JointAxisMode::Locked;
+  Joint joint(desc, sc.state);
+  for (const auto &row : joint.rows())
+    if (row.angular) sc.constraints.emplace_back(row);
+
+  // rest 已在 rebuild 时捕获为"当前相对姿态"；现在制造一个角向违反。
+  sc.state.pose.set_rotation(1, quat_from_rotvec(Vec3{0.2f, 0, 0}));
+  return sc;
+}
+
+// oracle 1a：在"一 unit 一 block、block 升序"的分区下，ζ = 1 必须与 XPBDStep 的
+// 串行 GS 逐位相同。这里用 SolveSchedule 的测试开关强制该分区，覆盖 pinned 的
+// chain/fan（Distance-only 且 XPBD 有有限解）：
+// ζ = 1 时 blend 项被显式跳过，行内核的 denom/Δλ/apply_delta 与 XPBD 同序同式；
+// 强制分区只是把全局约束顺序原样搬进 block 顺序，不改变任何算术。
+Check check_bpxpbd_zeta_one_equals_xpbd() {
+  Check c{"BPXPBD(zeta=1) == XPBD (single-unit blocks, pinned scenes)", true, ""};
+
+  SolveSchedule sched  = g_sched;
+  sched.force_single_unit_blocks = true;
+
+  auto run = [&](auto policy, scene::Scene sc) {
+    drive(sc, policy, g_serial, sched, 4, 50);
+    return digest::parts(sc.state, sc.constraints).all;
+  };
+
+  BPXPBDStep bpxpbd;
+  bpxpbd.zeta = Scalar_t(1);
+
+  const std::pair<const char *, scene::Scene> cases[] = {
+      {"chain/32", scene::chain(32)},
+      {"fan/64", scene::fan(64)},
+  };
+  // 注：lattice 不在等价场景里 —— 它含有**两端都是静态**的 Distance 行
+  // （底面层的 x/y 约束），XPBDStep 在 w==0 且 compliance==0 时除零得到 NaN，
+  // 参考实现本身没有有限值。BPXPBD 对全静态行的处理是显式跳过（见 row kernel 的
+  // denom 守卫），这是有意的健壮性差异，不属于"block 扫掠改变顺序"。
+  for (const auto &[name, sc] : cases) {
+    const auto a = run(XPBDStep{}, sc);
+    const auto b = run(bpxpbd, sc);
+    if (a != b) {
+      c.ok     = false;
+      c.detail = std::format("{}: xpbd={} bpxpbd={}", name, digest::to_hex(a), digest::to_hex(b));
+      return c;
+    }
+  }
+  return c;
+}
+
+// oracle 1b：显式构造"一 unit 一 block、block 升序"的分区，再比一次。
+// 这条同时检查 first-fit 的分配结果本身（block_units[k] == k）。
+Check check_bpxpbd_one_unit_per_block_equals_xpbd() {
+  Check c{"BPXPBD(zeta=1) == XPBD with one unit per block", true, ""};
+
+  scene::Scene sc_bp = hub_star(24);
+  BPXPBDStep   bpxpbd;
+  bpxpbd.zeta = Scalar_t(1);
+  drive(sc_bp, bpxpbd, g_serial, g_sched, 3, 30);
+
+  const ConstraintScratch &scr = sc_bp.state.scratch;
+  const std::size_t        nb  = scr.block_begin.empty() ? 0 : scr.block_begin.size() - 1;
+  if (nb != sc_bp.constraints.size()) {
+    c.ok     = false;
+    c.detail = std::format("{} blocks for {} units (want one per unit)", nb,
+                           sc_bp.constraints.size());
+    return c;
+  }
+  for (std::size_t b = 0; b < nb; ++b) {
+    if (scr.block_begin[b] != b || scr.block_units[b] != b) {
+      c.ok     = false;
+      c.detail = std::format("block {} is not unit {} (partition not ascending)", b,
+                             scr.block_units.empty() ? 0 : scr.block_units[b]);
+      return c;
+    }
+  }
+
+  scene::Scene sc_x = hub_star(24);
+  drive(sc_x, XPBDStep{}, g_serial, g_sched, 3, 30);
+
+  const auto a = digest::parts(sc_x.state, sc_x.constraints).all;
+  const auto b = digest::parts(sc_bp.state, sc_bp.constraints).all;
+  if (a != b) {
+    c.ok     = false;
+    c.detail = std::format("xpbd={} bpxpbd={}", digest::to_hex(a), digest::to_hex(b));
+  }
+  return c;
+}
+
+// oracle 2：ζ = 0 的 blend 必须让 fixed-point 残差整体单调下降（允许 float 尾差），
+// 且明显优于 ζ = 1。
+Check check_bpxpbd_blend_reduces_residual() {
+  Check c{"BPXPBD(zeta=0) residual decreases and beats zeta=1", true, ""};
+
+  // 用有 compliance 的链条：B-PXPBD 的 blend 项是为柔性约束设计的。刚度取 3e-4
+  // 让 ζ=0 的 fixed-point 映射保持收缩，同时 residual 仍远高于 float 噪声底。
+  auto probes = [](Scalar_t zeta) {
+    scene::Scene sc = scene::chain(12, Scalar_t(0.5), Scalar_t(0.85), true);
+    for (auto &v : sc.constraints) std::get<DistanceConstraint>(v).compliance = Scalar_t(3e-4);
+
+    BPXPBDStep    p;
+    p.zeta = zeta;
+    ResidualProbe probe;
+    probe.cs = &sc.constraints;
+
+    sc.state.reset_external();
+    sc.state.begin_step();
+    solve(sc.state, sc.constraints, p, 10, g_serial, g_sched, &probe, sc.topology_version);
+    sc.state.finish_step();
+    return probe.residual;
+  };
+
+  const auto r_blend = probes(Scalar_t(0));
+  const auto r_xpbd  = probes(Scalar_t(1));
+  if (r_blend.size() != 10 || r_xpbd.size() != 10) {
+    c.ok     = false;
+    c.detail = std::format("expected 10 samples, got {} / {}", r_blend.size(), r_xpbd.size());
+    return c;
+  }
+
+  // ζ=0：整体单调下降。允许一处 float 尾差回升（实测 ~1.35×），阈值放到 1.5×。
+  for (std::size_t i = 1; i < r_blend.size(); ++i) {
+    if (r_blend[i] > r_blend[i - 1] * Scalar_t(1.5)) {
+      c.ok     = false;
+      c.detail = std::format("residual grew at iter {}: {:.3e} -> {:.3e}", i, r_blend[i - 1],
+                             r_blend[i]);
+      return c;
+    }
+  }
+  if (!(r_blend.back() < r_blend.front() * Scalar_t(0.1))) {
+    c.ok     = false;
+    c.detail = std::format("residual did not drop by 10x: {:.3e} -> {:.3e}", r_blend.front(),
+                           r_blend.back());
+    return c;
+  }
+  // ζ=0 必须优于 ζ=1（ζ=1 在这条链条上停滞在 ~1e-4）。
+  if (!(r_blend.back() <= r_xpbd.back())) {
+    c.ok     = false;
+    c.detail = std::format("zeta=0 residual {:.3e} > zeta=1 residual {:.3e}", r_blend.back(),
+                           r_xpbd.back());
+    return c;
+  }
+  return c;
+}
+
+// 拓扑缓存校验：BPXPBD 走的是 block 分区，verify_topology 必须同时覆盖
+// entry 邻接与 block 分区，且缓存要真的被复用（build_count == 1）。
+Check check_bpxpbd_verify_topology() {
+  Check c{"BPXPBD topology cache verifies clean and is reused", true, ""};
+
+  SolveSchedule strict{};
+  strict.verify_topology = true;
+
+  scene::Scene sc = scene::lattice(4, 3, 2);
+  drive(sc, BPXPBDStep{}, g_serial, strict, 3, 20);
+
+  if (sc.state.scratch.stale_count != 0) {
+    c.ok     = false;
+    c.detail = std::format("stale_count={} (block verifier disagreed with the cache)",
+                           sc.state.scratch.stale_count);
+    return c;
+  }
+  if (sc.state.scratch.build_count != 1) {
+    c.ok     = false;
+    c.detail = std::format("build_count={} after 3 steps (want 1)", sc.state.scratch.build_count);
+    return c;
+  }
+  if (!sc.state.scratch.block_valid) {
+    c.ok     = false;
+    c.detail = "block partition is not marked valid after a BPXPBD step";
+    return c;
+  }
+  return c;
+}
+
+// 定义在接触用例一节；这里提前声明，供确定性检查复用。
+scene::Scene contact_fan_scene(std::size_t n, Scalar_t friction);
+
+// oracle 3：BPXPBD 的着色扫掠对线程数、grain、min_items 逐位不敏感。
+Check check_bpxpbd_determinism() {  Check c{"BPXPBD digests invariant across threads x grain x thresholds", true, ""};
+
+  auto run = [](auto &exec, const SolveSchedule &sched, scene::Scene sc) {
+    BPXPBDStep p; // 默认 zeta = 0.5，blend 项真的启用
+    drive(sc, p, exec, sched, 3, 30);
+    return digest::parts(sc.state, sc.constraints).all;
+  };
+
+  const auto ref_chain   = run(g_serial, SolveSchedule{}, scene::chain(32));
+  const auto ref_lattice = run(g_serial, SolveSchedule{}, scene::lattice(4, 3, 2));
+  // 接触 unit 的并行路径：一个 block 内的 unit 只写自己的 body ⇒ 与线程数无关。
+  const auto ref_contact = run(g_serial, SolveSchedule{}, contact_fan_scene(12, Scalar_t(0.5)));
+
+  for (unsigned threads : {1u, 8u}) {
+    for (std::size_t grain : {std::size_t(1), std::size_t(7), std::size_t(64)}) {
+      SolveSchedule cfg{};
+      cfg.grain_body           = grain;
+      cfg.grain_constraint     = grain;
+      cfg.min_items_body       = 1;
+      cfg.min_items_constraint = 1;
+
+      task::ThreadPoolExecutor pool(threads);
+      if (run(pool, cfg, scene::chain(32)) != ref_chain) {
+        c.ok     = false;
+        c.detail = std::format("chain diverged: threads={} grain={}", threads, grain);
+        return c;
+      }
+      if (run(pool, cfg, scene::lattice(4, 3, 2)) != ref_lattice) {
+        c.ok     = false;
+        c.detail = std::format("lattice diverged: threads={} grain={}", threads, grain);
+        return c;
+      }
+      if (run(pool, cfg, contact_fan_scene(12, Scalar_t(0.5))) != ref_contact) {
+        c.ok     = false;
+        c.detail = std::format("contact_fan diverged: threads={} grain={}", threads, grain);
+        return c;
+      }
+    }
+  }
+  return c;
+}
+
+// oracle 4：静止 + 无力 ⇒ BPXPBD 必须一动不动（不允许 stale λ / initial 造成幻影拉力）。
+Check check_bpxpbd_rest_chain_is_frozen() {
+  Check        c{"BPXPBD gravity-free rest chain is a true no-op", true, ""};
+  scene::Scene sc = scene::chain(32, Scalar_t(0.5), Scalar_t(1.0), false);
+  scene::make_quiescent(sc);
+  const auto pose_before = digest::pose(sc.state.pose);
+
+  BPXPBDStep p;
+  drive(sc, p, g_serial, g_sched, 2, 50);
+
+  if (digest::pose(sc.state.pose) != pose_before) {
+    c.ok     = false;
+    c.detail = "pose changed with C==0 and no gravity";
+    return c;
+  }
+  for (std::size_t b = 0; b < sc.state.size(); ++b) {
+    if (!is_zero(sc.state.velocity.velocity(b)) ||
+        !is_zero(sc.state.velocity.angular_velocity(b))) {
+      c.ok     = false;
+      c.detail = std::format("body {} gained velocity from nothing", b);
+      return c;
+    }
+  }
+  for (const auto &v : sc.constraints) {
+    if (std::visit([](const auto &cc) { return cc.lambda != 0.0f; }, v)) {
+      c.ok     = false;
+      c.detail = "lambda became nonzero with C==0";
+      return c;
+    }
+  }
+  return c;
+}
+
+// Phase 2：JointAxis 的 XPBD 语义。
+//   * Locked：λ 是乘子，更新式与 XPBDStep 完全一致 ⇒ ζ=1 时逐位相同；
+//   * Limited：λ 夹到可行域一侧；在限位内 λ=0、无位移。
+Check check_bpxpbd_joint_axis_locked_equals_xpbd() {
+  Check c{"BPXPBD(zeta=1) == XPBD on a Locked joint axis", true, ""};
+
+  scene::Scene a = joint_slider(JointAxisMode::Locked, Scalar_t(1), Scalar_t(0), Scalar_t(0));
+  scene::Scene b = joint_slider(JointAxisMode::Locked, Scalar_t(1), Scalar_t(0), Scalar_t(0));
+
+  drive(a, XPBDStep{}, g_serial, g_sched, 3, 20);
+  BPXPBDStep p;
+  p.zeta = Scalar_t(1);
+  drive(b, p, g_serial, g_sched, 3, 20);
+
+  const auto da = digest::parts(a.state, a.constraints).all;
+  const auto db = digest::parts(b.state, b.constraints).all;
+  if (da != db) {
+    c.ok     = false;
+    c.detail = std::format("xpbd={} bpxpbd={}", digest::to_hex(da), digest::to_hex(db));
+    return c;
+  }
+  const Scalar_t x = b.state.pose.position(1).x;
+  if (std::abs(x - Scalar_t(0.5)) > Scalar_t(1e-4)) {
+    c.ok     = false;
+    c.detail = std::format("locked joint settled at x={} (want 0.5)", x);
+  }
+  return c;
+}
+
+// 角向行与线性行走同一条内核；这里额外覆盖 gradient_angular / 角向 apply_delta。
+Check check_bpxpbd_angular_joint_locked_equals_xpbd() {
+  Check c{"BPXPBD(zeta=1) == XPBD on an angular Locked joint", true, ""};
+
+  scene::Scene a = angular_joint();
+  scene::Scene b = angular_joint();
+
+  drive(a, XPBDStep{}, g_serial, g_sched, 3, 20);
+  BPXPBDStep p;
+  p.zeta = Scalar_t(1);
+  drive(b, p, g_serial, g_sched, 3, 20);
+
+  const auto da = digest::parts(a.state, a.constraints).all;
+  const auto db = digest::parts(b.state, b.constraints).all;
+  if (da != db) {
+    c.ok     = false;
+    c.detail = std::format("xpbd={} bpxpbd={}", digest::to_hex(da), digest::to_hex(db));
+    return c;
+  }
+  const auto &row = std::get<JointAxisConstraint>(b.constraints.front());
+  if (std::abs(row.value(b.state)) > Scalar_t(1e-4)) {
+    c.ok     = false;
+    c.detail = std::format("angular joint settled at {} rad (want 0)", row.value(b.state));
+  }
+  return c;
+}
+
+Check check_bpxpbd_joint_axis_limited() {  Check c{"BPXPBD Limited joint stays in range and has no phantom lambda", true, ""};
+
+  // 限位内：C==0 ⇒ λ 必须保持 0，且 pose 完全不动。
+  scene::Scene inside = joint_slider(JointAxisMode::Limited, Scalar_t(0.1), Scalar_t(0),
+                                     Scalar_t(0.2));
+  const Vec3   inside_before = inside.state.pose.position(1);
+  BPXPBDStep   p;
+  drive(inside, p, g_serial, g_sched, 2, 20);
+  if (!bitwise_eq(inside.state.pose.position(1), inside_before)) {
+    c.ok     = false;
+    c.detail = "Limited joint moved while inside its limits";
+    return c;
+  }
+  for (const auto &v : inside.constraints) {
+    const auto &j = std::get<JointAxisConstraint>(v);
+    if (j.lambda != Scalar_t(0) || j.initial != Scalar_t(0)) {
+      c.ok     = false;
+      c.detail = std::format("inside limits: lambda={} initial={}", j.lambda, j.initial);
+      return c;
+    }
+  }
+
+  // 越上限：一步位置投影把它压回 x=upper，λ 必须是**负**的乘子（AVBD 的力是 F=K·C+λ，
+  // 与 XPBD 乘子反号）。用 1 次迭代直接观察夹紧后的 λ；多步会因为 v=Δx/dt 的惯性
+  // 把 body 甩过下界，反而测不到夹紧符号。
+  scene::Scene outside = joint_slider(JointAxisMode::Limited, Scalar_t(0.25), Scalar_t(0),
+                                      Scalar_t(0.2));
+  drive(outside, p, g_serial, g_sched, 1, 1);
+  const Scalar_t x = outside.state.pose.position(1).x;
+  if (std::abs(x - Scalar_t(0.2)) > Scalar_t(1e-5)) {
+    c.ok     = false;
+    c.detail = std::format("Limited joint ended at x={} (want upper=0.2)", x);
+    return c;
+  }
+  for (const auto &v : outside.constraints) {
+    const auto &j = std::get<JointAxisConstraint>(v);
+    if (!(j.lambda < Scalar_t(0))) {
+      c.ok     = false;
+      c.detail = std::format("Limited lambda={} (want < 0 for an upper-limit violation)",
+                             j.lambda);
+      return c;
+    }
+  }
+  return c;
+}
+
+// ==================== B-PXPBD 接触行（Phase 3） ====================
+// 这些用例直接合成 ContactConstraint（不跑窄相），把锚点放在两 body 的界面上。
+// penetration > 0 是几何穿透（C_n = -penetration + margin < 0），< 0 是间隙。
+void add_synthetic_contact(scene::Scene &sc, std::size_t body_a, std::size_t body_b,
+                           std::uint32_t manifold_id, Vec3 normal, Scalar_t penetration,
+                           Scalar_t friction, Vec3 slip = Vec3{0}) {
+  normal = glm::normalize(normal);
+  const Vec3 helper = std::abs(normal.y) < Scalar_t(0.9) ? Vec3{0, 1, 0} : Vec3{1, 0, 0};
+  const Vec3 t0     = glm::normalize(glm::cross(normal, helper));
+  const Vec3 t1     = glm::normalize(glm::cross(normal, t0));
+
+  const Vec3 pA  = sc.state.pose.position(body_a);
+  const Vec3 pB  = sc.state.pose.position(body_b);
+  const Vec3 mid = (pA + pB) * Scalar_t(0.5);
+  const Vec3 xA  = mid - normal * (penetration * Scalar_t(0.5)) + slip;
+  const Vec3 xB  = mid + normal * (penetration * Scalar_t(0.5));
+  const Vec3 rA  = transpose(sc.state.pose.rotation_matrix(body_a)) * (xA - pA);
+  const Vec3 rB  = transpose(sc.state.pose.rotation_matrix(body_b)) * (xB - pB);
+
+  for (int k = 0; k < 3; ++k) {
+    ContactConstraint c;
+    c.bodies_       = {body_a, body_b};
+    c.manifold_id   = manifold_id;
+    c.contact_index = 0;
+    c.kind          = static_cast<ContactKind>(k);
+    c.basis[0]      = normal;
+    c.basis[1]      = t0;
+    c.basis[2]      = t1;
+    c.rA            = rA;
+    c.rB            = rB;
+    c.target        = (k == 0) ? -Scalar_t(0.005) : Scalar_t(0);
+    c.friction      = friction;
+    c.compliance    = Scalar_t(0);
+    c.lambda        = Scalar_t(0);
+    c.penalty       = Scalar_t(0);
+    c.initial_c     = Scalar_t(0);
+    c.initial_c_raw = Scalar_t(0);
+    sc.constraints.emplace_back(c);
+  }
+}
+
+// A 在 B 上方 1 m，锚点落在界面 y=0.5；法线 +y 指向 A。重力可选。
+scene::Scene contact_pair_scene(Scalar_t penetration, Scalar_t friction, Vec3 slip,
+                                bool gravity) {
+  scene::Scene sc;
+  sc.name     = "contact_pair";
+  sc.state.dt = Scalar_t(1) / 60;
+  sc.state.resize(2);
+  scene::add_body(sc.state, 0, Vec3{0, 0, 0}, 0.0f); // B: static support
+  scene::add_body(sc.state, 1, Vec3{0, 1, 0}, 1.0f); // A: dynamic, above B
+  add_synthetic_contact(sc, 1, 0, 0, Vec3{0, 1, 0}, penetration, friction, slip);
+  if (!gravity)
+    scene::make_quiescent(sc);
+  return sc;
+}
+
+// n 个独立的动态 body 各自与同一个静态支撑接触：所有 unit 只共享静态 body，
+// 所以自然分区把它们放进同一个 block，且块内顺序 = 约束顺序。这正是一 unit
+// 一 block 的"串行顺序"，两者必须逐位相同。
+scene::Scene contact_fan_scene(std::size_t n, Scalar_t friction) {
+  scene::Scene sc;
+  sc.name     = "contact_fan";
+  sc.state.dt = Scalar_t(1) / 60;
+  sc.state.resize(n + 1);
+  scene::add_body(sc.state, 0, Vec3{0, 0, 0}, 0.0f); // static support
+  for (std::size_t i = 0; i < n; ++i) {
+    const Vec3 p{Scalar_t(0.5) * Scalar_t(i), 1, Scalar_t(0.25) * Scalar_t(i % 5)};
+    scene::add_body(sc.state, i + 1, p, 1.0f);
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    const Vec3 slip{Scalar_t(0.01) * Scalar_t(i % 3), 0, 0};
+    add_synthetic_contact(sc, i + 1, 0, static_cast<std::uint32_t>(i), Vec3{0, 1, 0},
+                          Scalar_t(0.01), friction, slip);
+  }
+  return sc;
+}
+
+// Phase 3a：分离的接触（C_n > 0，λ_n == 0）不得产生任何吸引力，法线行必须整行跳过。
+Check check_bpxpbd_contact_unilateral_no_pull() {
+  Check c{"BPXPBD separated contact exerts no pull", true, ""};
+
+  scene::Scene sc = contact_pair_scene(Scalar_t(-0.1), Scalar_t(0.5), Vec3{0}, false);
+  const Vec3   before = sc.state.pose.position(1);
+  BPXPBDStep   p;
+  drive(sc, p, g_serial, g_sched, 1, 10);
+  const Vec3 after = sc.state.pose.position(1);
+  if (!bitwise_eq(before, after)) {
+    c.ok     = false;
+    c.detail = std::format("A moved from ({},{},{}) to ({},{},{})", before.x, before.y, before.z,
+                           after.x, after.y, after.z);
+    return c;
+  }
+  for (const ConstraintVariant &v : sc.constraints) {
+    const ContactConstraint &cc = std::get<ContactConstraint>(v);
+    if (cc.lambda != Scalar_t(0)) {
+      c.ok     = false;
+      c.detail = std::format("row {} got lambda={} on a separated contact",
+                             static_cast<int>(cc.kind), cc.lambda);
+      return c;
+    }
+  }
+  return c;
+}
+
+// Phase 3b：穿透接触只推不拉（λ_n > 0 ⇒ A 沿 +n 移动），切向乘子必须落在
+// μλ_n 的锥内；slip 足够大时锥必须是紧的（不是把切线白白放过）。
+Check check_bpxpbd_contact_friction_cone() {
+  Check c{"BPXPBD contact friction cone bounds tangent multipliers", true, ""};
+
+  scene::Scene sc = contact_pair_scene(Scalar_t(0.01), Scalar_t(0.5), Vec3{0.1f, 0, 0}, false);
+  const Vec3   before = sc.state.pose.position(1);
+  BPXPBDStep   p;
+  drive(sc, p, g_serial, g_sched, 1, 1);
+  const Vec3 after = sc.state.pose.position(1);
+  if (!(after.y > before.y)) {
+    c.ok     = false;
+    c.detail = std::format("penetrating contact pushed A down: y {} -> {}", before.y, after.y);
+    return c;
+  }
+
+  Scalar_t lam[3] = {0, 0, 0};
+  for (const ConstraintVariant &v : sc.constraints) {
+    const ContactConstraint &cc = std::get<ContactConstraint>(v);
+    lam[static_cast<int>(cc.kind)] = cc.lambda;
+  }
+  if (!(lam[0] > Scalar_t(0))) {
+    c.ok     = false;
+    c.detail = std::format("normal multiplier is {} (want > 0)", lam[0]);
+    return c;
+  }
+  const Scalar_t tau   = std::sqrt(lam[1] * lam[1] + lam[2] * lam[2]);
+  const Scalar_t bound = Scalar_t(0.5) * lam[0];
+  if (!(tau <= bound * (Scalar_t(1) + Scalar_t(1e-4)) + Scalar_t(1e-7))) {
+    c.ok     = false;
+    c.detail = std::format("tangent |lambda|={} exceeds mu*lambda_n={}", tau, bound);
+    return c;
+  }
+  if (!(tau >= bound * Scalar_t(0.99))) {
+    c.ok     = false;
+    c.detail = std::format("cone is not active: |lambda_t|={} < 0.99*mu*lambda_n={}", tau, bound);
+    return c;
+  }
+  return c;
+}
+
+// Phase 3c：接触 unit（法线 + 两切线）在 block 扫掠与"一 unit 一 block"的串行
+// 顺序下必须逐位相同；一个接触点必须是一个 unit（3 行同块），不能被拆开。
+Check check_bpxpbd_contact_block_oracle() {
+  Check c{"BPXPBD contact block sweep == one unit per block", true, ""};
+
+  constexpr std::size_t kContacts = 12;
+
+  scene::Scene natural = contact_fan_scene(kContacts, Scalar_t(0.5));
+  BPXPBDStep   p_nat;
+  drive(natural, p_nat, g_serial, g_sched, 3, 20);
+
+  SolveSchedule forced = g_sched;
+  forced.force_single_unit_blocks = true;
+  scene::Scene serial = contact_fan_scene(kContacts, Scalar_t(0.5));
+  BPXPBDStep   p_ser;
+  drive(serial, p_ser, g_serial, forced, 3, 20);
+
+  const auto d_nat = digest::parts(natural.state, natural.constraints).all;
+  const auto d_ser = digest::parts(serial.state, serial.constraints).all;
+  if (d_nat != d_ser) {
+    c.ok     = false;
+    c.detail = std::format("block sweep={} serial={}", digest::to_hex(d_nat),
+                           digest::to_hex(d_ser));
+    return c;
+  }
+
+  // 自然分区：这些 unit 只共享静态 body ⇒ 全部落在同一个 block，顺序 = 约束顺序。
+  const auto &scr_nat = natural.state.scratch;
+  const std::size_t nb_nat = scr_nat.block_begin.empty() ? 0 : scr_nat.block_begin.size() - 1;
+  if (nb_nat != 1) {
+    c.ok     = false;
+    c.detail = std::format("independent contacts used {} blocks (want 1)", nb_nat);
+    return c;
+  }
+
+  // 强制一 unit 一 block：每个接触点必须仍是 3 行一个 unit，且块数 = 接触点数。
+  const auto &scr_ser = serial.state.scratch;
+  const std::size_t nb_ser = scr_ser.block_begin.empty() ? 0 : scr_ser.block_begin.size() - 1;
+  if (scr_ser.unit_rows.size() != kContacts) {
+    c.ok     = false;
+    c.detail = std::format("forced partition made {} units (want {})", scr_ser.unit_rows.size(),
+                           kContacts);
+    return c;
+  }
+  for (std::size_t u = 0; u < scr_ser.unit_rows.size(); ++u) {
+    if (scr_ser.unit_rows[u] != 3) {
+      c.ok     = false;
+      c.detail = std::format("contact unit {} has {} rows (want 3: normal + 2 tangents)", u,
+                             scr_ser.unit_rows[u]);
+      return c;
+    }
+  }
+  if (nb_ser != kContacts) {
+    c.ok     = false;
+    c.detail = std::format("forced partition made {} blocks (want {})", nb_ser, kContacts);
+    return c;
+  }
+
+  // 别让这个 oracle 空转：接触必须真的在承力。3 步之后物体可能已经被位置投影
+  // 的"修正变速度"顶得短暂分离（C>0 ⇒ 单边投影把 λ 放回 0），所以这里用一个
+  // 从静止开始的单步探针检查内核确实产生了正的法线乘子。
+  scene::Scene probe = contact_fan_scene(4, Scalar_t(0.5));
+  BPXPBDStep   p_probe;
+  drive(probe, p_probe, g_serial, g_sched, 1, 1);
+  Scalar_t lam_sum = 0;
+  for (const ConstraintVariant &v : probe.constraints) {
+    const ContactConstraint &cc = std::get<ContactConstraint>(v);
+    if (cc.kind == ContactKind::Normal)
+      lam_sum += cc.lambda;
+  }
+  if (!(lam_sum > Scalar_t(0))) {
+    c.ok     = false;
+    c.detail = "all contact normal multipliers are zero (oracle is vacuous)";
   }
   return c;
 }
@@ -1002,6 +1679,18 @@ std::vector<Check> run_selftest() {
       check_free_fall_matches_analytic(),
       check_gravity_is_not_special(),
       check_xpbd_equals_pbd_when_rigid(),
+      check_bpxpbd_zeta_one_equals_xpbd(),
+      check_bpxpbd_one_unit_per_block_equals_xpbd(),
+      check_bpxpbd_blend_reduces_residual(),
+      check_bpxpbd_verify_topology(),
+      check_bpxpbd_determinism(),
+      check_bpxpbd_rest_chain_is_frozen(),
+      check_bpxpbd_joint_axis_locked_equals_xpbd(),
+      check_bpxpbd_angular_joint_locked_equals_xpbd(),
+      check_bpxpbd_joint_axis_limited(),
+      check_bpxpbd_contact_unilateral_no_pull(),
+      check_bpxpbd_contact_friction_cone(),
+      check_bpxpbd_contact_block_oracle(),
       check_scatter_gather_equals_direct_accumulation(),
       check_topology_cache_is_reused(),
       check_cached_layout_equals_rebuilt(),

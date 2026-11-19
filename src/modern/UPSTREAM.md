@@ -3,10 +3,12 @@
 This tree is a snapshot of `/home/cyan/avbd-mo/src`, imported to replace the legacy
 `src/avbd` solver on the `modernize` branch.
 
-- Source HEAD: `8b9fa9a` (`manifold`) — "add speculative contacts and swept
-  CCD". Earlier snapshots were `0c73d9a` (contact stability), `0c4853b`
-  (joints), `7107cff` (friction + gradient sign), `04d2833` (k0 / block
-  assembly), `4450b74` (pair filter) and `a3d9930` plus staged collision work.
+- Source HEAD: `824b37b` (`manifold`) — "wire contacts into B-PXPBD and add
+  solver-switch reset support" (on top of `e6f995a`, the B-PXPBD skeleton).
+  Earlier snapshots were `8b9fa9a` (speculative contacts/CCD), `0c73d9a`
+  (contact stability), `0c4853b` (joints), `7107cff` (friction + gradient
+  sign), `04d2833` (k0 / block assembly), `4450b74` (pair filter) and
+  `a3d9930` plus staged collision work.
 - The speculative/CCD part of this snapshot (default `speculative_distance = 0`,
   so the pinned solver/collision baselines are still bit-identical):
   * `collision/contact_constraints.hpp` — `ContactEmitOptions::speculative_distance`
@@ -43,7 +45,7 @@ This tree is a snapshot of `/home/cyan/avbd-mo/src`, imported to replace the leg
     by default). The snapshot still matches `tests/baseline.txt` and
     `tests/collision_observable.txt` bit-for-bit.
 - Snapshot tree SHA-256 (everything under `src/modern` except this file):
-  `8dd693c141505b0961eff900d81ba5cae8ad8247cb957b8160064c62e26751a7`
+  `51c026ee51f9e5c75fbdd712799baf8b110824fea46e4aadf4834ecaeb71cf41`
   Recipe: `find src/modern -type f ! -name UPSTREAM.md -print0 | sort -z |
   xargs -0 sha256sum | sha256sum`.
 - Baseline data copied to `src/modern/tests/`:

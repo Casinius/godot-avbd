@@ -156,6 +156,11 @@ public:
   // sync() 在 step 之前自动调用它；手动用 step()/emit() 的调用方必须自己调。
   void absorb_warm_start(const ConstraintList &list);
 
+  // 清空 manifold store 的跨帧对偶状态（λ/stick），保留 manifold 与罚因子。
+  // 求解器切换时调用：AVBD 的 λ 是力，B-PXPBD 的 λ 是乘子，不能互相暖启动。
+  // 不要每帧调用——那会关掉正常 warm start。
+  void reset_warm_start() noexcept { store_.reset_warm_start(); }
+
   // absorb_warm_start + step + emit，并只在拓扑签名变化时 bump version。返回是否 bump。
   bool sync(const State &state, ConstraintList &list, std::uint64_t &topology_version);
 
