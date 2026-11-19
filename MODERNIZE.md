@@ -58,8 +58,10 @@ This file is the honest state of the migration, not a wish list.
   (stack drift 0.009 m, friction exact), constraints, API, queries and load.
   The 420-box pyramid still fails 6/9: XPBD turns impact depenetration into
   velocity through `v=dx/dt`, ejecting boxes (~16 m/s) that then free-fall.
-  AVBD's implicit contact does not do that. The next fix is a velocity-neutral
-  position projection after `finish_step`; B-PXPBD stays opt-in until then.
+  AVBD's implicit contact does not do that. An opt-in velocity-neutral
+  end-of-step projection exists (`projection_iterations>=1`), but it cannot see
+  penetration created inside the step; the next fix is to generate contacts at
+  the predicted pose before the solve. B-PXPBD stays opt-in until then.
 - `avbd_modern_test`: 50/50 structural selftests, solver digest and collision
   digest bit-identical to the pinned upstream baselines. Wired into
   `run_all_tests` and CI (`avbd_modern_tests`).

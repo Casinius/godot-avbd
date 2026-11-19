@@ -190,6 +190,13 @@ public:
     // `zeta` for the blend term and `contact_compliance` (1/K, m/N) for contact rows.
     void set_policy_stiffness(Scalar_t k0, Scalar_t beta, Scalar_t zeta = Scalar_t(0.5),
             Scalar_t contact_compliance = Scalar_t(0)) noexcept;
+    // B-PXPBD only: velocity-neutral post-solve position projection. AVBD ignores
+    // this (its implicit contact solve already handles depenetration), so passing
+    // values while AVBD is selected is a no-op. `enabled == false` or
+    // `iterations <= 0` turns the pass off. Must be called after set_solver(),
+    // which constructs a fresh BPXPBDStep on a switch.
+    void set_contact_projection(bool enabled, int iterations, Scalar_t beta, Scalar_t slop,
+            Scalar_t max_correction) noexcept;
     // Resting overlap the normal constraints target (metres). Smaller = less visible
     // penetration at the cost of a stiffer contact solve.
     void set_contact_margin(Scalar_t margin) noexcept;

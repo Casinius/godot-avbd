@@ -265,11 +265,15 @@ protected:
         // (see Solver::positionProjection). The penalty solve alone leaves deep overlaps
         // in a large pile, and BDF1 turns any later correction into velocity; this bounds
         // the overlap in position instead, so under-solving cannot become kinetic energy.
+        // Modern core: B-PXPBD only, and opt-in through a non-zero iteration count
+        // (the legacy default of 4 is kept available but no longer forced on).
         bool position_projection = true;
-        int projection_iterations = 4;
+        int projection_iterations = 0; // 0 = off (B-PXPBD opt-in; see ModernSpace)
         double projection_beta = 1.0;
         double projection_slop = 0.008;
-        double projection_max_correction = 0.0;
+        // Per-body, per-pass cap on the correction (metres / radians). Legacy used
+        // 0.8 in the demo project; 0 keeps the old "uncapped" meaning.
+        double projection_max_correction = 0.8;
 
         // Idle-sleep thresholds. The horizon (how long a body must stay under both
         // thresholds) is a TIME - Godot's 0.5 s - converted to internal ticks per step

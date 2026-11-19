@@ -1154,6 +1154,112 @@ Check check_bpxpbd_contact_deep_penetration_cap() {
   return c;
 }
 
+// Phase 3f：步末位置投影只改 pose，**绝不改 velocity**。
+//
+// 这是 B-PXPBD 冲击去穿透的语义核心：finish_step() 已经把本步位移写进速度，
+// 投影再做的那部分修正必须在速度之外；下一步 begin_step() 以修正后的位姿作为
+// x_initial，所以它也不会在下一步被反推成动能。两个探针：
+//   1) 深静态重叠：单次求解被 2 cm cap 限制，残留在位姿里的深穿透由投影清到
+//      slop，速度逐位不变；
+//   2) 动态冲击：冲击求解之后的投影同样不改速度（不额外注入动能）。
+Check check_bpxpbd_projection_is_velocity_neutral() {
+  Check c{"BPXPBD projection is velocity-neutral", true, ""};
+
+  auto raw_penetration = [](const State &s, const ContactConstraint &row) {
+    const Vec3 rA = rotate(s.pose.rotation(row.bodies_[0]), row.rA);
+    const Vec3 rB = rotate(s.pose.rotation(row.bodies_[1]), row.rB);
+    const Vec3 xA = s.pose.position(row.bodies_[0]) + rA;
+    const Vec3 xB = s.pose.position(row.bodies_[1]) + rB;
+    return -glm::dot(row.basis[0], xA - xB);
+  };
+  auto normal_row = [](const scene::Scene &sc) -> const ContactConstraint * {
+    for (const ConstraintVariant &v : sc.constraints) {
+      const ContactConstraint &cc = std::get<ContactConstraint>(v);
+      if (cc.kind == ContactKind::Normal)
+        return &cc;
+    }
+    return nullptr;
+  };
+  auto solve_finish = [](scene::Scene &sc, BPXPBDStep &p) {
+    sc.state.reset_external();
+    sc.state.begin_step();
+    solve(sc.state, sc.constraints, p, 1, g_serial, g_sched,
+          static_cast<NullPhaseObserver *>(nullptr), sc.topology_version);
+    sc.state.finish_step();
+  };
+
+  constexpr Scalar_t kSlop = Scalar_t(0.008);
+
+  // 1) 深静态重叠（求解器只走 2 cm cap，投影清剩余）。
+  {
+    scene::Scene sc = contact_pair_scene(Scalar_t(0.09), Scalar_t(0), Vec3{0}, false);
+    BPXPBDStep   p;
+    p.projection_iterations     = 4;
+    p.projection_beta           = Scalar_t(1);
+    p.projection_slop           = kSlop;
+    p.projection_max_correction = Scalar_t(0.8);
+    solve_finish(sc, p);
+
+    const ContactConstraint *row = normal_row(sc);
+    if (row == nullptr) {
+      c.ok = false;
+      c.detail = "probe has no normal contact row";
+      return c;
+    }
+    const Scalar_t before_pen = raw_penetration(sc.state, *row);
+    const Vec3     v_before   = sc.state.velocity.velocity(1);
+    const Vec3     w_before   = sc.state.velocity.angular_velocity(1);
+
+    p.post_project(sc.state, sc.constraints);
+
+    const Scalar_t after_pen = raw_penetration(sc.state, *row);
+    if (!(before_pen > Scalar_t(0.02))) {
+      c.ok     = false;
+      c.detail = std::format("probe is not deep after solve: {} m", before_pen);
+      return c;
+    }
+    if (!(after_pen <= kSlop + Scalar_t(1e-4))) {
+      c.ok     = false;
+      c.detail = std::format("projection left {} m (want <= slop {})", after_pen, kSlop);
+      return c;
+    }
+    if (!bitwise_eq(v_before, sc.state.velocity.velocity(1)) ||
+        !bitwise_eq(w_before, sc.state.velocity.angular_velocity(1))) {
+      c.ok     = false;
+      c.detail = std::format("projection changed velocity: v=({},{},{}) -> ({},{},{})",
+                             v_before.x, v_before.y, v_before.z,
+                             sc.state.velocity.velocity(1).x,
+                             sc.state.velocity.velocity(1).y,
+                             sc.state.velocity.velocity(1).z);
+      return c;
+    }
+  }
+
+  // 2) 动态冲击：投影同样不得改变已经算好的速度。
+  {
+    scene::Scene sc = contact_pair_scene(Scalar_t(0.09), Scalar_t(0), Vec3{0}, false);
+    sc.state.velocity.set_velocity(1, Vec3{0, -5, 0});
+    BPXPBDStep p;
+    p.projection_iterations     = 4;
+    p.projection_beta           = Scalar_t(1);
+    p.projection_slop           = kSlop;
+    p.projection_max_correction = Scalar_t(0.8);
+    solve_finish(sc, p);
+
+    const Vec3 v_before = sc.state.velocity.velocity(1);
+    const Vec3 w_before = sc.state.velocity.angular_velocity(1);
+    p.post_project(sc.state, sc.constraints);
+    if (!bitwise_eq(v_before, sc.state.velocity.velocity(1)) ||
+        !bitwise_eq(w_before, sc.state.velocity.angular_velocity(1))) {
+      c.ok     = false;
+      c.detail = "projection changed velocity on a dynamic impact";
+      return c;
+    }
+  }
+
+  return c;
+}
+
 // Phase 3e：步末速度级摩擦必须是**纯耗散**的。
 // 手工给一个真实重叠的接触一点法向乘子 λ_n > 0 和切向滑块速度，然后只跑
 // post_step：切向相对速度必须下降，系统动能不许上升。
@@ -1861,6 +1967,7 @@ std::vector<Check> run_selftest() {
       check_bpxpbd_contact_friction_cone(),
       check_bpxpbd_contact_block_oracle(),
       check_bpxpbd_contact_deep_penetration_cap(),
+      check_bpxpbd_projection_is_velocity_neutral(),
       check_bpxpbd_friction_pass_is_dissipative(),
       check_scatter_gather_equals_direct_accumulation(),
       check_topology_cache_is_reused(),

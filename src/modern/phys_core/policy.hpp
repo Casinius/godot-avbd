@@ -417,6 +417,15 @@ public:
   // 不修改发射路径。
   Scalar_t contact_compliance = Scalar_t(0);
 
+  // ——— 步末速度中性位置投影（见 post_project）———
+  // 0 = 关闭（默认惰性：核心测试和 AVBD 路径都不走这段）。Godot 适配层在
+  // B-PXPBD 模式下把它映射到 physics/avbd/projection_*。
+  int      projection_iterations     = 0;
+  Scalar_t projection_beta           = Scalar_t(1);
+  Scalar_t projection_slop           = Scalar_t(0.008);
+  // 每个 body 每次迭代的线/角修正上限（米 / 弧度）。0 = 不夹。
+  Scalar_t projection_max_correction = Scalar_t(0.8);
+
   // R = Σ λ∇C，每步/每迭代刷新。resize 只在 body 数变化时发生。
   std::vector<Vec3> R_lin;
   std::vector<Vec3> R_ang;
@@ -629,6 +638,162 @@ public:
       }
       apply_contact_friction(s, cs, i, end);
       i = end;
+    }
+  }
+
+  // —— 步末**速度中性**位置投影（B-PXPBD 专有）——
+  //
+  // finish_step() 已经把本步位移写进 velocity（v = (x - x_initial)/dt）。XPBD 的
+  // 接触是位置约束，撞击那一帧的去穿透位移也会变成速度；深度穿透时这一项足以
+  // 把箱子发射出去，而 AVBD 的隐式接触没有这个通道。真正确立支撑的是求解器里
+  // 的接触行；这里只清掉**求解后仍残留在当前位姿里**的深穿透，让下一步从干净
+  // 的位姿开始。
+  //
+  // 【为什么是速度中性的】本函数只写 pose，不碰 velocity、不重算 finish_step。
+  // 下一步 begin_step() 以修正后的位姿为 x_initial，所以这一段的位移不会出现在
+  // 下一步的 (x - x_initial)/dt 里。已经由求解器产生的 velocity 原样保留，不会
+  // 因为这次修正再拿到一份动能。
+  //
+  // 与 legacy Solver::projectContacts(positionProjection) 同构：
+  //   * 每个 manifold 用同一条法线；多接触点的臂长取所有超 slop 点的平均，
+  //     避免把对称面修出扭矩；
+  //   * dp = beta * avg(depth - slop) / K，K 含两侧线质量与角向有效质量；
+  //   * 每个 body 的累计增量按参与的 manifold 数平均（碰撞接缝不重复放大），
+  //     再按 projection_max_correction 夹紧；
+  //   * 最多 projection_iterations 次，残差低于 1% slop 时提前退出。
+  // 只读 ContactConstraint 的法线行；切线行、λ、initial_c、compliance 一律不参与。
+  // 静态-静态与 speculative（depth < 0）接触天然被跳过（后者不 > slop）。
+  void post_project(State &s, ConstraintList &cs) const {
+    if (projection_iterations <= 0 || !(projection_beta > Scalar_t(0)))
+      return;
+    const std::size_t nb = s.size();
+    if (nb == 0 || cs.empty())
+      return;
+
+    const Scalar_t slop      = std::max(projection_slop, Scalar_t(0));
+    const Scalar_t depth_tol = std::max(slop * Scalar_t(0.01), Scalar_t(1e-6));
+    const Scalar_t cap       = projection_max_correction;
+
+    std::vector<Vec3>          delta_lin(nb, Vec3{0});
+    std::vector<Vec3>          delta_ang(nb, Vec3{0});
+    std::vector<std::uint32_t> touches(nb, 0);
+
+    // I_world⁻¹ = R I_local⁻¹ Rᵀ。用当前位姿的 R 现算，不依赖 begin_step 刷新的
+    // （此时已经过时的）inertia_world_inv；也不写回 inertial。
+    auto angular_compliance = [&s](std::size_t b, Vec3 world_axis) noexcept {
+      const Vec3 local = transpose(s.pose.rotation_matrix(b)) * world_axis;
+      return glm::dot(local, s.inertial.local_inv_inertia(b) * local);
+    };
+    auto angular_response = [&s](std::size_t b, Vec3 world_axis) noexcept {
+      const Mat3 R     = s.pose.rotation_matrix(b);
+      const Vec3 local = transpose(R) * world_axis;
+      return R * (s.inertial.local_inv_inertia(b) * local);
+    };
+
+    const std::size_t n = cs.size();
+    for (int iter = 0; iter < projection_iterations; ++iter) {
+      std::fill(delta_lin.begin(), delta_lin.end(), Vec3{0});
+      std::fill(delta_ang.begin(), delta_ang.end(), Vec3{0});
+      std::fill(touches.begin(), touches.end(), std::uint32_t{0});
+
+      Scalar_t    max_depth = 0;
+      std::size_t i         = 0;
+      while (i < n) {
+        const auto *first = std::get_if<ContactConstraint>(&cs[i]);
+        if (first == nullptr || first->kind != ContactKind::Normal) {
+          ++i;
+          continue;
+        }
+
+        // 一个 manifold 的接触行是连续的；standalone 哨兵每个点是独立 manifold。
+        const std::uint32_t mid = first->manifold_id;
+        std::size_t         end = i + 1;
+        if (mid != kStandaloneManifold) {
+          while (end < n) {
+            const auto *next = std::get_if<ContactConstraint>(&cs[end]);
+            if (next == nullptr || next->manifold_id != mid)
+              break;
+            ++end;
+          }
+        }
+
+        const std::size_t bA = first->bodies_[0];
+        const std::size_t bB = first->bodies_[1];
+        if (!s.inertial.is_static(bA) || !s.inertial.is_static(bB)) {
+          const Vec3 n  = first->basis[0]; // manifold 级法线：所有点共用
+          const Mat3 RA = s.pose.rotation_matrix(bA);
+          const Mat3 RB = s.pose.rotation_matrix(bB);
+          const Vec3 pA = s.pose.position(bA);
+          const Vec3 pB = s.pose.position(bB);
+
+          Vec3      patch_ra{0}, patch_rb{0};
+          Scalar_t  patch_depth = 0;
+          std::size_t corrected = 0;
+          for (std::size_t j = i; j < end; ++j) {
+            const auto *row = std::get_if<ContactConstraint>(&cs[j]);
+            if (row == nullptr || row->kind != ContactKind::Normal)
+              continue;
+            const Vec3      rA   = RA * row->rA;
+            const Vec3      rB   = RB * row->rB;
+            const Scalar_t  pen  = -glm::dot(n, (pA + rA) - (pB + rB));
+            const Scalar_t  depth = pen - slop;
+            if (depth > Scalar_t(0)) {
+              patch_ra += rA;
+              patch_rb += rB;
+              patch_depth += depth;
+              ++corrected;
+            }
+          }
+          if (corrected != 0) {
+            const Scalar_t inv_c     = Scalar_t(1) / Scalar_t(corrected);
+            const Vec3     avg_ra    = patch_ra * inv_c;
+            const Vec3     avg_rb    = patch_rb * inv_c;
+            const Scalar_t avg_depth = patch_depth * inv_c;
+            max_depth = std::max(max_depth, avg_depth);
+
+            const Vec3 tA = glm::cross(avg_ra, n);
+            const Vec3 tB = glm::cross(avg_rb, n);
+            const Scalar_t wA = s.inertial.inv_mass(bA);
+            const Scalar_t wB = s.inertial.inv_mass(bB);
+            const Scalar_t K  = wA + wB + angular_compliance(bA, tA) +
+                               angular_compliance(bB, tB);
+            if (K > Scalar_t(0)) {
+              const Scalar_t dp = projection_beta * avg_depth / K;
+              if (wA > Scalar_t(0)) {
+                delta_lin[bA] += n * (wA * dp);
+                delta_ang[bA] += angular_response(bA, tA) * dp;
+                ++touches[bA];
+              }
+              if (wB > Scalar_t(0)) {
+                delta_lin[bB] -= n * (wB * dp);
+                delta_ang[bB] -= angular_response(bB, tB) * dp;
+                ++touches[bB];
+              }
+            }
+          }
+        }
+        i = end;
+      }
+
+      for (std::size_t b = 0; b < nb; ++b) {
+        if (touches[b] == 0)
+          continue;
+        const Scalar_t inv_touch = Scalar_t(1) / Scalar_t(touches[b]);
+        Vec3           d_lin     = delta_lin[b] * inv_touch;
+        Vec3           d_ang     = delta_ang[b] * inv_touch;
+        if (cap > Scalar_t(0)) {
+          const Scalar_t moved = glm::length(d_lin);
+          if (moved > cap)
+            d_lin *= cap / moved;
+          const Scalar_t turned = glm::length(d_ang);
+          if (turned > cap)
+            d_ang *= cap / turned;
+        }
+        s.pose.apply_delta(b, d_lin, d_ang);
+      }
+
+      if (max_depth <= depth_tol)
+        break;
     }
   }
 

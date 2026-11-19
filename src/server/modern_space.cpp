@@ -483,6 +483,19 @@ void ModernSpace::set_policy_stiffness(Scalar_t k0, Scalar_t beta, Scalar_t zeta
     }
 }
 
+void ModernSpace::set_contact_projection(bool enabled, int iterations, Scalar_t beta,
+        Scalar_t slop, Scalar_t max_correction) noexcept {
+    // AVBD has no post_project hook, and the values must not leak across a solver
+    // switch: set_solver() constructs a fresh BPXPBDStep, so the adapter re-applies
+    // these settings every step after selecting the policy.
+    if (auto *bpxpbd = std::get_if<BPXPBDStep>(&policy_)) {
+        bpxpbd->projection_iterations = enabled ? std::max(iterations, 0) : 0;
+        bpxpbd->projection_beta = beta;
+        bpxpbd->projection_slop = slop;
+        bpxpbd->projection_max_correction = max_correction;
+    }
+}
+
 void ModernSpace::ensure_executor(int threads) {
     const int wanted = threads <= 0 ? -1 : threads;
     if (exec_ != nullptr && exec_threads_ == wanted)
@@ -533,6 +546,12 @@ void ModernSpace::step(int iterations, int threads) {
             [&](auto &policy) {
                 if constexpr (requires { policy.post_step(state_, constraints_); })
                     policy.post_step(state_, constraints_);
+                // Velocity-neutral position projection (B-PXPBD only): runs after
+                // the velocity finish and before commit_prev, writes pose only, so
+                // the correction never enters the velocity this step or (because
+                // the next begin_tick recaptures the pose) any later step.
+                if constexpr (requires { policy.post_project(state_, constraints_); })
+                    policy.post_project(state_, constraints_);
             },
             policy_);
 

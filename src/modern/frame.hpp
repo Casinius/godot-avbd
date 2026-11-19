@@ -113,6 +113,13 @@ FrameStats step_frame(State &s, ConstraintList &cs, Policy &policy, Exec &exec,
   if constexpr (requires { policy.post_step(s, cs); })
     policy.post_step(s, cs);
 
+  // —— 策略的步末位置投影（B-PXPBD 的速度中性去穿透）——
+  // 同样在 finish（速度已由位移反推）之后、commit_prev 之前，但只写 pose：修正
+  // 不会进入本步已经算好的 velocity，下一步 begin_step 以修正后的位姿为基准，
+  // 所以也不会进入下一步的速度。AVBD 没有这个钩子 ⇒ `if constexpr` 整段消失。
+  if constexpr (requires { policy.post_project(s, cs); })
+    policy.post_project(s, cs);
+
   s.cache.commit_prev(s.velocity);
   return st;
 }

@@ -400,11 +400,11 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
             "physics/avbd/max_internal_steps", 4.0)), 1);
     p_space.position_projection = settings->get_setting("physics/avbd/position_projection", true);
     p_space.projection_iterations = static_cast<int>(settings->get_setting(
-            "physics/avbd/projection_iterations", 4.0));
+            "physics/avbd/projection_iterations", 0.0));
     p_space.projection_beta = settings->get_setting("physics/avbd/projection_beta", 1.0);
     p_space.projection_slop = settings->get_setting("physics/avbd/projection_slop", 0.008);
     p_space.projection_max_correction = settings->get_setting(
-            "physics/avbd/projection_max_correction", 0.0);
+            "physics/avbd/projection_max_correction", 0.8);
     p_space.sleep_linear_threshold = settings->get_setting(
             "physics/avbd/sleep_linear_threshold", 0.05);
     p_space.sleep_angular_threshold = settings->get_setting(
@@ -1402,6 +1402,15 @@ void AVBDPhysicsServer3D::_step(float p_step) {
                 static_cast<Scalar_t>(std::clamp(space.beta_linear, 1.0e4, 1.0e6)), Scalar_t(1e-2),
                 static_cast<Scalar_t>(std::clamp(space.bpxpbd_zeta, 0.0, 1.0)),
                 static_cast<Scalar_t>(std::max(space.bpxpbd_contact_compliance, 0.0)));
+        // Velocity-neutral position projection. The legacy projection_* settings were
+        // dead after the modern-core migration; they now drive B-PXPBD's step-end
+        // projection. AVBD ignores them (its implicit contact already depenetrates),
+        // so the AVBD path stays bit-identical.
+        space.modern->set_contact_projection(space.position_projection,
+                space.projection_iterations,
+                static_cast<Scalar_t>(std::clamp(space.projection_beta, 0.0, 1.0)),
+                static_cast<Scalar_t>(std::max(space.projection_slop, 0.0)),
+                static_cast<Scalar_t>(std::max(space.projection_max_correction, 0.0)));
         space.modern->set_contact_margin(Scalar_t(0.002));
 
         // Godot's physics tick is the sampling rate. If an internal rate is configured,

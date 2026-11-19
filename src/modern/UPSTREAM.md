@@ -3,9 +3,9 @@
 This tree is a snapshot of `/home/cyan/avbd-mo/src`, imported to replace the legacy
 `src/avbd` solver on the `modernize` branch.
 
-- Source HEAD: `feca2f9` (`manifold`) — "BPXPBD: gated deep-overlap cap,
-  velocity friction, stick bookkeeping" (on top of `824b37b` contacts and
-  `e6f995a` skeleton). Earlier snapshots were `8b9fa9a` (speculative
+- Source HEAD: `4cd21cf` (`manifold`) — "BPXPBD: opt-in velocity-neutral
+  end-of-step projection" (on top of `feca2f9` cap/friction, `824b37b`
+  contacts and `e6f995a` skeleton). Earlier snapshots were `8b9fa9a` (speculative
   contacts/CCD), `0c73d9a` (contact stability), `0c4853b` (joints), `7107cff`
   (friction + gradient sign), `04d2833` (k0 / block assembly), `4450b74`
   (pair filter) and `a3d9930` plus staged collision work.
@@ -45,7 +45,7 @@ This tree is a snapshot of `/home/cyan/avbd-mo/src`, imported to replace the leg
     by default). The snapshot still matches `tests/baseline.txt` and
     `tests/collision_observable.txt` bit-for-bit.
 - Snapshot tree SHA-256 (everything under `src/modern` except this file):
-  `ab2e299b12a0a02e51504540e2a7147d1d837cc7cce9f0385b044e10488182a0`
+  `3a0efa7a768934de267e4ecacd7413bd922c30b4c679d99a6f96062ed263a228`
   Recipe: `find src/modern -type f ! -name UPSTREAM.md -print0 | sort -z |
   xargs -0 sha256sum | sha256sum`.
 - Baseline data copied to `src/modern/tests/`:
