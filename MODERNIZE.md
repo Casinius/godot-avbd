@@ -124,3 +124,5 @@ no longer produce position multipliers. With a low-speed static-friction snap
 (0.5 velocity retention) all Godot gates pass: solver 38/38, constraints 11/11,
 server 30/30, queries 27/27, load PASS, pyramid 9/9. Core selftest 68/68,
 baselines unchanged.
+
+40 s verification (420-box double pyramid, `probe_late.gd`, 240 Hz solver, 20 iterations): no body below ground (`first_cross_frame=-1`, `below_frames=0`), `max_ke=0.4 J @38 s`, `max_speed=19.24 m/s @1.5 s` (the authored upper-pyramid landing), `max_penetration=0.505 m @1.075 s` (transient at that landing). The pile stays on the slab for the full run; the previous -2200 m free-fall runaway is gone.
