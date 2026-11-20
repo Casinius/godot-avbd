@@ -61,7 +61,10 @@ static void register_avbd_settings() {
 
     const std::pair<const char *, Variant> entries[] = {
             {"physics/avbd/threads", Variant(0)},
-            {"physics/avbd/iterations", Variant(8)},
+            {"physics/avbd/iterations", Variant(20)},
+            {"physics/avbd/solver", Variant("bpxpbd")},
+            {"physics/avbd/bpxpbd_zeta", Variant(0.4)},
+            {"physics/avbd/bpxpbd_contact_compliance", Variant(0.0002)},
             {"physics/avbd/alpha", Variant(0.99)},
             {"physics/avbd/beta_linear", Variant(10000.0)},
             {"physics/avbd/beta_angular", Variant(100.0)},

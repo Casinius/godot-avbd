@@ -229,14 +229,14 @@ protected:
         // Solver parameters, read from project settings at space creation and stamped
         // into the solver every step (so a changed setting shows up without a restart).
         int threads = 0;
-        int iterations = 8;
-        // Policy selection: 0 = AVBD (default), 1 = B-PXPBD. Read from
+        int iterations = 20;
+        // Policy selection: 0 = AVBD (legacy), 1 = B-PXPBD (default). Read from
         // `physics/avbd/solver` ("avbd" | "bpxpbd"); switching resets dual state.
-        int solver = 0;
-        // B-PXPBD blend weight and optional contact compliance (1/K, m/N). 0 compliance
-        // keeps contacts rigid, exactly as the contact emit path writes them.
-        double bpxpbd_zeta = 0.5;
-        double bpxpbd_contact_compliance = 0.0;
+        int solver = 1;
+        // B-PXPBD blend weight and contact compliance (1/K, m/N). These are the
+        // parity defaults; compliance is added to the emitted contact rows.
+        double bpxpbd_zeta = 0.4;
+        double bpxpbd_contact_compliance = 2e-4;
         double alpha = 0.99;
         double beta_linear = 10000.0;
         double beta_angular = 100.0;

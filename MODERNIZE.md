@@ -104,3 +104,12 @@ has no axis permutation. The soft-body nodes keep their own Z-up conversion.
 3. Make B-PXPBD reach parity: velocity-neutral position projection for impact
    depenetration, then re-run pyramid and flip the default.
 4. Then remove `src/avbd` and the soft-body dependence on it.
+
+## Current experiment (2026-11-20)
+
+B-PXPBD is the default in the working tree with `iterations=20`, `zeta=0.4`,
+`contact_compliance=2e-4`, 240 Hz solver tick, predicted-pose contacts, a
+velocity-level impact clamp and XPBD multiplier warm start. `test_solver`
+passes 38/38 but the 420-box pyramid still fails 6/9 (deep-impact depenetration
+becomes velocity). We are evaluating XPBD variants with contact-specific
+stabilization rather than tuning this variant further.

@@ -30,14 +30,17 @@ avbd/beta_angular=100.0
 avbd/threads=8
 avbd/interleaved_substeps=true
 avbd/speculative_margin=0.02
-avbd/iterations=8
+avbd/solver="bpxpbd"
+avbd/iterations=20
+avbd/bpxpbd_zeta=0.4
+avbd/bpxpbd_contact_compliance=0.0002
 avbd/max_internal_steps=8
 avbd/substeps=1
 avbd/jacobian_rebuild_distance=0.02
 avbd/position_projection=true
 avbd/projection_beta=1.0
 avbd/projection_max_correction=0.8
-avbd/internal_ticks_per_second=60
+avbd/internal_ticks_per_second=240
 avbd/adaptive_beta=true
 
 [rendering]

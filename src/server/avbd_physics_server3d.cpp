@@ -370,14 +370,19 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
         return;
     }
 
+    // Policy selection. B-PXPBD is the default now; "avbd" remains an opt-in legacy
+    // policy. The defaults (20 iterations, zeta 0.4, 2e-4 contact compliance) are the
+    // parity configuration the solver/constraint suites pass with, so an absent
+    // setting gets those instead of the old AVBD values.
+    const String solver_mode = settings->get_setting("physics/avbd/solver", "bpxpbd");
+    const bool bpxpbd = solver_mode == "bpxpbd";
+    p_space.solver = bpxpbd ? 1 : 0;
     p_space.threads = static_cast<int>(settings->get_setting("physics/avbd/threads", 0));
-    p_space.iterations = static_cast<int>(settings->get_setting("physics/avbd/iterations", 8));
-    // Policy selection. Absent setting = "avbd", so existing projects keep AVBD.
-    const String solver_mode = settings->get_setting("physics/avbd/solver", "avbd");
-    p_space.solver = (solver_mode == "bpxpbd") ? 1 : 0;
-    p_space.bpxpbd_zeta = settings->get_setting("physics/avbd/bpxpbd_zeta", 0.5);
+    p_space.iterations = static_cast<int>(
+            settings->get_setting("physics/avbd/iterations", bpxpbd ? 20 : 8));
+    p_space.bpxpbd_zeta = settings->get_setting("physics/avbd/bpxpbd_zeta", 0.4);
     p_space.bpxpbd_contact_compliance =
-            settings->get_setting("physics/avbd/bpxpbd_contact_compliance", 0.0);
+            settings->get_setting("physics/avbd/bpxpbd_contact_compliance", 2e-4);
     p_space.alpha = settings->get_setting("physics/avbd/alpha", 0.99);
     p_space.beta_linear = settings->get_setting("physics/avbd/beta_linear", 1e4);
     p_space.beta_angular = settings->get_setting("physics/avbd/beta_angular", 1e2);

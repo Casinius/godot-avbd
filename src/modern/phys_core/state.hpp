@@ -215,13 +215,18 @@ struct InertialState {
   // 惯性预测位姿：p + v·dt，q ⊗ exp(ω·dt)；静态 body 原地不动
   void predict_pose(std::size_t b, const PoseState &pose, Vec3 v, Vec3 omega,
                     Scalar_t dt, Vec3 &out_lin, Quat &out_ang) const noexcept {
+    predict_pose(b, pose.position(b), pose.rotation(b), v, omega, dt, out_lin, out_ang);
+  }
+  // 显式基准位姿版：调用方需要从**步首**位姿（而不是当前 pose）预测时使用。
+  void predict_pose(std::size_t b, Vec3 pos, Quat rot, Vec3 v, Vec3 omega,
+                    Scalar_t dt, Vec3 &out_lin, Quat &out_ang) const noexcept {
     if (is_static(b)) {
-      out_lin = pose.position(b);
-      out_ang = pose.rotation(b);
+      out_lin = pos;
+      out_ang = rot;
       return;
     }
-    out_lin = pose.position(b) + v * dt;
-    out_ang = glm::normalize(quat_from_rotvec(omega * dt) * pose.rotation(b));
+    out_lin = pos + v * dt;
+    out_ang = glm::normalize(quat_from_rotvec(omega * dt) * rot);
   }
 };
 

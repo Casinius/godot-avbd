@@ -509,12 +509,127 @@ int ModernSpace::threads_used() const noexcept {
     return exec_ == nullptr ? 1 : static_cast<int>(exec_->thread_count());
 }
 
+namespace {
+// Rebuild the inertial target from the step-start pose after a velocity change.
+// Without this, a pre-solve velocity impulse is invisible to the projection
+// solver, which always starts from cache.inertial_* (x~).
+void refresh_target_after_impulse(State &s, std::size_t b, Scalar_t dt) {
+    if (s.inertial.is_static(b))
+        return;
+    Vec3 lin;
+    Quat ang;
+    s.inertial.predict_pose(b, s.cache.initial_position(b), s.cache.initial_rotation(b),
+            s.velocity.velocity(b), s.velocity.angular_velocity(b), dt, lin, ang);
+    s.cache.set_inertial(b, lin, ang);
+}
+} // namespace
+
+void ModernSpace::project_contact_normal_velocity() {
+    // Fixed 3 sweeps: a contact can be re-closed by an impulse applied at a
+    // neighbouring contact (e.g. a box wedged between two others), so one pass is
+    // not enough. The order is the manifold store order (ascending proxy pair) and
+    // contact index, and the loop is serial: no atomics, no scheduling dependence.
+    constexpr int kSweeps = 3;
+    const std::span<const collision::Manifold> manifolds = collision_.manifolds();
+    if (manifolds.empty())
+        return;
+
+    auto sleeping = [this](std::size_t b) noexcept {
+        return b < sleeping_.size() && sleeping_[b];
+    };
+
+    for (int sweep = 0; sweep < kSweeps; ++sweep) {
+        for (const collision::Manifold &m : manifolds) {
+            const std::size_t a = m.body_a;
+            const std::size_t b = m.body_b;
+            if (state_.inertial.is_static(a) && state_.inertial.is_static(b))
+                continue;
+            if (sleeping(a) || sleeping(b))
+                continue;
+
+            const Vec3 n = m.basis.normal;
+            if (!(glm::dot(n, n) > Scalar_t(1e-12)))
+                continue;
+
+            for (std::size_t i = 0; i < m.count; ++i) {
+                const collision::ManifoldContact &mc = m.contacts[i];
+                // Speculative gaps (depth < 0) were already velocity-clamped by
+                // apply_speculative_velocity_clamp; this pass only stops true
+                // contacts from carrying a closing velocity into the position solve.
+                if (mc.depth < Scalar_t(0))
+                    continue;
+
+                const Vec3 ra = rotate(state_.pose.rotation(a), mc.rA);
+                const Vec3 rb = rotate(state_.pose.rotation(b), mc.rB);
+                const Vec3 va = state_.velocity.velocity(a) +
+                                glm::cross(state_.velocity.angular_velocity(a), ra);
+                const Vec3 vb = state_.velocity.velocity(b) +
+                                glm::cross(state_.velocity.angular_velocity(b), rb);
+                const Scalar_t vn = glm::dot(va - vb, n);
+                // Only true impacts. Killing the normal velocity of a resting
+                // contact removes the predicted penetration the XPBD normal row
+                // uses to build lambda_n, which in turn destroys position-level
+                // friction (the box slides away). Slow gravity approach must be
+                // left to the normal position constraint.
+                if (!(vn < -Scalar_t(1)))
+                    continue;
+
+                state_.inertial.refresh_world_inertia(a, state_.pose.rotation_matrix(a));
+                state_.inertial.refresh_world_inertia(b, state_.pose.rotation_matrix(b));
+                const Scalar_t inv_a = state_.inertial.inv_mass(a);
+                const Scalar_t inv_b = state_.inertial.inv_mass(b);
+                const Vec3 rna = glm::cross(ra, n);
+                const Vec3 rnb = glm::cross(rb, n);
+                // w_n = invMA + invMB + n·((I_A⁻¹(rA×n))×rA) + n·((I_B⁻¹(rB×n))×rB)
+                const Scalar_t w_n =
+                        inv_a + inv_b +
+                        glm::dot(n, glm::cross(state_.inertial.world_inv_inertia(a) * rna, ra)) +
+                        glm::dot(n, glm::cross(state_.inertial.world_inv_inertia(b) * rnb, rb));
+                if (!(w_n > Scalar_t(0)))
+                    continue;
+
+                const Scalar_t j = -vn / w_n;
+                if (inv_a > Scalar_t(0)) {
+                    state_.velocity.add_velocity(a, n * (j * inv_a));
+                    state_.velocity.add_omega(
+                            a, state_.inertial.world_inv_inertia(a) * (rna * j));
+                }
+                if (inv_b > Scalar_t(0)) {
+                    state_.velocity.add_velocity(b, n * (-j * inv_b));
+                    state_.velocity.add_omega(
+                            b, state_.inertial.world_inv_inertia(b) * (rnb * (-j)));
+                }
+                refresh_target_after_impulse(state_, a, state_.dt);
+                refresh_target_after_impulse(state_, b, state_.dt);
+            }
+        }
+    }
+}
+
 void ModernSpace::step(int iterations, int threads) {
     ensure_executor(threads);
 
     const auto t0 = std::chrono::steady_clock::now();
 
     state_.begin_step();
+
+    // B-PXPBD is an explicit position-projection solver: its iterative solve starts
+    // from the inertial target x~ = x + dt*v. Narrowphase must see that same pose, or
+    // an impact that happens inside this step has no contact until the next one, and
+    // finish_step turns the whole depenetration into velocity (impact ejection).
+    // So for B-PXPBD only, move to x~ before generating contacts. XPBDStep::
+    // begin_iterations() writes the same target again and is idempotent (it assigns
+    // pose = cache.inertial_*, then refreshes derived data). AVBD must *not* do this:
+    // its implicit residual needs the step-start pose. The `if constexpr` selects at
+    // compile time, so the AVBD branch is unchanged.
+    std::visit(
+            [&](auto &policy) {
+                using P = std::decay_t<decltype(policy)>;
+                if constexpr (std::is_same_v<P, BPXPBDStep>)
+                    state_.move_pose_to_inertial_target();
+            },
+            policy_);
+
     collision_.sync(state_, constraints_, topology_version_);
 
     // Continuous-collision fallback, then speculative pre-contact velocity clamp,
@@ -528,6 +643,24 @@ void ModernSpace::step(int iterations, int threads) {
     collision_.clamp_fast_bodies(state_, state_.dt);
     collision_.apply_speculative_velocity_clamp(state_, state_.dt);
     collision_.clamp_fast_bodies(state_, state_.dt);
+
+    // B-PXPBD only: inelastic normal-velocity projection on the true contacts that
+    // narrowphase just produced at x~. This removes the closing velocity that the
+    // position solve would otherwise turn into depenetration -> velocity at finish.
+    // Speculative gaps are already handled by apply_speculative_velocity_clamp; this
+    // pass only sees depth >= 0. AVBD's implicit residual must keep its pre-solve
+    // velocity, so the call is dropped at compile time for that alternative.
+    std::visit(
+            [&](auto &policy) {
+                using P = std::decay_t<decltype(policy)>;
+                if constexpr (std::is_same_v<P, BPXPBDStep>)
+                    project_contact_normal_velocity();
+                    // The impulses above changed velocity (and therefore x~).
+                    // Regenerate contacts at the new x~ so the position solve does
+                    // not evaluate anchors/normals captured at the pre-impact pose.
+                    collision_.sync(state_, constraints_, topology_version_);
+            },
+            policy_);
 
     std::visit(
             [&](auto &policy) {

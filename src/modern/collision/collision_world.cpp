@@ -200,16 +200,22 @@ bool CollisionWorld::sync(const State &state, ConstraintList &list,
 
 namespace {
 
-// 修改速度后必须把惯性预测位姿重算一遍：AVBD 的 solve_body 只读
-// cache.inertial_*，它是在 State::begin_step() 里由旧速度算好的。CCD/预接触
+// 修改速度后必须把惯性预测位姿重算一遍：solve_body / XPBD 的 begin_iterations
+// 只读 cache.inertial_*，它是在 State::begin_step() 里由旧速度算好的。CCD/预接触
 // 夹紧发生在 begin_step 之后，不刷新就等于没夹。
+//
+// 基准必须是**步首位姿** cache.initial_*，不是当前 pose：B-PXPBD 在窄相之前就把
+// pose 搬到了 x~，若仍从 pose 预测，x~ + dt*v_new 会把旧速度的位移重复积一次
+// （预接触夹紧因此失效，finish_step 还会把夹紧掉的速度又算回来）。用初值预测
+// 得到 x_initial + dt*v_new，正是速度被改写后本步应该到达的位置。AVBD 在调用点
+// 的 pose 就是步首（其 begin_iterations 不搬 pose），所以这一步对 AVBD 逐位不变。
 void refresh_inertial_target(State &s, std::size_t b, Scalar_t dt) noexcept {
   if (s.inertial.is_static(b))
     return;
   Vec3 lin;
   Quat ang;
-  s.inertial.predict_pose(b, s.pose, s.velocity.velocity(b), s.velocity.angular_velocity(b), dt,
-                          lin, ang);
+  s.inertial.predict_pose(b, s.cache.initial_position(b), s.cache.initial_rotation(b),
+                          s.velocity.velocity(b), s.velocity.angular_velocity(b), dt, lin, ang);
   s.cache.set_inertial(b, lin, ang);
 }
 

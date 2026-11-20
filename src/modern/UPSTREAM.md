@@ -3,12 +3,10 @@
 This tree is a snapshot of `/home/cyan/avbd-mo/src`, imported to replace the legacy
 `src/avbd` solver on the `modernize` branch.
 
-- Source HEAD: `4cd21cf` (`manifold`) — "BPXPBD: opt-in velocity-neutral
-  end-of-step projection" (on top of `feca2f9` cap/friction, `824b37b`
-  contacts and `e6f995a` skeleton). Earlier snapshots were `8b9fa9a` (speculative
-  contacts/CCD), `0c73d9a` (contact stability), `0c4853b` (joints), `7107cff`
-  (friction + gradient sign), `04d2833` (k0 / block assembly), `4450b74`
-  (pair filter) and `a3d9930` plus staged collision work.
+- Source HEAD: `591cac7` (`manifold`) — "BPXPBD: predicted-pose contacts and
+  inertial-target refresh (WIP)". Earlier snapshots are `4cd21cf` (projection),
+  `feca2f9` (cap/friction), `824b37b` (contacts), `e6f995a` (skeleton), `8b9fa9a`
+  (speculative CCD) and older commits.
 - The speculative/CCD part of this snapshot (default `speculative_distance = 0`,
   so the pinned solver/collision baselines are still bit-identical):
   * `collision/contact_constraints.hpp` — `ContactEmitOptions::speculative_distance`
@@ -45,7 +43,7 @@ This tree is a snapshot of `/home/cyan/avbd-mo/src`, imported to replace the leg
     by default). The snapshot still matches `tests/baseline.txt` and
     `tests/collision_observable.txt` bit-for-bit.
 - Snapshot tree SHA-256 (everything under `src/modern` except this file):
-  `3a0efa7a768934de267e4ecacd7413bd922c30b4c679d99a6f96062ed263a228`
+  `85cbdce0ac1c19f4dd2acd614052d47ce12d6931fa8818dad3bd0c282a78145e`
   Recipe: `find src/modern -type f ! -name UPSTREAM.md -print0 | sort -z |
   xargs -0 sha256sum | sha256sum`.
 - Baseline data copied to `src/modern/tests/`:

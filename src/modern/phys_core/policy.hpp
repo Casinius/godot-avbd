@@ -458,7 +458,12 @@ public:
     if (!contacts_initialized_) {
       for (ConstraintVariant &v : cs) {
         if (auto *c = std::get_if<ContactConstraint>(&v)) {
-          c->lambda = Scalar_t(0);
+          // XPBD multipliers are warm-started from the manifold store. That store
+          // is reset on a solver switch (reset_warm_start), so by the time we get
+          // here it only ever contains B-PXPBD multipliers. Zeroing them every
+          // step made stiff contacts start from lambda=0 each frame; with a
+          // compliant constraint at 240 Hz their 20-iteration budget could not
+          // build enough normal force, so loaded boxes sank through the floor.
           const Scalar_t raw = c->value(s);
           c->initial_c_raw   = raw;
 

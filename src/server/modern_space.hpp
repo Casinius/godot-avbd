@@ -230,6 +230,9 @@ private:
     static bool pair_filter_cb(void *user, std::size_t body_a, std::size_t body_b);
     static bool body_active_cb(void *user, std::size_t body);
     void ensure_executor(int threads);
+    // B-PXPBD only: inelastic normal-velocity projection on the manifolds generated
+    // at the predicted pose. Runs before the position solve, fixed order, no atomics.
+    void project_contact_normal_velocity();
     void apply_mass_properties(std::size_t index, const ModernBodyDesc &desc,
             std::span<const collision::ShapeInstance> shapes);
     void rebuild_filter_tables(const std::vector<ModernBodyDesc> &bodies);
@@ -239,7 +242,8 @@ private:
     std::vector<Joint> joints_{};
     std::size_t world_index_ = 0;
     collision::CollisionWorld collision_{};
-    std::variant<AVBDStep, BPXPBDStep> policy_{};
+    // B-PXPBD is the primary solver now; AVBD stays selectable as a legacy policy.
+    std::variant<AVBDStep, BPXPBDStep> policy_{BPXPBDStep{}};
     SolveSchedule schedule_{};
     std::unique_ptr<task::ThreadPoolExecutor> exec_{};
     int exec_threads_ = -1;
