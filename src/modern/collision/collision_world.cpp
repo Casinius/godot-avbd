@@ -184,10 +184,11 @@ void CollisionWorld::absorb_warm_start(const ConstraintList &list) {
 }
 
 bool CollisionWorld::sync(const State &state, ConstraintList &list,
-                          std::uint64_t &topology_version) {
+                          std::uint64_t &topology_version, bool absorb) {
   // list 里是上一帧求解后的约束；先把它承载的 dual 状态写回 manifold，
   // 再让 step() 的 feature 匹配去消费。这就是 warm start 的闭环。
-  absorb_warm_start(list);
+  if (absorb)
+    absorb_warm_start(list);
   step(state);
   emit(list);
   const bool changed = layout_signature_ != last_signature_;

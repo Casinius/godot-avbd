@@ -47,6 +47,32 @@ inline constexpr Scalar_t kPenaltyCeil  = Scalar_t(1e10);
 inline constexpr Scalar_t kContactReleaseGap  = Scalar_t(2e-3);
 inline constexpr Scalar_t kStickDriftHeal     = Scalar_t(2e-3);
 
+// ==================== TGS Soft（Box2D v3）接触参数与柔度 ====================
+// b2MakeSoft 的逐式移植；见 collision/tgs_soft.hpp 的注释。massScale +
+// impulseScale == 1（hertz == 0 的刚体特例除外，那时两者都是 0）。
+struct TgsSoftness {
+  Scalar_t biasRate     = 0;
+  Scalar_t massScale    = 0;
+  Scalar_t impulseScale = 0;
+};
+
+struct TgsSoftParams {
+  Scalar_t contact_hertz         = Scalar_t(30);
+  Scalar_t contact_damping_ratio = Scalar_t(10);
+  Scalar_t contact_speed         = Scalar_t(3);
+};
+
+[[nodiscard]] inline TgsSoftness make_soft(Scalar_t hertz, Scalar_t zeta,
+                                           Scalar_t h) noexcept {
+  if (!(hertz > Scalar_t(0)))
+    return TgsSoftness{};
+  const Scalar_t omega = Scalar_t(2) * Scalar_t(3.141592653589793) * hertz;
+  const Scalar_t a1    = Scalar_t(2) * zeta + h * omega;
+  const Scalar_t a2    = h * omega * a1;
+  const Scalar_t a3    = Scalar_t(1) / (Scalar_t(1) + a2);
+  return TgsSoftness{omega / a1, a2 * a3, a3};
+}
+
 struct ManifoldContact {
   std::uint64_t feature_key = 0;
   Vec3          rA{0};
@@ -56,6 +82,19 @@ struct ManifoldContact {
   Vec3          penalty{1};     // 每行罚因子；第一阶段 AVBD 只读全局 k
   Scalar_t      beta_scale = 1; // 自适应 beta 预留
   bool          stick      = false;
+
+  // —— TGS Soft 的跨子步状态（prepare 每帧写一次，push/solve 只读/更新）——
+  // lambda[0..2] 是持久化的法线/切向冲量（kg·m/s）；下面这些是同一组量的
+  // per-step 工作副本。分开存是为了不污染 AVBD/B-PXPBD 的 warm-start 口径。
+  Scalar_t base_separation     = 0; // 步首的 witness-point 分离（含 margin）
+  Scalar_t normal_impulse      = 0;
+  Scalar_t tangent_impulse[2]  = {0, 0};
+  Scalar_t total_normal_impulse = 0;
+  Vec3     anchorA_world{0};        // 步首 rA 的世界向量（相对质心）
+  Vec3     anchorB_world{0};
+  Scalar_t normal_mass         = 0; // 1 / (Σ gᵀ M⁻¹ g)，法线方向
+  Scalar_t tangent_mass[2]     = {0, 0};
+  TgsSoftness softness{};           // static/dynamic softness（prepare 时选择）
 };
 
 struct Manifold {
@@ -102,8 +141,13 @@ public:
   void reset_warm_start() noexcept {
     for (Manifold &m : current_) {
       for (std::size_t i = 0; i < m.count; ++i) {
-        m.contacts[i].lambda = Vec3{0};
-        m.contacts[i].stick  = false;
+        ManifoldContact &c  = m.contacts[i];
+        c.lambda            = Vec3{0};
+        c.stick             = false;
+        c.normal_impulse    = 0;
+        c.tangent_impulse[0] = 0;
+        c.tangent_impulse[1] = 0;
+        c.total_normal_impulse = 0;
       }
     }
   }

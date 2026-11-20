@@ -380,6 +380,48 @@ public:
   void ramp_stiffness() noexcept {}
 };
 
+// —— TGS Soft：Box2D v3 风格速度级接触 + XPBD 距离/关节 ——
+//
+// 接触**不走位置投影**：ContactConstraint 在这一 Policy 下是 no-op，真正的接触
+// 求解由 CollisionWorld 的 TGS Soft 核（collision/tgs_soft.hpp）在速度层完成。
+// 距离/关节仍复用 XPBD 的单行投影，但 begin_iterations 与原版 XPBD 不同：
+// 它不读 begin_step 算出的旧 x~，而是用**push 之后的最新速度**重算惯性目标再
+// 把 pose 搬过去。这正是 Box2D 的 "integrate positions" 阶段：接触冲量改变速度
+// 后，位置必须用新速度积分；而步末不调用 finish_step，velocity 保持求解器的
+// 权威值（不再由 (x - x_initial)/dt 反推）。
+//
+// 本 Policy 只读/写 State 与 ConstraintList，不依赖碰撞层，因此放在核心里。
+class TgsSoftStep : public XPBDStep {
+public:
+  static constexpr bool uses_solver_buffers = false;
+  static constexpr bool needs_topology      = false;
+  static constexpr bool constraint_blocks   = false;
+  static constexpr bool is_tgs_soft         = true;
+
+  template <Constraint<State> C> void step(State &s, C &c) {
+    if constexpr (std::is_same_v<C, ContactConstraint>) {
+      (void)s;
+      (void)c; // 接触由速度级核求解；位置级接触 λ 一律不产生
+    } else {
+      XPBDStep::step(s, c);
+    }
+  }
+
+  template <typename Exec, typename Sched>
+  void begin_iterations(State &s, Exec &, const Sched &) {
+    // 惯性目标以 cache.initial_*（步首位姿）为基准，用当前（push 后）速度重算。
+    for (std::size_t b = 0; b < s.size(); ++b) {
+      Vec3 lin;
+      Quat ang;
+      s.inertial.predict_pose(b, s.cache.initial_position(b), s.cache.initial_rotation(b),
+                              s.velocity.velocity(b), s.velocity.angular_velocity(b), s.dt, lin,
+                              ang);
+      s.cache.set_inertial(b, lin, ang);
+    }
+    s.move_pose_to_inertial_target();
+  }
+};
+
 // —— B-PXPBD：Blended Primal XPBD（Chen et al., MIG'23） ——
 //
 // 在 XPBD 的位置更新上多加一个全局残差修正项：

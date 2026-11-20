@@ -37,6 +37,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "collision/tgs_soft.hpp"
 #include "digest.hpp"
 #include "frame.hpp"
 #include "phys_core/constraint.hpp"
@@ -1937,6 +1938,154 @@ Check check_parallel_is_thread_count_invariant() {
   return c;
 }
 
+// —— TGS Soft（Box2D v3）核心不变量 ——
+Check check_tgs_soft_make_soft() {
+  Check c{"TGS Soft make_soft matches Box2D and clamps hertz", true, ""};
+
+  const Scalar_t h    = Scalar_t(1) / 240;
+  const Scalar_t hz   = Scalar_t(30);
+  const Scalar_t zeta = Scalar_t(10);
+  const auto     soft = collision::make_soft(hz, zeta, h);
+  const Scalar_t omega = Scalar_t(2) * std::acos(Scalar_t(-1)) * hz;
+  const Scalar_t a1    = Scalar_t(2) * zeta + h * omega;
+  const Scalar_t a2    = h * omega * a1;
+  const Scalar_t a3    = Scalar_t(1) / (Scalar_t(1) + a2);
+  if (!(std::abs(soft.biasRate - omega / a1) <= Scalar_t(1e-5) &&
+        std::abs(soft.massScale - a2 * a3) <= Scalar_t(1e-5) &&
+        std::abs(soft.impulseScale - a3) <= Scalar_t(1e-5))) {
+    c.ok     = false;
+    c.detail = "make_soft formula mismatch";
+    return c;
+  }
+  if (!(std::abs(soft.massScale + soft.impulseScale - Scalar_t(1)) <= Scalar_t(1e-5))) {
+    c.ok     = false;
+    c.detail = "massScale + impulseScale != 1";
+    return c;
+  }
+  const auto rigid = collision::make_soft(Scalar_t(0), zeta, h);
+  if (rigid.biasRate != Scalar_t(0) || rigid.massScale != Scalar_t(0) ||
+      rigid.impulseScale != Scalar_t(0)) {
+    c.ok     = false;
+    c.detail = "hertz=0 must be rigid (all zero)";
+    return c;
+  }
+
+  // hertz 被 prepare 夹到 0.125/dt：240 Hz 时 100 -> 30。
+  State s;
+  s.dt = h;
+  s.resize(2);
+  s.inertial.set_inv_mass(1, Scalar_t(1));
+  s.inertial.set_inv_mass(0, Scalar_t(1)); // both dynamic ⇒ dynamic softness
+  s.external.uniform_accel = Vec3{0};
+  s.reset_external();
+  s.begin_step();
+  collision::Manifold m;
+  m.body_a = 1;
+  m.body_b = 0;
+  m.count  = 1;
+  m.contacts[0].depth = Scalar_t(0.01);
+  collision::tgs_soft::prepare(s, std::span<collision::Manifold>(&m, 1), Scalar_t(0.002),
+                               collision::TgsSoftParams{Scalar_t(100), zeta, Scalar_t(3)});
+  if (!(std::abs(m.contacts[0].softness.biasRate - soft.biasRate) <= Scalar_t(1e-5))) {
+    c.ok     = false;
+    c.detail = "hertz clamp at 0.125/dt not applied";
+    return c;
+  }
+  return c;
+}
+
+Check check_tgs_soft_accumulated_clamp() {
+  Check c{"TGS Soft accumulated normal impulse never goes negative", true, ""};
+
+  State s;
+  s.dt = Scalar_t(1) / 240;
+  s.resize(2);
+  s.inertial.set_inv_mass(1, Scalar_t(1));
+  s.inertial.set_local_inv_inertia(1, Mat3(1));
+  s.external.uniform_accel = Vec3{0};
+  s.reset_external();
+  s.begin_step();
+
+  collision::Manifold m;
+  m.body_a           = 1;
+  m.body_b           = 0;
+  m.count            = 1;
+  m.friction         = Scalar_t(0.5);
+  m.basis.normal     = Vec3{0, 1, 0};
+  m.basis.tangent0   = Vec3{1, 0, 0};
+  m.basis.tangent1   = Vec3{0, 0, 1};
+  m.contacts[0].depth = Scalar_t(0.01);
+  m.contacts[0].lambda[0] = Scalar_t(1); // 暖启动 1 N·s
+  const auto kernels = std::span<collision::Manifold>(&m, 1);
+  collision::TgsSoftParams params;
+  collision::tgs_soft::prepare(s, kernels, Scalar_t(0.002), params);
+
+  // 强分离速度：求解器想回撤整段累积冲量，但下界 -normalImpulse 不允许反号。
+  s.velocity.set_velocity(1, Vec3{0, 20, 0});
+  for (int i = 0; i < 4; ++i) {
+    collision::tgs_soft::push(s, kernels, params);
+    collision::tgs_soft::solve(s, kernels, params);
+    if (!(m.contacts[0].normal_impulse >= Scalar_t(0))) {
+      c.ok     = false;
+      c.detail = std::format("iteration {}: normalImpulse={}", i,
+                             m.contacts[0].normal_impulse);
+      return c;
+    }
+  }
+  collision::tgs_soft::store(kernels);
+  if (!(m.contacts[0].lambda[0] >= Scalar_t(0))) {
+    c.ok     = false;
+    c.detail = "stored normal impulse went negative";
+  }
+  return c;
+}
+
+Check check_tgs_soft_speculative_no_pull() {
+  Check c{"TGS Soft speculative gap exerts no pull", true, ""};
+
+  State s;
+  s.dt = Scalar_t(1) / 240;
+  s.resize(2);
+  s.inertial.set_inv_mass(1, Scalar_t(1));
+  s.inertial.set_local_inv_inertia(1, Mat3(1));
+  s.external.uniform_accel = Vec3{0};
+  s.reset_external();
+  s.begin_step();
+
+  collision::Manifold m;
+  m.body_a            = 1;
+  m.body_b            = 0;
+  m.count             = 1;
+  m.friction          = Scalar_t(0.5);
+  m.basis.normal      = Vec3{0, 1, 0};
+  m.basis.tangent0    = Vec3{1, 0, 0};
+  m.basis.tangent1    = Vec3{0, 0, 1};
+  m.contacts[0].depth = Scalar_t(-0.02); // 2 cm 真实间隙
+  const auto kernels = std::span<collision::Manifold>(&m, 1);
+  collision::TgsSoftParams params;
+
+  for (Scalar_t approach : {Scalar_t(0), Scalar_t(-1)}) {
+    s.velocity.set_velocity(1, Vec3{0, approach, 0});
+    s.velocity.set_omega(1, Vec3{0});
+    m.contacts[0].lambda       = Vec3{0};
+    m.contacts[0].normal_impulse = 0;
+    m.contacts[0].tangent_impulse[0] = 0;
+    m.contacts[0].tangent_impulse[1] = 0;
+    collision::tgs_soft::prepare(s, kernels, Scalar_t(0.002), params);
+    const Vec3 before = s.velocity.velocity(1);
+    collision::tgs_soft::push(s, kernels, params);
+    const Vec3 after = s.velocity.velocity(1);
+    // gap/h = 6 m/s > approach ⇒ 本步不该闭合间隙，因此没有冲量。
+    if (!bitwise_eq(before, after) || m.contacts[0].normal_impulse != Scalar_t(0)) {
+      c.ok     = false;
+      c.detail = std::format("speculative gap pulled: j={} v_y {} -> {}",
+                             m.contacts[0].normal_impulse, before.y, after.y);
+      return c;
+    }
+  }
+  return c;
+}
+
 std::vector<Check> run_collision_selftest() {
   std::vector<Check> out;
   for (auto &rc : collision_selftest::run())
@@ -1969,6 +2118,9 @@ std::vector<Check> run_selftest() {
       check_bpxpbd_contact_deep_penetration_cap(),
       check_bpxpbd_projection_is_velocity_neutral(),
       check_bpxpbd_friction_pass_is_dissipative(),
+      check_tgs_soft_make_soft(),
+      check_tgs_soft_accumulated_clamp(),
+      check_tgs_soft_speculative_no_pull(),
       check_scatter_gather_equals_direct_accumulation(),
       check_topology_cache_is_reused(),
       check_cached_layout_equals_rebuilt(),

@@ -230,13 +230,19 @@ protected:
         // into the solver every step (so a changed setting shows up without a restart).
         int threads = 0;
         int iterations = 20;
-        // Policy selection: 0 = AVBD (legacy), 1 = B-PXPBD (default). Read from
-        // `physics/avbd/solver` ("avbd" | "bpxpbd"); switching resets dual state.
+        // Policy selection: 0 = AVBD (legacy), 1 = B-PXPBD (default),
+        // 2 = TGS Soft (Box2D v3 velocity-level contacts). Read from
+        // `physics/avbd/solver` ("avbd" | "bpxpbd" | "tgssoft"); switching resets dual state.
         int solver = 1;
         // B-PXPBD blend weight and contact compliance (1/K, m/N). These are the
         // parity defaults; compliance is added to the emitted contact rows.
         double bpxpbd_zeta = 0.4;
         double bpxpbd_contact_compliance = 2e-4;
+        // TGS Soft contact softness (Box2D v3 defaults). Hertz is clamped to
+        // 0.125/dt by the core prepare pass.
+        double tgs_soft_hertz = 30.0;
+        double tgs_soft_damping_ratio = 1.0;
+        double tgs_soft_contact_speed = 3.0;
         double alpha = 0.99;
         double beta_linear = 10000.0;
         double beta_angular = 100.0;

@@ -62,9 +62,12 @@ static void register_avbd_settings() {
     const std::pair<const char *, Variant> entries[] = {
             {"physics/avbd/threads", Variant(0)},
             {"physics/avbd/iterations", Variant(20)},
-            {"physics/avbd/solver", Variant("bpxpbd")},
+            {"physics/avbd/solver", Variant("tgssoft")},
             {"physics/avbd/bpxpbd_zeta", Variant(0.4)},
             {"physics/avbd/bpxpbd_contact_compliance", Variant(0.0002)},
+            {"physics/avbd/tgssoft_contact_hertz", Variant(30.0)},
+            {"physics/avbd/tgssoft_damping_ratio", Variant(1.0)},
+            {"physics/avbd/tgssoft_contact_speed", Variant(3.0)},
             {"physics/avbd/alpha", Variant(0.99)},
             {"physics/avbd/beta_linear", Variant(10000.0)},
             {"physics/avbd/beta_angular", Variant(100.0)},

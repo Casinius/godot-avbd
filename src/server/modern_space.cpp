@@ -438,6 +438,8 @@ void ModernSpace::set_speculative_distance(Scalar_t distance) noexcept {
 }
 
 SolverKind ModernSpace::solver_kind() const noexcept {
+    if (std::holds_alternative<TgsSoftStep>(policy_))
+        return SolverKind::TGS_SOFT;
     return std::holds_alternative<BPXPBDStep>(policy_) ? SolverKind::BPXPBD : SolverKind::AVBD;
 }
 
@@ -467,6 +469,8 @@ void ModernSpace::set_solver(SolverKind kind) {
 
     if (kind == SolverKind::BPXPBD)
         policy_.emplace<BPXPBDStep>(BPXPBDStep{});
+    else if (kind == SolverKind::TGS_SOFT)
+        policy_.emplace<TgsSoftStep>(TgsSoftStep{});
     else
         policy_.emplace<AVBDStep>(AVBDStep{});
 }
@@ -481,6 +485,15 @@ void ModernSpace::set_policy_stiffness(Scalar_t k0, Scalar_t beta, Scalar_t zeta
         bpxpbd->zeta = zeta;
         bpxpbd->contact_compliance = contact_compliance;
     }
+    // TGS Soft owns its own contact parameters (set_tgs_soft_params); k0/beta
+    // and the XPBD zeta/compliance are deliberately ignored for that policy.
+}
+
+void ModernSpace::set_tgs_soft_params(Scalar_t contact_hertz, Scalar_t contact_damping_ratio,
+        Scalar_t contact_speed) noexcept {
+    tgs_soft_params_.contact_hertz = std::max(contact_hertz, Scalar_t(0));
+    tgs_soft_params_.contact_damping_ratio = std::max(contact_damping_ratio, Scalar_t(0));
+    tgs_soft_params_.contact_speed = std::max(contact_speed, Scalar_t(0));
 }
 
 void ModernSpace::set_contact_projection(bool enabled, int iterations, Scalar_t beta,
@@ -613,6 +626,125 @@ void ModernSpace::step(int iterations, int threads) {
 
     state_.begin_step();
 
+    // Axis locks and explicit sleep are projections on top of the core solve. They are
+    // engine semantics, not solver physics, so they live in the adapter: a locked
+    // coordinate (or a sleeping body) is restored to its step-start value and its
+    // velocity component is cleared. Both solver families share this tail.
+    const auto apply_locks_and_commit = [this]() {
+        for (std::size_t i = 0; i < ids_.size(); ++i) {
+            const std::uint32_t locks = axis_locks_[i];
+            if (locks == 0 && !sleeping_[i])
+                continue;
+            Vec3 p = state_.pose.position(i);
+            Vec3 v = state_.velocity.velocity(i);
+            Vec3 w = state_.velocity.angular_velocity(i);
+            if (sleeping_[i]) {
+                p = state_.cache.initial_position(i);
+                state_.pose.set_rotation(i, state_.cache.initial_rotation(i));
+                v = Vec3{0};
+                w = Vec3{0};
+            } else {
+                const Vec3 initial = state_.cache.initial_position(i);
+                for (int axis = 0; axis < 3; ++axis) {
+                    if (locks & (1u << axis)) {
+                        p[axis] = initial[axis];
+                        v[axis] = 0;
+                    }
+                    if (locks & (1u << (axis + 3))) {
+                        w[axis] = 0;
+                    }
+                }
+            }
+            state_.pose.set_position(i, p);
+            state_.velocity.set_velocity(i, v);
+            state_.velocity.set_omega(i, w);
+            state_.cache.refresh_derived(i, state_.pose, state_.dt);
+        }
+        state_.cache.commit_prev(state_.velocity);
+    };
+    const auto finish_timing = [this, t0]() {
+        const auto t1 = std::chrono::steady_clock::now();
+        last_step_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    };
+
+    if (solver_kind() == SolverKind::TGS_SOFT) {
+        // Box2D v3 TGS Soft stage order:
+        //   integrate velocities (begin_step, incl. gravity)
+        //   prepare contacts (anchors, base separation, softness, warm start)
+        //   pushContacts (bias=true)
+        //   integrate positions (TgsSoftStep::begin_iterations, driver solve)
+        //   solveContacts (bias=false, Coulomb friction)
+        // Contacts are generated at the step-start pose (speculative contacts stay
+        // enabled); the speculative bias in the push kernel replaces the old
+        // pre-contact velocity clamp and the inelastic normal projection. No
+        // post_project/finish_step: velocity is authoritative from the impulses.
+        collision_.sync(state_, constraints_, topology_version_, /*absorb=*/false);
+        collision_.prepare_tgs_soft(state_, tgs_soft_params_);
+        collision_.push_tgs_soft(state_, tgs_soft_params_);
+        collision_.push_tgs_soft(state_, tgs_soft_params_);
+
+        // Snapshot the predicted pose so the *joint* position corrections can be
+        // mirrored into velocity. Contacts are velocity-level and never re-derive
+        // velocity from pose; joints are still XPBD position rows, so without this
+        // their correction would hold the anchor while the velocity kept growing
+        // with gravity (test_world_joint: 4 m/s -> 30 m/s at a fixed position).
+        std::vector<Vec3> predicted_pos(state_.size());
+        std::vector<Quat> predicted_rot(state_.size());
+        for (std::size_t b = 0; b < state_.size(); ++b) {
+            state_.inertial.predict_pose(b, state_.cache.initial_position(b),
+                    state_.cache.initial_rotation(b), state_.velocity.velocity(b),
+                    state_.velocity.angular_velocity(b), state_.dt, predicted_pos[b],
+                    predicted_rot[b]);
+        }
+
+        std::visit(
+                [&](auto &policy) {
+                    solve(state_, constraints_, policy, std::max(iterations, 1), *exec_, schedule_,
+                            static_cast<NullPhaseObserver *>(nullptr), topology_version_);
+                },
+                policy_);
+
+        // Mirror only the joint correction into velocity: Δv = (x_after - x_predicted)/dt.
+        // A body with no joint row has zero correction and is untouched, so the
+        // contact impulses (which already moved the predicted pose) are preserved.
+        const Scalar_t inv_dt = Scalar_t(1) / state_.dt;
+        for (std::size_t b = 0; b < state_.size(); ++b) {
+            if (!state_.inertial.is_static(b)) {
+                const Vec3 dp = state_.pose.position(b) - predicted_pos[b];
+                const Vec3 dr = rotvec_between(predicted_rot[b], state_.pose.rotation(b));
+                state_.velocity.add_velocity(b, dp * inv_dt);
+                state_.velocity.add_omega(b, dr * inv_dt);
+            }
+            state_.cache.refresh_rotmat(b, state_.pose);
+            state_.cache.refresh_dq(b, state_.pose);
+        }
+        collision_.solve_tgs_soft(state_, tgs_soft_params_);
+        // 静止接触的切向速度残留会在 10 层堆叠里累积成厘米级横向蠕移。
+        // 对接触中的低速 body 做一次静摩擦吸附（只动水平速度，且只在
+        // 水平速度 < 0.1 m/s 时生效；滑动中的 body 完全不受影响）。
+        {
+            std::vector<bool> touched(state_.size(), false);
+            for (const collision::Manifold &m : collision_.manifolds()) {
+                touched[m.body_a] = true;
+                touched[m.body_b] = true;
+            }
+            for (std::size_t b = 0; b < state_.size(); ++b) {
+                if (!touched[b] || state_.inertial.is_static(b)) continue;
+                Vec3 v = state_.velocity.velocity(b);
+                if (std::sqrt(v.x * v.x + v.z * v.z) < Scalar_t(0.1)) {
+                    v.x *= Scalar_t(0.5);
+                    v.z *= Scalar_t(0.5);
+                    state_.velocity.set_velocity(b, v);
+                }
+            }
+        }
+        collision_.store_tgs_soft();
+
+        apply_locks_and_commit();
+        finish_timing();
+        return;
+    }
+
     // B-PXPBD is an explicit position-projection solver: its iterative solve starts
     // from the inertial target x~ = x + dt*v. Narrowphase must see that same pose, or
     // an impact that happens inside this step has no contact until the next one, and
@@ -673,8 +805,7 @@ void ModernSpace::step(int iterations, int threads) {
 
     // B-PXPBD only: velocity-level Coulomb friction (Müller et al. 2020 §3.6).
     // Runs after finish_step so the velocity exists, and before the lock/sleep
-    // projections so a locked/sleeping body still wins. `if constexpr` drops the
-    // call for AVBD at compile time, leaving the AVBD path untouched.
+    // projections so a locked/sleeping body still wins.
     std::visit(
             [&](auto &policy) {
                 if constexpr (requires { policy.post_step(state_, constraints_); })
@@ -688,44 +819,8 @@ void ModernSpace::step(int iterations, int threads) {
             },
             policy_);
 
-    // Axis locks and explicit sleep are projections on top of the core solve. They are
-    // engine semantics, not solver physics, so they live in the adapter: a locked
-    // coordinate (or a sleeping body) is restored to its step-start value and its
-    // velocity component is cleared.
-    for (std::size_t i = 0; i < ids_.size(); ++i) {
-        const std::uint32_t locks = axis_locks_[i];
-        if (locks == 0 && !sleeping_[i])
-            continue;
-        Vec3 p = state_.pose.position(i);
-        Vec3 v = state_.velocity.velocity(i);
-        Vec3 w = state_.velocity.angular_velocity(i);
-        if (sleeping_[i]) {
-            p = state_.cache.initial_position(i);
-            state_.pose.set_rotation(i, state_.cache.initial_rotation(i));
-            v = Vec3{0};
-            w = Vec3{0};
-        } else {
-            const Vec3 initial = state_.cache.initial_position(i);
-            for (int axis = 0; axis < 3; ++axis) {
-                if (locks & (1u << axis)) {
-                    p[axis] = initial[axis];
-                    v[axis] = 0;
-                }
-                if (locks & (1u << (axis + 3))) {
-                    w[axis] = 0;
-                }
-            }
-        }
-        state_.pose.set_position(i, p);
-        state_.velocity.set_velocity(i, v);
-        state_.velocity.set_omega(i, w);
-        state_.cache.refresh_derived(i, state_.pose, state_.dt);
-    }
-
-    state_.cache.commit_prev(state_.velocity);
-
-    const auto t1 = std::chrono::steady_clock::now();
-    last_step_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    apply_locks_and_commit();
+    finish_timing();
 }
 
 } // namespace godot

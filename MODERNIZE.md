@@ -113,3 +113,14 @@ velocity-level impact clamp and XPBD multiplier warm start. `test_solver`
 passes 38/38 but the 420-box pyramid still fails 6/9 (deep-impact depenetration
 becomes velocity). We are evaluating XPBD variants with contact-specific
 stabilization rather than tuning this variant further.
+
+## Solver decision (2026-11-20)
+
+The default solver is now Box2D-v3-style **TGS Soft** contacts (`"tgssoft"`),
+with B-PXPBD and AVBD kept selectable as legacy policies. TGS Soft is a
+velocity-level contact solver (soft push bias, bias-free relax, accumulated
+impulse clamps, warm start, speculative separation, Coulomb friction); contacts
+no longer produce position multipliers. With a low-speed static-friction snap
+(0.5 velocity retention) all Godot gates pass: solver 38/38, constraints 11/11,
+server 30/30, queries 27/27, load PASS, pyramid 9/9. Core selftest 68/68,
+baselines unchanged.

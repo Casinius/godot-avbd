@@ -9,15 +9,15 @@
  *
  *     State (pose/velocity/inertia/external) + ConstraintList
  *     collision::CollisionWorld (shape table -> broadphase -> narrowphase -> manifolds)
- *     std::variant<AVBDStep, BPXPBDStep> + SolveSchedule + a task::ThreadPoolExecutor
+ *     std::variant<AVBDStep, BPXPBDStep, TgsSoftStep> + SolveSchedule + ThreadPoolExecutor
  *
  * and nothing Godot-specific. The server translates its records into ModernBodyDesc
  * once per rebuild, then drives this object with begin_tick/step.
  *
  * `SolverKind` selects the policy at runtime (project setting `physics/avbd/solver`).
- * AVBD remains the default; switching zeroes all dual state and clears the collision
- * world's warm start, because AVBD's lambda is a force while B-PXPBD's is a position
- * multiplier (different units, not interchangeable).
+ * Switching zeroes all dual state and clears the collision world's warm start, because
+ * AVBD's lambda is a force, B-PXPBD's is a position multiplier and TGS Soft's is a
+ * velocity-level impulse (different units, not interchangeable).
  *
  * Design notes that the rest of the server depends on
  * ---------------------------------------------------
@@ -104,10 +104,12 @@ struct ModernJointDesc {
     std::array<ModernJointAxis, 3> angular{};
 };
 
-// Policy selection. AVBD is the default; B-PXPBD is opt-in via the project setting.
+// Policy selection. B-PXPBD is the current default; AVBD is legacy and TGS Soft
+// is the opt-in Box2D v3 velocity-level contact solver.
 enum class SolverKind {
     AVBD = 0,
     BPXPBD = 1,
+    TGS_SOFT = 2,
 };
 
 class ModernSpace {
@@ -190,6 +192,9 @@ public:
     // `zeta` for the blend term and `contact_compliance` (1/K, m/N) for contact rows.
     void set_policy_stiffness(Scalar_t k0, Scalar_t beta, Scalar_t zeta = Scalar_t(0.5),
             Scalar_t contact_compliance = Scalar_t(0)) noexcept;
+    // TGS Soft contact tuning (Box2D v3 defaults: 30 Hz, zeta 10, 3 m/s push speed).
+    void set_tgs_soft_params(Scalar_t contact_hertz, Scalar_t contact_damping_ratio,
+            Scalar_t contact_speed) noexcept;
     // B-PXPBD only: velocity-neutral post-solve position projection. AVBD ignores
     // this (its implicit contact solve already handles depenetration), so passing
     // values while AVBD is selected is a no-op. `enabled == false` or
@@ -242,8 +247,10 @@ private:
     std::vector<Joint> joints_{};
     std::size_t world_index_ = 0;
     collision::CollisionWorld collision_{};
-    // B-PXPBD is the primary solver now; AVBD stays selectable as a legacy policy.
-    std::variant<AVBDStep, BPXPBDStep> policy_{BPXPBDStep{}};
+    // B-PXPBD is the primary solver now; AVBD stays selectable as a legacy policy
+    // and TGS Soft is the opt-in velocity-level contact path.
+    std::variant<AVBDStep, BPXPBDStep, TgsSoftStep> policy_{TgsSoftStep{}};
+    collision::TgsSoftParams tgs_soft_params_{};
     SolveSchedule schedule_{};
     std::unique_ptr<task::ThreadPoolExecutor> exec_{};
     int exec_threads_ = -1;

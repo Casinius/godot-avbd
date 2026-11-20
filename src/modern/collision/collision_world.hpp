@@ -40,6 +40,7 @@
 #include "collision/shape.hpp"
 #include "collision/shape_instance.hpp"
 #include "collision/shape_table.hpp"
+#include "collision/tgs_soft.hpp"
 
 namespace collision {
 
@@ -162,7 +163,25 @@ public:
   void reset_warm_start() noexcept { store_.reset_warm_start(); }
 
   // absorb_warm_start + step + emit，并只在拓扑签名变化时 bump version。返回是否 bump。
-  bool sync(const State &state, ConstraintList &list, std::uint64_t &topology_version);
+  // absorb == false 给 TGS Soft 用：它的持久冲量存在 ManifoldContact::lambda 里，
+  // 由 tgs_soft::store 写回，不能再让 AVBD/B-PXPBD 的 ContactConstraint lambda
+  // 在 sync 开头把它覆盖掉。
+  bool sync(const State &state, ConstraintList &list, std::uint64_t &topology_version,
+            bool absorb = true);
+
+  // —— TGS Soft（Box2D v3 风格速度级接触）——
+  // prepare：每帧一次（sync 之后、push 之前）；push：位置积分之前；
+  // solve：位置积分之后；store：持久化冲量到 manifold 供下一帧暖启动。
+  void prepare_tgs_soft(State &state, const TgsSoftParams &params) {
+    tgs_soft::prepare(state, store_.manifolds_for_warm_start(), emit_options_.margin, params);
+  }
+  void push_tgs_soft(State &state, const TgsSoftParams &params) {
+    tgs_soft::push(state, store_.manifolds_for_warm_start(), params);
+  }
+  void solve_tgs_soft(State &state, const TgsSoftParams &params) {
+    tgs_soft::solve(state, store_.manifolds_for_warm_start(), params);
+  }
+  void store_tgs_soft() { tgs_soft::store(store_.manifolds_for_warm_start()); }
 
   // —— Layer 2：保守扫掠 CCD 兜底 ——
   // 在 sync() 之后、求解之前调用。只处理"本步线位移超过

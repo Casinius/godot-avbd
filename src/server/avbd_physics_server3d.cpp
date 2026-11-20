@@ -370,19 +370,26 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
         return;
     }
 
-    // Policy selection. B-PXPBD is the default now; "avbd" remains an opt-in legacy
-    // policy. The defaults (20 iterations, zeta 0.4, 2e-4 contact compliance) are the
-    // parity configuration the solver/constraint suites pass with, so an absent
+    // Policy selection. B-PXPBD remains the default; "avbd" is legacy and
+    // "tgssoft" selects the Box2D v3 velocity-level contact solver. The defaults
+    // (20 iterations, zeta 0.4, 2e-4 contact compliance) are the parity
+    // configuration the solver/constraint suites pass with, so an absent
     // setting gets those instead of the old AVBD values.
-    const String solver_mode = settings->get_setting("physics/avbd/solver", "bpxpbd");
+    const String solver_mode = settings->get_setting("physics/avbd/solver", "tgssoft");
     const bool bpxpbd = solver_mode == "bpxpbd";
-    p_space.solver = bpxpbd ? 1 : 0;
+    p_space.solver = bpxpbd ? 1 : (solver_mode == "tgssoft" ? 2 : 0);
     p_space.threads = static_cast<int>(settings->get_setting("physics/avbd/threads", 0));
     p_space.iterations = static_cast<int>(
             settings->get_setting("physics/avbd/iterations", bpxpbd ? 20 : 8));
     p_space.bpxpbd_zeta = settings->get_setting("physics/avbd/bpxpbd_zeta", 0.4);
     p_space.bpxpbd_contact_compliance =
             settings->get_setting("physics/avbd/bpxpbd_contact_compliance", 2e-4);
+    p_space.tgs_soft_hertz =
+            settings->get_setting("physics/avbd/tgssoft_contact_hertz", 30.0);
+    p_space.tgs_soft_damping_ratio =
+            settings->get_setting("physics/avbd/tgssoft_damping_ratio", 1.0);
+    p_space.tgs_soft_contact_speed =
+            settings->get_setting("physics/avbd/tgssoft_contact_speed", 3.0);
     p_space.alpha = settings->get_setting("physics/avbd/alpha", 0.99);
     p_space.beta_linear = settings->get_setting("physics/avbd/beta_linear", 1e4);
     p_space.beta_angular = settings->get_setting("physics/avbd/beta_angular", 1e2);
@@ -1398,15 +1405,22 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         // Policy selection first: set_policy_stiffness is type-aware, and switching the
         // solver resets dual state (no force<->multiplier cross-injection). set_solver is
         // a cheap no-op when the kind has not changed.
-        space.modern->set_solver(
-                space.solver == 1 ? SolverKind::BPXPBD : SolverKind::AVBD);
+        const SolverKind kind = space.solver == 1   ? SolverKind::BPXPBD
+                                : space.solver == 2 ? SolverKind::TGS_SOFT
+                                                    : SolverKind::AVBD;
+        space.modern->set_solver(kind);
         // Contact stiffness. The legacy beta_linear setting was the per-contact penalty
         // scale; the modern AVBD policy exposes exactly that as its per-step k0.
-        // B-PXPBD uses zeta/contact-compliance instead (see ModernSpace).
+        // B-PXPBD uses zeta/contact-compliance instead (see ModernSpace). TGS Soft
+        // uses its own hertz/damping/speed triple and ignores these values.
         space.modern->set_policy_stiffness(
                 static_cast<Scalar_t>(std::clamp(space.beta_linear, 1.0e4, 1.0e6)), Scalar_t(1e-2),
                 static_cast<Scalar_t>(std::clamp(space.bpxpbd_zeta, 0.0, 1.0)),
                 static_cast<Scalar_t>(std::max(space.bpxpbd_contact_compliance, 0.0)));
+        space.modern->set_tgs_soft_params(
+                static_cast<Scalar_t>(std::max(space.tgs_soft_hertz, 0.0)),
+                static_cast<Scalar_t>(std::max(space.tgs_soft_damping_ratio, 0.0)),
+                static_cast<Scalar_t>(std::max(space.tgs_soft_contact_speed, 0.0)));
         // Velocity-neutral position projection. The legacy projection_* settings were
         // dead after the modern-core migration; they now drive B-PXPBD's step-end
         // projection. AVBD ignores them (its implicit contact already depenetrates),
