@@ -440,7 +440,11 @@ void ModernSpace::set_speculative_distance(Scalar_t distance) noexcept {
 SolverKind ModernSpace::solver_kind() const noexcept {
     if (std::holds_alternative<TgsSoftStep>(policy_))
         return SolverKind::TGS_SOFT;
-    return std::holds_alternative<BPXPBDStep>(policy_) ? SolverKind::BPXPBD : SolverKind::AVBD;
+    if (std::holds_alternative<BPXPBDStep>(policy_))
+        return SolverKind::BPXPBD;
+    if (std::holds_alternative<XPBDStep>(policy_))
+        return SolverKind::XPBD;
+    return SolverKind::AVBD;
 }
 
 void ModernSpace::set_solver(SolverKind kind) {
@@ -471,6 +475,8 @@ void ModernSpace::set_solver(SolverKind kind) {
         policy_.emplace<BPXPBDStep>(BPXPBDStep{});
     else if (kind == SolverKind::TGS_SOFT)
         policy_.emplace<TgsSoftStep>(TgsSoftStep{});
+    else if (kind == SolverKind::XPBD)
+        policy_.emplace<XPBDStep>(XPBDStep{});
     else
         policy_.emplace<AVBDStep>(AVBDStep{});
 }
@@ -494,6 +500,14 @@ void ModernSpace::set_tgs_soft_params(Scalar_t contact_hertz, Scalar_t contact_d
     tgs_soft_params_.contact_hertz = std::max(contact_hertz, Scalar_t(0));
     tgs_soft_params_.contact_damping_ratio = std::max(contact_damping_ratio, Scalar_t(0));
     tgs_soft_params_.contact_speed = std::max(contact_speed, Scalar_t(0));
+}
+
+void ModernSpace::set_xpbd_substeps(int substeps) noexcept {
+    xpbd_substeps_ = std::clamp(substeps, 1, 16);
+}
+
+void ModernSpace::set_xpbd_iterations(int iterations) noexcept {
+    xpbd_iterations_ = std::clamp(iterations, 1, 64);
 }
 
 void ModernSpace::set_contact_projection(bool enabled, int iterations, Scalar_t beta,
@@ -630,7 +644,10 @@ void ModernSpace::step(int iterations, int threads) {
     // engine semantics, not solver physics, so they live in the adapter: a locked
     // coordinate (or a sleeping body) is restored to its step-start value and its
     // velocity component is cleared. Both solver families share this tail.
-    const auto apply_locks_and_commit = [this]() {
+    // `commit` is false for intermediate XPBD substeps: a locked/sleeping body must
+    // be restored every substep (otherwise it drifts through the substeps), but the
+    // previous-velocity snapshot belongs to the end of the whole step() call.
+    const auto apply_locks_and_commit = [this](bool commit = true) {
         for (std::size_t i = 0; i < ids_.size(); ++i) {
             const std::uint32_t locks = axis_locks_[i];
             if (locks == 0 && !sleeping_[i])
@@ -660,7 +677,8 @@ void ModernSpace::step(int iterations, int threads) {
             state_.velocity.set_omega(i, w);
             state_.cache.refresh_derived(i, state_.pose, state_.dt);
         }
-        state_.cache.commit_prev(state_.velocity);
+        if (commit)
+            state_.cache.commit_prev(state_.velocity);
     };
     const auto finish_timing = [this, t0]() {
         const auto t1 = std::chrono::steady_clock::now();
@@ -740,6 +758,57 @@ void ModernSpace::step(int iterations, int threads) {
         }
         collision_.store_tgs_soft();
 
+        apply_locks_and_commit();
+        finish_timing();
+        return;
+    }
+
+    if (solver_kind() == SolverKind::XPBD) {
+        // Müller et al. 2020 / Macklin 2019 small-step recipe: split each step() call
+        // into `substeps` independent begin/finish pairs at h = dt/substeps, with
+        // contacts regenerated at the predicted pose every substep. An impact born
+        // inside the tick is therefore seen by the position solve in the same tick
+        // instead of being ejected by finish_step on the next one. XPBDStep::
+        // begin_iterations() moves bodies to x~ = x + h*(v + M^-1 f) and finish_step()
+        // recovers v = (x - x_initial)/h at the small h. No velocity-level contact
+        // kernel runs: contacts stay pure unilateral position multipliers + cone.
+        const int      substeps = std::max(xpbd_substeps_, 1);
+        const int      iters    = std::max(xpbd_iterations_, 1);
+        const Scalar_t full_dt  = state_.dt;
+        const Scalar_t sub_dt   = full_dt / static_cast<Scalar_t>(substeps);
+        state_.dt = sub_dt;
+        const auto sub_t0 = std::chrono::steady_clock::now();
+        for (int sub = 0; sub < substeps; ++sub) {
+            state_.begin_step();
+            // Narrowphase sees the step-start pose; XPBDStep::begin_iterations()
+            // moves to x~ inside solve(). Generating at x~ (as B-PXPBD does) makes
+            // impact depenetration explode through v = dx/dt, so keep the original
+            // order here.
+            collision_.sync(state_, constraints_, topology_version_);
+            // Keep the existing speculative margin and CCD. Their travel thresholds
+            // scale with the substep dt, which is the conservative direction.
+            collision_.clamp_fast_bodies(state_, sub_dt);
+            collision_.apply_speculative_velocity_clamp(state_, sub_dt);
+            collision_.clamp_fast_bodies(state_, sub_dt);
+
+            std::visit(
+                    [&](auto &policy) {
+                        using P = std::decay_t<decltype(policy)>;
+                        if constexpr (std::is_same_v<P, XPBDStep>)
+                            policy.prepare_contacts(state_, constraints_);
+                        solve(state_, constraints_, policy, iters, *exec_, schedule_,
+                              static_cast<NullPhaseObserver *>(nullptr), topology_version_);
+                    },
+                    policy_);
+            state_.finish_step();
+            apply_locks_and_commit(/*commit=*/false);
+        }
+        state_.cache.commit_prev(state_.velocity);
+        const auto sub_t1 = std::chrono::steady_clock::now();
+        last_substep_ms_ =
+                std::chrono::duration<double, std::milli>(sub_t1 - sub_t0).count() /
+                static_cast<double>(substeps);
+        state_.dt = full_dt;
         apply_locks_and_commit();
         finish_timing();
         return;

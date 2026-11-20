@@ -63,6 +63,8 @@ static void register_avbd_settings() {
             {"physics/avbd/threads", Variant(0)},
             {"physics/avbd/iterations", Variant(20)},
             {"physics/avbd/solver", Variant("tgssoft")},
+            {"physics/avbd/xpbd_substeps", Variant(4)},
+            {"physics/avbd/xpbd_iterations", Variant(2)},
             {"physics/avbd/bpxpbd_zeta", Variant(0.4)},
             {"physics/avbd/bpxpbd_contact_compliance", Variant(0.0002)},
             {"physics/avbd/tgssoft_contact_hertz", Variant(30.0)},

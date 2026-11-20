@@ -361,6 +361,169 @@ public:
 
   template <typename Ref> void batch_update(State &, std::span<Ref>) {} // 无批次阶段
 
+  // —— 小步接触准备（只由 Godot 适配层在 XPBD 子步里调用）——
+  // 深重叠（spawn 穿插、落地第一帧）在位置级一步修完会经 v = dx/dt 变成弹射速度。
+  // 和 AVBD/B-PXPBD 同一套深度 cap：慢速接触只允许每子步修 kContactMaxPenetration，
+  // 实时括号仍保持斜率 1（body 一被推动，C_eff 立刻恢复支撑）。快速撞击不夹，
+  // 否则求解器看不见足够的退穿透距离，整摞会压着穿过地面。
+  // 核心 pinned 场景不调这个函数（initial_c/initial_c_raw 保持 0），摘要不变。
+  void prepare_contacts(State &s, ConstraintList &cs) const {
+    for (ConstraintVariant &v : cs) {
+      auto *c = std::get_if<ContactConstraint>(&v);
+      if (c == nullptr)
+        continue;
+      const Scalar_t raw = c->value(s);
+      c->initial_c_raw   = raw;
+      bool           cap = false;
+      if (c->kind == ContactKind::Normal && c->target <= Scalar_t(0)) {
+        const Vec3 n   = c->basis[0];
+        const Vec3 rAw = rotate(s.pose.rotation(c->bodies_[0]), c->rA);
+        const Vec3 rBw = rotate(s.pose.rotation(c->bodies_[1]), c->rB);
+        const Vec3 vA  = s.velocity.velocity(c->bodies_[0]) +
+                        glm::cross(s.velocity.angular_velocity(c->bodies_[0]), rAw);
+        const Vec3 vB = s.velocity.velocity(c->bodies_[1]) +
+                        glm::cross(s.velocity.angular_velocity(c->bodies_[1]), rBw);
+        cap = glm::dot(vA - vB, n) >= -kContactCapApproachSpeed;
+      }
+      c->initial_c = cap ? std::max(raw, -c->target - kContactMaxPenetration) : raw;
+      // XPBD multipliers are warm-started from the manifold store across substeps.
+    }
+  }
+
+  // —— 接触点 unit 内核（Müller et al. 2020 §3.6 的位置级接触）——
+  //
+  // driver 的串行 Gauss-Seidel 分支用 step_unit() 把同一 (manifold_id, contact_index)
+  // 的 1~3 行**成组**交给这里。普通行仍走 step()，顺序和算术都不变。
+  // 之前 XPBDStep 把 ContactConstraint 当普通双边行处理：法线没有 λ_n≥0 的单边夹紧
+  // （分离接触会被拉回去）、切线没有摩擦锥（|λ_t| 没有 μλ_n 上界）。这里补齐两点，
+  // 乘子单位保持 XPBD 的 kg·m（不是 AVBD 的力 N）。
+  template <typename Ref>
+  void step_unit(State &s, Ref *refs, std::uint32_t first, std::uint32_t rows) {
+    if (refs[first].type_index == variant_index<ContactConstraint, ConstraintVariant>::value) {
+      contact_unit(s, refs, first, rows);
+      return;
+    }
+    for (std::uint32_t r = 0; r < rows; ++r) refs[first + r].step(s, *this);
+  }
+
+ private:
+  template <typename Ref>
+  void contact_unit(State &s, Ref *refs, std::uint32_t first, std::uint32_t rows) {
+    ContactConstraint *row[3] = {nullptr, nullptr, nullptr};
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      auto *c = static_cast<ContactConstraint *>(refs[first + r].obj);
+      const int k = static_cast<int>(c->kind);
+      if (k >= 0 && k < 3 && row[k] == nullptr)
+        row[k] = c;
+    }
+    if (row[0] == nullptr)
+      return; // 没有法线行就没有摩擦锥，切线无意义
+
+    const auto         bodies   = row[0]->bodies_;
+    const Scalar_t     inv_dt2  = Scalar_t(1) / (s.dt * s.dt);
+    bool               have[3]  = {false, false, false};
+    Scalar_t           C[3]     = {0, 0, 0};
+    Scalar_t           w[3]     = {0, 0, 0};
+    Scalar_t           alpha[3] = {0, 0, 0};
+    Vec3               g[3][2];
+    Vec3               ga[3][2];
+    for (int k = 0; k < 3; ++k) {
+      if (row[k] == nullptr)
+        continue;
+      have[k] = true;
+      // 原始几何。core pinned 场景 initial_c/initial_c_raw 都是 0 ⇒ 与旧的
+      // evaluate() 逐位相同；适配层 prepare_contacts 记录的 cap 只改法线的常量项。
+      C[k] = row[k]->value(s);
+      if (k == 0)
+        C[0] -= (row[0]->initial_c_raw - row[0]->initial_c);
+      const auto gl   = row[k]->gradient(s);
+      const auto gla  = row[k]->gradient_angular(s);
+      for (int n = 0; n < 2; ++n) {
+        g[k][n]  = gl[n];
+        ga[k][n] = gla[n];
+      }
+      // 有效质量完全来自惯性张量，不引入 AVBD 的罚因子 K。
+      w[k] = s.inertial.effective_mass(bodies[0], g[k][0], ga[k][0]) +
+             s.inertial.effective_mass(bodies[1], g[k][1], ga[k][1]);
+      alpha[k] = row[k]->compliance * inv_dt2;
+    }
+
+    Scalar_t dlam[3] = {0, 0, 0};
+    // —— 法线：单边 XPBD 乘子 λ_n ≥ 0 ——
+    // 符号约定：C<0 是穿透，正的 Δλ 沿 +n 推开 A；C>0 且 λ_n==0 的分离接触整行跳过，
+    // 绝不会产生吸引力（这条是 selftest 的硬契约）。
+    {
+      const Scalar_t lam = row[0]->lambda;
+      const Scalar_t denom = w[0] + alpha[0];
+      if (denom > Scalar_t(0)) {
+        const Scalar_t dl   = (-C[0] - alpha[0] * lam) / denom;
+        // target > 0 是 core 的 mixed 场景那种"期望深度"的**合成双边行**（没有
+        // "两表面最多重叠"的物理含义），不是刚体接触。保留旧的逐位双边算术，让
+        // pinned 的 avbd/xpbd/pbd 摘要不变；真实的刚体窄相接触一律 target<=0，
+        // 走下面的单边 λ_n>=0 分支。
+        if (row[0]->target > Scalar_t(0)) {
+          dlam[0]        = dl;
+          row[0]->lambda = lam + dl;
+        } else if (!(C[0] > Scalar_t(0) && lam == Scalar_t(0))) {
+          const Scalar_t next = std::max(Scalar_t(0), lam + dl);
+          // 夹紧不生效时保留原始 dl（逐位沿用旧的单行投影算术）；只有要把乘子
+          // 夹回 0 时才用剩余量，避免施加超过互补条件的修正。
+          dlam[0]        = (next == lam + dl) ? dl : (next - lam);
+          row[0]->lambda = next;
+        }
+      }
+    }
+    const Scalar_t lam_n = row[0]->lambda;
+
+    // —— 切线：各自做 XPBD dual，再按**新鲜**的 λ_n 把乘子对径向夹进摩擦锥 ——
+    Scalar_t cand[3] = {0, 0, 0};
+    for (int k = 1; k < 3; ++k) {
+      if (!have[k])
+        continue;
+      const Scalar_t lam   = row[k]->lambda;
+      const Scalar_t denom = w[k] + alpha[k];
+      cand[k] = denom > Scalar_t(0) ? lam + (-C[k] - alpha[k] * lam) / denom : lam;
+    }
+    const Scalar_t cone_bound = std::max(Scalar_t(0), row[0]->friction) * lam_n;
+    const Scalar_t tau_before = std::sqrt(cand[1] * cand[1] + cand[2] * cand[2]);
+    if (have[1] && have[2]) {
+      if (tau_before > cone_bound && tau_before > Scalar_t(0)) {
+        const Scalar_t scale = cone_bound / tau_before;
+        cand[1] *= scale;
+        cand[2] *= scale;
+      }
+    } else {
+      // 只发射了一条切线（μ==0 的正常发射不应该有，这里守锥兜底）。
+      for (int k = 1; k < 3; ++k)
+        if (have[k]) cand[k] = std::clamp(cand[k], -cone_bound, cone_bound);
+    }
+    for (int k = 1; k < 3; ++k) {
+      if (!have[k])
+        continue;
+      dlam[k]        = cand[k] - row[k]->lambda;
+      row[k]->lambda = cand[k];
+    }
+    // 静摩擦标记：乘子仍在锥内 ⇒ 下一 substep/帧的 manifold feature 匹配保留旧锚点。
+    if (have[1] && have[2])
+      row[1]->stick = row[2]->stick = (tau_before <= cone_bound);
+
+    // —— 位置：每个 body 一次，body 0 先、body 1 后（与旧单行投影同序）——
+    for (int n = 0; n < 2; ++n) {
+      const std::size_t b = bodies[n];
+      if (s.inertial.is_static(b))
+        continue;
+      Vec3 d_lin{0}, d_ang{0};
+      for (int k = 0; k < 3; ++k) {
+        if (!have[k] || dlam[k] == Scalar_t(0))
+          continue;
+        d_lin += g[k][n] * (s.inertial.inv_mass(b) * dlam[k]);
+        d_ang += (s.inertial.world_inv_inertia(b) * ga[k][n]) * dlam[k];
+      }
+      s.pose.apply_delta(b, d_lin, d_ang);
+    }
+  }
+
+ public:
   // XPBD 是显式位置投影：必须先把 pose 搬到惯性目标（含本次重力/外力的位移），
   // 再在它上面逐约束投影。不搬就等于把惯性项丢了。
   // 逐 body 独立 ⇒ 可并行且位精确。
@@ -405,6 +568,13 @@ public:
     } else {
       XPBDStep::step(s, c);
     }
+  }
+
+  // XPBDStep 的接触 unit 内核在这里必须被屏蔽：TGS Soft 的接触是速度级的，位置级
+  // 一行都不能产生。driver 的串行分支会优先调 step_unit，所以显式覆盖回逐行 step。
+  template <typename Ref>
+  void step_unit(State &s, Ref *refs, std::uint32_t first, std::uint32_t rows) {
+    for (std::uint32_t r = 0; r < rows; ++r) refs[first + r].step(s, *this);
   }
 
   template <typename Exec, typename Sched>

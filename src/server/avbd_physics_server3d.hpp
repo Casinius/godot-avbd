@@ -230,10 +230,14 @@ protected:
         // into the solver every step (so a changed setting shows up without a restart).
         int threads = 0;
         int iterations = 20;
-        // Policy selection: 0 = AVBD (legacy), 1 = B-PXPBD (default),
-        // 2 = TGS Soft (Box2D v3 velocity-level contacts). Read from
-        // `physics/avbd/solver` ("avbd" | "bpxpbd" | "tgssoft"); switching resets dual state.
+        // Policy selection: 0 = AVBD (legacy), 1 = B-PXPBD, 2 = TGS Soft
+        // (Box2D v3 velocity-level contacts), 3 = XPBD (position-based contacts).
+        // Read from `physics/avbd/solver`; switching resets dual state.
         int solver = 1;
+        // XPBD small-step schedule: substeps per step() call and Gauss-Seidel
+        // iterations per substep (other policies ignore both).
+        int xpbd_substeps = 4;
+        int xpbd_iterations = 2;
         // B-PXPBD blend weight and contact compliance (1/K, m/N). These are the
         // parity defaults; compliance is added to the emitted contact rows.
         double bpxpbd_zeta = 0.4;

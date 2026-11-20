@@ -377,10 +377,15 @@ void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     // setting gets those instead of the old AVBD values.
     const String solver_mode = settings->get_setting("physics/avbd/solver", "tgssoft");
     const bool bpxpbd = solver_mode == "bpxpbd";
-    p_space.solver = bpxpbd ? 1 : (solver_mode == "tgssoft" ? 2 : 0);
+    p_space.solver = bpxpbd ? 1 : (solver_mode == "tgssoft" ? 2 :
+                                  (solver_mode == "xpbd" ? 3 : 0));
     p_space.threads = static_cast<int>(settings->get_setting("physics/avbd/threads", 0));
     p_space.iterations = static_cast<int>(
             settings->get_setting("physics/avbd/iterations", bpxpbd ? 20 : 8));
+    p_space.xpbd_substeps = static_cast<int>(
+            settings->get_setting("physics/avbd/xpbd_substeps", 4));
+    p_space.xpbd_iterations = static_cast<int>(
+            settings->get_setting("physics/avbd/xpbd_iterations", 2));
     p_space.bpxpbd_zeta = settings->get_setting("physics/avbd/bpxpbd_zeta", 0.4);
     p_space.bpxpbd_contact_compliance =
             settings->get_setting("physics/avbd/bpxpbd_contact_compliance", 2e-4);
@@ -1407,8 +1412,11 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         // a cheap no-op when the kind has not changed.
         const SolverKind kind = space.solver == 1   ? SolverKind::BPXPBD
                                 : space.solver == 2 ? SolverKind::TGS_SOFT
+                                : space.solver == 3 ? SolverKind::XPBD
                                                     : SolverKind::AVBD;
         space.modern->set_solver(kind);
+        space.modern->set_xpbd_substeps(space.xpbd_substeps);
+        space.modern->set_xpbd_iterations(space.xpbd_iterations);
         // Contact stiffness. The legacy beta_linear setting was the per-contact penalty
         // scale; the modern AVBD policy exposes exactly that as its per-step k0.
         // B-PXPBD uses zeta/contact-compliance instead (see ModernSpace). TGS Soft

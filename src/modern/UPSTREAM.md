@@ -3,10 +3,9 @@
 This tree is a snapshot of `/home/cyan/avbd-mo/src`, imported to replace the legacy
 `src/avbd` solver on the `modernize` branch.
 
-- Source HEAD: `8ac2b76` (`manifold`) — "add Box2D-v3-style TGS Soft contact
-  solver". Earlier snapshots include `591cac7` (B-PXPBD WIP), `4cd21cf`
-  (projection), `feca2f9` (cap/friction), `824b37b` (contacts), `e6f995a`
-  (skeleton), `8b9fa9a` (speculative CCD) and older commits.
+- Source HEAD: `f760333` (`manifold`) — "faithful XPBD: unilateral contacts,
+  cone, small-step driver". Earlier snapshots include `8ac2b76` (TGS Soft)
+  and older commits.
 - The speculative/CCD part of this snapshot (default `speculative_distance = 0`,
   so the pinned solver/collision baselines are still bit-identical):
   * `collision/contact_constraints.hpp` — `ContactEmitOptions::speculative_distance`
@@ -43,7 +42,7 @@ This tree is a snapshot of `/home/cyan/avbd-mo/src`, imported to replace the leg
     by default). The snapshot still matches `tests/baseline.txt` and
     `tests/collision_observable.txt` bit-for-bit.
 - Snapshot tree SHA-256 (everything under `src/modern` except this file):
-  `5692374ed1ca50e895c646fbabacab0a4dc9ae87f4e70083271549cc5b8c6b3d`
+  `1f86b7e22d0b18b38b249732fe1183abeb860bbcd643454ab428d4fb39cea1c9`
   Recipe: `find src/modern -type f ! -name UPSTREAM.md -print0 | sort -z |
   xargs -0 sha256sum | sha256sum`.
 - Baseline data copied to `src/modern/tests/`:

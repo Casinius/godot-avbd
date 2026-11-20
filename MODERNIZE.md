@@ -126,3 +126,9 @@ server 30/30, queries 27/27, load PASS, pyramid 9/9. Core selftest 68/68,
 baselines unchanged.
 
 40 s verification (420-box double pyramid, `probe_late.gd`, 240 Hz solver, 20 iterations): no body below ground (`first_cross_frame=-1`, `below_frames=0`), `max_ke=0.4 J @38 s`, `max_speed=19.24 m/s @1.5 s` (the authored upper-pyramid landing), `max_penetration=0.505 m @1.075 s` (transient at that landing). The pile stays on the slab for the full run; the previous -2200 m free-fall runaway is gone.
+
+XPBD is now a selectable policy (`physics/avbd/solver="xpbd"`) with proper
+unilateral contacts, a friction cone and a small-step driver. It passes the
+pyramid at 4 substeps x 2 iterations, but `test_solver` remains 36/38 at that
+budget (stack drift 0.32 m, impulse vx 8.93); 16x16 passes the solver but is
+too slow. TGS Soft stays the default because it passes both suites.

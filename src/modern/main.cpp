@@ -999,6 +999,73 @@ Check check_bpxpbd_contact_friction_cone() {
   return c;
 }
 
+// —— XPBD（非 blended）的位置级刚体接触：§3.6 的单边 + 摩擦锥 ——
+// 与 B-PXPBD 的接触共用 synthetic scene，但乘子是 XPBD 的 kg·m，且没有 blend/R。
+Check check_xpbd_contact_unilateral_no_pull() {
+  Check c{"XPBD separated contact exerts no pull", true, ""};
+
+  scene::Scene sc = contact_pair_scene(Scalar_t(-0.1), Scalar_t(0.5), Vec3{0}, false);
+  const Vec3   before = sc.state.pose.position(1);
+  XPBDStep     p;
+  drive(sc, p, g_serial, g_sched, 1, 10);
+  const Vec3 after = sc.state.pose.position(1);
+  if (!bitwise_eq(before, after)) {
+    c.ok     = false;
+    c.detail = std::format("A moved from ({},{},{}) to ({},{},{})", before.x, before.y, before.z,
+                           after.x, after.y, after.z);
+    return c;
+  }
+  for (const ConstraintVariant &v : sc.constraints) {
+    const ContactConstraint &cc = std::get<ContactConstraint>(v);
+    if (cc.lambda != Scalar_t(0)) {
+      c.ok     = false;
+      c.detail = std::format("row {} got lambda={} on a separated contact",
+                             static_cast<int>(cc.kind), cc.lambda);
+      return c;
+    }
+  }
+  return c;
+}
+
+Check check_xpbd_contact_friction_cone() {
+  Check c{"XPBD contact friction cone bounds tangent multipliers", true, ""};
+
+  scene::Scene sc = contact_pair_scene(Scalar_t(0.01), Scalar_t(0.5), Vec3{0.1f, 0, 0}, false);
+  const Vec3   before = sc.state.pose.position(1);
+  XPBDStep     p;
+  drive(sc, p, g_serial, g_sched, 1, 1);
+  const Vec3 after = sc.state.pose.position(1);
+  if (!(after.y > before.y)) {
+    c.ok     = false;
+    c.detail = std::format("penetrating contact pushed A down: y {} -> {}", before.y, after.y);
+    return c;
+  }
+
+  Scalar_t lam[3] = {0, 0, 0};
+  for (const ConstraintVariant &v : sc.constraints) {
+    const ContactConstraint &cc = std::get<ContactConstraint>(v);
+    lam[static_cast<int>(cc.kind)] = cc.lambda;
+  }
+  if (!(lam[0] > Scalar_t(0))) {
+    c.ok     = false;
+    c.detail = std::format("normal multiplier is {} (want > 0)", lam[0]);
+    return c;
+  }
+  const Scalar_t tau   = std::sqrt(lam[1] * lam[1] + lam[2] * lam[2]);
+  const Scalar_t bound = Scalar_t(0.5) * lam[0];
+  if (!(tau <= bound * (Scalar_t(1) + Scalar_t(1e-4)) + Scalar_t(1e-7))) {
+    c.ok     = false;
+    c.detail = std::format("tangent |lambda|={} exceeds mu*lambda_n={}", tau, bound);
+    return c;
+  }
+  if (!(tau >= bound * Scalar_t(0.99))) {
+    c.ok     = false;
+    c.detail = std::format("cone is not active: |lambda_t|={} < 0.99*mu*lambda_n={}", tau, bound);
+    return c;
+  }
+  return c;
+}
+
 // Phase 3c：接触 unit（法线 + 两切线）在 block 扫掠与"一 unit 一 block"的串行
 // 顺序下必须逐位相同；一个接触点必须是一个 unit（3 行同块），不能被拆开。
 Check check_bpxpbd_contact_block_oracle() {
@@ -2114,6 +2181,8 @@ std::vector<Check> run_selftest() {
       check_bpxpbd_joint_axis_limited(),
       check_bpxpbd_contact_unilateral_no_pull(),
       check_bpxpbd_contact_friction_cone(),
+      check_xpbd_contact_unilateral_no_pull(),
+      check_xpbd_contact_friction_cone(),
       check_bpxpbd_contact_block_oracle(),
       check_bpxpbd_contact_deep_penetration_cap(),
       check_bpxpbd_projection_is_velocity_neutral(),

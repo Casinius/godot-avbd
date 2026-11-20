@@ -112,9 +112,29 @@ void solve(State &s, ConstraintList &cs, Policy &p, int iters, Exec &exec,
       }
       if (obs) obs->on_phase(SolvePhase::Scatter, it, s);
     } else {
-      // XPBD / PBD：step() 直接写 pose（Gauss-Seidel），**并行化会错**。
+      // XPBD / PBD / TGS Soft：step() 直接写 pose（Gauss-Seidel），**并行化会错**。
       // 要并行必须改算法（约束着色或 Jacobi 化），那是行为变更，不在本轮范围。
-      for (auto &r : refs) r.step(s, p);
+      // 有 step_unit() 的 policy（XPBD）把相邻的接触三行成组交出去：法线的单边夹紧
+      // 与切线的摩擦锥必须联合投影。非接触行仍逐行 step()，顺序/算术不变。
+      if constexpr (requires { p.step_unit(s, refs.data(), std::uint32_t(0), std::uint32_t(1)); }) {
+        std::size_t i = 0;
+        while (i < refs.size()) {
+          std::size_t rows = 1;
+          if (refs[i].type_index ==
+              variant_index<ContactConstraint, ConstraintVariant>::value) {
+            while (rows < 3 && i + rows < refs.size() &&
+                   refs[i + rows].type_index == refs[i].type_index &&
+                   refs[i + rows].joins_unit != nullptr &&
+                   refs[i + rows].joins_unit(refs[i + rows - 1].obj, refs[i + rows].obj))
+              ++rows;
+          }
+          p.step_unit(s, refs.data(), static_cast<std::uint32_t>(i),
+                      static_cast<std::uint32_t>(rows));
+          i += rows;
+        }
+      } else {
+        for (auto &r : refs) r.step(s, p);
+      }
       if (obs) obs->on_phase(SolvePhase::Scatter, it, s);
     }
 

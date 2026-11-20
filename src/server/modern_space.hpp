@@ -9,7 +9,7 @@
  *
  *     State (pose/velocity/inertia/external) + ConstraintList
  *     collision::CollisionWorld (shape table -> broadphase -> narrowphase -> manifolds)
- *     std::variant<AVBDStep, BPXPBDStep, TgsSoftStep> + SolveSchedule + ThreadPoolExecutor
+ *     std::variant<AVBDStep, BPXPBDStep, TgsSoftStep, XPBDStep> + SolveSchedule + ThreadPoolExecutor
  *
  * and nothing Godot-specific. The server translates its records into ModernBodyDesc
  * once per rebuild, then drives this object with begin_tick/step.
@@ -110,6 +110,7 @@ enum class SolverKind {
     AVBD = 0,
     BPXPBD = 1,
     TGS_SOFT = 2,
+    XPBD = 3,
 };
 
 class ModernSpace {
@@ -195,6 +196,16 @@ public:
     // TGS Soft contact tuning (Box2D v3 defaults: 30 Hz, zeta 10, 3 m/s push speed).
     void set_tgs_soft_params(Scalar_t contact_hertz, Scalar_t contact_damping_ratio,
             Scalar_t contact_speed) noexcept;
+    // XPBD only: Müller-style small-step schedule. `substeps` splits each step() call
+    // into that many begin/finish pairs with dt/substeps, regenerating contacts every
+    // substep; `iterations` is the per-substep Gauss-Seidel budget (the paper's 20x1
+    // recipe favours tiny dt over many iterations). Other solvers ignore both.
+    void set_xpbd_substeps(int substeps) noexcept;
+    void set_xpbd_iterations(int iterations) noexcept;
+    [[nodiscard]] int xpbd_substeps() const noexcept { return xpbd_substeps_; }
+    [[nodiscard]] int xpbd_iterations() const noexcept { return xpbd_iterations_; }
+    // Mean wall time of one XPBD substep inside the last step() call (milliseconds).
+    [[nodiscard]] double last_substep_ms() const noexcept { return last_substep_ms_; }
     // B-PXPBD only: velocity-neutral post-solve position projection. AVBD ignores
     // this (its implicit contact solve already handles depenetration), so passing
     // values while AVBD is selected is a no-op. `enabled == false` or
@@ -249,8 +260,11 @@ private:
     collision::CollisionWorld collision_{};
     // B-PXPBD is the primary solver now; AVBD stays selectable as a legacy policy
     // and TGS Soft is the opt-in velocity-level contact path.
-    std::variant<AVBDStep, BPXPBDStep, TgsSoftStep> policy_{TgsSoftStep{}};
+    std::variant<AVBDStep, BPXPBDStep, TgsSoftStep, XPBDStep> policy_{TgsSoftStep{}};
     collision::TgsSoftParams tgs_soft_params_{};
+    int xpbd_substeps_ = 4;
+    int xpbd_iterations_ = 2;
+    double last_substep_ms_ = 0.0;
     SolveSchedule schedule_{};
     std::unique_ptr<task::ThreadPoolExecutor> exec_{};
     int exec_threads_ = -1;
@@ -265,7 +279,6 @@ private:
     std::vector<double> angular_damp_;
     std::vector<std::uint32_t> axis_locks_;
     std::vector<bool> sleeping_;
-
     std::uint64_t topology_version_ = 0;
     double last_step_ms_ = 0.0;
 };
