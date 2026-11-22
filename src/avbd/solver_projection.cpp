@@ -29,6 +29,7 @@ namespace avbd {
 
 namespace {
 
+// Effective angular compliance along `localAxis`: t.(I^-1 t), with I rotated into world space.
 [[nodiscard]] float angularCompliance(const Rigid &body, const float3 &localAxis) noexcept
 {
     const float3 &I = body.moment;
@@ -52,9 +53,8 @@ namespace {
 }
 
 
-// A locked axis does not move, so the projection drops that component. The effective mass
-// was computed as if it did, which makes the correction slightly soft on locked bodies -
-// the same documented approximation the rest of the solver makes for axis locks.
+// Locked axes drop their correction component; effective mass still assumes mobility, so the
+// correction is slightly soft - the solver's documented axis-lock approximation.
 void applyLocked(Rigid &body, float3 &dLin, float3 &dAng) noexcept
 {
     maskLockedLinear(body.axisLockLinear, dLin);
@@ -75,10 +75,8 @@ void Solver::projectContacts(bool projectPositions, float brakeWindow)
     const float cap = projectionMaxCorrection;
     const float window = brakeWindow > 0.0f ? brakeWindow : collisionDt;
 
-    // Only manifolds whose pair can still move are worth walking. A parked or sleeping
-    // pair cannot change velocity or pose this step, so every contact test against it
-    // would be a no-op; compacting the live set once keeps the brake and all projection
-    // iterations over the same small list instead of re-filtering every slot.
+    // Compact to movable pairs once: parked/sleeping pairs cannot change pose or velocity, so
+    // testing them is a no-op; the brake and every projection pass share this small list.
     projectionActive.clear();
     for (uint32_t slot : manifolds.live)
     {
@@ -93,10 +91,8 @@ void Solver::projectContacts(bool projectPositions, float brakeWindow)
     if (projectionActive.empty())
         return;
 
-    // Interception. A pair may only close the gap it has at this pose within the time left
-    // before the contact set is refreshed again; otherwise a fast body travels a whole
-    // substep into its neighbour and the solver spends the next round undoing that overlap,
-    // which is what converts a collision into a launch.
+    // Interception: close only the current gap within the time left before contacts refresh, or a
+    // fast body tunnels a whole substep and the undo becomes a launch.
     if (speculativeMargin > 0.0f)
     {
         for (uint32_t slot : projectionActive)
@@ -177,10 +173,8 @@ void Solver::projectContacts(bool projectPositions, float brakeWindow)
     projDeltaAng.resize(updateOrder.size());
     projManifoldCount.resize(updateOrder.size());
 
-    // Nothing below this residual is worth another full pass: the depth is already
-    // measured past the slop, so a fraction of the slop is a correction that cannot
-    // show up above float noise in the next pose. Resting and sleeping piles therefore
-    // stop after the first pass that has nothing left to move.
+    // Sub-slop residual corrections are below float noise, so resting/sleeping piles stop after the
+    // first pass with nothing left to move.
     const float depthTolerance = std::max(slop * 0.01f, 1.0e-6f);
 
     for (int iter = 0; iter < projectionIterations; iter++)

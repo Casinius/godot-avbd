@@ -1,27 +1,5 @@
-/*
- * General 6-DOF joint.
- *
- * Part of godot-avbd; the augmented-Lagrangian structure follows the reference
- * implementation (github.com/savant117/avbd-demo3d, MIT), as the rest of src/avbd does.
- *
- * Each of the six degrees of freedom is Free, Locked or Limited, and may carry a spring. A
- * degree of freedom is measured in the joint frame, which is body A's local frame anchored at
- * rA - or the world when bodyA is null, which is how the joint pins a body to a fixed pose.
- * Measurements are in physical units: metres for a linear axis, radians for an angular one,
- * and radians for the limits, so they mean the same thing whatever size the bodies are.
- *
- * Two things here are not a direct copy of anything in the reference implementation.
- *
- * The angular side has to survive a spinning axle. A locked axis cannot read its component of
- * the rotation vector between the two bodies: a wheel turning about its axle sweeps those
- * components through the full circle every half turn, so a hinge built that way tears itself
- * apart after a few revolutions. Instead the deviation from the joint's rest orientation is
- * split into the twist about each non-locked axis and the remaining swing, and only the swing
- * is handed to the locked axes.
- *
- * And a constraint anchored away from a body's centre acts through a moment arm, so it is
- * stamped through both halves of the system at once - see stampAxis.
- */
+// General 6-DOF joint; AL structure follows avbd-demo3d (MIT). DOFs Free/Locked/Limited (+spring),
+// measured in A's frame (world if bodyA null). Swing-twist split survives spinning axles; off-centre anchors stamp both halves.
 
 #include <algorithm>
 #include <cmath>
@@ -68,12 +46,8 @@ float3 GenericJoint::anchorB() const
     return bodyB->positionLin + qrot(bodyB->positionAng, rB);
 }
 
-// Remove the twist about axis `p_axis` from `p_dev`, writing its angle to `r_angle`.
-//
-// A quaternion's twist about n is (n * (v.n), w) normalised, so the angle is 2*atan2(v.n, w).
-// That stays continuous through a full turn, which is what a spinning axle needs. Near a half
-// turn the twist quaternion degenerates (both the projected vector part and w vanish), and
-// there is then no twist to remove.
+// Remove twist about `p_axis` from `p_dev` into `r_angle`: (n*(v.n), w) normalised, angle
+// 2*atan2(v.n, w) - continuous through a full turn (spinning axles); degenerate near half turn means no twist.
 static void removeTwist(quat &p_dev, int p_axis, float &r_angle)
 {
     const float3 &n = frameAxis(p_axis);
@@ -95,27 +69,14 @@ static void removeTwist(quat &p_dev, int p_axis, float &r_angle)
 
 void GenericJoint::angularValues(float p_out[3]) const
 {
-    // Deviation from the rest configuration, in the joint frame (body A's).
-    //
-    // Both quantities below are B relative to A as seen *by A*: the current one, and the one
-    // captured when the joint was created. The deviation is then the rest pose taken away from
-    // the current one, which is identity exactly when the bodies are in their rest arrangement.
-    //
-    // The order matters and is easy to get wrong in a way nothing notices: putting the rest term
-    // anywhere else happens to be harmless while the rest pose is the identity (every joint built
-    // from upright bodies), and silently wrong as soon as a body starts out rotated - a wheel
-    // turned onto its axle, say. Then the locked axes see an error proportional to the rest
-    // rotation, which grows as the body spins and tears the joint apart.
-    // B relative to A now, and the same quantity at rest. Taking the rest arrangement away from
-    // the current one gives identity exactly when the bodies are back where they started, and its
-    // axis-angle in A's frame is what each degree of freedom measures.
+    // deviation = rest^-1 * (B-relative-to-A now), identity at rest; rest-term placement is CRITICAL:
+    // Harmless only while rest is identity; once rotated, locked-axis error grows with spin and tears the joint apart.
     const quat qA = frameOrientation();
     const quat relativeNow = qmul(qconj(qA), normalize(bodyB->positionAng));
     quat dev = qmul(normalize(rest), qconj(relativeNow));
 
-    // The twist about every non-locked axis belongs to that axis - a spring or a limit reads
-    // its angle - and must not be visible to the locked ones. Removing one twist is exact; with
-    // several non-locked axes it is applied one axis at a time, the usual approximation.
+    // Each non-locked axis owns its twist (spring/limit reads it); locked axes must not see it.
+    // Removing one twist is exact; several are removed one axis at a time (usual approximation).
     for (int i = 0; i < 3; i++)
     {
         if (angular[i].mode != AxisMode::Locked)
@@ -173,22 +134,16 @@ bool GenericJoint::axisConstraint(const JointAxis &p_axis, float p_value, float 
     }
 }
 
-// The force one degree of freedom applies this pass, and the constraint value behind it.
-//
-// Both passes must agree on this value: the dual pass stores the force it produces as the next
-// multiplier and grows the penalty from the same error. Computing it in one place is what keeps
-// the augmented Lagrangian consistent - a lock stabilised in only one of the two would have the
-// primal fighting the full error while the dual believed it was correcting a fraction of it,
-// which converges to the wrong answer rather than merely converging slowly.
+// One source of truth for the constraint value: the dual pass stores its force as the next multiplier
+// and grows the penalty from the same error; disagreeing passes converge to the wrong answer, not just slowly.
 bool GenericJoint::axisForce(const JointAxis &p_axis, float p_value, float p_alpha, float &r_constraint,
         float &r_force) const
 {
     if (!axisConstraint(p_axis, p_value, r_constraint))
         return false;
 
-    // A lock is stabilised against where the step started, so its error is worked out over
-    // several steps instead of being fought in one. A limit is not: biasing it would let it
-    // settle short of its bound.
+    // A lock is stabilised against the step's start (error spread over steps); a limit is not,
+    // since biasing would let it settle short of its bound.
     if (p_axis.mode == AxisMode::Locked)
         r_constraint -= p_axis.initial * p_alpha;
 
@@ -205,10 +160,8 @@ bool GenericJoint::axisForce(const JointAxis &p_axis, float p_value, float p_alp
 void GenericJoint::stampAxis(Block &block, const JointAxis &p_axis, float p_value, float p_alpha, float3 p_jLin,
         float3 p_jAng, float p_rate) const
 {
-    // Constraint term of the augmented Lagrangian, stamped through both Jacobian rows. The
-    // cross block is what couples the body's translation and rotation, and it is not optional:
-    // an anchor away from the centre of mass moves as much by turning the body as by moving it,
-    // so dropping that term constrains the wrong point.
+    // Constraint term stamped through both Jacobian rows; the cross block couples translation and
+    // rotation and is not optional - an off-centre anchor turns as much as it translates.
     float C;
     float F;
     if (axisForce(p_axis, p_value, p_alpha, C, F))
@@ -234,18 +187,8 @@ void GenericJoint::stampAxis(Block &block, const JointAxis &p_axis, float p_valu
     }
 }
 
-// How stiff a degree of freedom may become before the solver can no longer resolve it.
-//
-// The augmented Lagrangian grows a constraint's penalty while it is violated, which is what makes
-// it converge to zero error. Left unbounded that is a trap: the constraint's own frequency is
-// sqrt(penalty / effective inertia), and once it approaches the step rate the iteration stops
-// converging, so the error grows, so the penalty grows further. A degree of freedom that is
-// *already* satisfied has nothing to gain from a large penalty and everything to lose, and a
-// body spinning fast is exactly where it shows up first.
-//
-// The cap is the penalty at which the constraint's frequency is still a comfortable fraction of
-// the step rate, using the smaller of the two bodies' effective inertia about the axis - the
-// lighter side is the one that limits the timestep.
+// Cap penalty before sqrt(k/I) nears the step rate: convergence stops, then error and penalty run away
+// (a fast-spinning body first); use the smaller body's effective inertia - the lighter side limits dt.
 float GenericJoint::penaltyLimit(const Rigid *p_body, float3 p_axis, bool p_angular) const
 {
     // Inertia (or mass) seen along the axis by this body.
@@ -357,11 +300,8 @@ void GenericJoint::updateDual(float alpha)
             float F;
             if (!axisForce(axis, values[k], alpha, C, F))
             {
-                // Complementary slackness: a limit that is not being pushed against applies no
-                // force, so its multiplier is zero. Keeping the previous one would re-apply it
-                // the moment the axis came back to the bound, which reads as a violent kick -
-                // and the stiffer the axis, the harder the kick, so a stiffer limit would
-                // behave *worse* than a soft one.
+                // Complementary slackness: an inactive limit applies no force, so lambda = 0;
+                // keeping it re-applies as a violent kick on return, harsher for stiffer axes.
                 if (axis.mode == AxisMode::Limited)
                     axis.lambda = 0.0f;
                 continue;

@@ -16,9 +16,8 @@
 
 namespace avbd {
 
-// A forward range over an intrusive singly-linked list: Node must expose a public
-// `Node *next`. Empty iteration = null head; the end iterator is a null-node iterator,
-// so begin()/end() compare by pointer and the range is trivially multi-pass.
+// Forward range over an intrusive singly-linked list (Node exposes `Node *next`). Null head
+// is empty; end is a null-node iterator, so begin()/end() compare by pointer and multi-pass.
 template <typename Node>
 class next_range {
 public:

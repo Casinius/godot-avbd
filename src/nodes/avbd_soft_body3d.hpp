@@ -40,9 +40,8 @@ class AVBDSoftBody3D : public MultiMeshInstance3D {
     double stiffness_linear = 1000.0;
     double stiffness_angular = 250.0;
 
-    // Latest simulated pose of each cell. A rebuild recreates the solver, so the poses are
-    // kept here to put the lattice back where it was rather than resetting it to its spawn
-    // layout. Absent until the lattice has been built once.
+    // Latest simulated pose of each cell; a rebuild recreates the solver, so poses are kept
+    // here to restore the lattice rather than reset it. Absent until the first build.
     struct Cell {
         avbd::float3 position;
         avbd::quat rotation;

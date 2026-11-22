@@ -1,19 +1,5 @@
-/*
- * Conversions between Godot's Y-up scene space and the AVBD solver's Z-up space.
- *
- * The solver core (src/avbd, ported from github.com/savant117/avbd-demo3d) works in
- * Z-up coordinates with gravity along -Z, and treats boxes as centres with full
- * widths. Godot is Y-up with gravity along -Y. The mapping between the two is a
- * +90 degree rotation about X:
- *
- *     sim = (x, -z, y)          godot = (x, z, -y)
- *
- * which maps Godot +Y onto sim +Z and Godot +Z onto sim -Y, preserving handedness.
- *
- * "Sim space" below means the coordinate system defined by the soft-body world node's
- * transform (AVBDSoftWorld3D's local space), or the server's world for the physics-server
- * path - the two agree because a server scene has no intermediate world transform.
- */
+/* Godot Y-up <-> solver Z-up: sim=(x,-z,y)=+90 deg about X (Godot +Y->sim +Z, +Z->sim -Y);
+ * solver gravity is -Z and boxes are centres with full widths. Core: savant117/avbd-demo3d (MIT). */
 
 #ifndef AVBD_GODOT_CONVERT_HPP
 #define AVBD_GODOT_CONVERT_HPP
@@ -41,9 +27,8 @@ inline godot::Vector3 to_godot(const avbd::float3 &v) {
     return godot::Vector3(v.x, v.z, -v.y);
 }
 
-// A direction expressed on a Godot axis, in solver space. Anything that names an *axis index*
-// rather than passing a vector - per-axis joint modes, limits and springs - has to go through
-// this, or it will drive the wrong axis: Godot Y is solver Z, and Godot Z is solver -Y.
+// Axis indices (per-axis joint modes, limits, springs) must go through here or they drive
+// the wrong axis: Godot Y is solver Z, Godot Z is solver -Y.
 inline avbd::float3 axis_to_sim(int p_godot_axis) {
     return to_sim(p_godot_axis == 0 ? godot::Vector3(1, 0, 0)
                                     : (p_godot_axis == 1 ? godot::Vector3(0, 1, 0)
@@ -106,9 +91,8 @@ inline avbd::float3 point_to_sim(const godot::Transform3D &world_global, const g
     return to_sim(world_global.affine_inverse().xform(p));
 }
 
-// Property value to solver stiffness: strictly negative means "infinitely stiff"
-// (a hard constraint). Godot floats and scene files cannot carry infinity, so the
-// sentinel keeps the property serialisable. Zero disables the constraint.
+// Stiffness: strictly negative is the "infinitely stiff" sentinel (hard constraint), since
+// Godot floats/scenes cannot carry infinity; zero disables the constraint.
 inline float stiffness_from_property(double p_value) {
     return p_value < 0.0 ? std::numeric_limits<float>::infinity() : (float)p_value;
 }

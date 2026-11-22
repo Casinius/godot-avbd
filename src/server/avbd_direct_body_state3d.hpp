@@ -1,21 +1,11 @@
 /*
  * AVBDDirectBodyState3D - the PhysicsDirectBodyState3D the server hands the engine.
- *
  * Part of godot-avbd. Solver core ported from github.com/savant117/avbd-demo3d (MIT).
- *
- * Godot's body state sync callback contract (verified against Godot 4.7,
- * scene/3d/physics/rigid_body_3d.cpp `_body_state_changed` and
- * modules/godot_physics_3d/godot_body_3d.cpp `call_queries`) is a *single argument*:
- * a PhysicsDirectBodyState3D. The same instance is also the first argument of the
- * force integration callback, followed by the stored userdata.
- *
- * One instance per space is cached by the server and re-pointed at each body before
- * the callbacks run, so the engine never holds a stale view. Every getter reads the
- * avbd::Rigid live; setters write straight through to it, mirroring what the engine's
- * own `_integrate_forces` users expect.
- *
- * The converter lives in src/nodes/godot_convert.hpp and maps Godot's Y-up scene
- * space onto the solver's Z-up space.
+ * Callback contract (verified vs Godot 4.7): ONE PhysicsDirectBodyState3D argument; the same
+ * instance is also the first force-integration callback argument, followed by the userdata.
+ * One instance per space is cached and re-pointed at each body, so the engine sees no stale view;
+ * getters read the avbd::Rigid live and setters write straight through.
+ * Converter: src/nodes/godot_convert.hpp maps Godot Y-up onto the solver's Z-up.
  */
 
 #ifndef AVBD_DIRECT_BODY_STATE3D_HPP

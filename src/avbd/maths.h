@@ -8,19 +8,9 @@
  * of this software for any purpose.
  * It is provided "as is" without express or implied warranty.
  *
- * Math layer over linalg.h (sgorsten, Unlicense). The types are linalg aliases
- * with the storage layout the rest of the engine always assumed:
- *   float3   linalg::vec<float,3>          - {x, y, z}
- *   float3x3 linalg::mat<float,3,3>        - column-major, m[col][row]
- *   quat     linalg::vec<float,4>          - {x, y, z, w}, Hamilton product
- *
- * Differences from Eigen that the port had to respect:
- *   - linalg's `operator*` is component-wise between two operands of the same
- *     shape (cmul); algebraic products are `mul(...)`, `dot(...)`, `qmul(...)`,
- *     `qrot(...)` and `outerprod(...)`.
- *   - Eigen's `m(row, col)` maps to linalg's `m[col][row]`.
- *   - Eigen's Quaternion ctor was (w, x, y, z); linalg stores {x, y, z, w}.
  */
+// Math over linalg.h: engine layout (float3x3 m[col][row], quat {x,y,z,w}); operator* is
+// component-wise, use mul/dot/qmul/qrot/outerprod; transpose for rows (Eigen term order kept where noted).
 
 #pragma once
 
@@ -37,10 +27,8 @@ using float3 = linalg::aliases::float3;
 using float3x3 = linalg::aliases::float3x3;
 using quat = linalg::aliases::float4;
 
-// The linalg free functions the engine calls unqualified, re-exported so the
-// call sites read `dot(a, b)` / `normalize(v)` without a linalg:: qualifier.
-// Scalar overloads of std::min/std::max/std::clamp are always named with the
-// std:: prefix at the call sites, so nothing here collides.
+// Re-export linalg free functions so call sites read `dot(a,b)` unqualified; scalar std::min/max/
+// clamp are always std::-qualified at call sites, so nothing collides.
 using linalg::abs;
 using linalg::cross;
 using linalg::dot;
@@ -55,11 +43,8 @@ using linalg::qconj;
 using linalg::rotation_quat;
 using linalg::transpose;
 
-// Eigen reduces a 4-vector's squared norm as (x^2+z^2)+(y^2+w^2) (its SSE lane
-// pairing), while linalg folds left-to-right; the orders round differently, so the
-// quaternion helpers below keep the reference rounding. Non-template overloads win
-// over the linalg templates for vec<float,4> arguments; 2- and 3-component vectors
-// fall through to linalg's, which already match Eigen's scalar order.
+// Keep Eigen's (x^2+z^2)+(y^2+w^2) reduction order (linalg folds left-to-right; different
+// rounding). Non-template overloads win for vec<float,4>; smaller vectors use linalg's matching order.
 [[nodiscard]] inline float qlength2(quat q) noexcept
 {
     return (q.x * q.x + q.z * q.z) + (q.y * q.y + q.w * q.w);
@@ -75,11 +60,8 @@ using linalg::transpose;
     return quat{-q.x, -q.y, -q.z, q.w} / qlength2(q);
 }
 
-// Quaternion rotate and rotation matrix, written with Eigen's operation order
-// (t = 2*(z x v); v + w*t + z x t, and the tx/ty/... factorisation). linalg's own
-// qrot/qmat expand different-but-equivalent expressions whose rounding differs by
-// ulps; on stiff, chaotic scenes (joint lattices, pyramids) that drift compounds
-// into visibly different behaviour, so the port keeps the reference rounding.
+// Use Eigen's operation order (t=2*(z x v); v+w*t+z x t, tx/ty/... factorisation): linalg's
+// equivalent expressions round by differing ulps, and on stiff scenes (lattices, pyramids) drift compounds.
 [[nodiscard]] inline float3 qrot(quat q, float3 v) noexcept
 {
     const float3 z{q.x, q.y, q.z};
@@ -94,10 +76,8 @@ using linalg::transpose;
     const float twx = tx * q.w, twy = ty * q.w, twz = tz * q.w;
     const float txx = tx * q.x, txy = ty * q.x, txz = tz * q.x;
     const float tyy = ty * q.y, tyz = tz * q.y, tzz = tz * q.z;
-    // Column-major: each braced float3 is a COLUMN, so column j reads (R0j, R1j, R2j).
-    // The R12/R21 pair is (tyz - twx, tyz + twx); exchanging them makes the matrix neither
-    // a rotation nor a transpose, and everything built on it silently uses the wrong
-    // orientation - the broad-phase bounds then exclude pairs that really overlap.
+    // Each braced float3 is a COLUMN. R12/R21 = (tyz - twx, tyz + twx): do not swap - that is
+    // neither a rotation nor a transpose, and broad-phase bounds would exclude real overlaps.
     return float3x3{
             {1.0f - (tyy + tzz), txy + twz, txz - twy},
             {txy - twz, 1.0f - (txx + tzz), tyz + twx},
@@ -123,9 +103,8 @@ using linalg::cmul;
     return float3x3{float3{m00, 0.0f, 0.0f}, float3{0.0f, m11, 0.0f}, float3{0.0f, 0.0f, m22}};
 }
 
-// Right-handed orthonormal frame with the given unit vector as its first ROW (the contact
-// normal). The manifold code reads the frame axes with row()/mul(), which use the matrix's
-// rows, so the axes must end up there: linalg matrices are column-major, hence transpose.
+// Right-handed frame with the normal as its first ROW. The manifold reads rows via row()/mul(),
+// so linalg's column-major storage is transposed to put the axes in rows.
 [[nodiscard]] inline float3x3 orthonormal(float3 normal) noexcept
 {
     float3 t1 = std::fabs(normal.x) > std::fabs(normal.z)
@@ -162,9 +141,8 @@ inline constexpr quat quatIdentity{0.0f, 0.0f, 0.0f, 1.0f};
   return float3{d.x, d.y, d.z} * 2.0f;
 }
 
-// First-order quaternion integration, as the original custom maths did: half of omega (as a
-// pure quaternion) left-multiplied, then renormalised. The added rotation vector is the same
-// small-angle quantity `operator-(quat, quat)` measures.
+// First-order integration: half omega (pure quaternion) left-multiplied, then renormalised; the
+// added vector is the same small-angle quantity `operator-(quat,quat)` measures.
 [[nodiscard]] inline quat operator+(quat a, float3 b) noexcept {
   // A pure quaternion has w = 0; the product's coefficients are added to a's, w included,
   // exactly as Eigen's coeffs()+ chain did, then the result is renormalised.
@@ -173,28 +151,8 @@ inline constexpr quat quatIdentity{0.0f, 0.0f, 0.0f, 1.0f};
   return normalize(quat{a.x + p.x * 0.5f, a.y + p.y * 0.5f, a.z + p.z * 0.5f, a.w + p.w * 0.5f});
 }
 
-// Solve the symmetric 6x6 system [aLin  aCross^T; aCross  aAng] x = [bLin;
-// bAng].
-//
-// Two kernels, one bounded-update policy:
-//   1. Fixed-size LDL^T - stack-only, ~200 ns kernel. The workhorse.
-//   2. Fixed-size pivoted LDL^T - diagonal pivoting, different rounding. Retry
-//      path when (1) is not sane.
-//   3. Zero update - last resort when neither kernel is sane.
-// "Sane" means finite and < 10 m per component: an update is velocity*dt plus a position
-// correction, so 10 m is orders past anything physical. Degenerate blocks (thin cylinders
-// standing on end produce near-singular stiffness ratios ~1e6) used to let one wild pivot
-// compound into e15-scale positions; the policy caps every solve at the physical bound.
-// The fixed kernel's rounding differs from the old dynamic-Eigen implementation, which
-// re-anchors every state digest - accepted on the real-time branch.
-// Fixed-size 6x6 LDL^T without pivoting, over an already-assembled system. The
-// system is dominated by the M/dt^2 diagonal (a 1 kg body at 240 Hz carries a
-// 57,600 kg/s^2 diagonal against ~1e4 penalty terms), so the pivot growth symmetric
-// pivoting exists for does not occur here, and dropping it lands the kernel an order
-// of magnitude cheaper. Plain sequential float ops keep the result bit-identical for
-// every thread count. Returns false on a degenerate pivot (non-positive D, which a
-// near-singular block can produce) or an unsane solution - callers retry with the
-// pivoted path in solve() below.
+// Solve 6x6: LDL^T (~200 ns) -> pivoted LDL^T -> zero; sane = finite <10 m (~1e6 stiffness gave e15).
+// M/dt^2 dominates (1 kg@240 Hz: 57,600 vs ~1e4); sequential float ops bit-identical, false -> retry pivoted.
 inline bool ldlt6_solve(const std::array<std::array<float, 6>, 6> &a, const std::array<float, 6> &b,
                         std::array<float, 6> &x) noexcept {
   std::array<std::array<float, 6>, 6> l{};
@@ -239,19 +197,8 @@ inline bool ldlt6_solve(const std::array<std::array<float, 6>, 6> &a, const std:
   return std::isfinite(worst) && worst < 1.0e1f;
 }
 
-// Pivoted LDL^T, a faithful port of Eigen's LDLT (ldlt_inplace<Lower>::unblocked
-// plus LDLT::_solve_impl_transposed) over the fixed 6x6 arrays. This is the
-// rounding fallback the Eigen dynamic-LDLT retry used to provide, and it must
-// reproduce Eigen's behaviour bit for bit, because the retry fires on indefinite
-// blocks (negative geometric stiffness can push a diagonal below zero) where the
-// two factorisations otherwise pick different pivots and the solutions diverge:
-//   - pivot = largest |diagonal| of the trailing block, first maximum wins;
-//   - the pivot threshold is exactly zero (a negative pivot is a valid pivot);
-//   - a zero pivot fails only if the remaining column is non-zero, or when a
-//     later step is non-zero after a zero one was accepted;
-//   - the solve divides by |d| > numeric_limits<float>::min() and zeroes the
-//     component otherwise (Eigen's pseudo-inverse of D);
-//   - the permutation is applied as running swaps, P forward then P^T backward.
+// Pivoted LDL^T: bit-for-bit port of Eigen's LDLT (do not change); for indefinite blocks (pivots diverge).
+// largest |diag| first-max, zero threshold; zero pivot fails on non-zero remainder; |d|>min else 0; swaps P then P^T.
 inline bool ldlt6_pivoted_solve(const std::array<std::array<float, 6>, 6> &a_in, const std::array<float, 6> &b,
                                 std::array<float, 6> &x) noexcept {
   std::array<std::array<float, 6>, 6> a = a_in; // working copy; lower triangle becomes L and D

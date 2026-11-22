@@ -27,6 +27,7 @@
 
 namespace avbd {
 
+// Warm every force for the step and drop inactive ones; returns the non-manifold force count.
 int Solver::warmstartForces()
 {
     const int forceCount = collectForces();
@@ -35,9 +36,8 @@ int Solver::warmstartForces()
         forceActive[i] = forceOrder[i]->initialize() ? 1 : 0;
     }, kMinForcesPerDispatch);
 
-    // One pass both reaps and compacts: `forceOrder` is list order, and deleting a force
-    // only unlinks it from that list, so the survivors keep the exact order a second
-    // collectForces() would produce.
+    // Reap and compact in one pass: forceOrder is list order and deletion only unlinks, so
+    // survivors keep the exact order a second collectForces() would produce.
     int write = 0;
     for (int i = 0; i < forceCount; i++)
     {
@@ -63,9 +63,8 @@ int Solver::warmstartForces()
                     (int)manifolds.frozen(slot));
     }, kMinForcesPerDispatch);
 
-    // Dormant manifolds (contact grace) keep their slot and hot state for a few ticks
-    // instead of being reaped. initialize only enters dormancy while the grace setting is
-    // positive, so with the default 0 this branch never fires.
+    // Contact-grace dormancy keeps a manifold's slot and hot state; grace defaults to 0, so
+    // this reaping exception never fires with default settings.
     int liveWrite = 0;
     for (int i = 0; i < manifoldCount; i++)
     {
@@ -105,19 +104,14 @@ int Solver::warmstartForces()
     return liveForceCount;
 }
 
-// Compute one body's inertial position and warm-start it (Eq. 2 and the adaptive
-// warm-start of the original VBD paper).
-//
-// Per-body and independent, so `runSubstep` dispatches it as an independent batch. It
-// covers static bodies as well: their poses do not move, but the constraint code reads
-// their cached `initialLin`/`initialAng`.
+// Inertial position and adaptive warm start (VBD paper Eq. 2), dispatched as an independent
+// batch; static bodies are included because constraint code reads their cached initial pose.
 void Solver::warmstartBody(int i)
 {
     Rigid *body = warmstartOrder[i];
 
-    // Axis locks (Godot BodyAxis): a locked axis cannot carry velocity into the step,
-    // and gravity does not act along a locked linear axis. Constraint coupling can
-    // still displace a locked axis within a step; documented approximation.
+    // Godot BodyAxis locks zero velocity on locked axes; coupling can still displace them within
+    // a step - the documented approximation.
     maskLockedLinear(body->axisLockLinear, body->velocityLin);
     maskLockedAngular(body->axisLockAngular, body->velocityAng);
 
@@ -147,26 +141,8 @@ void Solver::warmstartBody(int i)
     }
 }
 
-// One region body for the whole iteration set: `iterations` rounds of the
-// colour-parallel Gauss-Seidel primal followed by a dual pass, with a barrier
-// fence at every phase boundary.
-//
-// The primal runs colour by colour: every body of colour c assembles its full
-// block system against the poses the earlier colours already applied, solves it
-// and applies the update immediately - Gauss-Seidel across colours, parallel
-// and race-free within one (a colour is an independent set of the constraint
-// graph by construction). Manifolds take the self-contained updatePrimal path,
-// which consumes the previous round's cache for the first touch and recomputes
-// once for the second; each manifold is seen by at most one body per colour, so
-// nothing races.
-//
-// The colouring is capped at kMaxColours so the barrier count per round is
-// bounded; bodies the greedy colouring could not fit run one block-Jacobi round
-// after the colours (precompute, solve against the post-colour snapshot,
-// combine), using jacobiRelaxation as the combine control.
-//
-// NullSync (small scenes) runs the identical body inline in list order, which is
-// exactly the threads=1 reference the digest tests compare against.
+// One body's BDF1 velocity after the final iteration. Independent per body, so it runs as a
+// parallel batch; static bodies are included only for bookkeeping.
 void Solver::finishBody(int i, bool idleDetection)
 {
     Rigid *body = warmstartOrder[i];
@@ -181,16 +157,8 @@ void Solver::finishBody(int i, bool idleDetection)
     // lock's promise is "this axis does not move" to whoever reads state back.
     maskLockedLinear(body->axisLockLinear, body->velocityLin);
     maskLockedAngular(body->axisLockAngular, body->velocityAng);
-    // Idle detection: a movable, non-sleeping body whose velocities stayed under both
-    // thresholds for sleepFrames consecutive steps falls asleep (velocity zeroed,
-    // Godot semantics). Only touches this body's fields, so it is safe inside the
-    // parallel dispatch and deterministic regardless of thread count.
-    // Automatic sleep only for bodies whose host allows it (sleep_mode == SLEEP).
-    // A body with can_sleep=false used to enter idle sleep here anyway; the next
-    // selection then simulated it again (sleep_mode NEVER), but the finish stage
-    // skipped its velocity update because `sleeping` was still set - the body
-    // moved with a permanently zero velocity, and contacts could pump it upward
-    // indefinitely. That was the pyramid_dbl runaway.
+    // Idle sleep needs sleep_mode == SLEEP; it touches only per-body fields, so it is thread-count
+    // independent. Dropping the mode gate caused the pyramid_dbl zero-velocity runaway.
     if (idleDetection && sleepFrames > 0 && body->mass > 0 && !body->sleeping && body->sleep_mode == 1)
     {
         if (length2(body->velocityLin) < sleepLinearThreshold * sleepLinearThreshold &&
@@ -206,19 +174,11 @@ void Solver::finishBody(int i, bool idleDetection)
         }
     }
 }
-// Island-wide sleep bookkeeping. Movable, sleep-enabled bodies are grouped into islands
-// through force connectivity (union-find over the flattened body list; static bodies and
-// sleep_mode == NEVER bodies join nothing and never propagate). An island where every
-// member cleared idle detection this step (stillFrames >= sleepFrames or already
-// sleeping) is put to sleep as a unit: Godot semantics, and it removes the
-// partially-assembled-chain edge case where the bottom box qualifies a step before the
-// boxes above it. Deterministic: the union-find walks the force list in list order and
-// the minimum-body-index island representative is independent of visit order.
+// Force-connected sleep-enabled bodies sleep as one island (fixes the bottom-of-chain edge case);
+// static/NEVER bodies join none. Union-find in list order + min-index rep make it order-independent.
 void Solver::islandSleep()
 {
-    // Only bodies that can sleep join an island. With the default sleepFrames = 0 this
-    // whole pass is skipped by the caller, so the core suite (which never sets
-    // sleep_mode) is unaffected.
+    // Only sleep-enabled bodies join; sleepFrames = 0 makes the caller skip this pass entirely.
     islandBodies.clear();
     for (Rigid *body = bodies; body != 0; body = body->next)
         if (body->mass > 0 && body->sleep_mode == 1)
@@ -289,10 +249,8 @@ void Solver::islandSleep()
     }
 }
 
-// The primal half of one iteration for a single body (Eqs. 4-6): assemble the 6x6 system
-// from every force acting on the body, then solve it and move the body.
-//
-// Solve the assembled system and move the body by the result (Eq. 4).
+// Solve the assembled 6x6 block and move the body by the result (Eq. 4); this function does not
+// assemble - each force stamps its own block in the primal pass.
 void Block::apply(Rigid &body) const noexcept
 {
     float3 dxLin, dxAng;
@@ -301,32 +259,14 @@ void Block::apply(Rigid &body) const noexcept
     body.positionAng = body.positionAng + dxAng;
 }
 
-// Colour-parallel Gauss-Seidel: bodies sharing a force never solve at the same
-// instant, so each colour is an independent set - one barrier per colour carries
-// the Gauss-Seidel ordering, and the result is deterministic for a fixed
-// colouring no matter the thread count.
-//
-// The colouring is capped at kMaxColours: a body whose neighbours already used
-// every colour goes to the overflow bucket, which the primal runs as one
-// block-Jacobi round (every delta solved against the same post-colour snapshot,
-// then combined). The bucket costs three barriers when non-empty and is empty in
-// every ordinary scene; it exists so a pathological clique cannot make the
-// barrier count unbounded.
-//
-// The wake-up and island-sleep logic is unchanged from the colouring era: a sleeping body
-// sharing a force with a moving movable body re-enters the update set, and settled
-// islands sleep together.
+// The step's movable, awake bodies, in deterministic list order; everything else is skipped.
 void Solver::selectUpdateBodies()
 {
     warmstartOrder.clear();
     updateOrder.clear();
 
-    // Wake-up pass: a sleeping body (sleep_mode enabled) sharing a force with a moving
-    // movable body is woken before selection, so it re-enters this step's update set.
-    // A neighbour that is itself below the idle thresholds is not a disturbance: stacks
-    // must be allowed to fall asleep together, one body at a time. Serial and read-only
-    // over the force adjacency apart from the examined body itself, so the outcome is
-    // fixed regardless of thread count.
+    // A sleeping body sharing a force with a moving neighbour re-enters the update set; a
+    // below-threshold neighbour is no disturbance (stacks sleep together). Serial: thread-count independent.
     if (sleepFrames > 0)
     {
         const float lin2 = sleepLinearThreshold * sleepLinearThreshold;
@@ -362,19 +302,16 @@ void Solver::selectUpdateBodies()
         body->updateIndex = -1;
         body->contactOnly = true;
 
-        // Sleep mode support (Godot 4.7 API)
-        // SLEEP_MODE_NEVER: always update
-        // SLEEP_MODE_SLEEP: update unless idle detection has put it to sleep
-        // SLEEP_MODE_START_IN_SLEEP: start in sleep
+        // Godot 4.7 sleep modes: NEVER always updates, SLEEP skips when idle-sleeping,
+        // START_IN_SLEEP starts asleep and wakes on motion or forces.
         if (body->mass > 0)
         {
             // Check if body should be updated based on sleep mode
             bool should_update = true;
             if (body->sleep_mode == 1) // SLEEP_MODE_SLEEP
             {
-                // Idle detection (finishBody) is the only way into sleep here;
-                // a sleeping body with contacts stays out of the update set until the
-                // wake-up pass above re-admits it.
+                // finishBody's idle detection is the only way in; a sleeping body stays out
+                // until the wake-up pass above re-admits it.
                 if (body->sleeping)
                     should_update = false;
             }
@@ -410,10 +347,8 @@ void Solver::selectUpdateBodies()
     bodyDeltaLin.resize(updateOrder.size());
     bodyDeltaAng.resize(updateOrder.size());
 
-    // Overflow-bucket eligibility: a body carrying any non-manifold force (joint, spring,
-    // world anchor) is routed into the overflow bucket by colourGraph - the contact map
-    // is clamped, hard joints do not tolerate the snapshot solve. Every force in the
-    // list is non-manifold; contacts do not count.
+    // Any non-manifold force (joint, spring, anchor) routes a body to colourGraph's overflow
+    // bucket: hard joints cannot tolerate the clamped contact snapshot solve.
     for (Force *f = forces; f != 0; f = f->next)
     {
         if (f->bodyA != 0)
@@ -425,14 +360,8 @@ void Solver::selectUpdateBodies()
     colourGraph();
 }
 
-// Greedy colouring of the update set's constraint graph, in updateOrder order:
-// each body takes the smallest colour none of its already-coloured neighbours
-// holds, capped at kMaxColours. The order is the body list order, so the colour
-// assignment is a pure function of the scene - deterministic regardless of
-// thread count. Neighbours are found through the bodies' own force lists; a
-// body not yet coloured (later in the order) constrains nothing, and overflow
-// neighbours never block a colour because the overflow bucket runs Jacobi
-// against a snapshot and is safe to overlap with any colour.
+// Independent sets of the constraint graph, capped at kMaxColours; the rest go to the
+// block-Jacobi overflow bucket. Colour order is the Gauss-Seidel order and is deterministic.
 void Solver::colourGraph()
 {
     const int n = static_cast<int>(updateOrder.size());

@@ -43,13 +43,8 @@ static bool pairOverlaps(const ForceAdjacency &adjacency, const ManifoldStore &m
     const bool layersAllow = ((bodyA->collisionLayer & bodyB->collisionMask) != 0) ||
             ((bodyB->collisionLayer & bodyA->collisionMask) != 0);
     const bool constrained = pairConstrained(adjacency, manifolds, bodyA, bodyB);
-    // Two static bodies can never need a contact: neither can move, and the solver has no
-    // update for either. Without this the pair still got a manifold slot in broadPhase,
-    // and `ManifoldStore::frozen()` then reported it alive every step (both sides are
-    // immovable), so `warmstartForces` kept a zero-contact manifold forever - one store
-    // slot and eight contact records per overlapping pair of static bodies, on a terrain
-    // made of static boxes for instance. A pair that both *sleep* is a different thing: its
-    // manifold carries the state that has to survive until it wakes, so only mass 0 counts.
+    // Two static (mass 0) bodies need no contact: without this they hold a frozen zero-contact
+    // manifold forever. Sleeping pairs differ - their manifold must survive to wake, so only mass 0.
     const bool bothStatic = bodyA->mass <= 0.0f && bodyB->mass <= 0.0f;
     if (verbose)
     {
@@ -69,11 +64,8 @@ static bool pairOverlaps(const ForceAdjacency &adjacency, const ManifoldStore &m
     return boundsOverlap && layersAllow && !constrained && !bothStatic;
 }
 
-// A sleeping body whose swept AABB touches a moving movable body wakes up. AABBs are
-// already grown by the speculative margin, so a touch here means "these two meet within the
-// tick"; no real contact is needed. Serial by construction (called from broadPhase's pair
-// loop): the fields are plain bools/ints and two pairs sharing a body used to write them
-// from two threads.
+// Swept AABBs already include the speculative margin, so a touch wakes a sleeper within the tick
+// without real contact. Serial by construction: parallel pairs sharing a body raced on bools.
 static void wakeSleeperPair(Rigid *a, Rigid *b) noexcept
 {
     if (a->sleeping && !b->sleeping && b->mass > 0.0f)
@@ -88,13 +80,8 @@ static void wakeSleeperPair(Rigid *a, Rigid *b) noexcept
     }
 }
 
-// Contact detection: the Morton LBVH broad phase, rebuilt or refit every step.
-//
-// It indexes the swept world AABBs and emits packed pair candidates. The surrounding
-// pipeline - pair sort, layer/constraint filter, manifold creation - is shared.
-//
-// Determinism: pair collection is integer-sorted and de-duplicated, and the final
-// (min-index, other) sort fixes the manifold creation order.
+// Morton LBVH over swept AABBs, rebuilt/refit each step; pair sort, filter and manifold creation
+// are shared. Determinism: integer sort + dedup and (min-index, other) order fix creation order.
 void Solver::broadPhase()
 {
     bodiesInOrder.clear();
@@ -104,19 +91,15 @@ void Solver::broadPhase()
     for (int i = 0; i < count; i++)
         bodiesInOrder[i]->broadIndex = i;
 
-    // Pair existence and AABB wake-up read the constraint graph, so it has to be current
-    // before the candidate filter runs. Built again after warm-starting, when the live
-    // manifold set has changed.
+    // Pair filter and AABB wake-up read the constraint graph; rebuild it again after warm-starting
+    // changes the live manifold set.
     buildForceAdjacency();
 
     if (count < 2)
         return;
 
-    // Swept bounds: the union of the body's AABB at the step start and at the step end.
-    // For linear motion that union is exact - centred at p + disp/2 with half extent
-    // h + |disp|/2 - and the rotation term conservatively grows it by the arc a point at
-    // the bounding radius sweeps. The speculative margin is the last growth, which is
-    // what lets a pair whose surfaces are about to meet enter the narrow phase.
+    // Swept bounds = start/end AABB union: exact for linear motion (centre p + disp/2, extent
+    // h + |disp|/2), grown for rotation then speculativeMargin so near-misses reach narrow phase.
     bodyAabbHalf.resize(static_cast<size_t>(count));
     bodyAabbCenter.resize(static_cast<size_t>(count));
     pool->forCount(count, [this](int i) {
@@ -169,19 +152,13 @@ void Solver::broadPhase()
         if (!broadPairValid[k]) continue;
         const int i = pairFirst(sweepPairs[k]);
 
-        // 睡眠 + awake 的 AABB 重叠就唤醒。不需要真实接触——AABB 已经含 margin，
-        // 重叠意味着"下几个 substep 内会碰"。
-        //
-        // 这一步必须在串行阶段：`sleeping`/`stillFrames` 是普通字段，两个候选 pair
-        // 在并行 filter 里同时写同一个 body 是数据竞争（C++ 里就是 UB，TSAN 会报）。
-        // 放在这里还有一个好处：顺序由排好序的 pair 表决定，唤醒结果与线程数无关。
+        // 睡眠体与 awake 可动体的 swept AABB（已含 margin）重叠即唤醒，无需真实接触。
+        // 必须在此串行执行：并行写 sleeping/stillFrames 是 UB；顺序由排序后的 pair 表决定，与线程数无关。
         wakeSleeperPair(bodiesInOrder[pairFirst(sweepPairs[k])],
                 bodiesInOrder[pairSecond(sweepPairs[k])]);
         const int j = pairSecond(sweepPairs[k]);
-        // A dormant manifold (contact grace) let this pair back into the candidate set
-        // (pairConstrained skips dormant ones so overlap can wake sleepers); it will
-        // revive in its own initialize(), so creating a second manifold here would double
-        // the pair's constraints.
+        // A dormant contact-grace manifold is in the candidate set so overlap can wake sleepers;
+        // it revives in its own initialize() - creating another here would double constraints.
         bool exists = false;
         for (const ForceRef &ref : forceAdjacency.of(i))
         {
@@ -205,16 +182,5 @@ void Solver::broadPhase()
     }
 
 }
-
-// Bring every force up to date for this step, and drop the ones that have gone inactive.
-//
-// Initialising is independent work - a force only reads the body poses and writes its own
-// warm-started state - so it runs in parallel. Deleting is not: an inactive force (a
-// broken joint) unlinks itself from the solver and from both bodies' lists, so that
-// mutation happens in one thread, in list order, once the parallel pass has finished.
-// Manifolds live in the store, so "deleting" one is removing its slot from the live list
-// and returning it to the free list.
-//
-// Returns the number of non-manifold forces left, and leaves `forceOrder` indexing those.
 
 } // namespace avbd

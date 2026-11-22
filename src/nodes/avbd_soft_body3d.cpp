@@ -25,10 +25,8 @@ namespace {
 // in this module (Godot x -> sim x, Godot y -> sim z, Godot z -> sim y).
 constexpr int SIM_AXIS[3] = {0, 2, 1};
 
-// Offset of `p_distance` along a Godot axis, expressed in solver space. The
-// conversion is the same one positions use, because the mapping flips one sign:
-// Godot +Z points along solver -Y, so the neighbour offsets are not symmetric in
-// the two frames.
+// Offset along a Godot axis in solver space (Godot +Z -> sim -Y): the same conversion
+// positions use, with a sign flip so neighbour offsets are asymmetric across frames.
 avbd::float3 axis_offset(int p_godot_axis, float p_distance) {
     const godot::Vector3 unit = p_godot_axis == 0 ? godot::Vector3(1, 0, 0)
                                                   : (p_godot_axis == 1 ? godot::Vector3(0, 1, 0)
@@ -205,9 +203,8 @@ void AVBDSoftBody3D::_build(avbd::Solver &p_solver, const Transform3D &p_node_in
         }
     }
 
-    // Rigid links along every axis, plus collision suppression for the diagonal
-    // neighbours that the links do not already cover (constraint-connected pairs
-    // never collide, see Rigid::constrainedTo).
+    // Rigid links along every axis, plus collision suppression for diagonal neighbours the
+    // links miss (constraint-connected pairs never collide, see Rigid::constrainedTo).
     const float k_linear = stiffness_from_property(stiffness_linear);
     const float k_angular = stiffness_from_property(stiffness_angular);
 

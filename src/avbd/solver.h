@@ -35,17 +35,12 @@ namespace detail {
 class JobPool;
 }
 
-// Work per item differs by orders of magnitude between the phases below, so each one gets
-// its own break-even batch size. Measured on a 12-core machine: one dispatch into the pool
-// costs ~45 us, a body's primal update ~1 us, one manifold's contact solve ~85 ns, and a
-// dual update ~200 ns. Break-even is therefore roughly 45 bodies, 500 contact solves and
-// 250 dual updates - i.e. a scene has to be a few hundred bodies before splitting a phase
-// across threads pays for the dispatch itself.
+// Each phase has its own break-even batch size. Measured on 12 cores: dispatch ~45 us, primal ~1 us,
+// contact solve ~85 ns, dual ~200 ns; break-even ~45 bodies / 500 solves / 250 duals.
 constexpr int kMinBodiesPerDispatch = 48;
 constexpr int kMinForcesPerDispatch = 256;
-// The broad phase's per-body preparation (AABB bound, level, cell key) costs tens of
-// nanoseconds per body, so a dispatch only pays off at a much larger batch than a body's
-// primal update does (~1 us). Below this the loop runs inline and saves the round trip.
+// Broad-phase per-body preparation (AABB, level, cell key) costs tens of ns vs ~1 us for a primal update,
+// so dispatch pays only at a much larger batch; below this the loop runs inline and saves the round trip.
 constexpr int kMinBodiesPerCheapDispatch = 512;
 
 // Core solver class which holds all the rigid bodies and forces, and has logic to step the simulation forward in time
@@ -64,32 +59,20 @@ struct Solver
     float betaAng = 100.0f;    // Penalty ramping for angular constraints
     float gamma = 0.999f;      // Warmstarting decay, < 1
 
-    // Primal rounds the current step actually runs (set by step()/stepInterleaved before
-    // any constraint is touched). A constraint penalty is only as stiff as the iteration
-    // budget can resolve, so the joint penalty cap reads this: the augmented-Lagrangian
-    // dual gains `penalty * C` every round, and a penalty that a long iteration set
-    // converges with makes a short one diverge into a launcher. See
-    // GenericJoint::penaltyLimit.
+    // Rounds actually run this step (set before any constraint is touched). The joint penalty cap reads it:
+    // a penalty stable over many rounds launches a short run. See GenericJoint::penaltyLimit.
     int roundsThisStep = 8;
 
-    // Round split: the first ceil(newtonRatio * rounds) rounds run the full primal (the
-    // dense 6x6 block solve); the rest skip the primal and run dual-only relaxation on the
-    // existing forces, with contact stiffness decayed by `stiffnessDecay` per round so the
-    // cheap rounds finish what the Newton rounds started instead of fighting a stiff ramp.
-    // 1.0 / 1.0 = every round is a Newton round (historical behaviour).
+    // First ceil(newtonRatio * rounds) rounds run the full 6x6 primal; the rest are dual-only with contact
+    // stiffness decayed by stiffnessDecay. 1.0/1.0 = all-Newton (historical behaviour).
     float newtonRatio = 1.0f;
     float stiffnessDecay = 1.0f;
 
-    // Adaptive beta: a per-contact multiplier on betaLin, carried across steps with the
-    // warm start. A contact whose penetration did not shrink against last step doubles its
-    // multiplier (capped at ADAPTIVE_BETA_MAX); a converging one halves it back toward 1.
-    // This is the augmented-Lagrangian kappa update applied per constraint: a loaded stack
-    // contact stiffens until it actually carries its share, instead of every contact
-    // sharing one global ramp rate.
+    // Per-contact betaLin multiplier carried in the warm start: doubles if penetration did not shrink
+    // (capped at ADAPTIVE_BETA_MAX), halves if converging. Per-constraint augmented-Lagrangian kappa update.
     bool adaptiveBeta = false;
-    // Residual penetration (metres) at or below which a contact counts as solved: the
-    // multiplier decays instead of doubling, so float noise on a resting contact cannot
-    // ratchet it to the cap.
+    // Residual penetration (m) at or below which a contact counts as solved: multiplier decays rather than
+    // doubles, so float noise cannot ratchet a resting contact to the cap.
     float adaptiveBetaErrorFloor = 1e-3f;
 
 #ifdef AVBD_DIAG
@@ -105,55 +88,28 @@ struct Solver
     Diag diag;
 #endif
 
-    // Early-exit threshold on the mean penetration residual: when a Newton round
-    // improves the average residual by less than this (or worsens it), the iteration set
-    // ends early - remaining rounds would polish float noise at full price. 0 disables
-    // the check. Realistic value ~1e-5.
+    // Early-exit when a Newton round improves mean penetration by less than this (or worsens it): further
+    // rounds would polish float noise. 0 disables; realistic ~1e-5.
     float convergenceThreshold = 0.0f;
 
-    // Combine-pass relaxation for the overflow bucket of the coloured primal - the
-    // bodies the greedy colouring could not fit inside kMaxColours, which run as one
-    // block-Jacobi round against a pose snapshot. Such a snapshot solve can overshoot
-    // where the coloured Gauss-Seidel updates do not; scaling the applied delta by
-    // omega < 1 trades per-iteration progress for stability. The
-    // bucket is empty in ordinary scenes, so these are tuning knobs for pathological
-    // constraint cliques. Suite sweep: 0.5-0.7 hold every rigid bucket scene; 1.0
-    // drifts a fully-cliqued stack.
+    // Relaxation for the block-Jacobi overflow bucket's combine pass: snapshot solves can overshoot, so
+    // scale the delta. Sweep: 0.5-0.7 hold all rigid bucket scenes; 1.0 drifts a cliqued stack.
     float jacobiRelaxation = 0.7f;
 
-    // Route every body whose forces are all contact manifolds (Rigid::contactOnly) into the
-    // block-Jacobi overflow bucket instead of the coloured Gauss-Seidel. True in a pile of
-    // boxes - which makes the bucket the whole primal for a contact-only scene, not an
-    // exception. False runs those bodies through the colouring.
-    //
-    // A/B on the 420-box double pyramid (`test_penetration.gd --pen-seconds=30`, identical
-    // wall time, 626 ms / 600-frame pyramid run either way):
-    //                        p50 pen   p99 pen   worst *settled*   max speed
-    //   true  (Jacobi)        8.0 mm    11.3 mm        15.3 mm        17.9 m/s
-    //   false (colour GS)     7.4 mm     8.8 mm        36.3 mm        18.4 m/s
-    // Gauss-Seidel improves the median (it is the better solver) but leaves a systematic
-    // tail: a pair that the colour order revisits last settles 3.6 cm deep, because the
-    // update order is a property of the scene, not of the load. Jacobi averages those
-    // order effects away and has the better worst case, so it stays the default until the
-    // colouring gets an ordering pass (lowest body first, or a random sweep per round).
-    // Exposed as `physics/avbd/contact_gs` on the Godot side.
+    // All-contact bodies use block-Jacobi, not colour GS: 420-box A/B worst 15.3 vs 36.3 mm
+    // (GS p50/p99 7.4/8.8 vs 8.0/11.3 mm); GS's 3.6 cm colour-order tail keeps Jacobi the default.
     bool contactOnlyOverflow = true;
 
-    // Anchor drift (metres) at which a sticky contact's frozen arms are re-adopted from the
-    // current collision pass. STICK_DRIFT_HEAL is the default; lowering it re-anchors more
-    // eagerly, which trades warm-start continuity for a C0 that always measures the surfaces
-    // that are actually touching.
+    // Anchor drift (m) at which sticky frozen arms are re-adopted from the collision pass. Defaults to
+    // STICK_DRIFT_HEAL; lowering trades warm-start continuity for a C0 on actually-touching surfaces.
     float stickDriftHeal = STICK_DRIFT_HEAL;
 
-    // Depth (metres) the constraint solve is allowed to see for one contact. A position-level
-    // step turns the correction it applies into velocity (v = dp/dt), so an unbounded deep
-    // overlap is expelled as a launch. This is the historical cap; see Solver docs.
+    // Depth (m) the solve sees per contact. Position correction becomes velocity (v = dp/dt), so an
+    // unbounded overlap launches bodies. Historical cap; see Solver docs.
     float maxPenetration = CONTACT_MAX_PENETRATION;
 
-    // Incremental arm-rebuild distance (metres): later rounds reuse a contact's cached
-    // world moment arms while the body rotations have drifted less than this from the
-    // captured pose. 0 disables caching (fresh arms every round; default).
-    // Realistic value 1e-4 (0.1 mm): in-iteration arm drift is millimetre-scale.
+    // Arm-rebuild threshold (m): later rounds reuse cached world arms until rotations drift this far.
+    // 0 disables caching (default); realistic 1e-4 (0.1 mm), as in-iteration arm drift is millimetre-scale.
     float jacobianRebuildDistance = 0.0f;
 
     // Base gap (metres), extended by predicted relative motion until the next collision refresh; 0 disables.
@@ -161,9 +117,8 @@ struct Solver
 
     // Position correction excludes resting contacts and does not feed displacement into velocity.
     bool positionProjection = true;
-    // Jacobi passes measure all contacts before moving bodies, avoiding manifold-order pose bias.
-    // `projectionIterations` is an upper bound: a pass whose worst remaining depth is below
-    // 1% of projectionSlop stops the loop, and sleeping/parked pairs are not walked at all.
+    // Jacobi passes measure before moving, avoiding manifold-order bias. projectionIterations is an upper
+    // bound: stop when worst depth < 1% of projectionSlop; sleeping/parked pairs are skipped.
     int projectionIterations = 4;
     float projectionBeta = 1.0f;
     // Leave millimetre-scale resting penetration to the penalty solve.
@@ -171,30 +126,16 @@ struct Solver
     // Per-body, per-pass cap on summed translation (metres) and rotation (radians); 0 is uncapped.
     float projectionMaxCorrection = 0.0f;
 
-    // Ticks a manifold whose pair slipped out of the swept AABBs stays dormant instead of
-    // being deleted. A reaped manifold loses its whole hot state - penalty ramp, duals,
-    // stick flags - so the impact-time feature churn (contacts flickering in and out as
-    // faces toggle) restarts every returning contact from the penalty floor, and a loaded
-    // stack pays that restart hundreds of times per tick. A dormant manifold keeps its
-    // contacts and hot state (it contributes nothing while separated: every solve loop
-    // walks contacts) and re-matches by feature key when the pair returns. Freshly formed
-    // contacts inside a live manifold also seed their penalty from 5% of betaLin instead
-    // of the floor while this is enabled. 0 = delete on first separation, as before.
+    // Separated pairs stay dormant (hot state kept, re-matched by feature key): reaping would restart
+    // churning contacts from the penalty floor hundreds of times/tick. New contacts seed at 5% betaLin; 0 = old delete.
     int contactGraceTicks = 0;
 
-    // Worker threads for the per-body phases. 0 = one per hardware thread, 1 = run
-    // everything inline on the calling thread. The result does not depend on this value:
-    // every body solves its own block system against the same pose snapshot, and applies
-    // its own delta.
+    // Worker threads for per-body phases: 0 = per hardware thread, 1 = inline. Results are thread-count
+    // independent: each body solves its block against the same pose snapshot.
     int threads = 0;
 
-    // Idle detection: a movable body whose BDF1 velocities stay under both thresholds for
-    // this many consecutive steps falls asleep (velocity zeroed, Godot semantics).
-    // 0 disables automatic sleeping; the core tests rely on the default for bit-identical
-    // digests. The horizon is a TIME (Godot's 0.5 s) converted to steps by the host, not a
-    // fixed 60 frames. The server layer overrides all three from physics/avbd/sleep_*
-    // settings (defaults 0.05 m/s, 0.05 rad/s, 1.0x horizon); the core defaults here stay
-    // as they were so pinned digests are unaffected.
+    // Steps under both BDF1 velocity thresholds before sleep (Godot semantics, velocity zeroed); 0 disables.
+    // Horizon is a TIME (Godot 0.5 s -> steps, not 60 frames). Keep defaults for bit-identical digests; host overrides.
     float sleepLinearThreshold = 0.1f;       // m/s
     float sleepAngularThreshold = 0.139626f; // rad/s (Godot default: 8 deg/s)
     int sleepFrames = 0;                     // steps below thresholds before sleeping
@@ -206,9 +147,8 @@ struct Solver
     Solver();
     ~Solver();
 
-    // Bodies and forces are linked into the solver and into each other by raw pointers, and
-    // a step deletes forces (see warmstartForces), so neither can be copied or moved: a copy
-    // would share the list heads and double-delete them.
+    // Raw-pointer intrusive lists are shared and a step deletes forces, so copying or moving would share list
+    // heads and double-delete; hence the deleted special members.
     Solver(const Solver &) = delete;
     Solver &operator=(const Solver &) = delete;
     Solver(Solver &&) = delete;
@@ -216,14 +156,11 @@ struct Solver
 
     // Closest body along a ray, and the hit point in that body's local space (null if none).
     [[nodiscard]] Rigid *pick(float3 origin, float3 dir, float3 &local);
-    // Masked variant with Godot's pair semantics: a body is a candidate when
-    // (body.layer & p_mask) != 0. The two-argument form above forwards with an
-    // accept-everything mask. Both walk the last built broad-phase tree (ray/AABB
-    // pruned); before any step has built one, they fall back to a body-list walk.
+    // Masked pick: candidate when (body.layer & p_mask) != 0 (2-arg form forwards an all-accept mask). Both
+    // walk the last broad-phase tree; before one exists, they fall back to a body-list walk.
     [[nodiscard]] Rigid *pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask);
-    // Bodies whose last-built broad-phase bounds overlap the query AABB, filtered by
-    // (layer & p_mask) != 0. Backs the direct space state's shape and point queries;
-    // the same no-tree fallback applies.
+    // Bodies whose last broad-phase bounds overlap the AABB and pass (layer & p_mask) != 0, for space
+    // shape/point queries; same no-tree fallback.
     void collectAABB(float3 min, float3 max, uint32_t p_mask, std::vector<Rigid *> &out) const;
     // Manifold store accessors for hosts and diagnostics. `index` is a position in the
     // live list, not a store slot; the slot is an implementation detail.
@@ -232,9 +169,8 @@ struct Solver
     // bodies solved by the block-Jacobi overflow bucket instead of coloured Gauss-Seidel.
     [[nodiscard]] int colourGroups() const { return colourCount; }
     [[nodiscard]] int overflowBodies() const { return static_cast<int>(overflowOrder.size()); }
-    // Diagnostics only: did the last broad phase emit this pair as a narrow-phase candidate?
-    // A pair that genuinely overlaps and answers no here is a broad-phase miss, not a solve
-    // failure. Linear scan - the callers run at diagnostic rates.
+    // Diagnostics only: did the last broad phase emit this pair? Overlap + "no" means a broad-phase
+    // miss, not a solve failure. Linear scan (callers run at diagnostic rates).
         [[nodiscard]] bool sweepHasPair(const Rigid *a, const Rigid *b) const
     {
         const uint64_t key = packPair(a->broadIndex, b->broadIndex);
@@ -243,9 +179,8 @@ struct Solver
                 return true;
         return false;
     }
-    // Diagnostics for a probe run: when a pair matches these two bodies (either order), the
-    // broad phase, the manifold pass and the reaper print every lifecycle event for it. A
-    // pair with a real overlap and no constraint needs exactly this to be attributed.
+    // Probe diagnostics: a pair matching these bodies (either order) prints every lifecycle event in
+    // broad phase, manifold pass and reaper - needed to attribute a real overlap with no constraint.
     Rigid *tracePair[2] = { nullptr, nullptr };
     [[nodiscard]] bool traceMatch(const Rigid *a, const Rigid *b) const
     {
@@ -295,14 +230,11 @@ struct Solver
     void clear();
     void step();
 
-    // Decide which bodies the primal phases may move this step (wake-up, island sleep and
-    // the sleep-mode gate), size the per-body delta buffers, and colour the constraint
-    // graph for the Gauss-Seidel primal.
+    // Choose movable bodies this step (wake-up, island sleep, sleep-mode gate), size delta buffers and
+    // colour the constraint graph for the Gauss-Seidel primal.
     void selectUpdateBodies();
-    // Interleaved substeps: one broad phase / force warmstart / update-set selection per
-    // tick, then `substeps` rounds of (body warmstart, primal+dual, velocity finish) with
-    // the contact error rebased between them. `roundsPerSubstep` 0 splits the tick's
-    // `iterations` evenly. `dt` must already be the substep dt.
+    // One broad phase / force warmstart / selection per tick, then substeps of (warmstart, primal+dual,
+    // finish) with C0 rebased between. roundsPerSubstep 0 splits `iterations`; `dt` must be substep dt.
     void stepInterleaved(int substeps, int roundsPerSubstep);
     // Greedy kMaxColours-bounded colouring of the update set's constraint graph;
     // bodies that do not fit join the block-Jacobi overflow bucket.
@@ -311,17 +243,13 @@ struct Solver
     // Number of worker threads actually in use (1 when running inline).
     [[nodiscard]] int threadCount() const;
 
-    // Per-phase wall time of the last step, milliseconds. Diagnostics only - nothing in the
-    // solver reads it - and it is what the host's get_*_time() accessors report, so a profile
-    // can attribute a step without a second copy of the schedule. A host that reads it from
-    // another thread while a step runs gets the previous step's numbers.
+    // Last step's per-phase wall time (ms), diagnostics only - host get_*_time() reports it. A cross-thread
+    // read during a step sees the previous step's numbers.
     struct PhaseTimes
     {
         double broadPhase = 0.0;  // broad phase: bounds, LBVH build, pair filter, manifold slots
-        // The algorithm under the broad phase alone: the LBVH build/refit plus candidate
-        // emission, excluding the bounds/AABB pass, the pair sort, the exact filter and
-        // manifold slot creation. This separates the broad-phase index cost from the
-        // shared pipeline around it.
+        // LBVH build/refit + candidate emission only; excludes bounds, pair sort, exact filter and slot
+        // creation, separating index cost from the surrounding pipeline.
         double broadIndex = 0.0;
         double graph = 0.0;       // force warmstart + adjacency rebuild + update-set selection/colouring
         double solve = 0.0;       // the iteration region (primal rounds + dual passes)
@@ -338,19 +266,15 @@ struct Solver
     [[nodiscard]] double get_finish_time() const { return lastStepTimes.finish; }
 
 private:
-    // Every body in list order. The inertial/warmstart and BDF1 phases run over this,
-    // because they also have to keep the cached state of static bodies current: contact
-    // and joint code reads `initialLin`/`initialAng` of *both* bodies of a constraint, and
-    // the ground is usually one of them.
+    // All bodies in list order: warmstart/BDF1 must refresh cached state even for static bodies, since
+    // constraints read initialLin/initialAng of both ends (often the ground).
     std::vector<Rigid *> warmstartOrder;
 
-    // Broad-phase: the body list flattened to index-addressable order (rebuilt every
-    // step), the Morton LBVH over those bodies, and the candidate pair list (sorted
-    // unique (min index, other), the manifold creation order).
+    // Flattened index-addressable body list (rebuilt each step), Morton LBVH over it, and the sorted
+    // unique candidate pair list (also the manifold creation order).
     std::vector<Rigid *> bodiesInOrder;
-    // Swept AABBs per bodiesInOrder: the tight bounds grown by this step's linear
-    // displacement, the rotation sweep and the speculative margin. center is the
-    // current position plus half the displacement; half is the matching extent.
+    // Swept AABBs: tight bounds grown by linear displacement, rotation sweep and speculative margin.
+    // center = current position + half displacement; half is the matching extent.
     std::vector<float3> bodyAabbHalf;
     std::vector<float3> bodyAabbCenter;
     LbvhBroadPhase broadLbvh;
@@ -360,12 +284,8 @@ private:
     std::vector<uint8_t> broadPairValid;
     std::vector<uint64_t> pairSortScratch;
 
-    // Bodies that take part in the primal update (movable, awake ones), in list order.
-    // The coloured Gauss-Seidel primal solves one block system per body of each
-    // colour and applies it immediately; bodies the greedy colouring cannot fit
-    // inside kMaxColours land in an overflow bucket that runs one block-Jacobi
-    // round (solve every delta against the same snapshot, then combine), using
-    // the delta buffers below.
+    // Movable, awake bodies in list order. Colour GS solves each body's block and applies it at once;
+    // those not fitting kMaxColours form an overflow block-Jacobi round using the delta buffers below.
     std::vector<Rigid *> updateOrder;
     std::vector<float3> bodyDeltaLin;
     std::vector<float3> bodyDeltaAng;
@@ -376,11 +296,8 @@ private:
     // pass and every projection iteration walk this instead of the full live list.
     std::vector<uint32_t> projectionActive;
 
-    // Constraint-graph colouring, rebuilt by colourGraph() every step. Bodies of
-    // one colour share no force, so a colour's whole set can solve and apply in
-    // parallel (Gauss-Seidel between colours, one barrier each). bodyColour is
-    // indexed by updateOrder position and holds either a colour < kMaxColours or
-    // kMaxColours itself for the block-Jacobi overflow bucket.
+    // Per-step colouring: same-colour bodies share no force, so solve/apply in parallel (GS between
+    // colours). bodyColour[updateOrder pos] is a colour or kMaxColours for the Jacobi overflow bucket.
     static constexpr int kMaxColours = 8;
     static constexpr uint8_t kOverflowColour = kMaxColours;
     std::vector<uint8_t> bodyColour;
@@ -395,9 +312,8 @@ private:
     // Per-body constraint adjacency, keyed by Rigid::broadIndex. Rebuilt at the start of
     // the broad phase (pair filter) and again after warm-starting (colour/primal/sleep).
     ForceAdjacency forceAdjacency;
-    // The non-manifold force list rebuilt each step so the phases can address joints,
-    // springs and ignore pairs by index, plus the per-force result of initialize() so the
-    // deletion can be done in one thread after the parallel initialisation.
+    // Non-manifold forces rebuilt each step for index access to joints/springs/ignores, plus each
+    // initialize() result so deletion runs in one thread after parallel init.
     std::vector<Force *> forceOrder;
     std::vector<uint8_t> forceActive;
     // Per-slot initialize() result for the step's manifolds (parallel fill, serial reap).
@@ -423,10 +339,8 @@ private:
     int warmstartForces();
     // One body's inertial/warm-start update (independent across the list).
     void warmstartBody(int i);
-    // The whole iteration set as one persistent-worker region: `targetIterations` rounds of
-    // the block-Jacobi primal (one full block solve per body against the iteration-start
-    // pose, then a combine pass) plus dual passes, fenced by LoopSync barriers. Both sync
-    // types run the identical body; NullSync is the inline/reference path.
+    // Persistent-worker region: targetIterations block-Jacobi primal rounds (solve vs iteration-start
+    // pose, then combine) + dual passes, fenced by LoopSync. Both sync types run the identical body.
     template <typename Sync>
     void iterateBody(int workerIndex, Sync &sync, int targetIterations, int forceCount,
             float &r_prevResidual, std::atomic<bool> &r_converged);
@@ -445,10 +359,8 @@ private:
     // store. Serial: the lists are mutated only on the calling thread at this point.
     void buildForceAdjacency();
 
-    // Island-wide sleep bookkeeping (runs when sleeping is enabled): movable bodies are
-    // grouped into islands through force connectivity, and an island whose every body
-    // cleared idle detection this step puts all its members to sleep together. Prevents
-    // the partially-asleep contact chain from thrashing between states.
+    // With sleeping enabled, group movable bodies into force-connected islands; if all pass idle
+    // detection, sleep the whole island, so partially-asleep contact chains cannot thrash.
     void islandSleep();
 };
 

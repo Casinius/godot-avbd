@@ -172,10 +172,8 @@ bool ManifoldStore::frozen(uint32_t slot) const noexcept
 }
 
 namespace {
-// S = B^T K B in the six independent entries of a symmetric 3x3. The basis rows are the
-// linear jacobian rows (up to sign) and K is diagonal, so S is a weighted sum of the
-// three basis-row outer products. The expression order matches the old per-stamp code
-// exactly, so caching it does not change the result.
+// S = B^T K B (six symmetric entries) = weighted sum of basis-row outer products, K diagonal.
+// Expression order matches the old per-stamp code exactly: caching does not change the result.
 inline Manifold::BasisHessian basisHessian(const float3x3 &basis, const float3 &k) noexcept
 {
     const float3 b0 = row(basis, 0);
@@ -195,15 +193,8 @@ inline Manifold::BasisHessian basisHessian(const float3x3 &basis, const float3 &
             k.x * b0z2 + k.y * b1z2 + k.z * b2z2};
 }
 
-// The constraint value the primal and dual work against: the step-start error damped by
-// (1-alpha), plus the pose bracket in the contact basis. Penetration is damped so a deep
-// impact does not overshoot; a speculative contact that is still geometrically apart is
-// NOT penetrating yet, and damping its gap to 1% makes any millimetre of jitter look like
-// a violation - the pair starts pushing from up to `speculativeMargin` away, an invisible
-// inflation layer that measurably deepens every jam in a dense pile. Use the full gap for
-// those, so the pair only acts once the bracket predicts a real overlap. With the margin
-// disabled the geometry never reports a separated pair, so the branch is unreachable and
-// the expression is the original one bit for bit.
+// C = (1-alpha)*step-start error + pose bracket; penetration damped to avoid deep-impact overshoot.
+// Separated speculative contacts MUST use the full gap (1% damping deepens jams); margin off = bit-for-bit original.
 inline float3 constraintError(const float3 &c0, const float3 &bracket, const float3x3 &basis,
         float oneMinusAlpha, bool speculative) noexcept
 {
@@ -211,15 +202,8 @@ inline float3 constraintError(const float3 &c0, const float3 &bracket, const flo
     return c0 * (separated ? 1.0f : oneMinusAlpha) + mul(basis, bracket);
 }
 
-// Cap the stored penetration (see CONTACT_MAX_PENETRATION) on the normal row only. The two
-// tangential rows are the friction error, and their size is a property of where the contact
-// anchors sit on the two faces, not of how deep the pair is: in a sheared pile the anchors of
-// one contact are routinely decimetres apart along the friction axes. Scaling the whole
-// vector by its norm then divides the normal depth down by that tangential distance -
-// measured on the double pyramid, a 9 cm penetration arrived at the solve as 0.65 cm, which
-// is under the projection slop and buys almost no penalty force, so the pair sank as far as
-// it could and stayed there. The tangential rows need no cap here: the friction cone limits
-// the force they can produce.
+// Cap penetration on the NORMAL row only: scaling the whole vector by its norm cut 9 cm to 0.65 cm - the pair sank.
+// Tangential rows are friction error (anchor offsets) needing no cap; the friction cone limits their force.
 inline void clampPenetration(float3 &c0, float cap) noexcept
 {
     if (c0.x < -cap)
@@ -234,9 +218,7 @@ struct ForceClamp
     float scaleBeforeClamp;
 };
 
-// Normal force is one-sided and the tangential pair must stay inside the friction cone.
-// The primal force cache, the dual force and the dual's look-ahead force all need the same
-// clamp; the expressions and their order are kept verbatim so the solver stays bit-exact.
+// Normal force one-sided, tangential inside the cone; keep expressions and their order verbatim - bit-exact.
 inline ForceClamp clampContactForce(float3 &F, float mu) noexcept
 {
     F[0] = std::min(F[0], 0.0f);
@@ -319,15 +301,8 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
                 }
                 else
                 {
-                    // Stick heal: a sticky pair's anchors are glued to each other, so their
-                    // separation (what STICK_THRESH checks every dual update) stays ~zero no
-                    // matter how far the pair has slid. Compare the frozen anchors against the
-                    // fresh contact geometry at the current pose instead: past Solver::stickDriftHeal (default STICK_DRIFT_HEAL)
-                    // the "static" contact is really sliding, the old anchors no longer sit on
-                    // the touching surfaces, and C0 measures anchor separation - phantom
-                    // penetration the dual then answers with real force. Re-anchor from the
-                    // current pass and drop the force history (the penalty ramp survives, so
-                    // support rebuilds in-round).
+                    // Stick heal: glued anchors hide sliding from STICK_THRESH; compare to fresh geometry.
+                    // Past stickDriftHeal: phantom C0 -> real force; re-anchor, drop force, keep penalty ramp.
                     const float3 oldA = a->positionLin + qrot(a->positionAng,
                             contacts[first + j].rA);
                     const float3 oldB = b->positionLin + qrot(b->positionAng,
@@ -344,11 +319,8 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
                         newContacts[i].rA = newRA;
                         newContacts[i].rB = newRB;
                         newStick[i] = 0;
-                        // Keep the normal support impulse: it is a function of how hard the
-                        // pair is pressed together, not of where the anchors sit. Dropping it
-                        // made every sliding contact lose its support each tick - the pile
-                        // never settled, it just kept re-sinking. Only friction is tied to the
-                        // anchors that just moved.
+                        // Keep normal support: press-based, not anchor-based; dropping it made the pile re-sink.
+                        // Only friction is tied to the anchors that moved.
                         newLambda[i] = float3{newLambda[i].x, 0.0f, 0.0f};
                     }
                 }
@@ -363,10 +335,8 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
             solver.diag.newContacts++;
 #endif
 
-    // Fresh-contact seed: a contact that matched no feature key starts its penalty at a
-    // fraction of betaLin instead of the floor, so an impact-time contact does not spend its
-    // first ticks ramping from k=1 while the load runs through it. Gated on the grace
-    // setting (default 0 keeps the historical floor start).
+    // Fresh contact (unmatched feature key) seeds penalty at a fraction of betaLin, so impacts don't ramp from k=1.
+    // Gated on grace ticks; default 0 keeps the historical floor start.
     if (solver.contactGraceTicks > 0)
     {
         const float seed = std::max(PENALTY_MIN, 0.05f * solver.betaLin);
@@ -386,22 +356,14 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
         contactBetaScale[first + i] = newBetaScale[i];
     }
 
-    // Grace dormancy: the pair separated and no contacts came back. Parking the manifold
-    // (instead of reporting it dead for warmstartForces to reap) keeps the hot state of
-    // `liveCount` contacts untouched in the arrays above, so a pair that returns within
-    // Solver::contactGraceTicks re-matches by feature key instead of rebuilding from the
-    // penalty floor. numContacts stays 0, which makes every solve loop over this manifold
-    // a no-op.
+    // Grace dormancy: parking (not reaping) keeps hot state so a return within grace ticks re-matches by feature key.
+    // numContacts stays 0, so every solve loop over this manifold is a no-op.
     if (numContacts[slot] == 0)
     {
         if (solver.contactGraceTicks > 0 && dormantTicks[slot] < solver.contactGraceTicks)
         {
-            // Park the stiffness, not the force. What a revived pair needs is the penalty
-            // ramp it earned; the lambda from before the separation is support for a pose
-            // that no longer exists. Kept alive, it is applied in full by the first primal
-            // round after revival - a kick of lambda*dt that a settled box feels as a
-            // several-m/s shove out of the pile. The release rule in the live path exists
-            // for the same reason: a separated pair may carry no force.
+            // Park stiffness, not force: old lambda supports a dead pose; reviving with it shoves a box several m/s.
+            // The live-path release rule is the same: a separated pair may carry no force.
             for (int i = 0; i < liveCount; i++)
             {
                 contactLambda[first + i] = float3{};
@@ -423,20 +385,12 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
         float3 xB = b->positionLin + qrot(b->positionAng, contacts[first + i].rB);
         contactC0[first + i] = mul(basis[slot], xA - xB) + float3{COLLISION_MARGIN, 0, 0};
 
-        // Cap the depth the solve sees. The BDF1 finish turns the step's displacement into
-        // velocity (v = dp/dt), so an unclamped 10 cm impact overlap is expelled at ~24 m/s,
-        // that body crosses several neighbours before their next collision pass, and each of
-        // those hits injects another ejection - the pile never settles (measured: a double
-        // pyramid at 0.6 m overlaps, boxes leaving at 18 m/s). The residual is re-measured and
-        // driven out over the following steps.
+        // Cap depth: BDF1 v=dp/dt means an unclamped 10 cm overlap expels at ~24 m/s, re-ejecting neighbours.
+        // Measured: double pyramid at 0.6 m overlaps, boxes left at 18 m/s; residual drains over later steps.
         clampPenetration(contactC0[first + i], solver.maxPenetration);
 
-        // Adaptive beta (the augmented-Lagrangian kappa update, per contact): a sticking
-        // contact whose penetration did not shrink against last step doubles its personal
-        // ramp multiplier; a converging one halves it back toward 1. Fresh contacts start
-        // neutral. The residual is penetration depth (the margin is not an error to
-        // converge), and a residual at or below the floor counts as solved so float noise
-        // on a resting contact cannot ratchet the multiplier to the cap.
+        // Adaptive beta: non-shrinking penetration doubles the ramp, converging halves toward 1; fresh starts neutral.
+        // Residual = penetration depth, not margin; <= floor = solved so float noise can't ratchet to cap.
         if (solver.adaptiveBeta && prevErr[i] >= 0.0f)
         {
             const float err = std::max(0.0f, COLLISION_MARGIN - contactC0[first + i].x);
@@ -457,33 +411,19 @@ bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
             contactBetaScale[first + i] = 1.0f;
         }
 
-        // Contact release: the anchors say the pair is geometrically apart, so no contact
-        // force can act - whatever impulse the dual still holds came from an earlier pose
-        // and must not be applied across the gap. The warm-start decay alone would keep a
-        // big impact impulse alive for hundreds of ticks, and the penalty term keeps
-        // stamping it into the solve every round; the pile then pops a box out at 10+ m/s
-        // long after it was still. The penalty (stiffness) survives, so the support
-        // rebuilds in one round when the pair closes again.
+        // Contact release: apart means no force; stale impulse must not cross the gap - decay alone lasts ages.
+        // Penalty restamps it, popping a box at 10+ m/s; stiffness survives, so support rebuilds in one round.
         if (contactC0[first + i][0] > COLLISION_MARGIN + CONTACT_RELEASE_GAP)
         {
             contactLambda[first + i] = float3{};
             contactStick[first + i] = 0;
         }
 
-        // Initial penalty (Eq. 19): the original computed base * 10^(2*log10(pen)) —
-        // algebraically pen^2 — and clamped to [PENALTY_MIN, PENALTY_MAX]. pen is capped
-        // at 0.02 above, so the product is <= 4e-4 < PENALTY_MIN: the clamp always
-        // saturates at the floor and the log10/pow chain was dead computation
-        // (~300 us/step across a full manifold set). Penalty starts at PENALTY_MIN and is
-        // ramped per iteration in updateDual (betaLin * |C|, capped by PENALTY_MAX).
-        // The warmstart decay below is kept bit-for-bit.
+        // Initial penalty (Eq. 19): old log10/pow pen^2 always floored (pen<=0.02 -> 4e-4 < MIN), dead ~300 us/step.
+        // Starts at PENALTY_MIN, ramped per updateDual; warmstart decay below kept bit-for-bit.
         contactLambda[first + i] = contactLambda[first + i] * solver.alpha * solver.gamma;
-        // Warmstart the penalty too (Eq. 19). Resetting it to the floor every frame
-        // threw away the ramp the previous step had already built, so a resting body
-        // had to re-grow its support from PENALTY_MIN each frame and sank until the
-        // dual happened to catch up. The reference implementation decays and clamps
-        // the carried value instead; a fresh contact starts from the floor because
-        // its slots were value-initialised.
+        // Warmstart penalty (Eq. 19): floor resets discarded the ramp, so resting bodies sank until the dual caught up.
+        // Reference decays/clamps the carried value; fresh contacts start at floor (value-initialised).
         contactPenalty[first + i] = clamp(contactPenalty[first + i] * solver.gamma,
                 float3{PENALTY_MIN, PENALTY_MIN, PENALTY_MIN},
                 float3{PENALTY_MAX, PENALTY_MAX, PENALTY_MAX});
@@ -503,9 +443,8 @@ void ManifoldStore::decayPenalty(uint32_t slot, float decay) noexcept
         contactPenalty[first + i] = clamp(contactPenalty[first + i] * decay, floor, cap);
 }
 
-// Recompute C0 at the current pose, keeping the contact set (rA/rB/basis) from the tick's
-// collision pass. The prepared force cache belongs to the old C0, so invalidate it; the
-// next primal touch will precompute against the rebased error.
+// Recompute C0 at the current pose, keeping the contact set (rA/rB/basis) from the collision pass.
+// The force cache belongs to the old C0, so invalidate it; the next primal touch precomputes against the rebased error.
 void ManifoldStore::rebase(uint32_t slot, float maxPenetration) noexcept
 {
     Rigid *a = this->bodyA[slot];
@@ -521,14 +460,8 @@ void ManifoldStore::rebase(uint32_t slot, float maxPenetration) noexcept
     flags[slot] = static_cast<uint8_t>(flags[slot] & ~kPrimalCacheReady);
 }
 
-// The primal runs in two phases so the two bodies of a manifold share one assembly:
-// preCompute (parallel over forces, once per round) evaluates everything both stamps
-// need - world arms, angular jacobians, and the clamped contact forces - from the
-// round's pose snapshot; stampCached (parallel over bodies) stamps each body's side
-// from that cache. Before the split, each of the two per-round updatePrimal calls
-// recomputed the whole shared half and used only its own side of the stamps. Same
-// inputs in the same order, so the cached values are bit-identical to what the stamps
-// used to recompute.
+// Primal split: preCompute (per force, once/round) caches the shared half; stampCached (per body) stamps each side.
+// Same inputs in the same order, so cached values are bit-identical to the old recompute.
 void ManifoldStore::preCompute(uint32_t slot, const Solver &solver, float alpha) noexcept
 {
     Rigid *a = this->bodyA[slot];
@@ -545,11 +478,8 @@ void ManifoldStore::preCompute(uint32_t slot, const Solver &solver, float alpha)
     const float3x3 rotB = qmat(b->positionAng);
     const bool speculative = solver.speculativeMargin > 0.0f;
 
-    // Constraint value in the basis frame. The linear jacobian rows are the basis rows
-    // (±), and each angular row is rWorld x that basis row, so the four matrix-vector
-    // products the old assembly built collapse into one bracket the basis then rotates:
-    //   C = C0(1-alpha) + B * [ (dqA_lin - dqB_lin) + (dqA_ang x rA) - (dqB_ang x rB) ]
-    // No angular jacobian matrices are needed: the basis is the only frame C lives in.
+    // Constraint in basis frame: Jlin=±basis rows, Jang=rWorld x basis row; four old products collapse to one bracket:
+    //   C = C0(1-alpha) + B*[(dqA_lin-dqB_lin) + (dqA_ang x rA) - (dqB_ang x rB)]; basis is the only frame.
     for (int i = 0; i < numContacts[slot]; i++)
     {
         const float3 rA = mul(rotA, contacts[first + i].rA);
@@ -577,25 +507,13 @@ void ManifoldStore::stampCached(uint32_t slot, Rigid *body, Block &block) const 
     const int first = base(slot);
     const float3x3 &frame = this->basis[slot];
 
-    // Both bodies share the linear jacobian up to sign, Jlin = ±basis, so the linear
-    // Hessian Jlin^T K Jlin = B^T K B is the same for A and B. K is diagonal, so that
-    // "basis sandwich" S is just a weighted sum of the three basis-row outer products.
-    // With R = skew(rWorld) the angular jacobian is Jang = ±B R^T, which gives the whole
-    // stamp in closed form:
-    //   lhsLin   = S
-    //   lhsAng   = Jang^T K Jang = R S R^T
-    //   lhsCross = Jang^T K Jlin = R S
-    //   rhsLin   = ±B^T F
-    //   rhsAng   = ±R (B^T F)
-    // This replaces the three generic 3x3 products (and their transposes) the old stamp
-    // built per contact, per body. The symmetric results are written mirrored so the
-    // pivot fallback in Block::solveDelta still sees a full matrix.
+    // S=B^T K B (K diagonal): sum of basis-row outer products; R=skew(rWorld), Jang=±B R^T -> closed form:
+    //   lhsLin=S, lhsAng=R S R^T, lhsCross=R S, rhsLin=±B^T F, rhsAng=±R(B^T F); mirror symmetric for pivot fallback.
     const float3 b0 = row(frame, 0);
     const float3 b1 = row(frame, 1);
     const float3 b2 = row(frame, 2);
 
-    // S is refreshed by initialize()/updateDual() whenever the penalty changes, so the
-    // per-body stamp does not recompute the same sandwich for the second body.
+    // S is refreshed when the penalty changes, so the second body's stamp need not recompute it.
     // Accumulate in registers, then write back once.
     float3x3 accLin{};
     float3x3 accAng{};
@@ -603,10 +521,8 @@ void ManifoldStore::stampCached(uint32_t slot, Rigid *body, Block &block) const 
     float3 accRhsLin{};
     float3 accRhsAng{};
 
-    // A zero cached force does not make the contact inactive: the normal force is clamped
-    // at zero while the contact can still be compressed within the margin, and its penalty
-    // still belongs in the Hessian. Skipping it removes the support stiffness, which lets
-    // loaded stacks sink through each other and, once deep enough, launch.
+    // A zero cached force is not inactive: normal clamped at zero while compressed, penalty still in Hessian.
+    // Skipping it removes support stiffness, letting loaded stacks sink and then launch.
     for (int i = 0; i < numContacts[slot]; i++)
     {
         const float3 &F = contactForceCache[first + i];
@@ -656,11 +572,8 @@ void ManifoldStore::stampCached(uint32_t slot, Rigid *body, Block &block) const 
 void ManifoldStore::updatePrimal(uint32_t slot, const Solver &solver, Rigid *body, float alpha,
         Block &block)
 {
-    // The first body to touch this manifold in a round consumes the force/jacobian cache
-    // the previous round's dual left behind: no pose in this computation has moved since
-    // then (the other body has not been solved yet either), so recomputing would produce
-    // the same floats. The second body's colour runs after poses have moved, so it
-    // recomputes - that is the round's one fresh evaluation.
+    // First touch consumes the previous dual's cache: no pose moved yet, so recomputing gives the same floats.
+    // The second body's colour runs after poses moved, so it recomputes - the round's one fresh evaluation.
     if ((flags[slot] & kPrimalCacheReady) == 0)
         preCompute(slot, solver, alpha);
     stampCached(slot, body, block);
@@ -680,16 +593,12 @@ void ManifoldStore::updateDual(uint32_t slot, const Solver &solver, float alpha)
     const float3 dqBLin = b->positionLin - b->initialLin;
     const float3 dqBAng = b->positionAng - b->initialAng;
 
-    // Both contact rotations share the two body quats, which never change inside this
-    // loop: one rotation-matrix conversion (~20 ns) replaces two quat multiplies per
-    // contact (~16 ns each at 8 contacts = ~256 ns/manifold).
+    // Loop-invariant quats: one qmat (~20 ns) replaces two quat multiplies/contact (~16 ns each; 8 = ~256 ns/manifold).
     const float3x3 rotA = qmat(a->positionAng);
     const float3x3 rotB = qmat(b->positionAng);
 
-    // Drift-gated arm reuse (the jacobianRebuildDistance semantics, now living in the
-    // dual): when neither body's rotation moved further than the threshold since the last
-    // capture, the cached world moment arms are reused for C and for the next round's
-    // stamp. Only the arms are cached now - the angular jacobian matrices are gone.
+    // Drift-gated arm reuse (jacobianRebuildDistance): under the rotation threshold, reuse cached world arms.
+    // Only arms are cached now; angular jacobian matrices are gone.
     const bool cacheable = solver.jacobianRebuildDistance > 0.0f;
     const float rebuild2 = solver.jacobianRebuildDistance * solver.jacobianRebuildDistance;
     const float3 dA = rotA[0] - rotACaptured[slot][0];
@@ -743,11 +652,8 @@ void ManifoldStore::updateDual(uint32_t slot, const Solver &solver, float alpha)
         // round's stamps. Refresh it here, where the new penalty is already in hand.
         linHessian[first + i] = basisHessian(frame, contactPenalty[first + i]);
 
-        // Leave the primal's cache ready for the next Newton round. The pose is frozen
-        // between here and the next stampCached (the solve runs after the next
-        // preCompute would), so the next preCompute would recompute exactly this bracket
-        // - and, with the ramped penalty and the just-stored lambda, exactly this force.
-        // Doing it here removes the standalone preCompute from every round after the first.
+        // Leave the primal cache ready: pose is frozen until stampCached, so preCompute repeats this bracket/force.
+        // Doing it here removes the standalone preCompute after round one.
         float3 fNext = cmul(contactPenalty[first + i], C) + contactLambda[first + i];
         clampContactForce(fNext, mu);
         contactForceCache[first + i] = fNext;
@@ -764,9 +670,7 @@ void ManifoldStore::updateDual(uint32_t slot, const Solver &solver, float alpha)
     flags[slot] = static_cast<uint8_t>(flags[slot] | kPrimalCacheReady);
 }
 
-// Accumulate this manifold's penetration error for the convergence probe. With
-// speculative contacts on, a positive normal error is a gap the bodies have not closed
-// yet, not penetration: counting it would skew the residual probe.
+// For the convergence probe: with speculative contacts a positive normal is a gap, not penetration - don't count it.
 void ManifoldStore::accumulatePenetration(uint32_t slot, const Solver &solver, float &r_total,
         int &r_count) const noexcept
 {

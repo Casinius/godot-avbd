@@ -47,9 +47,8 @@ struct RayHit {
 
 // Support radius of a shape along `axis` (the box/cylinder extent projected on the axis).
 [[nodiscard]] float supportRadius(const Shape &shape, const float3 &axis) noexcept;
-// Penetration along a contact normal: support(a)+support(b)-|centre separation|. This is
-// the SAT overlap on that axis and gives rest queries a real depth instead of a distance
-// between two arbitrary anchor points.
+// Penetration along a contact normal: support(a)+support(b)-|centre separation|, the SAT
+// overlap that gives rest queries a real depth rather than a distance between anchors.
 [[nodiscard]] float penetrationDepth(const Shape &a, const Shape &b, const float3 &normal) noexcept;
 
 // Tight world-space AABB of the shape. The cylinder bound is the bound of its local-axis
@@ -61,12 +60,8 @@ void shapeAabb(const Shape &shape, float3 &r_min, float3 &r_max) noexcept;
         std::span<Manifold::Contact> contacts, float3x3 &r_basis,
         float margin = 0.0f);
 
-// Translation sweep of `base` along `motion` against a static `target`.
-//
-// `safe` is the last tested fraction without a contact, `unsafe` the first with one;
-// `margin` has the same meaning as collideShapes()' speculative margin. The sweep is
-// bounded by the swept AABB overlap interval, so a fast motion cannot tunnel through a
-// target just because its final pose is past it.
+// Sweep `base` along `motion` against a static `target`: `safe`/`unsafe` bracket the first
+// contact, `margin` matches collideShapes(), and the swept-AABB bound stops fast tunnelling.
 struct SweepHit {
     bool hit = false;
     float safe = 1.0f;

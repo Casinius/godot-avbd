@@ -1,23 +1,5 @@
-/*
- * AVBDSoftWorld3D - drives AVBDSoftBody3D nodes through a solver of their own.
- *
- * Part of godot-avbd. Solver core ported from github.com/savant117/avbd-demo3d (MIT).
- *
- * This is the minimal surviving piece of the old AVBDWorld3D node layer: soft bodies
- * have no PhysicsServer3D representation this round, so a node has to own their solver.
- * Rigid bodies and joints do NOT go here - a scene with those uses the AVBD physics
- * server (project setting physics/3d/physics_engine = "AVBD") and standard Godot nodes.
- *
- * Responsibilities, deliberately narrow:
- *   - collect the AVBDSoftBody3D nodes in this subtree (re-scan on tree changes)
- *   - collect child StaticBody3D "ground" nodes (one box shape each) as static solver
- *     bodies, so a lattice has something to rest on: soft cells live in this node's
- *     solver and cannot collide with bodies the physics server owns
- *   - step their solver in _physics_process (following the game: a paused SceneTree
- *     pauses this node through the engine's own pause handling)
- *   - write results back to the soft body visuals
- * Properties: gravity and threads only. Everything else is the soft body's own.
- */
+/* AVBDSoftWorld3D drives AVBDSoftBody3D nodes in their own solver (no server representation);
+ * rigid bodies/joints use the AVBD physics server. Core ported from savant117/avbd-demo3d (MIT). */
 
 #ifndef AVBD_SOFT_WORLD3D_HPP
 #define AVBD_SOFT_WORLD3D_HPP

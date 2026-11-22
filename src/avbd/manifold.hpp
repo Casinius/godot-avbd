@@ -24,9 +24,8 @@ struct Force;
 // Maximum contact points a manifold can carry. The collision paths emit at most eight.
 inline constexpr int kMaxManifoldContacts = 8;
 
-// Collision manifold types. Manifolds themselves live in the solver's ManifoldStore
-// (structure of arrays, stable slots) rather than in per-pair objects, so this struct is
-// a namespace for the shared records plus the solver-free pair query.
+// Manifolds live in the solver's ManifoldStore (SoA, stable slots), not per-pair objects; this struct
+// just namespaces the shared records and solver-free pair query.
 struct Manifold
 {
     // Used to track contact features between frames
@@ -43,9 +42,8 @@ struct Manifold
         int key;
     };
 
-    // Contact point geometry. This is what collision detection writes; the hot solver
-    // state lives in ManifoldStore's parallel arrays, so the per-contact stride the primal
-    // and dual walk stays small.
+    // Contact geometry written by collision detection; hot solver state is in ManifoldStore's parallel
+    // arrays, keeping the per-contact stride the primal/dual walk small.
     struct Contact
     {
         FeaturePair feature;
@@ -53,10 +51,8 @@ struct Manifold
         float3 rB; // contact offset in B's local space (relative to center)
     };
 
-    // The symmetric linear Hessian B^T K B, six independent entries: K is diagonal and
-    // the basis is orthonormal, so every pair of bodies of this manifold shares it. It
-    // changes only when the penalty changes, so initialize()/updateDual() refresh it once
-    // per round and both body stamps read it.
+    // Symmetric B^T K B (six entries); K diagonal and basis orthonormal, so both bodies' stamps share it.
+    // It changes only with penalty, so initialize()/updateDual() refresh it once per round.
     struct BasisHessian
     {
         float s00, s01, s02, s11, s12, s22;
@@ -67,14 +63,8 @@ struct Manifold
     static int collide(Rigid *bodyA, Rigid *bodyB, std::span<Contact> contacts, float3x3 &basis);
 };
 
-// Every collision manifold of one solver, as parallel arrays over stable slots.
-//
-// A slot is allocated from `freeList` (or appended) and stays put until the manifold is
-// released; `live` lists the slots that currently own a manifold, in creation order, so
-// every per-manifold phase is a compact walk over `live`. Contact state is indexed
-// `slot * kMaxManifoldContacts + k`; the fixed stride wastes a partly unused tail on
-// manifolds with few contacts, but keeps warm-start matching, parallel per-slot writes
-// and the per-slot passes trivial.
+// SoA over stable slots: a slot stays until released; `live` gives a compact creation-order walk.
+// Contacts at slot*8+k - fixed stride wastes a partial tail but keeps warm-start matching and parallel writes trivial.
 struct ManifoldStore
 {
     // Per-slot state.
@@ -124,19 +114,14 @@ struct ManifoldStore
     // Scale every contact's penalty in this slot (stiffness decay for the dual-only tail).
     void decayPenalty(uint32_t slot, float decay) noexcept;
 
-    // Refresh the contact set for the step and warm-start the hot state. Returns false
-    // when the pair separated (and is not parked in the contact-grace window); the slot
-    // stays allocated either way and the caller decides whether to release it.
+    // Refresh contacts and warm-start hot state. False if separated (and not in the grace window);
+    // the slot stays allocated either way - the caller decides whether to release it.
     bool initialize(uint32_t slot, Solver &solver);
     // Recompute C0 at the current pose without re-running collision detection. Used between
     // interleaved substeps; invalidates the prepared primal force cache.
     void rebase(uint32_t slot, float maxPenetration) noexcept;
-    // Two consumers share one cache. updatePrimal (the coloured Gauss-Seidel path) uses
-    // the force/moment-arm cache the previous round's dual left behind: the first body to
-    // touch the manifold this round consumes it for free, and the second colour - by then
-    // poses have moved - recomputes once (preCompute) and stamps its side. The overflow
-    // bucket's Jacobi path instead runs preCompute over slots, then stampCached over
-    // bodies, so one assembly serves both sides against the same snapshot.
+    // One cache, two consumers: colour GS reuses last round's dual arms (first body free, second recomputes
+    // after poses moved); the Jacobi overflow preComputes all slots then stamps both bodies against one snapshot.
     void preCompute(uint32_t slot, const Solver &solver, float alpha) noexcept;
     void stampCached(uint32_t slot, Rigid *body, Block &block) const noexcept;
     void updatePrimal(uint32_t slot, const Solver &solver, Rigid *body, float alpha, Block &block);
@@ -167,10 +152,8 @@ struct ForceRef
     }
 };
 
-// Per-body constraint adjacency in CSR form, keyed by Rigid::broadIndex. Rebuilt every
-// step (before the broad phase for the pair filter, after warmstart for the solve): the
-// colouring, the primal walk, the sleep wake-up and the island grouping read it instead
-// of following the intrusive body lists. Manifold references carry a store slot.
+// CSR adjacency per broadIndex, rebuilt each step (pre-broad-phase for pair filter, post-warmstart for
+// solve); colouring, primal, wake-up and islands read it. Manifold refs carry a store slot.
 struct ForceAdjacency
 {
     std::vector<uint32_t> start; // bodyCount + 1 offsets
@@ -192,13 +175,8 @@ private:
     std::vector<uint32_t> cursor; // fill positions, reused across builds
 };
 
-// Discrete shape-pair collision query: up to 8 contact points between two `Shape`s,
-// independent of any solver. `contacts` must hold at least 8 slots (`Manifold`'s
-// capacity) - exported because space queries reuse the exact path `Manifold` walks.
-// `basis` receives an orthonormal frame whose first row is the contact normal (A -> B).
-// `speculativeMargin` lets separated shapes report contacts up to that distance apart
-// (the constraint error is then positive); 0 keeps the query strictly overlap-only.
-// Returns the contact count (0 = separated).
+// Solver-free shape-pair query, <=8 contacts; `contacts` needs 8 slots (Manifold capacity, reused by space queries).
+// `basis` row 0 = normal (A->B); speculativeMargin makes near-misses positive-error; 0 = overlap-only; returns count.
 int collideShapes(const Shape &a, const Shape &b,
                   std::span<Manifold::Contact> contacts,
                   float3x3 &basis,

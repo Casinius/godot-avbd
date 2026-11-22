@@ -1,6 +1,4 @@
-/*
- * Morton LBVH broad phase. See bvh_broadphase.hpp for what the port changed and why.
- */
+/* Morton LBVH broad phase; bvh_broadphase.hpp documents what the port changed and why. */
 
 #include "bvh_broadphase.hpp"
 
@@ -114,10 +112,8 @@ int LbvhBroadPhase::buildTopology(std::span<const float3> aabbCenter)
     nodeRight.reserve(static_cast<size_t>(2 * n - 1));
     nodeBody.reserve(static_cast<size_t>(2 * n - 1));
 
-    // Leaves first (in sorted order), so the merge below is a simple range walk. A range
-    // of leaves [begin, end) is replaced by the internal node that spans it; the stack of
-    // open ranges is rebuilt without recursion (a 4k-body scene would otherwise recurse
-    // log2(n) deep per level with a heap allocation at every step).
+    // Leaves in sorted order, merged bottom-up as a range walk. The open-range stack is
+    // iterative: recursion would go log2(n) deep per level with a heap allocation each step.
     std::vector<int> level;
     level.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i)
@@ -139,9 +135,8 @@ int LbvhBroadPhase::buildTopology(std::span<const float3> aabbCenter)
 int LbvhBroadPhase::refit(std::span<const float3> aabbHalfExt,
         std::span<const float3> aabbCenter)
 {
-    // Every node was created in a build order that puts children before parents inside a
-    // pair but not globally, so the walk is a post-order over the stored child indices.
-    // Iterative with an explicit stack: same reason as the build.
+    // Build order puts children before parents only within a pair, so refit is a post-order
+    // walk over stored child indices, iterative (same reason as the build).
     std::vector<int> stack;
     stack.reserve(64);
     stack.push_back(root);

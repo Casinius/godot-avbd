@@ -15,9 +15,8 @@
 
 namespace avbd {
 
-// Godot BodyAxis bits: one helper for every place a locked component must read back as
-// motionless (the positional projection, the warm start and the final velocity). Keeping the
-// bit tests here means the three sites cannot silently disagree about which axis is locked.
+// Godot BodyAxis locks: one helper for every site that must read a locked component back as
+// motionless (projection, warm start, final velocity), so the three cannot disagree.
 inline void maskLockedLinear(uint8_t locks, float3 &v) noexcept
 {
     if (locks)
@@ -66,11 +65,9 @@ inline void maskLockedAngular(uint8_t locks, float3 &v) noexcept
     return nullptr;
 }
 
-// True when a force already joins the pair. Mirrors Rigid::constrainedTo: any joint,
-// spring or ignore pair counts, and a live manifold counts, but a dormant one (contact
-// grace) does not - the pair must still wake on AABB overlap and re-enter the narrow
-// phase, or a sleeping body behind a dormant manifold is invisible to an incoming body.
-[[nodiscard]] static bool pairConstrained(const ForceAdjacency &adjacency,
+// True when a force joins the pair (joint/spring/ignore/live manifold, as Rigid::constrainedTo);
+// a dormant contact-grace manifold does not count, so the pair can still wake on AABB overlap.
+[[nodiscard]] inline bool pairConstrained(const ForceAdjacency &adjacency,
         const ManifoldStore &manifolds, Rigid *bodyA, Rigid *bodyB)
 {
     for (const ForceRef &ref : adjacency.of(bodyA->broadIndex))

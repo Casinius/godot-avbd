@@ -232,15 +232,8 @@ inline bool addContact(const Shape& shapeA, const Shape& shapeB, std::span<Manif
     return true;
 }
 
-// SAT with the frame table. The caller precomputes m[i][j] = axisA_i·axisB_j and
-// dA/dB = delta in each box's frame once per pair; every axis projection then reduces
-// to table reads:
-//   face axis A_i: |delta·A_i| = |dA[i]| and the projection radius of A is exactly
-//     halfA[i] (its own face normal) - no sqrt, no per-axis absDot storm;
-//   edge axis A_i×B_j: the cross product is perpendicular to both parents, so each
-//     box's radius reads the two off-axis entries of m (perpendicularity identity).
-// The generic per-axis form (normalise, absDot both boxes' three axes) did ~30
-// multiplies plus a sqrt per axis, 15 axes per pair.
+// SAT frame table: m[i][j]=axisA_i·axisB_j and dA/dB precomputed once per pair; projections are table reads (no sqrt).
+// Face radius = halfA[i]; edge reads two off-axis m entries. Old per-axis form: ~30 mults + sqrt, 15 axes/pair.
 
 inline bool testFaceAxisA(const OBB& boxA, const OBB& boxB, const float3& dA, const float3x3& m, int i,
         float speculativeMargin, SatAxis& best)
@@ -294,9 +287,8 @@ inline bool testEdgeAxis(const OBB& boxA, const OBB& boxB, const float3& delta, 
         return true;
 
     const float invLen = 1.0f / std::sqrt(lenSq);
-    // (A_i x B_j) is perpendicular to A_i and B_j, so each box's support along it is
-    // the support along the two adjacent axes, read off the frame table:
-    //   |A_k . (A_i x B_j)| = |m[(i+2)%3][j]| for k=(i+1)%3, |m[(i+1)%3][j]| for k=(i+2)%3
+    // (A_i x B_j) is perpendicular to both parents, so support reads two adjacent frame-table axes:
+    //   |A_k·(A_i x B_j)| = |m[(i+2)%3][j]| (k=(i+1)%3), |m[(i+1)%3][j]| (k=(i+2)%3).
     const int i1 = (i + 1) % 3, i2 = (i + 2) % 3;
     const int j1 = (j + 1) % 3, j2 = (j + 2) % 3;
     const float rA = (boxA.half[i1] * std::abs(m[j][i2]) + boxA.half[i2] * std::abs(m[j][i1])) * invLen;
@@ -458,14 +450,8 @@ inline int buildFaceManifold(const Shape& shapeA, const Shape& shapeB, const OBB
 
     if (!contactCount)
     {
-        // The clip window caught nothing: the faces only meet at a corner. The support
-        // points are the deepest points along the normal, so their normal separation is
-        // the contact error - but their *tangential* offset is arbitrary (it is the
-        // distance between whichever corners the support direction happens to pick, up to
-        // a full box width). That offset becomes a tangential constraint error, ramps the
-        // friction penalty against a phantom, and after the next rebase rotates into the
-        // normal: box-sized penetration and an explosive impulse. Keep the normal
-        // separation, put both anchors at A's support point.
+        // Corner-only clip: arbitrary tangential offset -> phantom friction, then normal impulse on rebase.
+        // Keep the normal separation; put both anchors at A's support point (offset can be a full box width).
         float3 xA = supportPoint(boxA, normalAB);
         float3 xB = supportPoint(boxB, -normalAB);
         xB = xA - normalAB * dot(xA - xB, normalAB);
@@ -504,16 +490,8 @@ inline int buildEdgeContact(const Shape& shapeA, const Shape& shapeB, const OBB&
 }
 
 
-// -----------------------------------------------------------------------------
-// Shapes
-//
-// Box-box is the reference implementation's SAT + clipping, above. The other pairs are built on
-// closest points, which is exact for a sphere against anything and for the curved side of a
-// cylinder; the flat caps of a cylinder are handled by testing the rim and cap samples against
-// the other shape. Sampling a curved surface is the usual way to get a manifold (rather than a
-// single point) out of it, and the samples are placed deterministically, so contacts are stable
-// from frame to frame and warm-starting works.
-// -----------------------------------------------------------------------------
+// Shapes: box-box keeps reference SAT; others use closest points (exact for spheres/cylinder sides), caps via samples.
+// Samples are placed deterministically, so contacts are stable frame to frame and warm-start works.
 
 constexpr int RIM_SAMPLES = 8;
 // Interior rings along a cylinder's side, between the two caps.
@@ -566,11 +544,8 @@ inline bool pointInBox(const Shape& box, const float3& p, float3& r_push, float&
     return true;
 }
 
-// Speculative variant of pointInBox: a point outside but within `margin` of the box reports a
-// gap - r_depth negative, r_push pointing out of the box toward the point, so the existing
-// anchor math `other = sample + push * depth` lands on the box surface for both signs. The
-// closest point is the componentwise clamp of the local coordinates, which is exact for box
-// edges. Returns false when the point is inside (use pointInBox) or farther than margin out.
+// Speculative pointInBox: within `margin` gives negative depth + outward push so anchors land on the surface.
+// Closest point is the componentwise clamp (exact for box edges); false if inside or farther than margin.
 inline bool pointNearBox(const Shape& box, const float3& p, float margin, float3& r_push, float& r_depth)
 {
     const float3 local = qrot(qconj(box.rotation), p - box.center);
@@ -674,10 +649,8 @@ inline bool pointInCylinder(const Shape& cyl, const float3& p, float3& r_push, f
     return true;
 }
 
-// Speculative variant of pointInCylinder: a point outside but within `margin` of the cylinder
-// reports a gap - r_depth negative, r_push pointing out of the cylinder toward the point, so
-// `other = sample + push * depth` lands on the cylinder surface for both signs. Returns false
-// when the point is inside (use pointInCylinder) or farther than margin out.
+// Speculative pointInCylinder: within `margin` gives negative depth + outward push so anchors land on the surface.
+// Returns false if inside (use pointInCylinder) or farther than margin out.
 inline bool pointNearCylinder(const Shape& cyl, const float3& p, float margin, float3& r_push, float& r_depth)
 {
     const float3 local = qrot(qconj(cyl.rotation), p - cyl.center);
@@ -696,9 +669,8 @@ inline bool pointNearCylinder(const Shape& cyl, const float3& p, float margin, f
     return true;
 }
 
-// The validity test both cylinder paths run on a sample: inside the shape, or within the
-// speculative margin of it. The order matters: the exact inside query runs first and only its
-// failure lets the near query run, exactly as the open-coded `!in && !(margin > 0 && near)` did.
+// Sample validity: inside the shape or within speculative margin. ORDER matters: exact inside query runs first.
+// Only its failure runs the near query - matches old `!in && !(margin > 0 && near)` exactly.
 inline bool sampleInsideBox(const Shape& box, const float3& p, float margin, float3& r_push, float& r_depth)
 {
     return pointInBox(box, p, r_push, r_depth)
@@ -719,19 +691,13 @@ struct Candidate
     float3 xB;
     float3 normal; // points from the shape the sample belongs to, outwards
     float depth;
-    // Stable identity of the sample that produced this contact: a path tag, which shape
-    // owns the sample, and its local index. Warm-start matching keys on this, so it must
-    // not depend on the depth ranking (a rank-keyed contact resets its state whenever the
-    // ranking moves, which for sampled cylinders is almost every tick).
+    // Sample identity (path tag, owner, local index) keys warm-start matching; it must NOT depend on depth ranking.
+    // Rank-keyed contacts reset state whenever ranking moves - almost every tick for sampled cylinders.
     uint32_t feature;
 };
 
-// Emit the deepest MAX_CONTACTS candidates. Ranking by depth rather than taking them in sampling
-// order is what keeps a contact set sensible when there are more samples than the budget: the
-// shallow ones are the ones to drop.
-//
-// The ranking is an insertion sort into a stack array: stable (equal depths keep sampling
-// order) and allocation-free, unlike the vector + stable_sort copy this replaces.
+// Emit the deepest MAX_CONTACTS; rank by depth so shallow ones drop when samples exceed budget.
+// Ranking is a stable, allocation-free stack insertion sort (equal depths keep order), replacing vector + stable_sort.
 inline void emitRanked(const Shape& shapeA, const Shape& shapeB,
                        std::span<const Candidate> candidates,
                        std::span<Manifold::Contact> contacts, int& contactCount)
@@ -762,18 +728,8 @@ inline void emitRanked(const Shape& shapeA, const Shape& shapeB,
     }
 }
 
-// Samples a cylinder's surface: the two cap centres, the two rim circles, and rings partway
-// along the side (which is what gives a lying cylinder a line of contacts rather than just its
-// two ends).
-//
-// The angles are visited in an interleaved order rather than 0, 1, 2, ... because the contact
-// budget is smaller than the sample count: adding contacts stops at MAX_CONTACTS, and taking the
-// first N of an ordered ring would cover one arc and leave the other side unsupported - which
-// tips the body over. With a stride coprime to the sample count, any prefix is spread around the
-// circle.
-// The rim angles are the same on every call, so the sine and cosine table is built once.
-// The entries are produced by the same `std::cos` / `std::sin` of the same float angle the
-// per-sample code used, which keeps the sampled positions bit-identical.
+// Coprime angle stride (not 0,1,2,...) spreads a budget-limited prefix around the circle - one arc would tip the body.
+// Sin/cos table built once from the same std::cos/std::sin of the same float angle, so samples stay bit-identical.
 struct RimTrig
 {
     float cos[RIM_SAMPLES];
@@ -927,9 +883,7 @@ inline int collideSphereCylinder(const Shape& a, const Shape& b, bool sphereIsA,
     return count;
 }
 
-// Cylinder against box, in either order. Both directions are tested - the cylinder's surface
-// samples against the box, and the box's corners against the cylinder - so neither shape can slip
-// through the other however they are arranged.
+// Cylinder vs box: both directions tested (samples vs box, corners vs cylinder) so neither slips through.
 inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
         std::span<Manifold::Contact> contacts, float3x3& basisOut, float speculativeMargin)
 {
@@ -1067,10 +1021,8 @@ int collideShapes(const Shape& a, const Shape& b,
             return collideSphereBox(a, b, sphereIsA, contacts, basisOut, speculativeMargin);
         }
 
-        // The sampled cylinder paths accept gap contacts through the same signed point
-        // queries: a sample within the margin of the other shape reports a negative depth
-        // (a gap), and the solver's speculative machinery turns that into a contact that
-        // only pushes once the pair would close the gap within the step.
+        // Sampled cylinder paths accept gaps: within margin -> negative depth, a speculative contact.
+        // It pushes only once the pair would close the gap within the step.
         if (a.type == ShapeType::Cylinder && b.type == ShapeType::Cylinder)
             return collideCylinderCylinder(a, b, contacts, basisOut, speculativeMargin);
 

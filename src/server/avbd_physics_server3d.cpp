@@ -36,12 +36,8 @@ using namespace godot;
 AVBDPhysicsServer3D *AVBDPhysicsServer3D::SpaceData::singleton = nullptr;
 using namespace avbd_godot;
 
-// --- step profiling (AVBD_PROFILE=1) -----------------------------------------
-//
-// Env-gated aggregate timers for headless runs that need to attribute per-tick
-// cost to a phase: rebuild, project-settings reads, force integration, the
-// solver itself, contact collection, sync dispatch. Off by default; the on
-// path is a handful of steady_clock reads per step.
+// --- step profiling (AVBD_PROFILE=1): env-gated per-phase timers (rebuild/params/forces/solver/
+// contacts/sync) for headless runs; off by default, enabled path = a few steady_clock reads/step.
 
 namespace {
 using ProfClock = std::chrono::steady_clock;
@@ -61,9 +57,8 @@ struct StepProfile {
     double rebuild_ns = 0.0;
     double params_ns = 0.0;
     double forces_ns = 0.0;
-    // Spike attribution: per-phase maxima within the reporting window. The average
-    // hides exactly what a player feels - the one tick in a hundred that stalls the
-    // frame (a deep-impact tick, a broad-phase pair storm, a rebuild).
+    // Spike attribution: per-phase maxima in the window - the average hides the one tick in a
+    // hundred that stalls a frame (deep impact, pair storm, rebuild).
     double max_total_ns = 0.0;
     double max_solver_ns = 0.0;
     double max_sync_ns = 0.0;
@@ -89,9 +84,8 @@ StepProfile &step_profile() {
 }
 } // namespace
 
-// Godot 4.3 added per-axis springs to the generic 6-DOF joint and grew the server enums; the
-// godot-cpp headers this extension builds against predate that, so the new slots are named
-// here with the engine's values (servers/physics_server_3d.h, G6DOFJointAxisParam/Flag).
+// Godot 4.3 added 6-DOF per-axis springs; the pinned godot-cpp headers predate them, so the new
+// G6DOFJointAxisParam/Flag slot values are named here (servers/physics_server_3d.h).
 namespace g6dof_spring {
 constexpr int LINEAR_STIFFNESS = 7;
 constexpr int LINEAR_DAMPING = 8;
@@ -103,14 +97,8 @@ constexpr int FLAG_ENABLE_ANGULAR = 2;
 constexpr int FLAG_ENABLE_LINEAR = 3;
 } // namespace g6dof_spring
 
-// -----------------------------------------------------------------------------
-// Handles
-//
-// The extension interface offers no way to allocate a RID, so the server mints its own: an
-// integer id written into the RID's opaque bytes through the pointer godot-cpp does expose. The
-// engine only ever hands these values back to us, so the encoding is ours to choose - but it must
-// round-trip, which is what id_of() checks by reading them back.
-// -----------------------------------------------------------------------------
+// --- Handles: no engine RID factory, so the server mints ids into the RID's opaque bytes; the
+// --- engine only hands them back, so the encoding is ours but must round-trip (checked by id_of).
 
 RID AVBDPhysicsServer3D::make_rid(uint64_t p_id) const {
     RID rid;
@@ -146,7 +134,6 @@ AVBDPhysicsServer3D::SpaceData *AVBDPhysicsServer3D::find_space(const RID &p_rid
 
 // -----------------------------------------------------------------------------
 // Lifecycle
-// -----------------------------------------------------------------------------
 
 // Spaces may outlive _finish in edge paths (a space freed without the engine stopping
 // first): the destructor is the last chance to release the cached state objects.
@@ -210,11 +197,8 @@ void AVBDPhysicsServer3D::_on_project_settings_changed() {
 
 void AVBDPhysicsServer3D::_flush_queries() {
     flushing_queries = true;
-    // The engine flushes before stepping, so this is where the last step's poses reach
-    // the scene: the per-body state-sync callable, then scripted integration. Both read
-    // and write the solver's live state, so forces a script applies in _integrate_forces
-    // land in the step about to run (the GodotPhysics contract, and godot-jolt's shape).
-    // The first flush of a scene has no step behind it yet: nothing to deliver.
+    // Pre-step flush: last step's poses reach the scene via sync then integration callbacks, so
+    // script forces land in the coming step (GodotPhysics/jolt contract); first flush has no step.
     if (has_stepped) {
         StepProfile &prof = step_profile();
         const ProfClock::time_point prof_t_sync = ProfClock::now();
@@ -330,7 +314,6 @@ void AVBDPhysicsServer3D::_free_rid(const RID &p_rid) {
 
 // -----------------------------------------------------------------------------
 // Spaces
-// -----------------------------------------------------------------------------
 
 RID AVBDPhysicsServer3D::_space_create() {
     const uint64_t id = next_id++;
@@ -344,9 +327,8 @@ RID AVBDPhysicsServer3D::_space_create() {
     return make_rid(id);
 }
 
-// Solver parameters come from project settings the same way gravity does, so a project can
-// tune the solver without a node layer. Keys absent from a project fall back to the solver's
-// defaults.
+// Solver params come from project settings like gravity, so projects tune without a node layer;
+// absent keys fall back to solver defaults.
 void AVBDPhysicsServer3D::read_project_params(SpaceData &p_space) {
     const ProjectSettings *settings = ProjectSettings::get_singleton();
     if (settings == nullptr) {
@@ -405,10 +387,8 @@ bool AVBDPhysicsServer3D::_space_is_active(const RID &p_space) const {
 }
 
 void AVBDPhysicsServer3D::_space_set_param(const RID &p_space, PhysicsServer3D::SpaceParameter p_param, float p_value) {
-    // The space parameters are contact tolerances and sleep thresholds, none of which map onto
-    // AVBD's model. They are accepted and ignored rather than rejected, so a project's settings do
-    // not error out on load. Gravity does not come through here at all: Godot keeps it in the
-    // project settings, and a server is expected to read it (see read_project_gravity).
+    // Space params (contact tolerances, sleep thresholds) don't map to AVBD; accept-and-ignore so
+    // project settings don't error on load. Gravity never comes here - read from project settings.
     (void)p_space;
     (void)p_param;
     (void)p_value;
@@ -437,9 +417,8 @@ float AVBDPhysicsServer3D::_space_get_param(const RID &p_space, PhysicsServer3D:
     return 0.0;
 }
 
-// One state object per space, created on first ask. PhysicsDirectSpaceState3D is
-// reference-counted by the engine, so the server holds a raw pointer to the object it
-// owns for the space's lifetime.
+// One direct state per space, created lazily; the engine ref-counts it, so the server holds a raw
+// pointer it owns for the space's lifetime.
 PhysicsDirectSpaceState3D *AVBDPhysicsServer3D::_space_get_direct_state(const RID &p_space) {
     SpaceData *space = find_space(p_space);
     if (space == nullptr) {
@@ -497,12 +476,8 @@ int32_t AVBDPhysicsServer3D::_space_get_contact_count(const RID &p_space) const 
     return found->second->solver.manifoldContactPoints();
 }
 
-// -----------------------------------------------------------------------------
-// Shapes
-//
-// The engine sends a shape's parameters as a Variant from the matching *Shape3D resource, which
-// is also what it can read back, so the getters rebuild the same object.
-// -----------------------------------------------------------------------------
+// --- Shapes: the engine sends shape params as a Variant from the matching *Shape3D resource and
+// --- reads the same back, so getters rebuild that same object.
 
 RID AVBDPhysicsServer3D::_box_shape_create() {
     const uint64_t id = next_id++;
@@ -596,10 +571,8 @@ float AVBDPhysicsServer3D::_shape_get_margin(const RID &p_shape) const {
     return found == shapes.end() ? 0.0f : found->second.margin;
 }
 
-// -----------------------------------------------------------------------------
-// Soft-body server API: documented unsupported. Godot only drives these through
-// SoftBody3D nodes; every method answers neutrally and nothing is simulated.
-// -----------------------------------------------------------------------------
+// --- Soft-body server API (unsupported): driven only by SoftBody3D nodes; every method answers
+// --- neutrally, nothing simulated.
 
 RID AVBDPhysicsServer3D::_soft_body_create() {
     return make_rid(next_id++);
@@ -769,10 +742,8 @@ void AVBDPhysicsServer3D::_shape_set_data(const RID &p_shape, const Variant &p_d
     if (shape == nullptr) {
         return;
     }
-    // Godot 4.x payload per shape type (scene/resources/3d/*_shape_3d.cpp::_update_shape):
-    //   box      Vector3 - HALF extents (the resource sends `size / 2`)
-    //   sphere   float radius
-    //   cylinder Dictionary { radius: float, height: float } - full height
+    // Godot 4.x shape payloads: box = Vector3 HALF extents (`size / 2`), sphere = float radius,
+    // cylinder = Dictionary {radius, height} with full height.
     switch (shape->type) {
         case PhysicsServer3D::SHAPE_SPHERE: {
             if (p_data.get_type() == Variant::FLOAT) {
@@ -927,9 +898,8 @@ avbd::Shape AVBDPhysicsServer3D::query_shape_from_rigid(const avbd::Rigid &p_bod
     return s;
 }
 
-// Godot BodyAxis bits (linear X/Y/Z = 1/2/4, angular X/Y/Z = 8/16/32) to the solver's
-// sim-axis bits (0..2 = sim x/y/z). Godot Y is sim Z, Godot Z is sim -Y; the lock is a
-// directionless bit so the sign does not matter, only the permutation.
+// Godot BodyAxis bits (lin X/Y/Z = 1/2/4, ang = 8/16/32) -> sim bits (0..2): Godot Y = sim Z,
+// Godot Z = sim -Y; locks are directionless so only the permutation matters.
 static void axis_locks_to_sim(uint32_t p_locks, uint8_t &r_linear, uint8_t &r_angular) {
     static constexpr int kMap[3] = {0, 2, 1}; // godot axis -> sim axis
     r_linear = 0;
@@ -953,20 +923,11 @@ inline Container to_container(Range&& r) {
 
 
 
-// -----------------------------------------------------------------------------
-// The solver
-//
-// A space's solver is rebuilt from its bodies whenever any of them changes: AVBD holds one shape
-// per body and a flat body list, so there is nothing to incrementally patch. Bodies are few
-// enough per space that rebuilding is cheap, and it keeps the solver a pure function of the scene
-// rather than of the order the engine happened to call things in.
-// -----------------------------------------------------------------------------
+// --- The solver: fully rebuilt when a space's bodies change (one shape + flat list, no patching);
+// --- cheap for few bodies and deterministic - a pure function of the scene, not engine call order.
 
-// Density the solver should see for a body: its mass divided by its first shape's volume. The
-// solver derives mass and inertia from shape and density, so the density has to carry exactly
-// the engine's mass - a body that never set one is 1 kg (BODY_PARAM_MASS's documented default),
-// whatever its size. Mass 0 means a body with no volume to divide into, or one the engine
-// explicitly made massless; both stay massless in the solver, which reads that as immovable.
+// Solver density = mass / first-shape volume, carrying the engine's mass (unset = 1 kg default).
+// Mass 0 (no volume or explicitly massless) stays massless = immovable in the solver.
 float AVBDPhysicsServer3D::density_for(const BodyData &p_body) {
     if (p_body.mode != PhysicsServer3D::BODY_MODE_RIGID &&
             p_body.mode != PhysicsServer3D::BODY_MODE_RIGID_LINEAR) {
@@ -1015,9 +976,8 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space, std::source_location
     }
     space->solver.clear();
 
-    // Deterministic order: ids are minted in creation order, so sorting by id makes the
-    // solver's body list - and with it the Gauss-Seidel update order - a function of the
-    // scene, not of unordered_map bucket layout. Two identical scenes rebuild identically.
+    // Deterministic order: ids minted in creation order, so sorting by id makes the solver's body
+    // list (and Gauss-Seidel order) a function of the scene, not hash buckets.
     std::vector<uint64_t> space_body_ids = to_container<std::vector<uint64_t>>(bodies 
         | std::views::filter([&](const auto &entry) { return id_of(entry.second.space) == space_id; }) 
         | std::views::keys);
@@ -1057,9 +1017,8 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space, std::source_location
                 break;
             case PhysicsServer3D::SHAPE_CYLINDER:
                 type = avbd::ShapeType::Cylinder;
-                // Godot: x and z are the radius, y the height, axis local Y. The solver reads
-                // the radius from size.x and the height from size.z (its cylinder axis is its
-                // local Z, which is where Godot's Y lands in sim space), so order {r, r, h}.
+                // Godot cylinder: radius in x/z, height in y, axis local Y. Solver reads radius from
+                // size.x and height from size.z (its axis is local Z = Godot Y in sim): order {r,r,h}.
                 extents = {static_cast<float>(shape.radius), static_cast<float>(shape.radius),
                         static_cast<float>(shape.height)};
                 break;
@@ -1089,9 +1048,8 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space, std::source_location
                 break;
         }
         if (!simulated) {
-            // No neutral proxy exists (a trimesh ground's AABB would be a giant solid
-            // box): the body stays out of the solver entirely, per the unsupported-list
-            // contract in the header. Swap the scene to a box shape instead.
+            // No neutral proxy (a trimesh's AABB would be a giant solid box), so unsupported bodies
+            // stay out of the solver per the header's list - swap the scene to a box shape.
             if (!body.unsupported_warned) {
                 body.unsupported_warned = true;
                 WARN_PRINT("AVBD physics server: a body uses a shape AVBD cannot simulate "
@@ -1111,8 +1069,7 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space, std::source_location
         axis_locks_to_sim(body.axis_locks, body.rigid->axisLockLinear, body.rigid->axisLockAngular);
         body.rigid->sleeping = body.sleeping;
         //body.rigid->sleeping = false;
-        // Solver sleep modes: 0 = never sleeps, 1 = may sleep. Idle detection lives in the
-        // solver (Solver::sleepFrames); can_sleep only opens the gate.
+        // Sleep modes: 0 = never, 1 = may sleep; idle detection in Solver::sleepFrames, can_sleep gates it.
         body.rigid->sleep_mode = body.can_sleep ? 1 : 0;
         body.rigid->gravity = space->solver.gravity * static_cast<float>(body.gravity_scale);
     }
@@ -1136,9 +1093,8 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space, std::source_location
         }
     }
 
-    // Solver-body -> server id index for the query paths: the BVH hands candidates back
-    // as Rigid*, and this is the O(1) bridge to RIDs. Rebuilt here because every Rigid
-    // was just re-created.
+    // Solver-body -> server id index for queries: the BVH returns Rigid*, this is the O(1) RID
+    // bridge, rebuilt here since every Rigid was just re-created.
     space->rigid_ids.clear();
     for (auto &[id, body] : bodies) {
         if (id_of(body.space) == space_id && body.rigid != nullptr) {
@@ -1146,21 +1102,8 @@ void AVBDPhysicsServer3D::rebuild_space(const RID &p_space, std::source_location
         }
     }
 
-    // Joints second, once every body exists. One solver GenericJoint per engine joint
-    // whose both bodies live in this space (or whose A side is the world). Every Godot
-    // joint type maps onto the solver's GenericJoint; the specialised types fix which
-    // axes are locked (conventions verified against Godot 4.7 sources):
-    //   Pin       - all three linear axes locked, all angular free
-    //   Hinge     - linear locked; angular free about the hinge axis, locked elsewhere
-    //               (the hinge axis is the Z column of the hinge frame, see
-    //               modules/godot_physics_3d/joints/godot_hinge_joint_3d.cpp:160)
-    //   Slider    - free (or limited) along the slide axis (the X column of the joint
-    //               frame, godot_slider_joint_3d.cpp:125), locked on the orthogonal
-    //               linear axes; angular free about the slide axis, locked elsewhere
-    //   ConeTwist - linear locked; angular free about the twist axis, swing limited
-    //               on the two orthogonal axes (godot_cone_twist_joint_3d.cpp:117-139)
-    // A joint axis that does not line up with a solver axis snaps to the nearest one:
-    // the GenericJoint's degrees of freedom are principal axes only.
+    // One GenericJoint per joint after bodies (Godot 4.7): Pin linear-locked/ang-free; Hinge frame-Z
+    // free; Slider frame-X free/limited; ConeTwist twist free+swing limited; off-axis -> nearest axis.
     std::vector<uint64_t> space_joint_ids = to_container<std::vector<uint64_t>>(joints
             | std::views::keys);
             
@@ -1243,19 +1186,16 @@ static bool param_flag(const AVBDPhysicsServer3D::JointData &p_joint, int p_key)
 
 void AVBDPhysicsServer3D::rebuild_6dof_joint(SpaceData *space, const JointData &joint, avbd::Rigid *rigid_a,
         avbd::Rigid *rigid_b) {
-    // Anchors: Godot's local_ref is a full transform whose basis carries the joint frame;
-    // AVBD wants the offset in each body's frame and measures angles from the relative
-    // orientation at creation, which is what the two bases encode. With no A body the A
-    // anchor is world-space already (the server's sim space is the world).
+    // Anchors: Godot's local_ref basis carries the joint frame AVBD needs (offset in each body's
+    // frame, angles from creation orientation); with no A body its anchor is already world-space.
     const avbd::float3 r_a = to_sim(joint.ref_a.origin);
     const avbd::float3 r_b = to_sim(joint.ref_b.origin);
 
     avbd::GenericJoint *solver_joint = new avbd::GenericJoint(&space->solver, rigid_a,
             rigid_b, r_a, r_b);
 
-    // Six axes, Godot order X..Z linear then angular. Each Godot axis maps to a solver axis
-    // with a sign (Godot X -> solver X +, Y -> Z +, Z -> Y -); the same kAxisMapping the
-    // node layer uses, so both frontends mean the same joint.
+    // Six axes (Godot X..Z linear then angular) map to solver axes with signs: X->X+, Y->Z+, Z->Y-
+    // (same kAxisMapping as the node layer, so both frontends agree).
     for (int axis = 0; axis < 6; axis++) {
         const int godot_index = axis % 3;
         const bool angular = axis >= 3;
@@ -1325,9 +1265,8 @@ void AVBDPhysicsServer3D::rebuild_pin_joint(SpaceData *space, const JointData &j
 
 void AVBDPhysicsServer3D::rebuild_hinge_joint(SpaceData *space, const JointData &joint, avbd::Rigid *rigid_a,
         avbd::Rigid *rigid_b) {
-    // The hinge axis: for _joint_make_hinge_simple it is the vector the engine stored in
-    // ref_a's basis Z column (see _joint_make_hinge_simple below); for the full form it is
-    // the Z column of the hinge frame. Expressed in body A's local frame.
+    // Hinge axis = ref_a's basis Z column (both the simple and full forms store it there), in body
+    // A's local frame.
     const avbd::float3 axis_a_sim = to_sim(joint.ref_a.basis.get_column(2));
     const int hinge_axis = dominant_sim_axis(axis_a_sim);
     const float hinge_sign = dominant_sim_axis_sign(axis_a_sim, hinge_axis);
@@ -1452,11 +1391,8 @@ void AVBDPhysicsServer3D::rebuild_cone_twist_joint(SpaceData *space, const Joint
     // CONE_TWIST_JOINT_BIAS / SOFTNESS / RELAXATION: recorded, not mapped.
 }
 
-// Run every active space for one step, then tell each body what happened.
-//
-// Stepping follows the game: while the engine has the server inactive (SceneTree paused)
-// nothing steps. Solver parameters are stamped from project settings every step, and each
-// space runs `substeps` solver steps per engine step with dt split across them.
+// Step every active space, then update bodies. Paused (inactive) server steps nothing; solver params
+// are stamped from project settings each step and each space runs `substeps` steps (dt split).
 void AVBDPhysicsServer3D::_step(float p_step) {
     if (!server_active) {
         return;
@@ -1491,10 +1427,8 @@ void AVBDPhysicsServer3D::_step(float p_step) {
             continue;
         }
 
-        // A body joined/left this space since the last step; rebuild now that the
-        // engine has finished sending its setup (shapes, mass, material). Runs before
-        // the empty check: a space may be pending precisely because its first body is
-        // only now arriving.
+        // Body joined/left since last step: rebuild now that setup (shapes/mass/material) landed.
+        // Before the empty check - a space may be pending because its first body just arrived.
         if (space_rebuild_pending.erase(id) > 0) {
             const ProfClock::time_point prof_t_rebuild = ProfClock::now();
             rebuild_space(make_rid(id));
@@ -1532,10 +1466,8 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         space.solver.projectionSlop = static_cast<float>(std::max(space.projection_slop, 0.0));
         space.solver.projectionMaxCorrection = static_cast<float>(std::max(space.projection_max_correction, 0.0));
 
-        // Godot's physics tick is the sampling rate. If an internal rate is configured,
-        // accumulate engine time and advance the solver on its own fixed tick; the engine
-        // tick then only samples the state. 0 keeps the legacy one-solver-tick-per-engine-
-        // tick behaviour. The catch-up cap drops a backlog instead of spiralling.
+        // Godot's tick samples; internal_ticks_per_second advances the solver on its own fixed tick
+        // (engine tick samples). 0 = legacy 1 solver tick/engine tick; the cap drops backlog.
         double dt = p_step;
         int tickCount = 1;
         if (space.internal_ticks_per_second > 0.0) {
@@ -1551,9 +1483,8 @@ void AVBDPhysicsServer3D::_step(float p_step) {
             }
         }
         space.solver.dt = static_cast<float>(dt / static_cast<double>(substeps));
-        // Idle-sleep horizon: Godot's 0.5 s default scaled by sleep_time, expressed in
-        // internal ticks. A fixed step count would make a high-tick-rate project fall
-        // asleep sooner than intended - the horizon is a TIME, not 60 frames.
+        // Sleep horizon = 0.5 s * sleep_time in internal ticks; a fixed count would make high-rate
+        // projects sleep too soon - it's a TIME, not 60 frames.
         space.solver.sleepFrames = std::max(1,
                 static_cast<int>(std::lround(0.5 * space.sleep_time / dt)));
         space.solver.sleepLinearThreshold =
@@ -1567,10 +1498,8 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         for (int tick = 0; tick < tickCount; ++tick) {
             const float tickDt = static_cast<float>(dt);
 
-            // Forces accumulated since the last solver tick (persistent constant_* plus
-            // one-shot frame ones) become velocity changes now, so the solver integrates
-            // them with everything else. With an internal tick, a one-shot force waits
-            // until the next internal tick rather than being consumed by a sample.
+            // Accumulated forces (persistent constant_* + one-shot frame) become velocity changes
+            // now; with an internal tick a one-shot force waits for the next tick, not a sample.
             const ProfClock::time_point prof_t_forces = ProfClock::now();
             for (auto &[body_id, body] : bodies) {
                 if (id_of(body.space) != id || body.rigid == nullptr || body.rigid->mass <= 0.0f) {
@@ -1613,19 +1542,8 @@ void AVBDPhysicsServer3D::_step(float p_step) {
             stepped_any = true;
         }
 
-        // Snapshot the deepest contact on the stepping thread, where the force list is
-        // stable. The getters run on the main thread; walking solver.forces there races
-        // with manifold creation, revival and reaping, and a manifold read after it was
-        // unlinked (or reused from the pool) reports a depth for a pair that is no longer
-        // touching - the "phantom depth" that does not match any geometry.
-        //
-        // The stored error alone is not the answer either: it belongs to the contact set
-        // the tick's collision pass found, and the bodies have moved since (a fast pair can
-        // have separated within the tick, and a contact that rotated makes its stored
-        // normal measure a separation that no longer exists). Report the pair the solver
-        // believes is deepest, but measure it with a real SAT pass at the current pose, so
-        // the number always describes the geometry the host can see. One extra narrow
-        // phase per step, on the stepping thread.
+        // Snapshot on the stepping thread: main-thread solver.forces racing with manifold reaping
+        // gives phantom depths and stale C0, so re-measure the deepest pair via SAT at current pose.
         avbd::Rigid *deepest_a = nullptr;
         avbd::Rigid *deepest_b = nullptr;
         double deepest_stored = 0.0;
@@ -1672,12 +1590,8 @@ void AVBDPhysicsServer3D::_step(float p_step) {
         _monitor_areas();
         const ProfClock::time_point prof_t_contacts = ProfClock::now();
 
-        // Collect each body's contacts for the step (used by the DirectBodyState contact
-        // getters, i.e. RigidBody3D contact monitoring). Manifolds are the forces with
-        // contact points; a contact's world position comes from the anchor of the body
-        // being filled. Capped by max_contacts_reported, as Godot does: without the cap
-        // request no contacts are recorded. The manifold walk (and its two hash maps)
-        // only runs when some body in this space actually reports contacts.
+        // Collect contacts for DirectBodyState getters from manifolds, positioned at the filled
+        // body's anchor; capped by max_contacts_reported (0 = none) and only walked when requested.
         bool any_reports = false;
         for (auto &[collect_id, collect_body] : bodies) {
             (void)collect_id;
@@ -1743,9 +1657,8 @@ void AVBDPhysicsServer3D::_step(float p_step) {
                 continue;
             }
 
-            // Snapshot the solver's output into the host record; _flush_queries delivers
-            // it to the scene before the next step, through the callback the engine
-            // registered for this body. The server does not touch the scene itself.
+            // Snapshot solver output into the host record; _flush_queries delivers it via the
+            // engine's callback before the next step - the server never touches the scene itself.
             const avbd::Rigid *rigid = body.rigid;
 
             Transform3D transform;
@@ -1755,9 +1668,8 @@ void AVBDPhysicsServer3D::_step(float p_step) {
             body.transform = transform;
             body.linear_velocity = to_godot(rigid->velocityLin);
             body.angular_velocity = to_godot(rigid->velocityAng);
-            // Keep the host copy in step with the solver's sleep state: the pre-step sync
-            // writes body.sleeping back into body.rigid->sleeping, so a solver-side sleep
-            // decision would otherwise be overwritten on the next step.
+            // Keep the host copy in step with solver sleep: pre-step sync writes body.sleeping back
+            // into the rigid, so an uncopied solver-side sleep would be overwritten next step.
             body.sleeping = rigid->sleeping;
         }
 
@@ -1828,13 +1740,8 @@ void AVBDPhysicsServer3D::_step(float p_step) {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Joints
-//
-// The engine hands over a joint RID, then a type (joint_make_*), then axis parameters and flags
-// one call at a time. Everything is recorded in JointData; the solver object is built only in
-// rebuild_space, so a joint whose bodies are still being set up costs nothing.
-// -----------------------------------------------------------------------------
+// --- Joints: the engine sends RID, type (joint_make_*), then params/flags one call at a time. All
+// --- recorded in JointData; the solver joint is built only in rebuild_space, so half-set-up joints cost nothing.
 
 RID AVBDPhysicsServer3D::_joint_create() {
     const uint64_t id = next_id++;
@@ -1880,9 +1787,8 @@ void AVBDPhysicsServer3D::_joint_disable_collisions_between_bodies(const RID &p_
     if (found == joints.end()) {
         return;
     }
-    // A solver joint keeps its bodies from colliding no matter what (they share a force), so
-    // Godot's default exclusion comes free; asking for contact between the pair cannot be
-    // honoured and the record only reflects the request.
+    // Solver joints always stop their bodies colliding (shared force), so Godot's default exclusion
+    // is free; a request for contact can't be honoured - the record just reflects it.
     found->second.exclude_collision = p_disable;
 }
 
@@ -2216,7 +2122,6 @@ bool AVBDPhysicsServer3D::_generic_6dof_joint_get_flag(const RID &p_joint, Vecto
 
 // -----------------------------------------------------------------------------
 // Bodies
-// -----------------------------------------------------------------------------
 
 RID AVBDPhysicsServer3D::_body_create() {
     const uint64_t id = next_id++;
@@ -2235,9 +2140,8 @@ void AVBDPhysicsServer3D::_body_set_space(const RID &p_body, const RID &p_space)
     (void)0;
     const RID previous = body->space;
     body->space = p_space;
-    // The engine calls this the moment a node enters the tree - before its shapes and
-    // physics material arrive. Rebuilding now would freeze an empty body into the
-    // solver; deferring to the next step lets the whole setup land first.
+    // Called when a node enters the tree, before shapes/material arrive; rebuilding now would
+    // freeze an empty body, so defer to the next step.
     space_rebuild_pending[id_of(p_space)] = true;
     if (previous.is_valid()) {
         space_rebuild_pending[id_of(previous)] = true;
@@ -2382,11 +2286,8 @@ void AVBDPhysicsServer3D::_body_set_ray_pickable(const RID &p_body, bool p_enabl
     }
 }
 
-// --- DirectBodyState accessors -------------------------------------------------
-//
-// The state object is the engine's view of one body during (or after) a step; these
-// helpers do the BodyData lookups it cannot do itself. All of them tolerate an unknown
-// RID: the engine may ask about a body this server never saw.
+// --- DirectBodyState accessors: the engine's view of one body; these do the BodyData lookups it
+// --- can't. All tolerate an unknown RID - the engine may ask about a body we never saw.
 
 void AVBDPhysicsServer3D::body_state_add_constant_force(const RID &p_body, const Vector3 &p_force,
         const Vector3 &p_position) {
@@ -2506,10 +2407,8 @@ double AVBDPhysicsServer3D::get_solver_finish_time() const {
     return 0.0;
 }
 
-// The deepest normal overlap across every live manifold, as snapshotted at the end of the
-// last step. A contact's C0 is stamped at the start of the step (Manifold::initialize), so
-// this is the geometric penetration the last solve was working against, not a
-// solver-internal residual.
+// Deepest overlap across live manifolds, snapshotted at step end. C0 is stamped at step start
+// (Manifold::initialize), so this is geometric penetration, not a solver-internal residual.
 double AVBDPhysicsServer3D::get_solver_max_penetration() const {
     return diag_max_penetration;
 }
@@ -2524,10 +2423,8 @@ Array AVBDPhysicsServer3D::get_solver_deepest_contact() const {
     return out;
 }
 
-// Sleep/wake state of the last step, aggregated over every space. Mirrors the solver's own
-// predicates: a body is asleep when `sleeping` is set, a manifold is frozen when neither side
-// is a movable awake body (ManifoldStore::frozen), and the update set is what the solve
-// actually moved.
+// Last step's sleep/wake state over all spaces, mirroring solver predicates: asleep = `sleeping`,
+// frozen = neither side movable+awake (ManifoldStore::frozen), update set = what the solve moved.
 Dictionary AVBDPhysicsServer3D::get_solver_sleep_stats() const {
     int body_count = 0;
     int movable = 0;
@@ -2754,7 +2651,6 @@ const AVBDPhysicsServer3D::ShapeData *AVBDPhysicsServer3D::shape_data(const RID 
 
 // -----------------------------------------------------------------------------
 // Body parameters and forces
-// -----------------------------------------------------------------------------
 
 void AVBDPhysicsServer3D::_body_set_param(const RID &p_body, PhysicsServer3D::BodyParameter p_param,
         const Variant &p_value) {
@@ -2925,9 +2821,8 @@ void AVBDPhysicsServer3D::_body_add_constant_torque(const RID &p_body, const Vec
     }
 }
 
-// Godot BodyAxis bits (linear X/Y/Z = 1/2/4, angular X/Y/Z = 8/16/32) to the solver's
-// sim-axis bits (0..2 = sim x/y/z). Godot Y is sim Z, Godot Z is sim -Y; the lock is a
-// directionless bit so the sign does not matter, only the permutation.
+// Godot BodyAxis bits (lin X/Y/Z = 1/2/4, ang = 8/16/32) -> sim bits (0..2): Godot Y = sim Z,
+// Godot Z = sim -Y; locks are directionless so only the permutation matters.
 void AVBDPhysicsServer3D::_body_set_axis_lock(const RID &p_body, PhysicsServer3D::BodyAxis p_axis, bool p_lock) {
     BodyData *body = find_body(p_body);
     if (body == nullptr) {
@@ -3145,9 +3040,8 @@ void AVBDPhysicsServer3D::_body_reset_mass_properties(const RID &p_body) {
     if (body == nullptr) {
         return;
     }
-    // Godot's contract for this call is "restore the default inertia and centre of mass to
-    // cancel custom values". Both are always derived from the shape here, so the rebuild is
-    // the whole of the reset - it must not touch the engine's mass.
+    // Godot: restore default inertia/centre-of-mass. Both are shape-derived here, so a rebuild is
+    // the whole reset - must not touch the engine's mass.
     rebuild_space(body->space);
 }
 
@@ -3208,9 +3102,8 @@ int32_t AVBDPhysicsServer3D::_body_get_shape_count(const RID &p_body) const {
 }
 
 RID AVBDPhysicsServer3D::_body_get_shape(const RID &p_body, int32_t p_shape_idx) const {
-    // The engine keeps the shape RIDs; this server only records the parameters it was given, so
-    // there is no handle to give back. Returning an invalid RID is honest - the caller is asking
-    // for something this implementation does not track.
+    // The engine keeps shape RIDs; this server records only parameters, so return an invalid RID -
+    // there's no handle to give back for something we don't track.
     (void)p_body;
     (void)p_shape_idx;
     return RID();
@@ -3247,15 +3140,8 @@ void AVBDPhysicsServer3D::_body_clear_shapes(const RID &p_body) {
     space_rebuild_pending[id_of(body->space)] = true;
 }
 
-// -----------------------------------------------------------------------------
-// Areas
-//
-// Every storage virtual keeps the engine's description in an AreaData record, and
-// _monitor_areas diffs each area against the bodies of its space every step, calling
-// the monitor callbacks with Godot's four-argument contract (verified against 4.7
-// scene/3d/physics/area_3d.cpp): (status, body_rid, instance_id, body_shape, area_shape)
-// - status 0 = entered (AREA_BODY_ADDED), 1 = exited (AREA_BODY_REMOVED).
-// -----------------------------------------------------------------------------
+// --- Areas: storage virtuals fill AreaData; _monitor_areas diffs per step, firing monitors with
+// --- Godot 5-arg contract (vs 4.7): (status, body_rid, instance_id, body_shape, area_shape); 0/1=added/removed.
 
 RID AVBDPhysicsServer3D::_area_create() {
     const uint64_t id = next_id++;
@@ -3445,10 +3331,8 @@ void AVBDPhysicsServer3D::_area_set_area_monitor_callback(const RID &p_area, con
     }
 }
 
-// One step of area monitoring: diff every area's inside-set against the previous one and
-// fire the callbacks on the transitions. Godot's body-shape/area-shape arguments are the
-// first overlapping pair (this server keeps one solver shape per body, so 0 on the body
-// side and the area's first enabled shape on its side).
+// Area monitoring: diff each area's inside-set vs the previous step, fire callbacks on transitions.
+// Body/area-shape args are the first overlapping pair (one solver shape per body => 0 on body side).
 void AVBDPhysicsServer3D::_monitor_areas() {
     for (auto &[area_id, area] : areas) {
         (void)area_id;

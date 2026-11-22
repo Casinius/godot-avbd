@@ -27,9 +27,8 @@ struct Obb
     float radius = 0.0f;
 };
 
-// 15-axis SAT (6 face axes + 9 edge axes). `axes` are unit and orthogonal, so the
-// projections reduce to table reads; no normalisation is needed. A small epsilon biases
-// the test towards overlap (a false positive is cheap, a false negative is a lost contact).
+// 15-axis SAT (6 face + 9 edge); `axes` are unit/orthogonal so projections are table reads.
+// Small epsilon biases to overlap: a false positive is cheap, a false negative loses contact.
 [[nodiscard]] inline bool obbOverlaps(const Obb &a, const Obb &b) noexcept
 {
     constexpr float kSlop = 1.0e-5f;

@@ -73,9 +73,8 @@ struct Joint : Force
     void updatePrimal(Rigid *body, float alpha, Block &block) override;
     void updateDual(float alpha) override;
 
-    // Break the joint immediately, discarding its dual state. Used when a host
-    // application wants the fracture decision to survive being re-created (the
-    // solver has no way to remember a broken joint once it is deleted).
+    // Break now, discarding dual state: lets a host persist a fracture across re-creation (the solver
+    // cannot remember a deleted broken joint).
     void breakNow();
 
     bool isBroken() const override { return broken; }
@@ -140,15 +139,8 @@ struct JointAxis
     float initial = 0.0f; // constraint value at the start of the step, for stabilisation
 };
 
-// A general 6-DOF joint: three linear and three angular degrees of freedom, each Free, Locked
-// or Limited, each with an optional spring. The degrees of freedom are the axes of body A's
-// local frame (world axes when bodyA is null).
-//
-// Angular degrees of freedom are measured from the pose the joint was created in. Before the
-// locked axes are evaluated, the twist about every non-locked axis is removed: without that, a
-// wheel spinning about its axle would drag the locked axes with it, because a rotation vector
-// wraps every half turn and so cannot be read directly off the deviation. Removing one twist is
-// exact; with several non-locked axes it is applied axis by axis, which is the usual approximation.
+// 6-DOF joint: A's local axes (world if null), each Free/Locked/Limited + spring, from creation pose.
+// Strip non-locked twist before locks (rotation vectors wrap at half-turns); multi-axis strip is per-axis, approximate.
 struct GenericJoint : Force
 {
     float3 rA, rB; // anchors, in the local frame of each body
@@ -172,9 +164,8 @@ struct GenericJoint : Force
     [[nodiscard]] quat frameOrientation() const;
 
 
-    // Current displacement of one degree of freedom, measured in the joint frame: metres for a
-    // linear axis, radians for an angular one, both relative to the pose the joint was created
-    // in. Reporting only - the solver never reads these back.
+    // Current displacement (m for linear, rad for angular) from creation pose, in the joint frame.
+    // Reporting only - the solver never reads these back.
     [[nodiscard]] float linearValue(int p_axis) const;
     [[nodiscard]] float angularValue(int p_axis) const;
     // The whole angular measurement vector at once, cheaper than three separate calls.
@@ -191,13 +182,8 @@ private:
     // Shared by both passes so the primal and the dual never disagree about the error.
     [[nodiscard]] bool axisForce(const JointAxis &p_axis, float p_value, float p_alpha, float &r_constraint,
             float &r_force) const;
-    // Stamp one degree of freedom into the body's system: its constraint, and its spring if it
-    // has one.
-    //
-    // A constraint is stamped through *both* halves of the system: `p_jLin` is how it responds
-    // to the body moving and `p_jAng` to the body turning. They are the two Jacobian rows of one
-    // constraint, so a linear axis anchored off the centre of mass needs both - it moves the
-    // anchor point as much by rotating the body as by translating it.
+    // Stamp one DOF's constraint + spring. Stamp through both halves: p_jLin (translation) and p_jAng
+    // (rotation) are one constraint's two Jacobian rows - an off-centre anchor moves as much by either.
     void stampAxis(Block &block, const JointAxis &p_axis, float p_value, float p_alpha, float3 p_jLin,
             float3 p_jAng, float p_rate) const;
 };

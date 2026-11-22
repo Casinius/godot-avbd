@@ -38,14 +38,8 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local, uint32_t p_mask)
     Rigid *bestBody = 0;
     float3 bestLocal = {0, 0, 0};
 
-    // Exact per-body test against the body's own shape. Picking scans the body list rather
-    // than walking the broad phase; the exact test decides.
-    //
-    // The local half extents are per shape, and this used to be `size * 0.5f` for all of
-    // them. For a sphere `size.x` is the *radius* (Rigid's constructor and aabbHalfExtent
-    // both read it that way, and the server stores {radius, 0, 0}), so a sphere was tested
-    // as a zero-thickness box of half-extent r/2 in y and z - a ray could not hit one at
-    // all. A cylinder had its radius halved the same way.
+    // Exact per-body test against that body's own shape; picking scans bodies, not the LBVH.
+    // Halve extents per shape: for a sphere size.x is already the radius, so size*0.5 made it unhittable.
     const auto localHalfExtent = [](const Rigid &body) noexcept {
         switch (body.shape)
         {

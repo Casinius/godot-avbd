@@ -49,16 +49,13 @@ void shape_aabb(const avbd::Shape &s, avbd::float3 &r_min, avbd::float3 &r_max) 
     avbd::query::shapeAabb(s, r_min, r_max);
 }
 
-// // World-space (solver frame) position of body A's contact anchor.
-// avbd::float3 contact_world_a(const avbd::Rigid &a, const avbd::Manifold::Contact &c) {
-//     return a.positionLin + qrot(a.positionAng, c.rA);
-// }
+// // Unused helper: world-space (solver frame) position of body A's contact anchor.
+// // avbd::float3 contact_world_a(...) { return a.positionLin + qrot(a.positionAng, c.rA); }
 
 // The normal from A to B as a Godot-space vector.
 Vector3 contact_normal_godot(const avbd::float3x3 &basis) {
-    // Row 0 of the basis is the contact normal pointing from B to A; Godot's convention
-    // (PhysicsServer3DExtensionRayResult.normal) is the surface normal facing the query,
-    // which is from B towards A here as well - it is what the built-in server reports.
+    // Basis row 0 is the contact normal B->A; Godot's ray-result normal faces the query, also
+    // B->A here, matching the built-in server.
     return to_godot(avbd::float3{basis[0][0], basis[1][0], basis[2][0]});
 }
 

@@ -82,9 +82,8 @@ void AVBDSoftWorld3D::_collect(Node *p_node) {
 }
 
 Shape3D *AVBDSoftWorld3D::_first_shape(StaticBody3D *p_body) {
-	// Scan children directly: shape-owner registration is timing-sensitive during
-	// scene instantiation, and the ground contract is "a CollisionShape3D child
-	// carrying one BoxShape3D".
+	// Scan children directly: shape-owner registration is timing-sensitive during scene
+	// instantiation; ground contract is one CollisionShape3D child with one BoxShape3D.
 	const int child_count = p_body->get_child_count();
 	for (int i = 0; i < child_count; i++) {
 		CollisionShape3D *collision = Object::cast_to<CollisionShape3D>(p_body->get_child(i));
@@ -150,9 +149,8 @@ void AVBDSoftWorld3D::_rebuild() {
 }
 
 void AVBDSoftWorld3D::_physics_process(double p_delta) {
-    // Solver gravity is the signed magnitude along the simulation's -Z; the exposed
-    // property is a positive magnitude. Set BEFORE the rebuild: new rigids snapshot
-    // the solver's gravity at construction.
+    // Solver gravity is signed magnitude along sim -Z; the exposed property is positive. Set
+    // BEFORE rebuild: new rigids snapshot gravity at construction.
     solver.gravity = -static_cast<float>(gravity);
 
     if (_scan_changed()) {

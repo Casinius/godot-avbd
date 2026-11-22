@@ -26,14 +26,8 @@
 
 using namespace godot;
 
-// Offer AVBD to the engine as a selectable 3D physics engine. This is what lets a scene built
-// from Godot's own nodes - RigidBody3D, CollisionShape3D and so on - be simulated by AVBD, without
-// the project adopting any AVBD node classes. Selecting it is a project setting:
-//
-//   [physics]
-//   3d/physics_engine="AVBD"
-// The physics server factory the manager's creation Callable points at; freed at
-// deinitialization because nothing else owns it.
+// Offer AVBD as a selectable 3D engine ([physics] 3d/physics_engine="AVBD") so scenes built
+// from Godot's own nodes simulate without AVBD classes. avbd_factory is freed at deinit.
 static PhysicsServerFactory *avbd_factory = nullptr;
 
 static void register_physics_server() {
@@ -42,17 +36,15 @@ static void register_physics_server() {
         return;
     }
 
-    // The manager wants a callable that produces the server, so a small factory object holds one.
-    // The manager only keeps the Callable, which does not own the object - the factory is
-    // freed at deinitialization (see uninitialize_avbd_module).
+    // The manager keeps only the Callable, not the factory object, so we free the latter at
+    // deinitialization (see uninitialize_avbd_module).
     PhysicsServerFactory *factory = memnew(PhysicsServerFactory);
     avbd_factory = factory;
     manager->register_server("AVBD", Callable(factory, "create_server"));
 }
 
-// Register every physics/avbd/* solver setting with ProjectSettings, so the editor's
-// Project Settings dialog shows an "AVBD" group instead of the settings existing only
-// after a script writes them. Defaults must match read_project_params in the server.
+// Register every physics/avbd/* setting so the editor shows an "AVBD" group; defaults
+// must match read_project_params in the server.
 static void register_avbd_settings() {
     ProjectSettings *settings = ProjectSettings::get_singleton();
     if (settings == nullptr) {
@@ -103,11 +95,8 @@ static void register_avbd_settings() {
     }
 }
 
-// Everything registers at the SERVERS level (as godot-jolt does): the physics server
-// object must keep its ClassDB entry until PhysicsServer3D::finish() has called
-// _finish on it at exit. Registered at SCENE level the classes deregister with the
-// main loop first, and teardown fails with "Required virtual method ::_finish must be
-// overridden" plus a leaked instance.
+// Register at SERVERS level (as godot-jolt does): the ClassDB entry must outlive
+// PhysicsServer3D::finish(); SCENE level deregisters early and breaks teardown/leaks.
 static void uninitialize_avbd_module(ModuleInitializationLevel p_level) {
     if (p_level != MODULE_INITIALIZATION_LEVEL_SERVERS) {
         return;
@@ -119,9 +108,8 @@ static void uninitialize_avbd_module(ModuleInitializationLevel p_level) {
 }
 
 static void initialize_avbd_module(ModuleInitializationLevel p_level) {
-    // SERVERS: the engine-facing classes (the physics server must exist before the
-    // engine picks its physics engine, and its ClassDB entry must outlive
-    // PhysicsServer3D::finish()).
+    // SERVERS: engine-facing classes; the server must exist before the engine picks it,
+    // and its ClassDB entry must outlive PhysicsServer3D::finish().
     if (p_level == MODULE_INITIALIZATION_LEVEL_SERVERS) {
         GDREGISTER_CLASS(AVBDPhysicsServer3D);
         GDREGISTER_CLASS(PhysicsServerFactory);

@@ -448,9 +448,8 @@ SweepHit sweepShape(const Shape &base, const float3 &motion, const Shape &target
         return out;
     }
 
-    // The AABB interval is conservative. Walk it once to find the first contact, then
-    // bisect that bracket for a stable safe/unsafe pair. The interval already bounds the
-    // sweep, so a fast motion cannot skip past the target.
+    // Walk the conservative AABB interval once to find the first contact, then bisect that
+    // bracket for stable safe/unsafe values; the interval bounds the sweep against tunnelling.
     constexpr int kSamples = 32;
     float low = enter;
     float high = exit;

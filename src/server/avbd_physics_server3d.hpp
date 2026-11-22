@@ -1,36 +1,14 @@
 /*
- * AVBD as a Godot physics server.
- *
- * Part of godot-avbd. This implements PhysicsServer3DExtension, so a scene built from Godot's own
- * nodes - RigidBody3D, StaticBody3D, CollisionShape3D, Generic6DOFJoint3D - is simulated by AVBD
- * instead of Godot's built-in engine. Project settings > Physics > 3D > Physics Engine selects it
- * by name once the extension is loaded.
- *
- * This is the main path of the extension: standard Godot nodes, no AVBD node classes. The only
- * node classes left in src/nodes are the soft-body pair (AVBDSoftBody3D + AVBDSoftWorld3D), which
- * have no server representation this round.
- *
- * Design
- * ------
- * - RIDs are minted here. The extension interface has no RID factory, so each handle is an
- *   integer id written into the RID's opaque bytes (`RID::_native_ptr()`); the engine only ever
- *   hands them back to us, so their internal representation is ours to choose. Every id maps to
- *   one of the records below, and the map is the single place an object's lifetime is decided.
- * - One Solver per space. Bodies are `avbd::Rigid`; the shapes attached to a body become that
- *   body's size and shape type, since AVBD gives each body exactly one collision shape. A body
- *   with several shapes uses the first, and says so rather than pretending.
- * - Transforms flow one way per step: the engine writes a body's transform through
- *   `_body_set_state`, `_step` runs the solver, and the result is pushed back by calling the sync
- *   callback the engine registered for that body with a single argument - a
- *   PhysicsDirectBodyState3D (the Godot 4.x contract, verified against 4.7 sources).
- * - Stepping follows the game: `_set_active(false)` (what SceneTree pause triggers) stops the
- *   simulation until the game resumes.
- *
- * Unsupported this round (README has the full list and the reasons): exact capsule/convex/
- * concave geometry (queries use the same cylinder/AABB proxies the solver simulates), the
- * soft-body server API, CCD, damping, automatic sleeping, area gravity overrides. Motion
- * queries (`body_test_motion`, `move_and_collide`, `test_move`) and space queries are
- * implemented through the shared `src/avbd/query/` extension.
+ * AVBD as a Godot physics server (Part of godot-avbd). Implements PhysicsServer3DExtension:
+ * standard Godot nodes run through AVBD; selected in Project Settings > Physics > 3D > Physics
+ * Engine. Solver core ported from github.com/savant117/avbd-demo3d (MIT). Only soft-body node
+ * classes remain in src/nodes (no server representation).
+ * Design: RIDs minted here (no engine factory) as an integer in the RID's opaque bytes; this map
+ * is the sole arbiter of lifetime. One non-movable Solver per space; a body's first shape defines
+ * it (warns on more). Transforms flow one way: _body_set_state -> _step -> single-arg sync callback
+ * (Godot 4.x contract, verified vs 4.7); _set_active(false) (SceneTree pause) stops stepping.
+ * Unsupported: exact capsule/convex/concave geometry (cylinder/AABB proxies), soft-body API, CCD,
+ * damping, auto-sleep, area gravity overrides; motion/space queries use src/avbd/query/.
  */
 
 #ifndef AVBD_PHYSICS_SERVER3D_HPP
@@ -68,11 +46,8 @@ class AVBDPhysicsServer3D : public PhysicsServer3DExtension {
     friend class AVBDDirectBodyState3D;
     friend class AVBDDirectSpaceState3D;
 
-    // --- records -----------------------------------------------------------------
-    //
-    // One shape, as the engine described it. AVBD bodies have a single shape, so a body's shape
-    // list is collapsed to one of these when the body is simulated. Public because the space
-    // queries read query shape descriptors through it.
+    // --- records: one shape as the engine described it; a body's shape list collapses to one of
+    // these when simulated (AVBD bodies have one shape). Public for space queries.
 public:
     struct ShapeData {
         PhysicsServer3D::ShapeType type = PhysicsServer3D::SHAPE_BOX;
@@ -84,11 +59,8 @@ public:
         Variant data; // the engine's payload, round-tripped for _shape_get_data
     };
 
-    // --- query shape conversion -------------------------------------------------
-    // One place decides how a Godot shape becomes a solver query shape. Bodies and
-    // areas use the same proxy the solver simulates: capsule -> cylinder, convex ->
-    // the hull's local AABB box, unsupported -> false. Keeping this shared is what
-    // keeps ray/shape-cast results consistent with contact behaviour.
+    // --- query shape conversion: one shared mapping (capsule->cylinder, convex->AABB box,
+    // unsupported->false) so bodies, areas and casts use the solver's proxies and match contacts.
     static bool query_shape_from_data(const ShapeData &p_data, const Transform3D &p_transform,
             avbd::Shape &r_shape);
     static avbd::Shape query_shape_from_rigid(const avbd::Rigid &p_body);
@@ -106,11 +78,8 @@ protected:
         Vector3 linear_velocity;
         Vector3 angular_velocity;
 
-        // Body parameters the engine sets through _body_set_param. Mass decides the density the
-        // solver is built with; friction is passed through; bounce has no AVBD counterpart (the
-        // contact model is friction-only) and is remembered for the getter only. The default is
-        // BODY_PARAM_MASS's documented 1 kg: a RigidBody3D whose scene never mentions `mass`
-        // never calls the setter, and the solver must still simulate the engine's 1 kg.
+        // _body_set_param: mass->density, friction->solver, bounce getter-only (friction-only model).
+        // Default mass 1 kg = BODY_PARAM_MASS's documented value (setter skipped when absent).
         double mass = 1.0;
         float friction = 0.6f;
         double bounce = 0.0;
@@ -173,9 +142,8 @@ protected:
         avbd::Rigid *rigid = nullptr;        // null until the body joins a space that is stepped
     };
 
-    // One joint, as the engine described it. Parameters arrive axis by axis after the joint is
-    // made, so the record keeps everything and the solver is rebuilt from it. Godot axis order
-    // (X, Y, Z) is preserved here; the solver permutation happens at rebuild time, once.
+    // One joint as the engine described it. Axis parameters arrive after creation, so the record
+    // keeps everything for a rebuild; Godot axis order is kept, permuted once at rebuild.
 public:
     struct JointData {
         RID body_a;                          // invalid RID: joint A-side is the world
@@ -190,9 +158,8 @@ public:
         Vector3 pin_local_a;
         Vector3 pin_local_b;
 
-        // [axis][param/flag], axis 0..2 = Godot X..Z, first three rows linear, last three
-        // angular. Param slot count covers Godot 4.3+'s G6DOFJointAxisParam (spring entries at
-        // 7..9 and 19..21); flag slots cover its G6DOFJointAxisFlag (spring toggles at 2 and 3).
+        // [axis][param/flag]: axes 0..2 = Godot X..Z, rows 0..2 linear / 3..5 angular. Slots cover
+        // Godot 4.3+ spring params (7..9, 19..21) and flags (2, 3).
         static constexpr int kAxisRows = 6;
         static constexpr int kMaxParams = 24;
         static constexpr int kMaxFlags = 8;
@@ -209,9 +176,8 @@ protected:
     struct SpaceData {
         avbd::Solver solver;
         bool active = true;
-        // Re-read the project-setting solver parameters on the next step. Set at creation
-        // and by the settings-changed signal, so the common tick does not hash nine
-        // setting names for nothing.
+        // Re-read project-setting solver params next step: set at creation and on settings-changed,
+        // so common ticks don't hash setting names.
         bool params_dirty = true;
 
         // Solver parameters, read from project settings at space creation and stamped
@@ -228,36 +194,28 @@ protected:
         double newton_ratio = 1.0;
         double stiffness_decay = 1.0;
         int substeps = 1;
-        // Rotation drift (unit-column distance, ~2 sin(angle/2)) above which a manifold's
-        // cached angular jacobians are rebuilt. 0 disables the cache and reassembles them
-        // for every contact on every iteration (original behaviour).
+        // Rotation drift (~2 sin(angle/2)) above which a manifold's cached angular jacobians rebuild;
+        // 0 disables the cache (original behaviour).
         double jacobian_rebuild_distance = 0.0;
         // Interleaved substepping: one collision/update-set pass per tick, then a small
         // fixed round budget per substep (see Solver::stepInterleaved).
         bool interleaved_substeps = false;
         int rounds_per_substep = 0;
-        // Godot's physics tick is a sampling rate. When internal_ticks_per_second is
-        // non-zero the solver advances on its own fixed tick and the engine tick only
-        // samples the state; 0 keeps the legacy one-solver-tick-per-engine-tick.
+        // Godot's tick is a sampling rate: internal_ticks_per_second != 0 advances the solver on
+        // its own fixed tick (engine tick samples); 0 keeps one-solver-tick-per-engine-tick.
         double internal_ticks_per_second = 0.0;
         int max_internal_steps = 4;
         double internal_accumulator = 0.0;
-        // Positional projection of overlapping contacts, run after the velocity finish
-        // (see Solver::positionProjection). The penalty solve alone leaves deep overlaps
-        // in a large pile, and BDF1 turns any later correction into velocity; this bounds
-        // the overlap in position instead, so under-solving cannot become kinetic energy.
+        // Post-velocity positional projection (Solver::positionProjection) bounds deep pile
+        // overlaps in position, so BDF1 can't turn under-solving corrections into kinetic energy.
         bool position_projection = true;
         int projection_iterations = 4;
         double projection_beta = 1.0;
         double projection_slop = 0.008;
         double projection_max_correction = 0.0;
 
-        // Idle-sleep thresholds. The horizon (how long a body must stay under both
-        // thresholds) is a TIME - Godot's 0.5 s - converted to internal ticks per step
-        // (`sleepFrames = 0.5 s / dt`), NOT a fixed 60 frames: at 120 internal Hz that is
-        // 60 internal ticks, at 240 Hz it is 120. Only the velocity thresholds and a
-        // multiplier on the horizon are project settings; the core Solver defaults stay
-        // as they were so pinned digests are unaffected.
+        // Sleep horizon is a TIME (0.5 s -> sleepFrames = 0.5/dt ticks), not 60 frames; only
+        // velocity thresholds + horizon multiplier are settings, core defaults stay for digests.
         double sleep_linear_threshold = 0.05;  // m/s (Godot default 0.1)
         double sleep_angular_threshold = 0.05; // rad/s (Godot default ~0.1396 = 8 deg/s)
         double sleep_time = 1.0;               // multiplier on the 0.5 s horizon
@@ -265,16 +223,12 @@ protected:
         // Ticks a separated manifold keeps its hot state (see Solver::contactGraceTicks).
         // 0 = reap on first separation, the historical behaviour.
         int contact_grace_ticks = 0;
-        // Route contact-only bodies through the coloured Gauss-Seidel instead of the
-        // block-Jacobi bucket (Solver::contactOnlyOverflow). Off by default: see the A/B in
-        // solver.h.
+        // Route contact-only bodies through coloured Gauss-Seidel vs block-Jacobi
+        // (Solver::contactOnlyOverflow). Off by default - see the A/B in solver.h.
         bool contact_gs = false;
 
-        // Contact generation distance, in metres (see Solver::speculativeMargin). A contact
-        // is created while the shapes are still separated by up to this much, and the
-        // velocity pass clamps the approach so the gap closes within one step at most -
-        // a fast body is stopped at the surface instead of first penetrating several
-        // centimetres and paying for it with a stiff-penalty impulse. 0 = only real overlaps.
+        // Contact generation distance in metres (Solver::speculativeMargin): forms before overlap,
+        // velocity pass closes the gap within a step to avoid deep penetration; 0 = real overlaps.
         double speculative_margin = 0.01;
 
         // Debug contacts collected during the last step (world space, Godot frame).
@@ -287,9 +241,8 @@ protected:
         // Cached direct space state handed to the engine; owned, freed with the space.
         AVBDDirectSpaceState3D *direct_state = nullptr;
 
-        // Solver-body -> server id, rebuilt with the space. The direct space state's
-        // queries get their candidates back as Rigid* from the BVH; this is the O(1)
-        // bridge back to RIDs (body_id_of used to scan every body per result).
+        // Solver-body -> server id index, rebuilt with the space: O(1) Rigid* -> RID bridge for BVH
+        // query results (body_id_of used to scan every body per result).
         ankerl::unordered_dense::map<const avbd::Rigid *, uint64_t> rigid_ids;
     };
 
@@ -317,12 +270,8 @@ protected:
         std::vector<uint64_t> prev_inside_areas;
     };
 
-    // Object kinds are kept in separate maps so an id that arrives for the wrong kind is a miss
-    // rather than a reinterpretation. `ankerl::unordered_dense` stores values contiguously and
-    // relocates them on rehash, which is fine for the plain-data records. SpaceData owns a
-    // Solver - a non-movable RAII holder of intrusive lists whose nodes point back at it - so
-    // spaces keeps it behind a stable unique_ptr: the flat map only ever moves the handle,
-    // never the solver, and the space's address survives any rehash.
+    // Separate maps per kind: a wrong-kind id is a miss. SpaceData owns a non-movable Solver, so
+    // it lives behind a stable unique_ptr - rehash moves only the handle, never the solver.
     ankerl::unordered_dense::map<uint64_t, std::unique_ptr<SpaceData>> spaces;
     ankerl::unordered_dense::map<uint64_t, BodyData> bodies;
     ankerl::unordered_dense::map<uint64_t, ShapeData> shapes;
@@ -339,10 +288,8 @@ protected:
     // after that, so the engine never reads a body pose the solver has not produced.
     bool has_stepped = false;
 
-    // Deepest contact of the last completed step, snapshotted on the stepping thread.
-    // The getters run on the main thread, where walking solver.forces races with the
-    // solver's manifold creation/revival/reaping and can report depths for pooled
-    // manifolds that no longer describe a touching pair.
+    // Deepest contact of the last step, snapshotted on the stepping thread: main-thread getters
+    // walking solver.forces would race with manifold reaping and report phantom depths.
     double diag_max_penetration = 0.0;
     uint64_t diag_deepest_a = 0;
     uint64_t diag_deepest_b = 0;
@@ -367,12 +314,8 @@ protected:
     // parameters for a re-read on the next step.
     void _on_project_settings_changed();
 
-    // Rebuild the solver for one space from the bodies and joints assigned to it. Needed
-    // whenever a body, its shapes, its mode or a joint changes, because those decide what the
-    // solver holds.
-    // The source location is the rebuild reason: every call site is a distinct engine
-    // entry point, and knowing which one fired (and when) is what tells a mid-run
-    // rebuild - which destroys every manifold - apart from scene setup.
+    // Rebuild a space's solver when bodies/shapes/mode/joints change. The source-location reason
+    // matters: a mid-run rebuild destroys every manifold, unlike scene setup.
     void rebuild_space(const RID &p_space,
             std::source_location where = std::source_location::current());
 
@@ -381,9 +324,8 @@ protected:
     ankerl::unordered_dense::map<uint64_t, bool> space_rebuild_pending;
     // Lifetime count of rebuild_space() calls; reported by get_solver_sleep_stats().
     uint64_t rebuild_total = 0;
-    // Why the rebuilds happened, and when the last one landed relative to _step() calls. A
-    // rebuild destroys every manifold, so one arriving mid-run silently discards all
-    // warm-started contact state; these make that visible from a script.
+    // Why rebuilds happened and when, relative to _step(): a mid-run rebuild discards all
+    // warm-started contact state (manifolds); these make that visible from a script.
     ankerl::unordered_dense::map<std::string, uint64_t> rebuild_reasons;
     uint64_t step_total = 0;
     uint64_t rebuild_last_step = 0;
@@ -421,9 +363,8 @@ public:
     };
     // Every simulated body of the space whose layer survives the query mask.
     std::vector<QueryCandidate> query_candidates(const RID &p_space, uint32_t p_mask) const;
-    // The same contract, narrowed by the last built broad-phase tree: only bodies whose
-    // bound overlaps the query AABB (sim space). Before any step has built a tree this
-    // answers from the body list with per-body bounds.
+    // Same contract narrowed by the last broad-phase tree: only bodies whose sim-space bound
+    // overlaps the query AABB; before any tree exists, answers from the body list.
     std::vector<QueryCandidate> query_candidates_aabb(const RID &p_space, avbd::float3 p_min,
             avbd::float3 p_max, uint32_t p_mask) const;
     // Area shapes whose world bound overlaps the query AABB, posed in sim space.
@@ -462,20 +403,14 @@ public:
     double get_solver_solve_time() const;
     double get_solver_finish_time() const;
 
-    // Penetration diagnostics for the headless stress suites. A manifold's contact error
-    // C0 carries the geometric overlap captured at the start of the step: its normal
-    // component is `COLLISION_MARGIN - depth`, so the depth in metres is margin - C0.x.
-    // Returns the deepest contact across every space (0 when nothing penetrates).
+    // Headless-suite penetration diagnostic: C0.x = COLLISION_MARGIN - depth, so depth = margin -
+    // C0.x. Returns the deepest contact across all spaces (0 if none).
     double get_solver_max_penetration() const;
     // The deepest contact as [body_a_instance_id, body_b_instance_id, depth] (Godot
     // instance ids, so a script can resolve the nodes). Empty when nothing penetrates.
     Array get_solver_deepest_contact() const;
-    // Sleep/wake diagnostics for the stress suites. A sleeping body is skipped by the
-    // velocity update in Solver::finishBody, and a manifold with neither side awake is
-    // frozen (its contact state is deliberately left stale), so both counts say whether a
-    // penetration measurement was taken against a live solve or a parked one. `rebuilds` is
-    // cumulative over the server's lifetime: a rebuild destroys every manifold, so a rising
-    // count during a run means warm-started contact state is being thrown away.
+    // Sleep/wake diagnostics: sleepers skip finishBody, frozen manifolds stay stale (parked vs
+    // live). `rebuilds` is lifetime-cumulative; a rising count means warm-start state is discarded.
     Dictionary get_solver_sleep_stats() const;
     // Get the singleton instance of AVBDPhysicsServer3D.
     static AVBDPhysicsServer3D *get_singleton();
@@ -493,7 +428,7 @@ protected:
         // Target of the ProjectSettings::settings_changed connection made in _init. Bound
         // so the StringName callable can reach it; not meant for scripts.
         ClassDB::bind_method(D_METHOD("_on_project_settings_changed"), &AVBDPhysicsServer3D::_on_project_settings_changed);
-        // ClassDB::bind_method(D_METHOD("get_singleton"), &AVBDPhysicsServer3D::get_singleton); // static method, not bound
+        // get_singleton is a static method, so it is deliberately not bound to ClassDB.
     }
 
 public:
@@ -557,10 +492,8 @@ RID _box_shape_create() override;
     void _body_attach_object_instance_id(const RID &p_body, uint64_t p_id) override;
     uint64_t _body_get_object_instance_id(const RID &p_body) const override;
 
-    // --- soft-body server API: documented unsupported this round -----------------
-    // The engine calls these only for SoftBody3D nodes, which the demo scenes do not
-    // use (the AVBDSoftBody3D node class runs its own solver). Neutral answers keep a
-    // stray SoftBody3D from erroring; nothing is simulated.
+    // --- soft-body server API: unsupported. Only SoftBody3D nodes call these; neutral answers
+    // --- keep a stray one from erroring (AVBDSoftBody3D runs its own solver). Nothing simulated.
     RID _soft_body_create() override;
     void _soft_body_set_space(const RID &p_body, const RID &p_space) override;
     RID _soft_body_get_space(const RID &p_body) const override;
@@ -657,10 +590,8 @@ RID _box_shape_create() override;
     void _body_remove_shape(const RID &p_body, int32_t p_shape_idx) override;
     void _body_clear_shapes(const RID &p_body) override;
 
-    // --- joints -------------------------------------------------------------------
-    // Only the generic 6-DOF joint gets a solver counterpart: AVBD's GenericJoint covers every
-    // configuration the car and the demos need, and the other joint types are accepted and
-    // tracked (so scenes load) without acting. Their setters record and their getters replay.
+    // --- joints: only 6-DOF gets a solver joint (GenericJoint covers car/demos); other types are
+    // tracked so scenes load but don't act - setters record, getters replay.
     RID _joint_create() override;
     void _joint_clear(const RID &p_joint) override;
     PhysicsServer3D::JointType _joint_get_type(const RID &p_joint) const override;
@@ -711,9 +642,8 @@ RID _box_shape_create() override;
             float p_value) override;
     float _cone_twist_joint_get_param(const RID &p_joint, PhysicsServer3D::ConeTwistJointParam p_param) const override;
 
-    // --- areas --------------------------------------------------------------------
-    // Created and tracked; every storage virtual is implemented and monitoring runs each
-    // step (see _monitor_areas).
+    // --- areas: created/tracked, all storage virtuals implemented; monitoring runs each step
+    // --- (see _monitor_areas).
     RID _area_create() override;
     void _area_set_space(const RID &p_area, const RID &p_space) override;
     RID _area_get_space(const RID &p_area) const override;

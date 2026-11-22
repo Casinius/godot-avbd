@@ -1,28 +1,5 @@
-/*
- * Morton LBVH broad phase, ported from `main:src/avbd/bvh/`. It is the solver's only
- * broad phase; the hierarchical hashed grid it used to share the pipeline with has been
- * removed.
- *
- * The port keeps the algorithm and changes three things, all of which were needed for the
- * comparison that selected it:
- *
- *   1. Eigen -> linalg (the `main` tree is the pre-port branch).
- *   2. Leaves are sized from the solver's **swept world AABBs** (`half`/`centre`) instead
- *      of `body->radius` bounding spheres. A sphere-vs-AABB difference is a bigger effect
- *      than the tree-vs-grid difference, so sharing the input keeps the broad phase honest
- *      about the bodies it is given.
- *   3. `NodeStorage` is folded into one class. The original spread the arrays over a
- *      separate translation unit with accessors per node; that costs nothing measurable but
- *      makes the file count four instead of two.
- *
- * Output contract: packed `packPair(i, j)` candidates, unsorted and with each overlapping
- * pair emitted once. The caller sorts, dedupes and applies the exact AABB/layer/constraint
- * filter.
- *
- * Determinism: the build sorts by (morton code, body index), the traversal pushes children
- * in a fixed order, and the pair list is integer-sorted by the caller. The build and walk
- * are serial - the `pool` parameter is reserved for future parallel work.
- */
+// Morton LBVH, sole broad phase: ported to linalg, swept-AABB leaves, folded NodeStorage.
+// Serial/deterministic ((code,index) sort, fixed child order; `pool` reserved). Output: packPair(i,j) once each, unsorted; caller sorts/filters.
 
 #pragma once
 
@@ -53,9 +30,8 @@ public:
     int builds = 0;
     int refits = 0;
 
-    // Refits allowed before the topology is rebuilt from fresh Morton codes. A refit is
-    // cheap (one post-order walk) but the topology ages: bodies that move far from where
-    // their code said they were leave the tree unbalanced and the overlap tests worse.
+    // Refits allowed before rebuilding from fresh Morton codes. A refit is cheap (one post-order
+    // walk) but the topology ages: far-moved bodies unbalance the tree and worsen overlap tests.
     int refitBudget = 16;
 
 private:

@@ -26,39 +26,22 @@ inline constexpr float PENALTY_MIN = 1.0f;
 inline constexpr float PENALTY_MAX = 10000000000.0f;
 // Cap of the adaptive per-contact beta multiplier (see Solver::adaptiveBeta).
 inline constexpr float ADAPTIVE_BETA_MAX = 64.0f;
-// Base collision margin: a 1 mm skin keeps contacts from flickering on/off at the
-// exact surface. It is deliberately small - the margin is added to the contact
-// error, so a large value is a resting penetration floor.
+// 1 mm skin stops contact flicker at the surface. Deliberately small: it adds to contact error,
+// so a large value becomes a resting penetration floor.
 inline constexpr float COLLISION_MARGIN_BASE = 0.001f;
 // Base collision margin for compatibility
 inline constexpr float COLLISION_MARGIN = COLLISION_MARGIN_BASE;
 // Position threshold for sticking contacts (ie static friction)
 inline constexpr float STICK_THRESH = 0.00001f;
-// A sticky contact's anchors are material points frozen when static friction engaged, and
-// because the two anchors stay glued to each other while the pair slides, their separation
-// (what STICK_THRESH measures) never grows - stick never clears on its own, even as the
-// frozen anchors slide metres off the touching surfaces and turn C0 into phantom depth.
-// The merge heals instead: when a sticky pair's anchor world positions drift this far from
-// where the current collision pass puts the contact, the anchors are re-adopted and the
-// force history resets. The threshold sits at the collision-margin scale: below it the
-// "drift" is numerical noise on a genuinely static contact and re-anchoring would churn
-// resting manifolds for nothing.
+// Frozen sticky anchors stay glued while sliding (STICK_THRESH never grows; C0 goes phantom), so this
+// drift re-adopts them from the collision pass and resets force history; smaller, at noise scale, churns.
 inline constexpr float STICK_DRIFT_HEAL = 0.002f;
-// Geometric separation at which a contact's warm-started dual is dropped. The dual is a
-// force, and the alpha*gamma warm-start decay (~0.99/tick) bleeds an impact impulse off
-// over hundreds of ticks; while any of it is left the contact keeps applying it even
-// though the pair has visibly parted - measured as a box popping out of an otherwise
-// still pile at 10+ m/s seconds after the impact that loaded it. Anything above the
-// collision-margin skin plus this tolerance is a real gap, and a real gap carries no
-// contact force. Below it, the skin's own noise must not churn resting contacts.
+// Separation that drops a warm-started dual: ~0.99/tick decay leaks impulse for hundreds of ticks
+// (measured 10+ m/s pop from a still pile). Above skin+tolerance = real gap; below it, noise must not churn.
 inline constexpr float CONTACT_RELEASE_GAP = 2.0e-3f;
 
-// Cap on the penetration the constraint solve sees in one step (metres). A position-level
-// step turns displacement into velocity at finishBody (v = dp/dt), so removing a deep
-// impact overlap in a single step launches the pair at tens of m/s; that body then
-// crosses other boxes before their next collision pass and the pile never settles. The
-// cap bounds the per-step expulsion to 2 cm, i.e. <= 2 cm/dt, and the residual depth is
-// resolved over the following steps.
+// Penetration the solve sees per step (m). Uncapped, v = dp/dt launches deep impacts at tens of m/s
+// and the pile never settles; cap bounds expulsion to 2 cm/step, residual depth resolves over later steps.
 inline constexpr float CONTACT_MAX_PENETRATION = 0.02f;
 
 struct Rigid;
@@ -66,14 +49,8 @@ struct Force;
 struct Manifold;
 struct Solver;
 
-// The collision and inertia shape of a body.
-//
-// `size` means different things per shape, and this documents it once:
-//   Box      - full extents in x, y and z
-//   Sphere   - size.x is the radius; y and z are ignored
-//   Cylinder - size.x and size.y are the radius, size.z is the full height, and the axis is the
-//              body's local +Z. (Godot's CylinderShape3D is Y-up; the server rotates it into
-//              sim space, see godot_convert.hpp - the solver itself is always +Z.)
+// Collision/inertia shape. `size`: Box = full xyz extents; Sphere = size.x radius (yz ignored);
+// Cylinder = x/y radius, z height, axis local +Z (Godot's Y-up is rotated by the server; solver is always +Z).
 enum class ShapeType : int
 {
     Box = 0,
@@ -81,14 +58,8 @@ enum class ShapeType : int
     Cylinder = 2,
 };
 
-// A shape collision query: the collision and inertia shape of one body, decoupled from
-// the body itself so shape pairs can be tested without a solver (space queries do this).
-//
-// `half` / `radius` / `halfHeight` mean different things per type, documented once:
-//   Box      - half is half the full extents in x, y and z
-//   Sphere   - radius; half and halfHeight unused
-//   Cylinder - radius and halfHeight; the axis is the shape's local +Z, unit length,
-//              expressed in the same space as `center` (the solver's cylinder is Z-axis)
+// Shape-only collision query (no solver needed, for space queries). `half`/`radius`/`halfHeight` per type:
+// Box = half extents; Sphere = radius only; Cylinder = radius + halfHeight, axis unit +Z in `center`'s space.
 struct Shape
 {
     ShapeType type = ShapeType::Box;
@@ -121,32 +92,26 @@ struct Rigid
     float3 moment;
     float friction;
     float radius;
-    // Per-body gravity: the signed magnitude applied along -Z. Defaults to the
-    // solver's global gravity; a host may stamp a different value per body (this
-    // is how per-body gravity modes are expressed).
+    // Per-body gravity: signed magnitude along -Z, defaulting to the solver's global value; a host may
+    // stamp a different value per body (how per-body gravity modes are expressed).
     float gravity;
     bool sleeping = false;
-    // Consecutive steps with both velocities under the solver's sleep
-    // thresholds; reaching sleepFrames flips `sleeping` on. Only meaningful when the body
-    // is movable and sleep_mode enables sleeping.
+    // Consecutive steps under both sleep thresholds; reaching sleepFrames sets `sleeping`. Only
+    // meaningful for movable bodies with sleep_mode enabled.
     int stillFrames = 0;
 
-    // Godot-style collision filtering: a pair collides when either side's layer is in the
-    // other's mask. Defaults keep every pair colliding, which is what the solver did
-    // before these existed.
+    // Godot-style: a pair collides if either layer is in the other's mask. Defaults (1/1) collide all,
+    // matching pre-filtering behaviour.
     uint32_t collisionLayer = 1;
     uint32_t collisionMask = 1;
 
-    // Per-axis motion locks, bit 0..2 = solver x, y, z. A locked axis gets no gravity and
-    // cannot carry velocity into a step, which is what keeps a locked body hanging in
-    // place. Constraint coupling can still move it within a step; that residual is a
-    // documented approximation.
+    // Per-axis locks (bits 0..2 = x/y/z): no gravity, no carried-in velocity. Constraint coupling can still
+    // move a locked axis within a step - a documented approximation.
     uint8_t axisLockLinear = 0;
     uint8_t axisLockAngular = 0;
 
-    // Mass and inertia follow from the shape, so it is a constructor argument rather than
-    // something set afterwards: a body that exists with the wrong inertia is a bug waiting to
-    // happen. The five-argument form is a box.
+    // Mass/inertia follow from shape, hence constructor args rather than setters: a body with wrong
+    // inertia is a latent bug. The five-argument form is a box.
     Rigid(Solver *p_solver, float3 p_size, ShapeType p_shape, float p_density, float p_friction,
             float3 p_position, float3 p_velocity = float3{0, 0, 0});
     Rigid(Solver *p_solver, float3 p_size, float p_density, float p_friction, float3 p_position,
@@ -159,20 +124,17 @@ struct Rigid
     Rigid(Rigid &&) = delete;
     Rigid &operator=(Rigid &&) = delete;
 
-    // Block-Jacobi update-set bookkeeping, rewritten by Solver::selectUpdateBodies() each
-    // step: `inUpdateSet` marks the movable, awake bodies whose pose the primal phases may
-    // change. Bodies outside the set (static, sleeping) are never solved or moved.
+    // Rewritten by selectUpdateBodies() each step: `inUpdateSet` marks movable, awake bodies the primal may
+    // move; static/sleeping bodies are never solved.
     bool inUpdateSet = false;
     // Position of this body in Solver::updateOrder, or -1 when out of the update
     // set. The colouring reads its neighbours' colours through it.
     int updateIndex = -1;
-    // Position of this body in Solver::bodiesInOrder, rewritten by the broad phase every
-    // step. The constraint adjacency and the pair-existence check address bodies through
-    // it, so a rebuild never has to hash pointers.
+    // Position in Solver::bodiesInOrder (rebuilt each broad phase); adjacency and pair checks address
+    // bodies by it, avoiding pointer hashing.
     int broadIndex = -1;
-    // True when every force on the body is a contact manifold. Only such bodies are
-    // routed into the overflow bucket's block-Jacobi round by colourGraph: the contact
-    // map is clamped, hard joints do not tolerate the snapshot solve.
+    // All forces are contact manifolds. Only these enter colourGraph's Jacobi overflow: contacts are
+    // clamped, but hard joints do not tolerate the snapshot solve.
     bool contactOnly = true;
     int sleep_mode = 0; // 0=NEVER, 1=SLEEP, 2=START_IN_SLEEP
 };
@@ -181,12 +143,8 @@ struct Rigid
 // the broad phase and by the space queries, so both agree on the same bound.
 [[nodiscard]] float3 aabbHalfExtent(const Rigid &body) noexcept;
 
-// The 6x6 Newton system a single body solves each iteration, split into its two 3x3
-// diagonal blocks plus the coupling block, and the matching right-hand side.
-//
-// This is the output of the primal phase: every constraint the body takes part in stamps
-// its gradient and Hessian into one of these, and then it is solved for the update. Passing
-// it as one object replaced six separate reference parameters on `updatePrimal`.
+// One body's 6x6 Newton system: two 3x3 diagonal blocks + coupling + RHS. Constraints stamp their
+// gradient/Hessian here; passing it as one object replaced six `updatePrimal` reference params.
 struct Block
 {
     float3x3 lhsLin;   // lower triangle used
@@ -195,18 +153,8 @@ struct Block
     float3 rhsLin;
     float3 rhsAng;
 
-    // Mass term of the system: M / dt^2, with the body's current error as the right-hand
-    // side. `dtSq` is dt*dt: the division is kept as a division on purpose, since
-    // multiplying by a reciprocal would not be bit-identical.
-    //
-    // The angular half is the *world* inertia R I R^T, not the body-frame diagonal I. The
-    // rest of the system is world-frame: the constraint angle Jacobians are `r x n` with r
-    // in world space (ManifoldStore::stampCached builds R S R^T, Joint stamps `r x jLin`),
-    // and the update `positionAng + dAng` is a world-frame rotation vector. Pairing that with
-    // a body-frame diagonal inertia makes the effective angular mass wrong by whatever
-    // rotation the body happens to have: only an isotropic inertia (a sphere, a cube) is
-    // unaffected, and the demo's own 1 x 0.5 x 1 box is not (0.104 / 0.167 / 0.104).
-    // projectContacts' angularCompliance/angularResponse already did this correctly.
+    // M/dt^2 with error as RHS; keep the division - a reciprocal multiply is not bit-identical.
+    // Angular mass = world inertia R I R^T, not body-frame I: all Jacobians are world-frame; only isotropic OK.
     Block(float mass, float3 moment, float dtSq, float3 positionLin, float3 inertialLin,
           quat positionAng, quat inertialAng) noexcept {
         // The M/dt^2 diagonal is one value per matrix, then componentwise products.
@@ -224,9 +172,8 @@ struct Block
         rhsAng = mul(lhsAng, positionAng - inertialAng);
     }
 
-    // Solve for the update without applying it (block-Jacobi path: each body stores its
-    // delta and a later combine pass applies it). Assembles the 6x6 directly from the
-    // block's members - no by-value matrix copies on the hot path.
+    // Solve without applying (Jacobi path: store delta, combine applies it). Assembles the 6x6 in place,
+    // no by-value matrix copies on the hot path.
     void solveDelta(float3 &r_dxLin, float3 &r_dxAng) const noexcept {
         std::array<std::array<float, 6>, 6> a{};
         
