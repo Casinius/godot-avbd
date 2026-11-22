@@ -478,3 +478,14 @@ unsupported - so none of these numbers is a settled-pile measurement.
 agrees on the order of magnitude: `pyramid_dbl` AVBD 8.50 vs Jolt 7.79 ms per frame,
 `pyramid` 6.17 vs 6.56, `stack` 2.32 vs 2.63. Its absolute numbers include the demo's
 per-frame driver work, which is why they are several times the probe's.
+
+---
+
+# Refactor gate (current tree)
+
+The digests above are historical measurements from older commits and are no longer
+the comparison point for code cleanup. `tools/baseline/digests.txt` holds the
+current reference (recorded at `879f861`, before the readability refactors), and
+`tools/verify_refactor.sh` compares `xmake run avbd_core_test` against it after
+every change. The script also runs `avbd_query_test`. Godot-side suites are not
+covered: they need a Godot 4 binary on the host.

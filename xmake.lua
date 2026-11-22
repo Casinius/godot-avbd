@@ -40,6 +40,11 @@ local avbd_core = {
     "src/avbd/manifold.cpp",
     "src/avbd/collide.cpp",
     "src/avbd/solver.cpp",
+    "src/avbd/solver_query.cpp",
+    "src/avbd/solver_step.cpp",
+    "src/avbd/solver_projection.cpp",
+    "src/avbd/solver_broadphase.cpp",
+    "src/avbd/solver_solve.cpp",
 }
 
 option("asan")

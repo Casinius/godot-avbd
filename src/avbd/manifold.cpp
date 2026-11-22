@@ -225,6 +225,31 @@ inline void clampPenetration(float3 &c0, float cap) noexcept
     if (c0.x < -cap)
         c0.x = -cap;
 }
+
+// What the friction-cone clamp decided, so callers that need the pre-clamp tangential
+// magnitude (the dual's stick test) do not recompute it.
+struct ForceClamp
+{
+    float bounds;
+    float scaleBeforeClamp;
+};
+
+// Normal force is one-sided and the tangential pair must stay inside the friction cone.
+// The primal force cache, the dual force and the dual's look-ahead force all need the same
+// clamp; the expressions and their order are kept verbatim so the solver stays bit-exact.
+inline ForceClamp clampContactForce(float3 &F, float mu) noexcept
+{
+    F[0] = std::min(F[0], 0.0f);
+
+    const float bounds = std::fabs(F[0]) * mu;
+    const float frictionScale = length(float2{F[1], F[2]});
+    if (frictionScale > bounds && frictionScale > 0)
+    {
+        F[1] *= bounds / frictionScale;
+        F[2] *= bounds / frictionScale;
+    }
+    return {bounds, frictionScale};
+}
 } // namespace
 
 bool ManifoldStore::initialize(uint32_t slot, Solver &solver)
@@ -539,18 +564,7 @@ void ManifoldStore::preCompute(uint32_t slot, const Solver &solver, float alpha)
         // Compute force - the penalty is a diagonal, so K*C is componentwise.
         float3 F = cmul(contactPenalty[first + i], C) + contactLambda[first + i];
 
-        // Clamp normal force
-        F[0] = std::min(F[0], 0.0f);
-
-        // Clamp norm of friction forces to achieve a friction cone
-        float bounds = std::fabs(F[0]) * friction[slot];
-        float frictionScale = length(float2{F[1], F[2]});
-        if (frictionScale > bounds && frictionScale > 0)
-        {
-            F[1] *= bounds / frictionScale;
-            F[2] *= bounds / frictionScale;
-        }
-
+        clampContactForce(F, friction[slot]);
         contactForceCache[first + i] = F;
     }
     flags[slot] = static_cast<uint8_t>(flags[slot] | kPrimalCacheReady);
@@ -709,17 +723,7 @@ void ManifoldStore::updateDual(uint32_t slot, const Solver &solver, float alpha)
         // Compute force - the penalty is a diagonal, so K*C is componentwise.
         float3 F = cmul(contactPenalty[first + i], C) + contactLambda[first + i];
 
-        // Clamp normal force
-        F[0] = std::min(F[0], 0.0f);
-
-        // Clamp norm of friction forces to achieve a friction cone
-        float bounds = std::fabs(F[0]) * mu;
-        float frictionScale = length(float2{F[1], F[2]});
-        if (frictionScale > bounds && frictionScale > 0)
-        {
-            F[1] *= bounds / frictionScale;
-            F[2] *= bounds / frictionScale;
-        }
+        const ForceClamp cone = clampContactForce(F, mu);
 
         // Store updated force
         contactLambda[first + i] = F;
@@ -728,7 +732,7 @@ void ManifoldStore::updateDual(uint32_t slot, const Solver &solver, float alpha)
         const float beta = solver.betaLin * contactBetaScale[first + i];
         if (F[0] < 0)
             contactPenalty[first + i][0] = std::min(contactPenalty[first + i][0] + beta * std::fabs(C[0]), PENALTY_MAX);
-        if (frictionScale <= bounds)
+        if (cone.scaleBeforeClamp <= cone.bounds)
         {
             contactPenalty[first + i][1] = std::min(contactPenalty[first + i][1] + beta * std::fabs(C[1]), PENALTY_MAX);
             contactPenalty[first + i][2] = std::min(contactPenalty[first + i][2] + beta * std::fabs(C[2]), PENALTY_MAX);
@@ -745,14 +749,7 @@ void ManifoldStore::updateDual(uint32_t slot, const Solver &solver, float alpha)
         // - and, with the ramped penalty and the just-stored lambda, exactly this force.
         // Doing it here removes the standalone preCompute from every round after the first.
         float3 fNext = cmul(contactPenalty[first + i], C) + contactLambda[first + i];
-        fNext[0] = std::min(fNext[0], 0.0f);
-        const float boundsNext = std::fabs(fNext[0]) * mu;
-        const float frictionScaleNext = length(float2{fNext[1], fNext[2]});
-        if (frictionScaleNext > boundsNext && frictionScaleNext > 0)
-        {
-            fNext[1] *= boundsNext / frictionScaleNext;
-            fNext[2] *= boundsNext / frictionScaleNext;
-        }
+        clampContactForce(fNext, mu);
         contactForceCache[first + i] = fNext;
     }
 

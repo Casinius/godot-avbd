@@ -696,6 +696,21 @@ inline bool pointNearCylinder(const Shape& cyl, const float3& p, float margin, f
     return true;
 }
 
+// The validity test both cylinder paths run on a sample: inside the shape, or within the
+// speculative margin of it. The order matters: the exact inside query runs first and only its
+// failure lets the near query run, exactly as the open-coded `!in && !(margin > 0 && near)` did.
+inline bool sampleInsideBox(const Shape& box, const float3& p, float margin, float3& r_push, float& r_depth)
+{
+    return pointInBox(box, p, r_push, r_depth)
+            || (margin > 0.0f && pointNearBox(box, p, margin, r_push, r_depth));
+}
+
+inline bool sampleInsideCylinder(const Shape& cyl, const float3& p, float margin, float3& r_push, float& r_depth)
+{
+    return pointInCylinder(cyl, p, r_push, r_depth)
+            || (margin > 0.0f && pointNearCylinder(cyl, p, margin, r_push, r_depth));
+}
+
 // A candidate contact before it is handed to the manifold, with the penetration depth that
 // decides whether it is worth keeping, and the identity of the sampled feature.
 struct Candidate
@@ -934,8 +949,7 @@ inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
     {
         float3 pushOut;
         float depth;
-        if (!pointInBox(box, samples[i], pushOut, depth) &&
-                !(speculativeMargin > 0.0f && pointNearBox(box, samples[i], speculativeMargin, pushOut, depth)))
+        if (!sampleInsideBox(box, samples[i], speculativeMargin, pushOut, depth))
             continue;
 
         Candidate& c = candidates[candidateCount++];
@@ -958,8 +972,7 @@ inline int collideCylinderBox(const Shape& a, const Shape& b, bool cylinderIsA,
 
         float3 pushOut;
         float surfaceDist;
-        if (!pointInCylinder(cyl, cornerWorld, pushOut, surfaceDist) &&
-                !(speculativeMargin > 0.0f && pointNearCylinder(cyl, cornerWorld, speculativeMargin, pushOut, surfaceDist)))
+        if (!sampleInsideCylinder(cyl, cornerWorld, speculativeMargin, pushOut, surfaceDist))
             continue;
 
         Candidate& c = candidates[candidateCount++];
@@ -1006,8 +1019,7 @@ inline int collideCylinderCylinder(const Shape& a, const Shape& b,
         {
             float3 pushOut;
             float surfaceDist;
-            if (!pointInCylinder(into, samples[i], pushOut, surfaceDist) &&
-                    !(speculativeMargin > 0.0f && pointNearCylinder(into, samples[i], speculativeMargin, pushOut, surfaceDist)))
+            if (!sampleInsideCylinder(into, samples[i], speculativeMargin, pushOut, surfaceDist))
                 continue;
 
             Candidate& c = candidates[candidateCount++];

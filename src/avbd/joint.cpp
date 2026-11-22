@@ -39,39 +39,40 @@ Joint::Joint(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB, float3 p_rA, floa
     torqueArm = length2((p_bodyA ? p_bodyA->size : float3{0, 0, 0}) + p_bodyB->size);
 }
 
+float3 Joint::constraintLin() const noexcept
+{
+    return (bodyA ? bodyA->positionLin + qrot(bodyA->positionAng, rA) : rA)
+            - (bodyB->positionLin + qrot(bodyB->positionAng, rB));
+}
+
+float3 Joint::constraintAng() const noexcept
+{
+    return ((bodyA ? bodyA->positionAng : quatIdentity) - bodyB->positionAng) * torqueArm;
+}
+
+float3 Joint::warmPenalty(float3 p, float gamma, float stiffness) noexcept
+{
+    return float3{
+        std::min(std::clamp(p.x * gamma, PENALTY_MIN, PENALTY_MAX), stiffness),
+        std::min(std::clamp(p.y * gamma, PENALTY_MIN, PENALTY_MAX), stiffness),
+        std::min(std::clamp(p.z * gamma, PENALTY_MIN, PENALTY_MAX), stiffness)
+    };
+}
+
 bool Joint::initialize()
 {
     // Store constraint function at beginnning of timestep C(x-)
     // Note: if bodyA is null, it is assumed that the joint connects a body to the world space position rA
-    C0Lin = (bodyA ? bodyA->positionLin + qrot(bodyA->positionAng, rA) : rA) - (bodyB->positionLin + qrot(bodyB->positionAng, rB));
-    C0Ang = ((bodyA ? bodyA->positionAng : quatIdentity) - bodyB->positionAng) * torqueArm;
+    C0Lin = constraintLin();
+    C0Ang = constraintAng();
 
     // Warmstart the dual variables and penalty parameters (Eq. 19)
     // Penalty is safely clamped to a minimum and maximum value
     lambdaLin = lambdaLin * solver->alpha * solver->gamma;
     lambdaAng = lambdaAng * solver->alpha * solver->gamma;
-    penaltyLin = float3{
-        std::clamp(penaltyLin.x * solver->gamma, PENALTY_MIN, PENALTY_MAX),
-        std::clamp(penaltyLin.y * solver->gamma, PENALTY_MIN, PENALTY_MAX),
-        std::clamp(penaltyLin.z * solver->gamma, PENALTY_MIN, PENALTY_MAX)
-    };
-    penaltyAng = float3{
-        std::clamp(penaltyAng.x * solver->gamma, PENALTY_MIN, PENALTY_MAX),
-        std::clamp(penaltyAng.y * solver->gamma, PENALTY_MIN, PENALTY_MAX),
-        std::clamp(penaltyAng.z * solver->gamma, PENALTY_MIN, PENALTY_MAX)
-    };
-
-    // Clamp penalty to material stiffness
-    penaltyLin = float3{
-        std::min(penaltyLin.x, stiffnessLin),
-        std::min(penaltyLin.y, stiffnessLin),
-        std::min(penaltyLin.z, stiffnessLin)
-    };
-    penaltyAng = float3{
-        std::min(penaltyAng.x, stiffnessAng),
-        std::min(penaltyAng.y, stiffnessAng),
-        std::min(penaltyAng.z, stiffnessAng)
-    };
+    // Decay and cap to the material stiffness in one pass.
+    penaltyLin = warmPenalty(penaltyLin, solver->gamma, stiffnessLin);
+    penaltyAng = warmPenalty(penaltyAng, solver->gamma, stiffnessAng);
 
     return !broken;
 }
@@ -83,7 +84,7 @@ void Joint::updatePrimal(Rigid *body, float alpha, Block &block)
     {
         // Compute constraint and jacobians
         float3x3 K = diagonal(penaltyLin.x, penaltyLin.y, penaltyLin.z);
-        float3 C = (bodyA ? bodyA->positionLin + qrot(bodyA->positionAng, rA) : rA) - (bodyB->positionLin + qrot(bodyB->positionAng, rB));
+        float3 C = constraintLin();
         
         // Stabilization
         if (std::isinf(stiffnessLin))
@@ -136,7 +137,7 @@ void Joint::updatePrimal(Rigid *body, float alpha, Block &block)
     {
         // Compute constraint and jacobians
         float3x3 K = diagonal(penaltyAng.x, penaltyAng.y, penaltyAng.z);
-        float3 C = ((bodyA ? bodyA->positionAng : quatIdentity) - bodyB->positionAng) * torqueArm;
+        float3 C = constraintAng();
 
         // Stabilization
         if (std::isinf(stiffnessAng))
@@ -182,7 +183,7 @@ void Joint::updateDual(float alpha)
     {
         // Compute constraint and jacobians
         float3x3 K = diagonal(penaltyLin.x, penaltyLin.y, penaltyLin.z);
-        float3 C = (bodyA ? bodyA->positionLin + qrot(bodyA->positionAng, rA) : rA) - (bodyB->positionLin + qrot(bodyB->positionAng, rB));
+        float3 C = constraintLin();
 
         if (std::isinf(stiffnessLin))
         {
@@ -210,7 +211,7 @@ void Joint::updateDual(float alpha)
     {
         // Compute constraint and jacobians
         float3x3 K = diagonal(penaltyAng.x, penaltyAng.y, penaltyAng.z);
-        float3 C = ((bodyA ? bodyA->positionAng : quatIdentity) - bodyB->positionAng) * torqueArm;
+        float3 C = constraintAng();
 
         if (std::isinf(stiffnessAng))
         {
