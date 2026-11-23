@@ -30,18 +30,28 @@ public:
     int builds = 0;
     int refits = 0;
 
+    // Last call split (milliseconds, diagnostics only): topology build + refit vs the
+    // tree-vs-tree candidate emission that follows. Their sum is the caller's broadIndex.
+    double lastTreeMs = 0.0;
+    double lastEmitMs = 0.0;
+
     // Refits allowed before rebuilding from fresh Morton codes. A refit is cheap (one post-order
     // walk) but the topology ages: far-moved bodies unbalance the tree and worsen overlap tests.
     int refitBudget = 16;
 
 private:
-    // Node arrays, index-addressed. `body` >= 0 marks a leaf; the internal nodes keep
-    // explicit child indices, so there is no padding and every node is reachable.
-    std::vector<float3> nodeMin;
-    std::vector<float3> nodeMax;
-    std::vector<int> nodeLeft;
-    std::vector<int> nodeRight;
-    std::vector<int> nodeBody;
+    // One 32-byte node: min(12) + max(12) + two ints(8). A leaf sets left=-1 and keeps
+    // the body index in right; an internal node keeps both child indices. Siblings are
+    // allocated consecutively, so one 64B cache line holds a child pair during descent.
+    struct Node
+    {
+        float3 min;
+        float3 max;
+        int left;  // < 0: leaf (body index in right); >= 0: left child
+        int right; // leaf: body index; internal: right child
+    };
+    static_assert(sizeof(Node) == 32, "LBVH node must stay half a cache line");
+    std::vector<Node> nodes;
 
     // The exact body list the topology was built from, to know when a refit is still legal.
     std::vector<Rigid *> treeBodies;

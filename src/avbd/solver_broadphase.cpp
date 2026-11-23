@@ -127,6 +127,8 @@ void Solver::broadPhase()
                 bodyAabbCenter, *pool);
         lastBroadIndexMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - tIndex).count();
+        lastBroadTreeMs = broadLbvh.lastTreeMs;
+        lastBroadEmitMs = broadLbvh.lastEmitMs;
     }
 
     // Pairs are packed (min<<32 | max), so integer order is lexicographic order over the

@@ -249,8 +249,10 @@ struct Solver
     {
         double broadPhase = 0.0;  // broad phase: bounds, LBVH build, pair filter, manifold slots
         // LBVH build/refit + candidate emission only; excludes bounds, pair sort, exact filter and slot
-        // creation, separating index cost from the surrounding pipeline.
+        // creation, separating index cost from the surrounding pipeline. Equals broadTree + broadEmit.
         double broadIndex = 0.0;
+        double broadTree = 0.0;   // LBVH topology build + refit (serial, amortised rebuild every 16 steps)
+        double broadEmit = 0.0;   // tree-vs-tree candidate pair emission (the parallelisation target)
         double graph = 0.0;       // force warmstart + adjacency rebuild + update-set selection/colouring
         double solve = 0.0;       // the iteration region (primal rounds + dual passes)
         double finish = 0.0;      // velocity finish, position projection, contact rebase
@@ -258,9 +260,13 @@ struct Solver
     PhaseTimes lastStepTimes;
     // Set by broadPhase() so step()/stepInterleaved can fold it into lastStepTimes.
     double lastBroadIndexMs = 0.0;
+    double lastBroadTreeMs = 0.0;
+    double lastBroadEmitMs = 0.0;
 
     // Per-phase timings of the last step (ms).
     [[nodiscard]] double get_broadPhase_time() const { return lastStepTimes.broadPhase; }
+    [[nodiscard]] double get_broadTree_time() const { return lastStepTimes.broadTree; }
+    [[nodiscard]] double get_broadEmit_time() const { return lastStepTimes.broadEmit; }
     [[nodiscard]] double get_colourGraph_time() const { return lastStepTimes.graph; }
     [[nodiscard]] double get_solve_time() const { return lastStepTimes.solve; }
     [[nodiscard]] double get_finish_time() const { return lastStepTimes.finish; }

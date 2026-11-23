@@ -1737,11 +1737,12 @@ static int run_bench_scene(const std::string &name, int threads) {
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / (double)timed;
     const Solver::PhaseTimes &pt = s.lastStepTimes;
+    // rest = bounds + radix sort/unique + exact filter + manifold slots; index = tree + emit.
     std::printf("bench-scene '%s': bodies=%d broadPhase=%s pairs=%d contacts=%d %.3f ms/step "
-                "(broad %.3f, index %.3f, solve %.3f, finish %.3f)",
+                "(broad %.3f, index %.3f [tree %.3f emit %.3f], rest %.3f, solve %.3f, finish %.3f)",
             name.c_str(), count_bodies(s), "lbvh",
             s.broadPhasePairCount(), count_contact_points(s), ms, pt.broadPhase, pt.broadIndex,
-            pt.solve, pt.finish);
+            pt.broadTree, pt.broadEmit, pt.broadPhase - pt.broadIndex, pt.solve, pt.finish);
     if (g_benchSleep > 0)
         std::printf(" sleeping=%d/%d movable, warmup=%d", count_sleeping(s), count_movable(s), warmup);
     std::printf("\n");
@@ -1768,9 +1769,10 @@ static int run_bench(int threads) {
     // Phase breakdown of the last step (Solver::lastStepTimes). This is the number that says
     // whether the broad phase is worth replacing: on a contact scene the solver dominates.
     const Solver::PhaseTimes &pt = s.lastStepTimes;
-    std::printf("bench: last step phases: broad=%.3f (index %.3f) graph=%.3f solve=%.3f "
-                "finish=%.3f (sum=%.3f)\n", pt.broadPhase, pt.broadIndex, pt.graph, pt.solve,
-            pt.finish, pt.broadPhase + pt.graph + pt.solve + pt.finish);
+    std::printf("bench: last step phases: broad=%.3f (index %.3f [tree %.3f emit %.3f], "
+                "rest %.3f) graph=%.3f solve=%.3f finish=%.3f (sum=%.3f)\n",
+            pt.broadPhase, pt.broadIndex, pt.broadTree, pt.broadEmit, pt.broadPhase - pt.broadIndex,
+            pt.graph, pt.solve, pt.finish, pt.broadPhase + pt.graph + pt.solve + pt.finish);
     std::printf("bench: broadPhase=lbvh pairs=%d\n", s.broadPhasePairCount());
     if (g_benchSleep > 0)
         std::printf("bench: sleeping=%d/%d movable after %d warmup steps\n", count_sleeping(s),

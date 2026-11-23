@@ -70,8 +70,8 @@ void Solver::step()
     rebaseContacts();
     const Clock::time_point t4 = Clock::now();
 
-    lastStepTimes = PhaseTimes{msSince(t0, t1), lastBroadIndexMs, msSince(t1, t2), msSince(t2, t3),
-            msSince(t3, t4)};
+    lastStepTimes = PhaseTimes{msSince(t0, t1), lastBroadIndexMs, lastBroadTreeMs, lastBroadEmitMs,
+            msSince(t1, t2), msSince(t2, t3), msSince(t3, t4)};
 }
 
 // One substep: body warmstart, colour-parallel Gauss-Seidel region, BDF1 finish. Idle detection
@@ -155,8 +155,8 @@ void Solver::stepInterleaved(int substeps, int roundsPerSubstep)
     // Rebase to the final pose so the host's penetration diagnostic reflects the tick's actual
     // geometry, not the pose at contact init; the next tick's initialize() replaces it anyway.
     rebaseContacts();
-    lastStepTimes = PhaseTimes{msSince(t0, t1), lastBroadIndexMs, msSince(t1, t2),
-            msSince(t2, t3), msSince(t3, Clock::now())};
+    lastStepTimes = PhaseTimes{msSince(t0, t1), lastBroadIndexMs, lastBroadTreeMs, lastBroadEmitMs,
+            msSince(t1, t2), msSince(t2, t3), msSince(t3, Clock::now())};
 }
 
 // Rebase every manifold's constraint error at the current pose. Parallel over slots; a

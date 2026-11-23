@@ -3,6 +3,7 @@
 #include "bvh_broadphase.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -38,27 +39,20 @@ inline uint64_t morton3D(float x, float y, float z, float lo, float scale) noexc
 
 int LbvhBroadPhase::leaf(int bodyIndex, const float3 &mn, const float3 &mx)
 {
-    const int id = static_cast<int>(nodeMin.size());
-    nodeMin.push_back(mn);
-    nodeMax.push_back(mx);
-    nodeLeft.push_back(-1);
-    nodeRight.push_back(-1);
-    nodeBody.push_back(bodyIndex);
+    const int id = static_cast<int>(nodes.size());
+    nodes.push_back(Node{mn, mx, -1, bodyIndex});
     return id;
 }
 
 int LbvhBroadPhase::internal(int left, int right)
 {
-    const int id = static_cast<int>(nodeMin.size());
-    nodeMin.push_back(float3{std::min(nodeMin[left].x, nodeMin[right].x),
-            std::min(nodeMin[left].y, nodeMin[right].y),
-            std::min(nodeMin[left].z, nodeMin[right].z)});
-    nodeMax.push_back(float3{std::max(nodeMax[left].x, nodeMax[right].x),
-            std::max(nodeMax[left].y, nodeMax[right].y),
-            std::max(nodeMax[left].z, nodeMax[right].z)});
-    nodeLeft.push_back(left);
-    nodeRight.push_back(right);
-    nodeBody.push_back(-1);
+    const int id = static_cast<int>(nodes.size());
+    const Node &a = nodes[left];
+    const Node &b = nodes[right];
+    nodes.push_back(Node{
+            float3{std::min(a.min.x, b.min.x), std::min(a.min.y, b.min.y), std::min(a.min.z, b.min.z)},
+            float3{std::max(a.max.x, b.max.x), std::max(a.max.y, b.max.y), std::max(a.max.z, b.max.z)},
+            left, right});
     return id;
 }
 
@@ -101,16 +95,8 @@ int LbvhBroadPhase::buildTopology(std::span<const float3> aabbCenter)
         return a < b;
     });
 
-    nodeMin.clear();
-    nodeMax.clear();
-    nodeLeft.clear();
-    nodeRight.clear();
-    nodeBody.clear();
-    nodeMin.reserve(static_cast<size_t>(2 * n - 1));
-    nodeMax.reserve(static_cast<size_t>(2 * n - 1));
-    nodeLeft.reserve(static_cast<size_t>(2 * n - 1));
-    nodeRight.reserve(static_cast<size_t>(2 * n - 1));
-    nodeBody.reserve(static_cast<size_t>(2 * n - 1));
+    nodes.clear();
+    nodes.reserve(static_cast<size_t>(2 * n - 1));
 
     // Leaves in sorted order, merged bottom-up as a range walk. The open-range stack is
     // iterative: recursion would go log2(n) deep per level with a heap allocation each step.
@@ -141,21 +127,21 @@ int LbvhBroadPhase::refit(std::span<const float3> aabbHalfExt,
     stack.reserve(64);
     stack.push_back(root);
     // `visited` marks a node whose children are already updated.
-    std::vector<uint8_t> done(nodeMin.size(), 0);
+    std::vector<uint8_t> done(nodes.size(), 0);
 
     while (!stack.empty())
     {
         const int id = stack.back();
-        const int left = nodeLeft[id];
-        const int right = nodeRight[id];
+        const int left = nodes[id].left;
+        const int right = nodes[id].right;
         if (left < 0)
         {
             // Leaf: bounds come straight from the body's swept AABB.
-            const int body = nodeBody[id];
+            const int body = nodes[id].right;
             const float3 c = aabbCenter[body];
             const float3 h = aabbHalfExt[body];
-            nodeMin[id] = float3{c.x - h.x, c.y - h.y, c.z - h.z};
-            nodeMax[id] = float3{c.x + h.x, c.y + h.y, c.z + h.z};
+            nodes[id].min = float3{c.x - h.x, c.y - h.y, c.z - h.z};
+            nodes[id].max = float3{c.x + h.x, c.y + h.y, c.z + h.z};
             // Mark it done: a leaf has no children to wait for, and without the flag the
             // parent would re-push it forever.
             done[static_cast<size_t>(id)] = 1;
@@ -164,12 +150,12 @@ int LbvhBroadPhase::refit(std::span<const float3> aabbHalfExt,
         }
         if (done[static_cast<size_t>(left)] && done[static_cast<size_t>(right)])
         {
-            nodeMin[id] = float3{std::min(nodeMin[left].x, nodeMin[right].x),
-                    std::min(nodeMin[left].y, nodeMin[right].y),
-                    std::min(nodeMin[left].z, nodeMin[right].z)};
-            nodeMax[id] = float3{std::max(nodeMax[left].x, nodeMax[right].x),
-                    std::max(nodeMax[left].y, nodeMax[right].y),
-                    std::max(nodeMax[left].z, nodeMax[right].z)};
+            const Node &a = nodes[left];
+            const Node &b = nodes[right];
+            nodes[id].min = float3{std::min(a.min.x, b.min.x), std::min(a.min.y, b.min.y),
+                    std::min(a.min.z, b.min.z)};
+            nodes[id].max = float3{std::max(a.max.x, b.max.x), std::max(a.max.y, b.max.y),
+                    std::max(a.max.z, b.max.z)};
             done[static_cast<size_t>(id)] = 1;
             stack.pop_back();
             continue;
@@ -186,6 +172,8 @@ void LbvhBroadPhase::buildAndCollectPairs(std::span<Rigid *const> bodies,
         std::vector<uint64_t> &out, std::span<const float3> aabbHalfExt,
         std::span<const float3> aabbCenter, detail::JobPool &pool)
 {
+    using Clock = std::chrono::steady_clock;
+    const auto tStart = Clock::now();
     (void)pool; // the tree build and the traversal are serial by construction
     const int count = static_cast<int>(bodies.size());
     out.clear();
@@ -194,13 +182,15 @@ void LbvhBroadPhase::buildAndCollectPairs(std::span<Rigid *const> bodies,
         root = -1;
         treeBodies.clear();
         nodeCount = 0;
+        lastTreeMs = 0.0;
+        lastEmitMs = 0.0;
         return;
     }
 
     // A refit is legal only while every leaf still addresses the same body.
     const bool sameBodySet = root >= 0 && treeBodies.size() == bodies.size() &&
             std::equal(bodies.begin(), bodies.end(), treeBodies.begin());
-    if (!sameBodySet || age >= refitBudget || nodeMin.size() < 2)
+    if (!sameBodySet || age >= refitBudget || nodes.size() < 2)
     {
         treeBodies.assign(bodies.begin(), bodies.end());
         root = buildTopology(aabbCenter);
@@ -214,20 +204,23 @@ void LbvhBroadPhase::buildAndCollectPairs(std::span<Rigid *const> bodies,
         ++age;
         ++refits;
     }
-    nodeCount = static_cast<int>(nodeMin.size());
+    nodeCount = static_cast<int>(nodes.size());
 #ifdef AVBD_LBVH_DEBUG
     {
         int leaves = 0, badLeaves = 0;
-        for (size_t i = 0; i < nodeMin.size(); ++i)
-            if (nodeBody[i] >= 0) {
+        for (size_t i = 0; i < nodes.size(); ++i)
+            if (nodes[i].left < 0) {
                 ++leaves;
-                if (nodeMin[i].x == 0.0f && nodeMax[i].x == 0.0f) ++badLeaves;
+                if (nodes[i].min.x == 0.0f && nodes[i].max.x == 0.0f) ++badLeaves;
             }
         std::fprintf(stderr, "[lbvh] nodes=%zu leaves=%d badLeaves=%d root=%d rootMin=(%.2f %.2f %.2f) rootMax=(%.2f %.2f %.2f) builds=%d refits=%d\n",
-                nodeMin.size(), leaves, badLeaves, root, nodeMin[root].x, nodeMin[root].y,
-                nodeMin[root].z, nodeMax[root].x, nodeMax[root].y, nodeMax[root].z, builds, refits);
+                nodes.size(), leaves, badLeaves, root, nodes[root].min.x, nodes[root].min.y,
+                nodes[root].min.z, nodes[root].max.x, nodes[root].max.y, nodes[root].max.z, builds, refits);
     }
 #endif
+
+    const auto tEmit = Clock::now();
+    lastTreeMs = std::chrono::duration<double, std::milli>(tEmit - tStart).count();
 
     // Tree-vs-tree self query. A node pair enters the stack only if the two bounds
     // overlap, so every entry is a live pair; a leaf pair is the answer.
@@ -236,14 +229,16 @@ void LbvhBroadPhase::buildAndCollectPairs(std::span<Rigid *const> bodies,
     pending.push_back({root, root});
 
     const auto overlaps = [this](int a, int b) {
-        return !(nodeMin[b].x > nodeMax[a].x || nodeMax[b].x < nodeMin[a].x ||
-                nodeMin[b].y > nodeMax[a].y || nodeMax[b].y < nodeMin[a].y ||
-                nodeMin[b].z > nodeMax[a].z || nodeMax[b].z < nodeMin[a].z);
+        const Node &x = nodes[a];
+        const Node &y = nodes[b];
+        return !(y.min.x > x.max.x || y.max.x < x.min.x ||
+                y.min.y > x.max.y || y.max.y < x.min.y ||
+                y.min.z > x.max.z || y.max.z < x.min.z);
     };
     const auto push = [this, &overlaps](int a, int b) {
         if (a == b)
         {
-            if (nodeLeft[a] >= 0) // a leaf self-pair carries no information
+            if (nodes[a].left >= 0) // a leaf self-pair carries no information
                 pending.push_back({a, b});
             return;
         }
@@ -260,39 +255,40 @@ void LbvhBroadPhase::buildAndCollectPairs(std::span<Rigid *const> bodies,
 
         if (a == b)
         {
-            const int left = nodeLeft[a];
-            const int right = nodeRight[a];
+            const int left = nodes[a].left;
+            const int right = nodes[a].right;
             push(left, left);
             push(left, right);
             push(right, right);
             continue;
         }
 
-        const bool aLeaf = nodeLeft[a] < 0;
-        const bool bLeaf = nodeLeft[b] < 0;
+        const bool aLeaf = nodes[a].left < 0;
+        const bool bLeaf = nodes[b].left < 0;
         if (aLeaf && bLeaf)
         {
-            out.push_back(packPair(nodeBody[a], nodeBody[b]));
+            out.push_back(packPair(nodes[a].right, nodes[b].right));
             continue;
         }
         if (aLeaf)
         {
-            push(a, nodeLeft[b]);
-            push(a, nodeRight[b]);
+            push(a, nodes[b].left);
+            push(a, nodes[b].right);
         }
         else if (bLeaf)
         {
-            push(nodeLeft[a], b);
-            push(nodeRight[a], b);
+            push(nodes[a].left, b);
+            push(nodes[a].right, b);
         }
         else
         {
-            push(nodeLeft[a], nodeLeft[b]);
-            push(nodeLeft[a], nodeRight[b]);
-            push(nodeRight[a], nodeLeft[b]);
-            push(nodeRight[a], nodeRight[b]);
+            push(nodes[a].left, nodes[b].left);
+            push(nodes[a].left, nodes[b].right);
+            push(nodes[a].right, nodes[b].left);
+            push(nodes[a].right, nodes[b].right);
         }
     }
+    lastEmitMs = std::chrono::duration<double, std::milli>(Clock::now() - tEmit).count();
 }
 
 } // namespace avbd
