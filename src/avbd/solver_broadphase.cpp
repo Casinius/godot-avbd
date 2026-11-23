@@ -136,7 +136,7 @@ void Solver::broadPhase()
     radix_std::sort_with_buffer(sweepPairs.begin(), sweepPairs.end(), pairSortScratch);
     sweepPairs.erase(std::unique(sweepPairs.begin(), sweepPairs.end()), sweepPairs.end());
 
-    auto kMinPairsPerDispatch = kMinForcesPerDispatch;
+    auto kMinPairsPerDispatch = kMinBroadPairsPerDispatch;
     const size_t pairCount = sweepPairs.size();
     broadPairValid.resize(pairCount);
     pool->forCount(pairCount, [this](int k) {

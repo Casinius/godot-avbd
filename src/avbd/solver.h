@@ -41,7 +41,10 @@ constexpr int kMinBodiesPerDispatch = 48;
 constexpr int kMinForcesPerDispatch = 256;
 // Broad-phase per-body preparation (AABB, level, cell key) costs tens of ns vs ~1 us for a primal update,
 // so dispatch pays only at a much larger batch; below this the loop runs inline and saves the round trip.
-constexpr int kMinBodiesPerCheapDispatch = 512;
+constexpr int kMinBodiesPerCheapDispatch = 1024;
+// Pair filtering is cheaper still (~10-30 ns/pair), so the task-submission round trip only
+// pays off when the pair list is genuinely large. Below this the filter runs inline.
+constexpr int kMinBroadPairsPerDispatch = 2048;
 
 // Core solver class which holds all the rigid bodies and forces, and has logic to step the simulation forward in time
 struct Solver

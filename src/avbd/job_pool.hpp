@@ -214,10 +214,11 @@ public:
             }
             return;
         }
-        // Target ~4 items/chunk (enough chop points, low bookkeeping), clamped to [workers,
-        // 4*workers] so small batches aren't one task/item and large ones still split evenly.
+        // One contiguous chunk per participant. The old 4*workers fan-out bought load
+        // balance but cost ~0.2 ms in task submissions per dispatch - more than the whole
+        // broad phase at demo scale.
         const int workers = static_cast<int>(threadCount());
-        const int blocks = std::min(std::clamp(count / 4, workers, workers * 4), count);
+        const int blocks = std::min(workers, count);
         runChunks(count, blocks, [&fn](int, int first, int last) {
             for (int i = first; i < last; i++) {
                 fn(i);
