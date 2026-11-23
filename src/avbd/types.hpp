@@ -75,7 +75,6 @@ struct Shape
 struct Rigid
 {
     Solver *solver;
-    Force *forces;
     Rigid *next;
     float3 positionLin;
     quat positionAng;

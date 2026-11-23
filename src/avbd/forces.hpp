@@ -21,14 +21,12 @@ struct Force
     Solver *solver;
     Rigid *bodyA;
     Rigid *bodyB;
-    Force *nextA;
-    Force *nextB;
     Force *next;
 
     Force(Solver *p_solver, Rigid *p_bodyA, Rigid *p_bodyB);
     virtual ~Force();
 
-    // Same reason as Rigid: a force is a node in three intrusive lists at once.
+    // Same reason as Rigid: a force is a node in the solver's intrusive list.
     Force(const Force &) = delete;
     Force &operator=(const Force &) = delete;
     Force(Force &&) = delete;
